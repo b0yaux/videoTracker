@@ -36,30 +36,7 @@ void MediaPool::setCustomPath(const std::string& absolutePath) {
     ofLogNotice("ofxMediaPool") << "✅ Using custom path: " << absolutePath;
     
     // Scan the custom directory
-    dir.allowExt("wav");
-    dir.allowExt("mp3");
-    dir.allowExt("aiff");
-    dir.allowExt("mov");
-    dir.allowExt("mp4");
-    dir.allowExt("avi");
-    
-    dir.listDir();
-    
-    // Separate audio and video files
-    for (int i = 0; i < dir.size(); i++) {
-        std::string filename = dir.getName(i);
-        std::string fullPath = dir.getPath(i);
-        
-        if (isAudioFile(filename)) {
-            audioFiles.push_back(fullPath);
-            ofLogNotice("ofxMediaPool") << "Found audio file: " << filename;
-        } else if (isVideoFile(filename)) {
-            videoFiles.push_back(fullPath);
-            ofLogNotice("ofxMediaPool") << "Found video file: " << filename;
-        }
-    }
-    
-    ofLogNotice("ofxMediaPool") << "Found " << audioFiles.size() << " audio files, " << videoFiles.size() << " video files";
+    scanMediaFiles(absolutePath, dir);
     
     // Auto-pair files
     mediaPair();
@@ -81,33 +58,9 @@ void MediaPool::scanDirectory(const std::string& path) {
     ofLogNotice("ofxMediaPool") << "✅ Directory exists, scanning for media files...";
     
     // Scan for media files
-    dir.allowExt("wav");
-    dir.allowExt("mp3");
-    dir.allowExt("aiff");
-    dir.allowExt("mov");
-    dir.allowExt("mp4");
-    dir.allowExt("avi");
-    
-    dir.listDir();
-    
-    ofLogNotice("ofxMediaPool") << "Found " << dir.size() << " files in directory";
-    
-    // Separate audio and video files
-    for (int i = 0; i < dir.size(); i++) {
-        std::string filename = dir.getName(i);
-        std::string fullPath = dir.getPath(i);
-        
-        if (isAudioFile(filename)) {
-            audioFiles.push_back(fullPath);
-            ofLogNotice("ofxMediaPool") << "Audio file: " << filename;
-        } else if (isVideoFile(filename)) {
-            videoFiles.push_back(fullPath);
-            ofLogNotice("ofxMediaPool") << "Video file: " << filename;
-        }
-    }
-    
-    ofLogNotice("ofxMediaPool") << "Found " << audioFiles.size() << " audio files and " << videoFiles.size() << " video files";
+    scanMediaFiles(path, dir);
 }
+
 
 void MediaPool::mediaPair() {
     // Clear existing players before creating new ones
@@ -128,6 +81,7 @@ void MediaPool::mediaPair() {
             player->load(audioFile, matchingVideo);
             players.push_back(std::move(player));
             
+            
             ofLogNotice("ofxMediaPool") << "Paired: " << ofFilePath::getFileName(audioFile) 
                                          << " + " << ofFilePath::getFileName(matchingVideo);
         } else {
@@ -135,6 +89,7 @@ void MediaPool::mediaPair() {
             auto player = std::make_unique<MediaPlayer>();
             player->loadAudio(audioFile);
             players.push_back(std::move(player));
+            
             
             ofLogNotice("ofxMediaPool") << "Audio-only: " << ofFilePath::getFileName(audioFile);
         }
@@ -150,12 +105,14 @@ void MediaPool::mediaPair() {
             player->loadVideo(videoFile);
             players.push_back(std::move(player));
             
+            
             ofLogNotice("ofxMediaPool") << "Video-only: " << ofFilePath::getFileName(videoFile);
         }
     }
     
     ofLogNotice("ofxMediaPool") << "Created " << players.size() << " media players";
 }
+
 
 void MediaPool::pairByIndex() {
     clear();
@@ -465,19 +422,13 @@ void MediaPool::onStepTrigger(int step, int mediaIndex, float position,
     }
     
     float bpm = clock->getBPM(); // Get BPM from clock
-    ofLogNotice("ofxMediaPool") << "Step event received: step=" << step << ", bpm=" << bpm << ", stepLength=" << stepLength;
+    ofLogNotice("ofxMediaPool") << "Step event received: step=" << step << ", bpm=" << bpm << ", duration=" << stepLength << "s";
     
-    // Handle empty cells (rests) - only stop if no scheduled stop is in progress
+    // Handle empty cells (rests) - stop immediately
     if (mediaIndex < 0) {
         if (activePlayer) {
-            // Only stop immediately if there's no scheduled stop in progress
-            // This prevents empty steps from overriding the duration of previous steps
-            if (!activePlayer->hasScheduledStop()) {
-                activePlayer->stop();
-                ofLogNotice("ofxMediaPool") << "Step " << step << " is empty (rest) - stopping current media immediately";
-            } else {
-                ofLogNotice("ofxMediaPool") << "Step " << step << " is empty (rest) - but previous step has scheduled stop, letting it complete";
-            }
+            activePlayer->stop();
+            ofLogNotice("ofxMediaPool") << "Step " << step << " is empty (rest) - stopping current media immediately";
         }
         return;
     }
@@ -517,13 +468,12 @@ void MediaPool::onStepTrigger(int step, int mediaIndex, float position,
     player->position.set(position);
     player->speed.set(speed);
     
-    // Calculate step duration based on BPM and step length
-    // stepLength is already in beats (converted by ofApp)
-    float stepDurationSeconds = (60.0f / bpm) * stepLength;
+    // Use duration directly (already calculated in seconds by TrackerSequencer)
+    float stepDurationSeconds = stepLength;  // stepLength is now duration in seconds
     
-    ofLogNotice("ofxMediaPool") << "Calculated duration: " << stepDurationSeconds << "s (BPM=" << bpm << ", stepLength=" << stepLength << " steps)";
+    ofLogNotice("ofxMediaPool") << "Using duration: " << stepDurationSeconds << "s (passed from TrackerSequencer)";
     
-    // Trigger media playback with gating
+    // Trigger media playback with gating (default behavior for step-based playback)
     player->playWithGate(stepDurationSeconds);
     
     ofLogNotice("ofxMediaPool") << "Triggered media " << mediaIndex 
@@ -535,97 +485,12 @@ void MediaPool::stopAllMedia() {
     for (auto& player : players) {
         if (player) {
             player->stop();
-            player->cancelScheduledStop();
         }
     }
     
-    // Disconnect active player
     if (activePlayer) {
         disconnectActivePlayer();
     }
-    
-    ofLogNotice("ofxMediaPool") << "Stopped all media players";
-}
-
-//--------------------------------------------------------------
-void MediaPool::drawMediaPoolGUI() {
-    // Create a dedicated media library window
-    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    bool showWindow = true;
-    ImGui::Begin("Media Pool", &showWindow);
-    
-    // Media library info
-    ImGui::Text("Media Pool:");
-    
-    // Directory path bar with browse button
-    ImGui::Text("Directory:");
-    ImGui::SameLine();
-    
-    // Display current directory path (truncated if too long)
-    std::string displayPath = dataDirectory;
-    if (displayPath.length() > 50) {
-        displayPath = "..." + displayPath.substr(displayPath.length() - 47);
-    }
-    ImGui::Text("%s", displayPath.c_str());
-    
-    // Browse button
-    if (ImGui::Button("Browse Directory")) {
-        browseForDirectory();
-    }
-    
-    ImGui::Text("Total Players: %zu", getNumPlayers());
-    ImGui::Text("Current Index: %zu", currentIndex);
-    
-    ImGui::Separator();
-    
-    // Show indexed media list with actual file names
-    if (getNumPlayers() > 0) {
-        ImGui::Text("Available Media:");
-        auto playerNames = getPlayerNames();
-        auto playerFileNames = getPlayerFileNames();
-        
-        for (size_t i = 0; i < playerNames.size(); i++) {
-            auto player = getMediaPlayer(i);
-            if (player) {
-                std::string status = "";
-                if (player->isAudioLoaded()) status += "A";
-                if (player->isVideoLoaded()) status += "V";
-                if (status.empty()) status = "---";
-                
-                // Show actual file names
-                std::string fileInfo = "";
-                if (i < playerFileNames.size() && !playerFileNames[i].empty()) {
-                    fileInfo = " | " + playerFileNames[i];
-                }
-                
-                ImGui::Text("[%zu] %s [%s]%s", i, playerNames[i].c_str(), status.c_str(), fileInfo.c_str());
-            }
-        }
-    }
-    
-    ImGui::Separator();
-    
-    // Current player status
-    auto currentPlayer = getActivePlayer();
-    if (currentPlayer) {
-        ImGui::Text("Current Player Status:");
-        ImGui::Text("Audio: %s", currentPlayer->isAudioLoaded() ? "Loaded" : "Not loaded");
-        ImGui::Text("Video: %s", currentPlayer->isVideoLoaded() ? "Loaded" : "Not loaded");
-        ImGui::Text("Playing: %s", currentPlayer->isPlaying() ? "Yes" : "No");
-        
-        // Navigation buttons
-        if (ImGui::Button("Previous Player")) {
-            previousPlayer();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Next Player")) {
-            nextPlayer();
-        }
-    } else {
-        ImGui::Text("No current player");
-    }
-    
-    ImGui::End();
 }
 
 //--------------------------------------------------------------
@@ -651,6 +516,39 @@ void MediaPool::setDataDirectory(const std::string& path) {
         onDirectoryChanged(path);
     }
 }
+
+//--------------------------------------------------------------
+void MediaPool::scanMediaFiles(const std::string& path, ofDirectory& dir) {
+    // Configure directory to allow media file extensions
+    dir.allowExt("wav");
+    dir.allowExt("mp3");
+    dir.allowExt("aiff");
+    dir.allowExt("mov");
+    dir.allowExt("mp4");
+    dir.allowExt("avi");
+    
+    dir.listDir();
+    
+    ofLogNotice("ofxMediaPool") << "Found " << dir.size() << " files in directory";
+    
+    // Separate audio and video files
+    for (int i = 0; i < dir.size(); i++) {
+        std::string filename = dir.getName(i);
+        std::string fullPath = dir.getPath(i);
+        
+        if (isAudioFile(filename)) {
+            audioFiles.push_back(fullPath);
+            ofLogNotice("ofxMediaPool") << "Found audio file: " << filename;
+        } else if (isVideoFile(filename)) {
+            videoFiles.push_back(fullPath);
+            ofLogNotice("ofxMediaPool") << "Found video file: " << filename;
+        }
+    }
+    
+    ofLogNotice("ofxMediaPool") << "Found " << audioFiles.size() << " audio files, " << videoFiles.size() << " video files";
+}
+
+//--------------------------------------------------------------
 
 //--------------------------------------------------------------
 void MediaPool::browseForDirectory() {

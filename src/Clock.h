@@ -1,15 +1,40 @@
 //
 //  Clock.h
 //
-//  Clock wrapper for ofxTimeObjects - single source of truth for BPM
+//  Audio-rate clock - sample-accurate timing without PPQN
 //
 
 #pragma once
 
 #include "ofMain.h"
-#include "ofxTimeObjects.h"
+#include "ofxSoundObjects.h"
 
-class Clock {
+// Configuration structure for Clock
+struct ClockConfig {
+    float minBPM = 20.0f;
+    float maxBPM = 480.0f;
+    int minStepsPerBeat = 1;
+    int maxStepsPerBeat = 96;
+    float bpmSmoothFactor = 0.05f;
+    float pulseFadeFactor = 0.75f;
+    float pulseThreshold = 0.05f;
+};
+
+// Event data structures
+struct BeatEventData {
+    int beatNumber;
+    double timestamp;
+    float bpm;
+};
+
+struct StepEventData {
+    int stepNumber;
+    int beatNumber;
+    double timestamp;
+    float bpm;
+};
+
+class Clock : public ofxSoundOutput {
 public:
     Clock();
     ~Clock();
@@ -18,8 +43,6 @@ public:
     void setup();
     void setBPM(float bpm);
     float getBPM() const;
-    void setTicksPerBeat(int ticks);
-    int getTicksPerBeat() const;
     
     // Transport control
     void start();
@@ -28,30 +51,57 @@ public:
     void reset();
     bool isPlaying() const;
     
-    // Tick listener system
-    void addTickListener(std::function<void(const ofxTimeBuffer&)> listener);
-    void removeTickListener();
+    // Steps per beat control
+    void setStepsPerBeat(int spb);
+    int getStepsPerBeat() const;
     
-    // GUI integration
-    void drawGUI();
+    // Audio-rate listener system
+    void addAudioListener(std::function<void(ofSoundBuffer&)> listener);
+    void removeAudioListener();
+    
+    // Beat and step event systems for sample-accurate timing
+    ofEvent<BeatEventData> beatEvent;  // For visualizer (once per beat)
+    ofEvent<StepEventData> stepEvent;  // For TrackerSequencer (multiple per beat)
+    
+    // Configuration
+    void setConfig(const ClockConfig& cfg);
+    void setSampleRate(float rate);
+    
+    // Accessors for GUI
+    float getBeatPulse() const;
+    float getMinBPM() const;
+    float getMaxBPM() const;
+    float getSampleRate() const;
+    
+    // Audio callback (inherited from ofxSoundOutput)
+    void audioOut(ofSoundBuffer& buffer) override;
     
 private:
-    // Core clock
-    ofxTimeStream clock;
-    
     // State
     bool playing;
-    float currentBpm;
-    int ticksPerBeat;
+    std::atomic<float> currentBpm;
+    std::atomic<float> targetBpm;
     
-    // GUI state
-    float bpmSlider;
-    float lastBpmUpdate;
-    float bpmChangeThreshold;
-    bool isDragging;
+    // Configuration
+    ClockConfig config;
+    float sampleRate = 44100.0f;
+    int beatCounter = 0;
+    int stepCounter = 0;
     
-    // Tick listener
-    std::function<void(const ofxTimeBuffer&)> tickListener;
+    // BPM visualizer
+    float beatPulse;
+    float lastBeatTime;
+    float beatInterval;
+    
+    // Sample-accurate timing
+    double sampleAccumulator;
+    double beatAccumulator;
+    float samplesPerStep;
+    float samplesPerBeat;
+    int stepsPerBeat;
+    
+    // Audio listeners
+    std::vector<std::function<void(ofSoundBuffer&)>> audioListeners;
     
     // Internal methods
     void onBPMChanged();

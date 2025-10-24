@@ -7,14 +7,17 @@
 #pragma once
 
 #include "ofMain.h"
-#include "ofxTimeObjects.h"
 #include "ofxSoundObjects.h"
 #include "ofxVisualObjects.h"
 #include "MediaPlayer.h"
 #include "MediaPool.h"
+#include "MediaPoolGUI.h"
 #include "TrackerSequencer.h"
 #include "Clock.h"
+#include "ClockGUI.h"
 #include "ofxImGui.h"
+#include "imgui_internal.h" // For DockBuilder API
+#include "implot.h"
 
 class ofApp : public ofBaseApp {
 public:
@@ -26,19 +29,22 @@ public:
     
     void keyPressed(int key);
     void mousePressed(int x, int y, int button);
+    void windowResized(int w, int h);
     
     // Audio callbacks
     void audioOut(ofSoundBuffer& buffer);
     
     // Step event handler for TrackerSequencer
-    void onTrackerStepEvent(int step, float bpm, const TrackerSequencer::PatternCell& cell);
+    void onTrackerStepEvent(int step, float duration, const TrackerSequencer::PatternCell& cell);
     
 private:
     // Time objects
     Clock clock;
+    ClockGUI clockGUI;
     
     // Media pool system
     MediaPool mediaPool;
+    MediaPoolGUI mediaPoolGUI;
     
     // TrackerSequencer for pattern management
     TrackerSequencer trackerSequencer;
@@ -63,6 +69,7 @@ private:
     bool isPlaying = false;
     float globalVolume = 1.0f;  // Global volume control
     int numSteps = 16;
+    
     
     // BPM control is now handled by Clock
     
@@ -89,14 +96,18 @@ private:
     void setupGUI();
     
     void drawGUI();
-    void drawMediaLibraryInfo();
-    void drawClockControls();
-    void drawAudioOutput();
+    void drawMenuBar();
+    void setupDefaultLayout(bool forceReset = false);
     
+    // Layout management
+    void saveLayout();
+    void loadLayout();
     
-    // GUI methods
-    void drawMediaLibraryGUI();
-    void drawControlsOverlay();
+    // Panel methods
+    void drawClockPanel();
+	void drawAudioOutputPanel();
+	void drawTrackerPanel();
+	void drawMediaPoolPanel();
     
     // GUI callbacks
     void onBPMChanged(float& value);

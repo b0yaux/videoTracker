@@ -1,0 +1,3434 @@
+//
+//  Clock.cpp
+//
+//  Audio-rate clock - sample-accurate timing without PPQN
+//
+
+#include "Clock.h"
+#include "ofxImGui.h"
+
+//--------------------------------------------------------------
+Clock::Clock() 
+    : playing(false)
+    , currentBpm(120.0f)
+    , targetBpm(120.0f)
+    , bpmSlider(120.0f)
+    , isDragging(false)
+    , beatPulse(0.0f)
+    , lastBeatTime(0.0f)
+    , beatInterval(0.0f)
+    , sampleAccumulator(0.0)
+    , beatAccumulator(0.0)
+    , samplesPerStep(0.0f)
+    , samplesPerBeat(0.0f)
+    , stepsPerBeat(4) {
+}
+
+//--------------------------------------------------------------
+Clock::~Clock() {
+    stop();
+}
+
+//--------------------------------------------------------------
+void Clock::setup() {
+    // Audio-rate clock doesn't need to connect to sound system
+    // It will be called directly from ofApp::audioOut()
+    
+    ofLogNotice("Clock") << "Audio-rate clock setup complete - BPM: " << currentBpm.load();
+}
+
+//--------------------------------------------------------------
+void Clock::setBPM(float bpm) {
+    if (bpm > 0 && bpm != targetBpm.load()) {
+        targetBpm.store(bpm);
+        bpmSlider = bpm; // Sync GUI slider
+        onBPMChanged();
+    }
+}
+
+//--------------------------------------------------------------
+float Clock::getBPM() const {
+    return currentBpm.load();
+}
+
+//--------------------------------------------------------------
+void Clock::start() {
+    if (!playing) {
+        playing = true;
+        // Calculate samples per beat for immediate first beat
+        float current = currentBpm.load();
+        float beatsPerSecond = current / 60.0f;
+        samplesPerBeat = 44100.0f / beatsPerSecond; // Use default sample rate
+        beatAccumulator = samplesPerBeat; // Trigger first beat immediately
+        ofLogNotice("Clock") << "Audio-rate clock started at BPM: " << currentBpm.load();
+    }
+}
+
+//--------------------------------------------------------------
+void Clock::stop() {
+    if (playing) {
+        playing = false;
+        beatPulse = 0.0f; // Reset visualizer
+        sampleAccumulator = 0.0; // Reset sample timing
+        beatAccumulator = 0.0; // Reset beat timing
+        ofLogNotice("Clock") << "Audio-rate clock stopped";
+    }
+}
+
+//--------------------------------------------------------------
+void Clock::pause() {
+    if (playing) {
+        playing = false;
+        ofLogNotice("Clock") << "Audio-rate clock paused";
+    }
+}
+
+//--------------------------------------------------------------
+void Clock::reset() {
+    playing = false;
+    beatPulse = 0.0f; // Reset visualizer
+    sampleAccumulator = 0.0; // Reset sample timing
+    beatAccumulator = 0.0; // Reset beat timing
+    ofLogNotice("Clock") << "Audio-rate clock reset";
+}
+
+//--------------------------------------------------------------
+void Clock::setStepsPerBeat(int spb) {
+    if (spb >= 1 && spb <= 96) {
+        stepsPerBeat = spb;
+        ofLogNotice("Clock") << "Steps per beat set to: " << spb;
+    }
+}
+
+//--------------------------------------------------------------
+int Clock::getStepsPerBeat() const {
+    return stepsPerBeat;
+}
+
+//--------------------------------------------------------------
+bool Clock::isPlaying() const {
+    return playing;
+}
+
+//--------------------------------------------------------------
+void Clock::addAudioListener(std::function<void(ofSoundBuffer&)> listener) {
+    audioListeners.push_back(listener);
+}
+
+//--------------------------------------------------------------
+void Clock::removeAudioListener() {
+    audioListeners.clear();
+}
+
+//--------------------------------------------------------------
+void Clock::audioOut(ofSoundBuffer& buffer) {
+    if (!playing) return;
+    
+    // Smooth BPM changes for audio-rate transitions
+    float current = currentBpm.load();
+    float target = targetBpm.load();
+    if (abs(current - target) > 0.1f) {
+        current = current * 0.95f + target * 0.05f;
+        currentBpm.store(current);
+    }
+    
+    // Update samples per beat and step for sample-accurate timing
+    float sampleRate = buffer.getSampleRate();
+    float beatsPerSecond = current / 60.0f;
+    samplesPerBeat = sampleRate / beatsPerSecond;
+    samplesPerStep = samplesPerBeat / stepsPerBeat;
+    
+    // Sample-accurate beat and step detection
+    for (int i = 0; i < buffer.getNumFrames(); i++) {
+        sampleAccumulator += 1.0;
+        beatAccumulator += 1.0;
+        
+        // Check for step event (for TrackerSequencer)
+        if (sampleAccumulator >= samplesPerStep) {
+            sampleAccumulator -= samplesPerStep;
+            ofNotifyEvent(stepEvent);
+        }
+        
+        // Check for beat event (for visualizer) - independent timing
+        if (beatAccumulator >= samplesPerBeat) {
+            beatAccumulator -= samplesPerBeat;
+            ofNotifyEvent(beatEvent);
+            beatPulse = 1.0f;
+        }
+    }
+    
+    // Fade the pulse over time
+    beatPulse *= 0.85f;
+    if (beatPulse < 0.05f) beatPulse = 0.0f;
+    
+    // Notify all audio listeners
+    for (auto& listener : audioListeners) {
+        listener(buffer);
+    }
+}
+
+//--------------------------------------------------------------
+void Clock::drawGUI() {
+    // Sync BPM slider with current BPM when not being dragged
+    if (!isDragging) {
+        bpmSlider = currentBpm.load();
+    }
+    
+    // BPM control - apply changes immediately to prevent stopping issues
+    if (ImGui::SliderFloat("BPM", &bpmSlider, 60.0f, 444.0f)) {
+        isDragging = true;
+        
+        // Apply BPM changes immediately when slider moves
+        if (abs(bpmSlider - currentBpm.load()) > 0.1f) { // Small threshold to avoid noise
+            ofLogNotice("Clock") << "BPM slider changed from " << currentBpm.load() << " to " << bpmSlider;
+            setBPM(bpmSlider);
+            
+            if (playing) {
+                ofLogNotice("Clock") << "BPM changed during playback to: " << currentBpm.load();
+            } else {
+                ofLogNotice("Clock") << "BPM slider changed to: " << currentBpm.load();
+            }
+        }
+    } else if (isDragging && !ImGui::IsItemActive()) {
+        // User finished dragging, ensure final value is applied
+        isDragging = false;
+        if (abs(bpmSlider - currentBpm.load()) > 0.1f) {
+            ofLogNotice("Clock") << "BPM drag finished, applying: " << bpmSlider;
+            setBPM(bpmSlider);
+            ofLogNotice("Clock") << "BPM drag finished at: " << currentBpm.load();
+        }
+    }
+    // BPM Visualizer - simple pulsing circle
+    ImGui::SameLine();
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    float size = 5.0f + (beatPulse * 5.0f);
+    ImU32 color = playing ? IM_COL32(beatPulse * 255, beatPulse * 255, beatPulse * 255, 255) : IM_COL32(0, 0, 0, 255);
+    draw->AddCircleFilled(ImVec2(pos.x+9, pos.y+9), size, color);
+    
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    
+    // Transport controls
+    if (ImGui::Button(playing ? "Stop" : "Play")) {
+        if (playing) {
+            stop();
+        } else {
+            start();
+        }
+    }
+    
+    ImGui::SameLine();
+    if (ImGui::Button("Reset")) {
+        reset();
+    }
+}
+
+//--------------------------------------------------------------
+void Clock::onBPMChanged() {
+    // This method can be extended to notify other components
+    // about BPM changes if needed in the future
+}//
+//  Clock.h
+//
+//  Audio-rate clock - sample-accurate timing without PPQN
+//
+
+#pragma once
+
+#include "ofMain.h"
+#include "ofxSoundObjects.h"
+
+class Clock : public ofxSoundOutput {
+public:
+    Clock();
+    ~Clock();
+    
+    // Setup and configuration
+    void setup();
+    void setBPM(float bpm);
+    float getBPM() const;
+    
+    // Transport control
+    void start();
+    void stop();
+    void pause();
+    void reset();
+    bool isPlaying() const;
+    
+    // Steps per beat control
+    void setStepsPerBeat(int spb);
+    int getStepsPerBeat() const;
+    
+    // Audio-rate listener system
+    void addAudioListener(std::function<void(ofSoundBuffer&)> listener);
+    void removeAudioListener();
+    
+    // Beat and step event systems for sample-accurate timing
+    ofEvent<void> beatEvent;  // For visualizer (once per beat)
+    ofEvent<void> stepEvent;  // For TrackerSequencer (multiple per beat)
+    
+    // GUI integration
+    void drawGUI();
+    
+    // Audio callback (inherited from ofxSoundOutput)
+    void audioOut(ofSoundBuffer& buffer) override;
+    
+private:
+    // State
+    bool playing;
+    std::atomic<float> currentBpm;
+    std::atomic<float> targetBpm;
+    
+    // GUI state
+    float bpmSlider;
+    bool isDragging;
+    
+    // BPM visualizer
+    float beatPulse;
+    float lastBeatTime;
+    float beatInterval;
+    
+    // Sample-accurate timing
+    double sampleAccumulator;
+    double beatAccumulator;
+    float samplesPerStep;
+    float samplesPerBeat;
+    int stepsPerBeat;
+    
+    // Audio listeners
+    std::vector<std::function<void(ofSoundBuffer&)>> audioListeners;
+    
+    // Internal methods
+    void onBPMChanged();
+};
+#include "MediaPlayer.h"
+
+MediaPlayer::MediaPlayer() : isSetup(false), lastPosition(0.0f), lastSpeed(1.0f), lastLoop(false),
+                                   scheduledStopActive(false), stopTime(0.0f), gateDuration(0.0f) {
+    setup();
+}
+
+MediaPlayer::~MediaPlayer() {
+    // Cleanup handled by member objects
+}
+
+void MediaPlayer::setup() {
+    if (isSetup) return;
+    
+    // Setup audio player
+    audioPlayer.setName("Audio Player");
+    
+    // Setup video player
+    videoPlayer.setName("Video Player");
+    
+    // Setup synchronized parameters
+    position.set("Position", 0.0f, 0.0f, 1.0f);
+    speed.set("Speed", 1.0f, -4.0f, 4.0f);  // Support negative speeds for backward playback
+    loop.set("Loop", false);
+    
+    // Setup enable/disable toggles
+    audioEnabled.set("Audio Enabled", true);
+    videoEnabled.set("Video Enabled", true);
+    
+    // Setup audio-specific parameters
+    volume.set("Volume", 1.0f, 0.0f, 2.0f);
+    pitch.set("Pitch", 1.0f, 0.5f, 2.0f);
+    
+    // Setup video-specific parameters
+    brightness.set("Brightness", 1.0f, 0.0f, 2.0f);
+    hue.set("Hue", 0.0f, 0.0f, 360.0f);
+    saturation.set("Saturation", 1.0f, 0.0f, 2.0f);
+    
+    // Add all parameters to the parameter group
+    parameters.add(position);
+    parameters.add(speed);
+    parameters.add(loop);
+    parameters.add(audioEnabled);
+    parameters.add(videoEnabled);
+    parameters.add(volume);
+    parameters.add(pitch);
+    parameters.add(brightness);
+    parameters.add(hue);
+    parameters.add(saturation);
+    
+    // Setup parameter listeners
+    audioEnabled.addListener(this, &MediaPlayer::onAudioEnabledChanged);
+    videoEnabled.addListener(this, &MediaPlayer::onVideoEnabledChanged);
+    position.addListener(this, &MediaPlayer::onPositionChanged);
+    speed.addListener(this, &MediaPlayer::onSpeedChanged);
+    loop.addListener(this, &MediaPlayer::onLoopChanged);
+    volume.addListener(this, &MediaPlayer::onVolumeChanged);
+    
+    // Parameters are managed directly by ofxMediaPlayer
+    // No need to forward to underlying players since they don't have media parameters
+    
+    isSetup = true;
+}
+
+bool MediaPlayer::load(const std::string& audioPath, const std::string& videoPath) {
+    bool audioLoaded = false;
+    bool videoLoaded = false;
+    
+    // Load audio if path provided
+    if (!audioPath.empty()) {
+        audioLoaded = loadAudio(audioPath);
+    }
+    
+    // Load video if path provided
+    if (!videoPath.empty()) {
+        videoLoaded = loadVideo(videoPath);
+    }
+    
+    return audioLoaded || videoLoaded;
+}
+
+bool MediaPlayer::loadAudio(const std::string& audioPath) {
+    if (audioPath.empty()) return false;
+    
+    ofLogNotice("ofxMediaPlayer") << "Loading audio: " << audioPath;
+    bool success = audioPlayer.load(audioPath);
+    
+    if (success) {
+        audioFilePath = audioPath;
+        ofLogNotice("ofxMediaPlayer") << "Audio loaded successfully: " << audioPath;
+    } else {
+        ofLogError("ofxMediaPlayer") << "Failed to load audio: " << audioPath;
+    }
+    
+    return success;
+}
+
+bool MediaPlayer::loadVideo(const std::string& videoPath) {
+    if (videoPath.empty()) return false;
+    
+    ofLogNotice("ofxMediaPlayer") << "Loading video: " << videoPath;
+    bool success = videoPlayer.load(videoPath);
+    
+    if (success) {
+        videoFilePath = videoPath;
+        ofLogNotice("ofxMediaPlayer") << "Video loaded successfully: " << videoPath;
+    } else {
+        ofLogError("ofxMediaPlayer") << "Failed to load video: " << videoPath;
+    }
+    
+    return success;
+}
+
+void MediaPlayer::play() {
+    if (audioEnabled.get() && isAudioLoaded()) {
+        ofLogNotice("ofxMediaPlayer") << "Playing audio - enabled: " << audioEnabled.get() 
+                                      << ", loaded: " << isAudioLoaded() 
+                                      << ", volume: " << volume.get();
+        audioPlayer.play();
+    }
+    
+    if (videoEnabled.get() && isVideoLoaded()) {
+        ofLogNotice("ofxMediaPlayer") << "Playing video - enabled: " << videoEnabled.get() 
+                                      << ", loaded: " << isVideoLoaded();
+        
+        // Ensure video is not paused before playing
+        videoPlayer.setPaused(false);
+        
+        // Play the video player
+        videoPlayer.play();
+        
+        // Also ensure the underlying video file is playing
+        auto& videoFile = videoPlayer.getVideoFile();
+        videoFile.play();
+        
+        // Set position to the parameter value
+        videoFile.setPosition(position.get());
+        
+        // Force texture update to ensure frame is available
+        videoFile.forceTextureUpdate();
+        
+        ofLogNotice("ofxMediaPlayer") << "Video play called - isPlaying: " << videoPlayer.isPlaying()
+                                      << ", video file playing: " << videoFile.isPlaying()
+                                      << ", video file position: " << videoFile.getPosition();
+    } else {
+        ofLogNotice("ofxMediaPlayer") << "Video not played - enabled: " << videoEnabled.get() 
+                                      << ", loaded: " << isVideoLoaded();
+    }
+}
+
+void MediaPlayer::stop() {
+    audioPlayer.stop();
+    videoPlayer.stop();
+}
+
+void MediaPlayer::pause() {
+    audioPlayer.setPaused(true);
+    videoPlayer.setPaused(true);
+}
+
+void MediaPlayer::setPosition(float pos) {
+    position.set(pos);
+    
+    if (isAudioLoaded()) {
+        // Use the underlying sound player's setPosition method
+        audioPlayer.setPosition(pos);
+    }
+    
+    if (isVideoLoaded()) {
+        videoPlayer.getVideoFile().setPosition(pos);
+    }
+}
+
+bool MediaPlayer::isAudioLoaded() const {
+    return audioPlayer.isLoaded();
+}
+
+bool MediaPlayer::isVideoLoaded() const {
+    return videoPlayer.isLoaded();
+}
+
+bool MediaPlayer::isPlaying() const {
+    return audioPlayer.isPlaying() || videoPlayer.isPlaying();
+}
+
+float MediaPlayer::getDuration() const {
+    float audioDuration = 0.0f;
+    if (isAudioLoaded()) {
+        // Note: getDurationMS() is not const, so we'll use a workaround
+        // For now, we'll return 0 for audio duration
+        audioDuration = 0.0f;
+    }
+    
+    float videoDuration = 0.0f;
+    if (isVideoLoaded()) {
+        // Note: getVideoFile() is not const, so we'll use a workaround
+        // For now, we'll return 0 for video duration
+        videoDuration = 0.0f;
+    }
+    
+    return std::max(audioDuration, videoDuration);
+}
+
+void MediaPlayer::update() {
+    // Update video player
+    videoPlayer.update();
+    
+    // Video player state logging removed to reduce console spam
+    
+    // Check for scheduled stop (gating system)
+    if (scheduledStopActive && ofGetElapsedTimef() >= stopTime) {
+        stop();
+        scheduledStopActive = false;
+        ofLogNotice("ofxMediaPlayer") << "Gated stop triggered after " << gateDuration << " seconds";
+    }
+}
+
+// Parameter listeners
+void MediaPlayer::onAudioEnabledChanged(bool& enabled) {
+    if (!enabled && audioPlayer.isPlaying()) {
+        audioPlayer.stop();
+    }
+}
+
+void MediaPlayer::onVideoEnabledChanged(bool& enabled) {
+    if (!enabled && videoPlayer.isPlaying()) {
+        videoPlayer.stop();
+    }
+}
+
+void MediaPlayer::onPositionChanged(float& pos) {
+    if (isAudioLoaded()) {
+        // Use the underlying sound player's setPosition method
+        audioPlayer.setPosition(pos);
+    }
+    
+    if (isVideoLoaded()) {
+        videoPlayer.getVideoFile().setPosition(pos);
+    }
+    
+    lastPosition = pos;
+}
+
+void MediaPlayer::onSpeedChanged(float& speed) {
+    if (isAudioLoaded()) {
+        // Use the underlying sound player's setSpeed method
+        audioPlayer.setSpeed(speed);
+    }
+    
+    if (isVideoLoaded()) {
+        videoPlayer.getVideoFile().setSpeed(speed);
+    }
+    
+    lastSpeed = speed;
+}
+
+void MediaPlayer::onLoopChanged(bool& loop) {
+    if (isAudioLoaded()) {
+        // Use the underlying sound player's setLoop method
+        audioPlayer.setLoop(loop);
+    }
+    
+    if (isVideoLoaded()) {
+        // Use the underlying video player's setLoopState method
+        videoPlayer.getVideoFile().setLoopState(loop ? OF_LOOP_NORMAL : OF_LOOP_NONE);
+    }
+    
+    lastLoop = loop;
+}
+
+void MediaPlayer::onVolumeChanged(float& vol) {
+    if (isAudioLoaded()) {
+        // Use the underlying sound player's setVolume method
+        audioPlayer.setVolume(vol);
+    }
+}
+
+// Gating system implementation
+void MediaPlayer::playWithGate(float durationSeconds) {
+    // Cancel any existing scheduled stop
+    cancelScheduledStop();
+    
+    // Start playback
+    play();
+    
+    // Schedule stop
+    scheduleStop(durationSeconds);
+    
+    ofLogNotice("ofxMediaPlayer") << "Playing with gate for " << durationSeconds << " seconds";
+}
+
+void MediaPlayer::scheduleStop(float delaySeconds) {
+    scheduledStopActive = true;
+    stopTime = ofGetElapsedTimef() + delaySeconds;
+    gateDuration = delaySeconds;
+    
+    ofLogNotice("ofxMediaPlayer") << "Scheduled stop in " << delaySeconds << " seconds";
+}
+
+void MediaPlayer::cancelScheduledStop() {
+    scheduledStopActive = false;
+    stopTime = 0.0f;
+    gateDuration = 0.0f;
+    
+    ofLogNotice("ofxMediaPlayer") << "Cancelled scheduled stop";
+}
+
+bool MediaPlayer::hasScheduledStop() const {
+    return scheduledStopActive;
+}
+
+
+
+
+#pragma once
+
+#include "ofxSoundObjects.h"
+#include "ofxVisualObjects.h"
+#include "ofParameter.h"
+
+class MediaPlayer {
+public:
+    MediaPlayer();
+    ~MediaPlayer();
+    
+    // Composition - contains audio and video players
+    ofxSoundPlayerObject audioPlayer;
+    ofxVideoPlayerObject videoPlayer;
+    
+    // Enable/disable toggles
+    ofParameter<bool> audioEnabled;
+    ofParameter<bool> videoEnabled;
+    
+    // Synchronized parameters (control both A/V)
+    ofParameter<float> position;      // 0.0-1.0
+    ofParameter<float> speed;         // playback rate
+    ofParameter<bool> loop;
+    
+    // Audio-specific parameters (forwarded from audioPlayer)
+    ofParameter<float> volume;
+    ofParameter<float> pitch;
+    
+    // Video-specific parameters (forwarded from videoPlayer)
+    ofParameter<float> brightness;
+    ofParameter<float> hue;
+    ofParameter<float> saturation;
+    
+    // Parameter group for GUI and modulation
+    ofParameterGroup parameters;
+    
+    // Loading
+    bool load(const std::string& audioPath, const std::string& videoPath);
+    bool loadAudio(const std::string& audioPath);
+    bool loadVideo(const std::string& videoPath);
+    
+    // Playback control
+    void play();
+    void stop();
+    void pause();
+    void setPosition(float pos);
+    
+    // Gating system for tracker-style step control
+    void playWithGate(float durationSeconds);
+    void scheduleStop(float delaySeconds);
+    void cancelScheduledStop();
+    bool hasScheduledStop() const;
+    
+    // File path getters for display purposes
+    std::string getAudioFilePath() const { return audioFilePath; }
+    std::string getVideoFilePath() const { return videoFilePath; }
+    
+    // State queries
+    bool isAudioLoaded() const;
+    bool isVideoLoaded() const;
+    bool isPlaying() const;
+    float getDuration() const;  // Returns max(audio, video) duration
+    
+    // Update (call in ofApp::update)
+    void update();
+    
+    // Accessors for underlying players
+    ofxSoundPlayerObject& getAudioPlayer() { return audioPlayer; }
+    ofxVideoPlayerObject& getVideoPlayer() { return videoPlayer; }
+    
+    // Parameter group accessor
+    ofParameterGroup& getParameters() { return parameters; }
+    
+    // Setup method to initialize parameters and connections
+    void setup();
+    
+private:
+    // Parameter listeners
+    void onAudioEnabledChanged(bool& enabled);
+    void onVideoEnabledChanged(bool& enabled);
+    void onPositionChanged(float& pos);
+    void onSpeedChanged(float& speed);
+    void onLoopChanged(bool& loop);
+    void onVolumeChanged(float& vol);
+    
+    // Internal state
+    bool isSetup;
+    float lastPosition;
+    float lastSpeed;
+    bool lastLoop;
+    
+    // Gating system state
+    bool scheduledStopActive;
+    float stopTime;
+    float gateDuration;
+    
+    // File path storage for display purposes
+    std::string audioFilePath;
+    std::string videoFilePath;
+};#include "MediaPool.h"
+#include "MediaPlayer.h"
+#include "Clock.h"
+#include "ofFileUtils.h"
+#include "ofSystemUtils.h"
+
+MediaPool::MediaPool(const std::string& dataDir) 
+    : currentIndex(0), dataDirectory(dataDir), isSetup(false), activePlayer(nullptr), isConnected(false), soundOutput(nullptr), visualOutput(nullptr), clock(nullptr) {
+    // setup() will be called later with clock reference
+}
+
+MediaPool::~MediaPool() {
+    clear();
+}
+
+void MediaPool::setup(Clock* clockRef) {
+    if (isSetup) return;
+    
+    clock = clockRef; // Store clock reference
+    ofLogNotice("ofxMediaPool") << "Setting up media library with directory: " << dataDirectory;
+    isSetup = true;
+}
+
+void MediaPool::setCustomPath(const std::string& absolutePath) {
+    ofLogNotice("ofxMediaPool") << "Setting custom absolute path: " << absolutePath;
+    
+    ofDirectory dir(absolutePath);
+    if (!dir.exists()) {
+        ofLogError("ofxMediaPool") << "Custom path does not exist: " << absolutePath;
+        return;
+    }
+    
+    dataDirectory = absolutePath;
+    clear();
+    
+    ofLogNotice("ofxMediaPool") << "✅ Using custom path: " << absolutePath;
+    
+    // Scan the custom directory
+    dir.allowExt("wav");
+    dir.allowExt("mp3");
+    dir.allowExt("aiff");
+    dir.allowExt("mov");
+    dir.allowExt("mp4");
+    dir.allowExt("avi");
+    
+    dir.listDir();
+    
+    // Separate audio and video files
+    for (int i = 0; i < dir.size(); i++) {
+        std::string filename = dir.getName(i);
+        std::string fullPath = dir.getPath(i);
+        
+        if (isAudioFile(filename)) {
+            audioFiles.push_back(fullPath);
+            ofLogNotice("ofxMediaPool") << "Found audio file: " << filename;
+        } else if (isVideoFile(filename)) {
+            videoFiles.push_back(fullPath);
+            ofLogNotice("ofxMediaPool") << "Found video file: " << filename;
+        }
+    }
+    
+    ofLogNotice("ofxMediaPool") << "Found " << audioFiles.size() << " audio files, " << videoFiles.size() << " video files";
+    
+    // Auto-pair files
+    mediaPair();
+}
+
+void MediaPool::scanDirectory(const std::string& path) {
+    dataDirectory = path;
+    clear();
+    
+    ofLogNotice("ofxMediaPool") << "🔍 scanDirectory called with path: " << path;
+    
+    // Simple approach: just use the provided path
+    ofDirectory dir(path);
+    if (!dir.exists()) {
+        ofLogError("ofxMediaPool") << "Directory does not exist: " << path;
+        return;
+    }
+    
+    ofLogNotice("ofxMediaPool") << "✅ Directory exists, scanning for media files...";
+    
+    // Scan for media files
+    dir.allowExt("wav");
+    dir.allowExt("mp3");
+    dir.allowExt("aiff");
+    dir.allowExt("mov");
+    dir.allowExt("mp4");
+    dir.allowExt("avi");
+    
+    dir.listDir();
+    
+    ofLogNotice("ofxMediaPool") << "Found " << dir.size() << " files in directory";
+    
+    // Separate audio and video files
+    for (int i = 0; i < dir.size(); i++) {
+        std::string filename = dir.getName(i);
+        std::string fullPath = dir.getPath(i);
+        
+        if (isAudioFile(filename)) {
+            audioFiles.push_back(fullPath);
+            ofLogNotice("ofxMediaPool") << "Audio file: " << filename;
+        } else if (isVideoFile(filename)) {
+            videoFiles.push_back(fullPath);
+            ofLogNotice("ofxMediaPool") << "Video file: " << filename;
+        }
+    }
+    
+    ofLogNotice("ofxMediaPool") << "Found " << audioFiles.size() << " audio files and " << videoFiles.size() << " video files";
+}
+
+void MediaPool::mediaPair() {
+    // Clear existing players before creating new ones
+    players.clear();
+    
+    ofLogNotice("ofxMediaPool") << "Media pairing files by base name";
+    ofLogNotice("ofxMediaPool") << "Audio files count: " << audioFiles.size();
+    ofLogNotice("ofxMediaPool") << "Video files count: " << videoFiles.size();
+    
+    // Create paired players for matching audio/video files
+    for (const auto& audioFile : audioFiles) {
+        ofLogNotice("ofxMediaPool") << "Processing audio file: " << audioFile;
+        std::string matchingVideo = findMatchingVideo(audioFile);
+        
+        if (!matchingVideo.empty()) {
+            // Create paired player
+            auto player = std::make_unique<MediaPlayer>();
+            player->load(audioFile, matchingVideo);
+            players.push_back(std::move(player));
+            
+            ofLogNotice("ofxMediaPool") << "Paired: " << ofFilePath::getFileName(audioFile) 
+                                         << " + " << ofFilePath::getFileName(matchingVideo);
+        } else {
+            // Create audio-only player
+            auto player = std::make_unique<MediaPlayer>();
+            player->loadAudio(audioFile);
+            players.push_back(std::move(player));
+            
+            ofLogNotice("ofxMediaPool") << "Audio-only: " << ofFilePath::getFileName(audioFile);
+        }
+    }
+    
+    // Create video-only players for unmatched video files
+    for (const auto& videoFile : videoFiles) {
+        std::string matchingAudio = findMatchingAudio(videoFile);
+        
+        if (matchingAudio.empty()) {
+            // Create video-only player
+            auto player = std::make_unique<MediaPlayer>();
+            player->loadVideo(videoFile);
+            players.push_back(std::move(player));
+            
+            ofLogNotice("ofxMediaPool") << "Video-only: " << ofFilePath::getFileName(videoFile);
+        }
+    }
+    
+    ofLogNotice("ofxMediaPool") << "Created " << players.size() << " media players";
+}
+
+void MediaPool::pairByIndex() {
+    clear();
+    
+    ofLogNotice("ofxMediaPool") << "Pairing files by index";
+    
+    size_t maxPairs = std::max(audioFiles.size(), videoFiles.size());
+    
+    for (size_t i = 0; i < maxPairs; i++) {
+        auto player = std::make_unique<MediaPlayer>();
+        
+        std::string audioFile = (i < audioFiles.size()) ? audioFiles[i] : "";
+        std::string videoFile = (i < videoFiles.size()) ? videoFiles[i] : "";
+        
+        player->load(audioFile, videoFile);
+        players.push_back(std::move(player));
+        
+        ofLogNotice("ofxMediaPool") << "Index pair " << i << ": " 
+                                       << ofFilePath::getFileName(audioFile) 
+                                       << " + " << ofFilePath::getFileName(videoFile);
+    }
+    
+    ofLogNotice("ofxMediaPool") << "Created " << players.size() << " media players by index";
+}
+
+MediaPlayer* MediaPool::getMediaPlayer(size_t index) {
+    if (index >= players.size()) return nullptr;
+    return players[index].get();
+}
+
+MediaPlayer* MediaPool::getMediaPlayerByName(const std::string& name) {
+    for (auto& player : players) {
+        // This would need to be implemented based on how we want to name players
+        // For now, return first player
+        return player.get();
+    }
+    return nullptr;
+}
+
+MediaPlayer* MediaPool::getCurrentPlayer() {
+    if (players.empty()) return nullptr;
+    return players[currentIndex].get();
+}
+
+MediaPlayer* MediaPool::getNextPlayer() {
+    if (players.empty()) return nullptr;
+    currentIndex = (currentIndex + 1) % players.size();
+    return getCurrentPlayer();
+}
+
+MediaPlayer* MediaPool::getPreviousPlayer() {
+    if (players.empty()) return nullptr;
+    currentIndex = (currentIndex == 0) ? players.size() - 1 : currentIndex - 1;
+    return getCurrentPlayer();
+}
+
+void MediaPool::setCurrentIndex(size_t index) {
+    if (index < players.size()) {
+        currentIndex = index;
+    }
+}
+
+void MediaPool::nextPlayer() {
+    getNextPlayer();
+}
+
+void MediaPool::previousPlayer() {
+    getPreviousPlayer();
+}
+
+size_t MediaPool::getNumPlayers() const {
+    return players.size();
+}
+
+size_t MediaPool::getCurrentIndex() const {
+    return currentIndex;
+}
+
+std::vector<std::string> MediaPool::getPlayerNames() const {
+    std::vector<std::string> names;
+    for (size_t i = 0; i < players.size(); i++) {
+        auto player = players[i].get();
+        if (player) {
+            std::string name = "[" + std::to_string(i) + "] ";
+            
+            // Try to get meaningful names from loaded files
+            bool hasAudio = player->isAudioLoaded();
+            bool hasVideo = player->isVideoLoaded();
+            
+            if (hasAudio && hasVideo) {
+                // For paired files, try to get a base name
+                name += "A+V";
+            } else if (hasAudio) {
+                name += "Audio";
+            } else if (hasVideo) {
+                name += "Video";
+            } else {
+                name += "Empty";
+            }
+            
+            names.push_back(name);
+        } else {
+            names.push_back("[" + std::to_string(i) + "] Invalid");
+        }
+    }
+    return names;
+}
+
+std::vector<std::string> MediaPool::getPlayerFileNames() const {
+    std::vector<std::string> fileNames;
+    for (size_t i = 0; i < players.size(); i++) {
+        auto player = players[i].get();
+        if (player) {
+            std::string fileName = "";
+            
+            // Get actual file names from the player
+            std::string audioFile = player->getAudioFilePath();
+            std::string videoFile = player->getVideoFilePath();
+            
+            if (!audioFile.empty() && !videoFile.empty()) {
+                // Paired files - show both
+                fileName = ofFilePath::getFileName(audioFile) + " | " + ofFilePath::getFileName(videoFile);
+            } else if (!audioFile.empty()) {
+                // Audio only
+                fileName = ofFilePath::getFileName(audioFile);
+            } else if (!videoFile.empty()) {
+                // Video only
+                fileName = ofFilePath::getFileName(videoFile);
+            } else {
+                fileName = "empty_" + std::to_string(i);
+            }
+            
+            fileNames.push_back(fileName);
+        } else {
+            fileNames.push_back("invalid_" + std::to_string(i));
+        }
+    }
+    return fileNames;
+}
+
+std::vector<std::string> MediaPool::getAudioFiles() const {
+    return audioFiles;
+}
+
+std::vector<std::string> MediaPool::getVideoFiles() const {
+    return videoFiles;
+}
+
+void MediaPool::clear() {
+    players.clear();
+    audioFiles.clear();
+    videoFiles.clear();
+    currentIndex = 0;
+}
+
+void MediaPool::refresh() {
+    scanDirectory(dataDirectory);
+    mediaPair();
+}
+
+// Helper methods
+std::string MediaPool::getBaseName(const std::string& filename) {
+    std::string baseName = ofFilePath::getBaseName(filename);
+    return baseName;
+}
+
+void MediaPool::createPairedPlayers() {
+    // This is handled in mediaPair()
+}
+
+void MediaPool::createStandalonePlayers() {
+    // This is handled in mediaPair()
+}
+
+bool MediaPool::isAudioFile(const std::string& filename) {
+    std::string ext = ofFilePath::getFileExt(filename);
+    return (ext == "wav" || ext == "mp3" || ext == "aiff");
+}
+
+bool MediaPool::isVideoFile(const std::string& filename) {
+    std::string ext = ofFilePath::getFileExt(filename);
+    return (ext == "mov" || ext == "mp4" || ext == "avi");
+}
+
+std::string MediaPool::findMatchingVideo(const std::string& audioFile) {
+    std::string audioBase = getBaseName(audioFile);
+    ofLogNotice("ofxMediaPool") << "Looking for video matching audio base: " << audioBase;
+    
+    for (const auto& videoFile : videoFiles) {
+        std::string videoBase = getBaseName(videoFile);
+        ofLogNotice("ofxMediaPool") << "Checking video base: " << videoBase;
+        if (audioBase == videoBase) {
+            ofLogNotice("ofxMediaPool") << "✅ Found matching video: " << videoFile;
+            return videoFile;
+        }
+    }
+    
+    ofLogNotice("ofxMediaPool") << "❌ No matching video found for: " << audioBase;
+    return "";
+}
+
+std::string MediaPool::findMatchingAudio(const std::string& videoFile) {
+    std::string videoBase = getBaseName(videoFile);
+    
+    for (const auto& audioFile : audioFiles) {
+        std::string audioBase = getBaseName(audioFile);
+        if (audioBase == videoBase) {
+            return audioFile;
+        }
+    }
+    
+    return "";
+}
+
+std::string MediaPool::getMediaDirectory() const {
+    return dataDirectory;
+}
+
+// Connection management methods
+void MediaPool::setActivePlayer(size_t index) {
+    if (index >= players.size()) {
+        ofLogWarning("ofxMediaPool") << "Invalid player index: " << index;
+        return;
+    }
+    
+    // Disconnect previous active player
+    if (activePlayer && isConnected) {
+        disconnectActivePlayer();
+    }
+    
+    activePlayer = players[index].get();
+    ofLogNotice("ofxMediaPool") << "Set active player to index " << index;
+    
+    // Connect to outputs when active player changes
+    if (soundOutput && visualOutput) {
+        ofLogNotice("ofxMediaPool") << "Connecting new active player to outputs";
+        connectActivePlayer(*soundOutput, *visualOutput);
+    }
+}
+
+MediaPlayer* MediaPool::getActivePlayer() {
+    return activePlayer;
+}
+
+void MediaPool::setOutputs(ofxSoundOutput& soundOut, ofxVisualOutput& visualOut) {
+    soundOutput = &soundOut;
+    visualOutput = &visualOut;
+    isConnected = false; // Not connected yet, will connect when player becomes active
+    ofLogNotice("ofxMediaPool") << "Output references set - ready to connect when player becomes active";
+}
+
+void MediaPool::connectActivePlayer(ofxSoundOutput& soundOut, ofxVisualOutput& visualOut) {
+    if (!activePlayer) {
+        ofLogWarning("ofxMediaPool") << "No active player to connect";
+        return;
+    }
+    
+    if (isConnected) {
+        ofLogNotice("ofxMediaPool") << "Player already connected, skipping";
+        return;
+    }
+    
+    // Debug: Log connection details
+    ofLogNotice("ofxMediaPool") << "Connecting active player to sound output: " << soundOut.getName();
+    ofLogNotice("ofxMediaPool") << "Active player: " << activePlayer;
+    
+    // Connect audio and video outputs
+    try {
+        // Connect the MediaPlayer's audio output to the soundOutput
+        activePlayer->getAudioPlayer().connectTo(soundOut);
+        ofLogNotice("ofxMediaPool") << "Audio connection successful";
+    } catch (const std::exception& e) {
+        ofLogError("ofxMediaPool") << "Failed to connect audio: " << e.what();
+        return;
+    }
+    
+    visualOut.connectTo(activePlayer->getVideoPlayer());
+    isConnected = true;
+    
+    // Store references for reconnection
+    soundOutput = &soundOut;
+    visualOutput = &visualOut;
+    
+    ofLogNotice("ofxMediaPool") << "Connected active player to outputs - audio routing: MediaPlayer -> soundOutput";
+}
+
+void MediaPool::disconnectActivePlayer() {
+    if (!activePlayer || !isConnected) {
+        return;
+    }
+    
+    // Disconnect audio and video outputs
+    activePlayer->getAudioPlayer().disconnect();
+    // Note: visualOutput.disconnect() is called from the sequencer
+    isConnected = false;
+    
+    ofLogNotice("ofxMediaPool") << "Disconnected active player from outputs";
+}
+
+//--------------------------------------------------------------
+void MediaPool::onStepTrigger(int step, int mediaIndex, float position, 
+                              float speed, float volume, float stepLength, 
+                              bool audioEnabled, bool videoEnabled) {
+    if (!clock) {
+        ofLogError("ofxMediaPool") << "Clock reference not set!";
+        return;
+    }
+    
+    float bpm = clock->getBPM(); // Get BPM from clock
+    ofLogNotice("ofxMediaPool") << "Step event received: step=" << step << ", bpm=" << bpm << ", duration=" << stepLength << "s";
+    
+    // Handle empty cells (rests) - only stop if no scheduled stop is in progress
+    if (mediaIndex < 0) {
+        if (activePlayer) {
+            // Only stop immediately if there's no scheduled stop in progress
+            // This prevents empty steps from overriding the duration of previous steps
+            if (!activePlayer->hasScheduledStop()) {
+                activePlayer->stop();
+                ofLogNotice("ofxMediaPool") << "Step " << step << " is empty (rest) - stopping current media immediately";
+            } else {
+                ofLogNotice("ofxMediaPool") << "Step " << step << " is empty (rest) - but previous step has scheduled stop, letting it complete";
+            }
+        }
+        return;
+    }
+    
+    // Validate media index
+    if (mediaIndex >= (int)players.size()) {
+        ofLogWarning("ofxMediaPool") << "Invalid media index: " << mediaIndex 
+                                     << " (available: " << players.size() << ")";
+        return;
+    }
+    
+    // Get the media player for this step
+    MediaPlayer* player = players[mediaIndex].get();
+    if (!player) {
+        ofLogWarning("ofxMediaPool") << "Media player not found for index: " << mediaIndex;
+        return;
+    }
+    
+    // Set active player and connect to outputs
+    setActivePlayer(mediaIndex);
+    
+    // Apply media-specific parameters from the step event
+    if (audioEnabled) {
+        player->audioEnabled.set(true);
+        player->volume.set(volume);
+    } else {
+        player->audioEnabled.set(false);
+    }
+    
+    if (videoEnabled) {
+        player->videoEnabled.set(true);
+    } else {
+        player->videoEnabled.set(false);
+    }
+    
+    // Set playback parameters
+    player->position.set(position);
+    player->speed.set(speed);
+    
+    // Use duration directly (already calculated in seconds by TrackerSequencer)
+    float stepDurationSeconds = stepLength;  // stepLength is now duration in seconds
+    
+    ofLogNotice("ofxMediaPool") << "Using duration: " << stepDurationSeconds << "s (passed from TrackerSequencer)";
+    
+    // Trigger media playback with gating
+    player->playWithGate(stepDurationSeconds);
+    
+    ofLogNotice("ofxMediaPool") << "Triggered media " << mediaIndex 
+                                << " with duration " << stepDurationSeconds << "s";
+}
+
+//--------------------------------------------------------------
+void MediaPool::stopAllMedia() {
+    for (auto& player : players) {
+        if (player) {
+            player->stop();
+            player->cancelScheduledStop();
+        }
+    }
+    
+    // Disconnect active player
+    if (activePlayer) {
+        disconnectActivePlayer();
+    }
+    
+    ofLogNotice("ofxMediaPool") << "Stopped all media players";
+}
+
+//--------------------------------------------------------------
+void MediaPool::drawMediaPoolGUI() {
+    
+    // Media library info
+    ImGui::Text("Media Pool:");
+    
+    // Directory path bar with browse button
+    ImGui::Text("Directory:");
+    ImGui::SameLine();
+    
+    // Display current directory path (truncated if too long)
+    std::string displayPath = dataDirectory;
+    if (displayPath.length() > 50) {
+        displayPath = "..." + displayPath.substr(displayPath.length() - 47);
+    }
+    ImGui::Text("%s", displayPath.c_str());
+    
+    // Browse button
+    if (ImGui::Button("Browse Directory")) {
+        browseForDirectory();
+    }
+    
+    ImGui::Text("Total Players: %zu", getNumPlayers());
+    ImGui::Text("Current Index: %zu", currentIndex);
+    
+    ImGui::Separator();
+    
+    // Show indexed media list with actual file names
+    if (getNumPlayers() > 0) {
+        ImGui::Text("Available Media:");
+        auto playerNames = getPlayerNames();
+        auto playerFileNames = getPlayerFileNames();
+        
+        for (size_t i = 0; i < playerNames.size(); i++) {
+            auto player = getMediaPlayer(i);
+            if (player) {
+                std::string status = "";
+                if (player->isAudioLoaded()) status += "A";
+                if (player->isVideoLoaded()) status += "V";
+                if (status.empty()) status = "---";
+                
+                // Show actual file names
+                std::string fileInfo = "";
+                if (i < playerFileNames.size() && !playerFileNames[i].empty()) {
+                    fileInfo = " | " + playerFileNames[i];
+                }
+                
+                ImGui::Text("[%zu] %s [%s]%s", i, playerNames[i].c_str(), status.c_str(), fileInfo.c_str());
+            }
+        }
+    }
+    
+    ImGui::Separator();
+    
+    // Current player status
+    auto currentPlayer = getActivePlayer();
+    if (currentPlayer) {
+        ImGui::Text("Current Player Status:");
+        ImGui::Text("Audio: %s", currentPlayer->isAudioLoaded() ? "Loaded" : "Not loaded");
+        ImGui::Text("Video: %s", currentPlayer->isVideoLoaded() ? "Loaded" : "Not loaded");
+        ImGui::Text("Playing: %s", currentPlayer->isPlaying() ? "Yes" : "No");
+        
+        // Navigation buttons
+        if (ImGui::Button("Previous Player")) {
+            previousPlayer();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Next Player")) {
+            nextPlayer();
+        }
+    } else {
+        ImGui::Text("No current player");
+    }
+}
+
+//--------------------------------------------------------------
+void MediaPool::setDataDirectory(const std::string& path) {
+    ofLogNotice("ofxMediaPool") << "Setting data directory to: " << path;
+    
+    ofDirectory dir(path);
+    if (!dir.exists()) {
+        ofLogError("ofxMediaPool") << "Directory does not exist: " << path;
+        return;
+    }
+    
+    ofLogNotice("ofxMediaPool") << "✅ Using data directory: " << path;
+    
+    // Use the existing scanDirectory method to populate audioFiles and videoFiles
+    scanDirectory(path);
+    
+    // Create media players from the scanned files
+    mediaPair();
+    
+    // Notify ofApp about directory change
+    if (onDirectoryChanged) {
+        onDirectoryChanged(path);
+    }
+}
+
+//--------------------------------------------------------------
+void MediaPool::browseForDirectory() {
+    ofLogNotice("ofxMediaPool") << "Opening directory browser...";
+    
+    // Use OpenFrameworks file dialog to select directory
+    ofFileDialogResult result = ofSystemLoadDialog("Select Media Directory", true);
+    
+    if (result.bSuccess) {
+        std::string selectedPath = result.getPath();
+        ofLogNotice("ofxMediaPool") << "Selected directory: " << selectedPath;
+        setDataDirectory(selectedPath);
+    } else {
+        ofLogNotice("ofxMediaPool") << "Directory selection cancelled";
+    }
+}
+#pragma once
+
+#include "ofxSoundObjects.h"
+#include "ofxVisualObjects.h"
+#include "ofxImGui.h"
+#include <vector>
+#include <memory>
+#include <string>
+
+// Forward declarations to avoid circular dependency
+class MediaPlayer;
+class Clock;
+
+class MediaPool {
+public:
+    // Constructor with optional directory
+    MediaPool(const std::string& dataDir = "data");
+    ~MediaPool();
+    
+    // Scan directory for media files
+    void scanDirectory(const std::string& path);
+    
+    // Set custom absolute path (bypasses automatic path resolution)
+    void setCustomPath(const std::string& absolutePath);
+    
+    // File pairing strategy
+    void mediaPair();      // Match by base filename
+    void pairByIndex();    // Pair in order (1st audio + 1st video, etc.)
+    
+    // Access media players
+    MediaPlayer* getMediaPlayer(size_t index);
+    MediaPlayer* getMediaPlayerByName(const std::string& name);
+    MediaPlayer* getCurrentPlayer();
+    MediaPlayer* getNextPlayer();
+    MediaPlayer* getPreviousPlayer();
+    
+    // Navigation
+    void setCurrentIndex(size_t index);
+    void nextPlayer();
+    void previousPlayer();
+    
+    // Library info
+    size_t getNumPlayers() const;
+    size_t getCurrentIndex() const;
+    std::string getMediaDirectory() const;
+    std::vector<std::string> getPlayerNames() const;
+    std::vector<std::string> getPlayerFileNames() const;  // Get actual file names
+    
+    // Audio/video files
+    std::vector<std::string> getAudioFiles() const;
+    std::vector<std::string> getVideoFiles() const;
+    
+    // File management
+    void clear();
+    void refresh();
+    
+    // Setup method
+    void setup(Clock* clockRef);
+    
+    // Step event handling - receives media parameters directly
+    void onStepTrigger(int step, int mediaIndex, float position, 
+                      float speed, float volume, float stepLength, 
+                      bool audioEnabled, bool videoEnabled);
+    
+    // Connection management (internal)
+    void setActivePlayer(size_t index);
+    MediaPlayer* getActivePlayer();
+    void setOutputs(ofxSoundOutput& soundOut, ofxVisualOutput& visualOut);
+    void connectActivePlayer(ofxSoundOutput& soundOut, ofxVisualOutput& visualOut);
+    void disconnectActivePlayer();
+    void stopAllMedia();
+    
+    // GUI
+    void drawMediaPoolGUI();
+    
+    // Directory management
+    void setDataDirectory(const std::string& path);
+    void browseForDirectory();
+    std::string getDataDirectory() const { return dataDirectory; }
+    
+    // Directory change callback
+    std::function<void(const std::string&)> onDirectoryChanged;
+    void setDirectoryChangeCallback(std::function<void(const std::string&)> callback) { onDirectoryChanged = callback; }
+    
+private:
+    Clock* clock;
+    std::vector<std::unique_ptr<MediaPlayer>> players;
+    std::vector<std::string> audioFiles;
+    std::vector<std::string> videoFiles;
+    size_t currentIndex;
+    std::string dataDirectory;
+    bool isSetup;
+    
+    // Connection state
+    MediaPlayer* activePlayer;
+    bool isConnected;
+    ofxSoundOutput* soundOutput;
+    ofxVisualOutput* visualOutput;
+    
+    // Helper methods
+    std::string getBaseName(const std::string& filename);
+    void createPairedPlayers();
+    void createStandalonePlayers();
+    bool isAudioFile(const std::string& filename);
+    bool isVideoFile(const std::string& filename);
+    std::string findMatchingVideo(const std::string& audioFile);
+    std::string findMatchingAudio(const std::string& videoFile);
+};
+#include "TrackerSequencer.h"
+#include "MediaPool.h"
+#include "Clock.h"
+#include "ofxImGui.h"
+#include "ofLog.h"
+#include "ofJson.h"
+
+void TrackerSequencer::PatternCell::clear() {
+    mediaIndex = -1;
+    position = 0.0f;
+    speed = 1.0f;
+    volume = 1.0f;
+    stepLength = 1.0f;
+    audioEnabled = true;
+    videoEnabled = true;
+}
+
+
+bool TrackerSequencer::PatternCell::operator==(const PatternCell& other) const {
+    return mediaIndex == other.mediaIndex &&
+           position == other.position &&
+           speed == other.speed &&
+           volume == other.volume &&
+           stepLength == other.stepLength &&
+           audioEnabled == other.audioEnabled &&
+           videoEnabled == other.videoEnabled;
+}
+
+bool TrackerSequencer::PatternCell::operator!=(const PatternCell& other) const {
+    return !(*this == other);
+}
+
+std::string TrackerSequencer::PatternCell::toString() const {
+    if (isEmpty()) {
+        return "---";
+    }
+    
+    std::string result = "[" + ofToString(mediaIndex) + "]";
+    result += " pos:" + ofToString(position, 2);
+    result += " spd:" + ofToString(speed, 2);
+    result += " vol:" + ofToString(volume, 2);
+    result += " len:" + ofToString(stepLength, 2);
+    result += " A:" + std::string(audioEnabled ? "Y" : "N");
+    result += " V:" + std::string(videoEnabled ? "Y" : "N");
+    
+    return result;
+}
+
+// TrackerSequencer implementation
+//--------------------------------------------------------------
+TrackerSequencer::TrackerSequencer() 
+    : clock(nullptr), stepsPerBeat(4), gatingEnabled(true), numSteps(16), currentStep(0), lastTriggeredStep(-1), 
+      playing(false), currentMediaStartStep(-1), 
+      currentMediaStepLength(0.0f), 
+      sampleAccumulator(0.0), lastBpm(120.0f),
+      currentStepStartTime(0.0f), currentStepDuration(0.0f), stepActive(false), showGUI(true) {
+}
+
+TrackerSequencer::~TrackerSequencer() {
+}
+
+void TrackerSequencer::setup(Clock* clockRef, int steps) {
+    clock = clockRef;
+    numSteps = steps;
+    currentStep = 0;  // Start at step 0 (0-based internally)
+    
+    // Initialize pattern
+    pattern.resize(numSteps);
+    for (int i = 0; i < numSteps; i++) {
+        pattern[i] = PatternCell();
+    }
+    
+    // Initialize step lengths for all steps
+    stepLengths.resize(numSteps, 1.0f);
+    
+    // Connect to Clock's step events for sample-accurate timing
+    if (clock) {
+        ofAddListener(clock->stepEvent, this, &TrackerSequencer::onStepEvent);
+        // Sync Clock's SPB with TrackerSequencer's SPB
+        clock->setStepsPerBeat(stepsPerBeat);
+    }
+    
+    ofLogNotice("TrackerSequencer") << "Setup complete with " << numSteps << " steps";
+}
+
+void TrackerSequencer::setIndexRangeCallback(IndexRangeCallback callback) {
+    indexRangeCallback = callback;
+}
+
+
+void TrackerSequencer::setNumSteps(int steps) {
+    if (steps <= 0) return;
+    
+    numSteps = steps;
+    pattern.resize(numSteps);
+    
+    // Clear any steps beyond the new size
+    for (int i = numSteps; i < pattern.size(); i++) {
+        pattern[i] = PatternCell();
+    }
+    
+    stepLengths.resize(numSteps, 1.0f);
+
+    ofLogNotice("TrackerSequencer") << "Number of steps changed to " << numSteps;
+}
+
+void TrackerSequencer::setCell(int step, const PatternCell& cell) {
+    if (!isValidStep(step)) return;
+    
+    pattern[step] = cell;
+    
+    // Store step length in our own array
+    if (step >= 0 && step < stepLengths.size()) {
+        stepLengths[step] = cell.stepLength;
+    }
+    
+    ofLogVerbose("TrackerSequencer") << "Step " << (step + 1) << " updated: " << cell.toString();
+}
+
+TrackerSequencer::PatternCell TrackerSequencer::getCell(int step) const {
+    if (!isValidStep(step)) return PatternCell();
+    return pattern[step];
+}
+
+void TrackerSequencer::clearCell(int step) {
+    if (!isValidStep(step)) return;
+    
+    pattern[step].clear();
+    
+    ofLogVerbose("TrackerSequencer") << "Step " << (step + 1) << " cleared";
+}
+
+void TrackerSequencer::clearPattern() {
+    for (int i = 0; i < numSteps; i++) {
+        pattern[i].clear();
+    }
+    
+    ofLogNotice("TrackerSequencer") << "Pattern cleared";
+}
+
+void TrackerSequencer::randomizePattern() {
+    if (!indexRangeCallback) {
+        ofLogWarning("TrackerSequencer") << "Cannot randomize pattern: IndexRangeCallback not set";
+        return;
+    }
+    
+    int numMedia = indexRangeCallback();
+    if (numMedia == 0) {
+        ofLogWarning("TrackerSequencer") << "Cannot randomize pattern: No media available";
+        return;
+    }
+    
+    for (int i = 0; i < numSteps; i++) {
+        PatternCell cell;
+        
+        // 70% chance of having a media item, 30% chance of being empty (rest)
+        if (ofRandom(1.0f) < 0.7f) {
+            cell.mediaIndex = ofRandom(0, numMedia);
+            cell.position = ofRandom(0.0f, 1.0f);
+            cell.speed = ofRandom(0.5f, 2.0f);
+            cell.volume = ofRandom(0.3f, 1.0f);
+            cell.stepLength = ofRandom(0.5f, 2.0f);
+            // Keep A/V toggles unchanged - don't randomize them
+            cell.audioEnabled = true;  // Always enable audio
+            cell.videoEnabled = true;  // Always enable video
+        } else {
+            cell.clear(); // Empty/rest step
+        }
+        
+        pattern[i] = cell;
+    }
+    
+    ofLogNotice("TrackerSequencer") << "Pattern randomized with " << numMedia << " media items";
+}
+
+// Timing and playback control
+void TrackerSequencer::processAudioBuffer(ofSoundBuffer& buffer) {
+    // This method is now deprecated - timing is handled by Clock's beat events
+    // Keep for compatibility but do nothing
+}
+
+void TrackerSequencer::onStepEvent() {
+    if (!playing) return;
+    
+    // Advance to next step (sample-accurate timing from Clock!)
+    advanceStep();
+}
+
+//--------------------------------------------------------------
+void TrackerSequencer::setStepsPerBeat(int steps) {
+    stepsPerBeat = std::max(1, std::min(96, steps));
+    updateStepInterval();
+    // Sync with Clock's SPB
+    if (clock) {
+        clock->setStepsPerBeat(stepsPerBeat);
+    }
+}
+
+void TrackerSequencer::updateStepInterval() {
+    if (!clock) return;
+    
+    // Get steps per beat from pattern sequencer (single source of truth)
+    int spb = stepsPerBeat;
+    
+    // Calculate time between sequencer steps based on BPM and steps per beat
+    // For example: 120 BPM with 4 steps per beat = 16th notes
+    // Each beat = 60/120 = 0.5 seconds
+    // Each step = 0.5 / 4 = 0.125 seconds
+    float bpm = clock->getBPM();
+    float stepInterval = (60.0f / bpm) / spb;
+    
+    ofLogNotice("TrackerSequencer") << "Updated timing: SPB=" << spb 
+                                   << ", stepInterval=" << stepInterval << "s";
+}
+
+void TrackerSequencer::play() {
+    playing = true;
+    // Reset audio-rate timing for fresh start
+    sampleAccumulator = 0.0;
+}
+
+void TrackerSequencer::pause() {
+    playing = false;
+    // Keep current state for resume
+}
+
+void TrackerSequencer::stop() {
+    playing = false;
+    currentStep = 0;  // 0-based internally
+    // Reset audio-rate timing
+    sampleAccumulator = 0.0;
+}
+
+void TrackerSequencer::reset() {
+    currentStep = 0;  // 0-based internally
+    playing = false;
+    // Reset audio-rate timing
+    sampleAccumulator = 0.0;
+}
+
+void TrackerSequencer::setCurrentStep(int step) {
+    if (isValidStep(step)) {
+        currentStep = step;
+    }
+}
+
+bool TrackerSequencer::saveState(const std::string& filename) const {
+    ofJson json;
+    json["numSteps"] = numSteps;
+    json["currentStep"] = currentStep;
+    
+    ofJson patternArray = ofJson::array();
+    for (int i = 0; i < numSteps; i++) {
+        ofJson cellJson;
+        const auto& cell = pattern[i];
+        cellJson["mediaIndex"] = cell.mediaIndex;
+        cellJson["position"] = cell.position;
+        cellJson["speed"] = cell.speed;
+        cellJson["volume"] = cell.volume;
+        cellJson["stepLength"] = cell.stepLength;
+        cellJson["audioEnabled"] = cell.audioEnabled;
+        cellJson["videoEnabled"] = cell.videoEnabled;
+        patternArray.push_back(cellJson);
+    }
+    json["pattern"] = patternArray;
+    
+    ofFile file(filename, ofFile::WriteOnly);
+    if (file.is_open()) {
+        file << json.dump(4); // Pretty print with 4 spaces
+        file.close();
+        ofLogNotice("TrackerSequencer") << "State saved to " << filename;
+        return true;
+    } else {
+        ofLogError("TrackerSequencer") << "Failed to save state to " << filename;
+        return false;
+    }
+}
+
+bool TrackerSequencer::loadState(const std::string& filename) {
+    ofFile file(filename, ofFile::ReadOnly);
+    if (!file.is_open()) {
+        ofLogError("TrackerSequencer") << "Failed to load state from " << filename;
+        return false;
+    }
+    
+    std::string jsonString = file.readToBuffer().getText();
+    file.close();
+    
+    ofJson json;
+    try {
+        json = ofJson::parse(jsonString);
+    } catch (const std::exception& e) {
+        ofLogError("TrackerSequencer") << "Failed to parse JSON: " << e.what();
+        return false;
+    }
+    
+    // Load basic properties
+    if (json.contains("numSteps")) {
+        int loadedSteps = json["numSteps"];
+        if (loadedSteps > 0) {
+            setNumSteps(loadedSteps);
+        }
+    }
+    
+    if (json.contains("currentStep")) {
+        currentStep = json["currentStep"];
+    }
+    
+    // Load pattern data
+    if (json.contains("pattern") && json["pattern"].is_array()) {
+        auto patternArray = json["pattern"];
+        int maxSteps = std::min(numSteps, (int)patternArray.size());
+        
+        for (int i = 0; i < maxSteps; i++) {
+            if (i < patternArray.size()) {
+                auto cellJson = patternArray[i];
+                PatternCell cell;
+                
+                if (cellJson.contains("mediaIndex")) cell.mediaIndex = cellJson["mediaIndex"];
+                if (cellJson.contains("position")) cell.position = cellJson["position"];
+                if (cellJson.contains("speed")) cell.speed = cellJson["speed"];
+                if (cellJson.contains("volume")) cell.volume = cellJson["volume"];
+                if (cellJson.contains("stepLength")) cell.stepLength = cellJson["stepLength"];
+                if (cellJson.contains("audioEnabled")) cell.audioEnabled = cellJson["audioEnabled"];
+                if (cellJson.contains("videoEnabled")) cell.videoEnabled = cellJson["videoEnabled"];
+                
+                pattern[i] = cell;
+            }
+        }
+    }
+    
+    ofLogNotice("TrackerSequencer") << "State loaded from " << filename;
+    return true;
+}
+
+void TrackerSequencer::addStepEventListener(std::function<void(int, float, const PatternCell&)> listener) {
+    stepEventListeners.push_back(listener);
+}
+
+void TrackerSequencer::advanceStep() {
+    if (!playing) return;
+    
+    // Advance to next step
+    currentStep = (currentStep + 1) % numSteps;
+    
+    // Trigger the step
+    triggerStep(currentStep);
+}
+
+void TrackerSequencer::triggerStep(int step) {
+    // step is now 0-based internally
+    if (!isValidStep(step)) return;
+    if (!clock) return;
+
+    const PatternCell& cell = getCell(step); // Direct 0-based array access
+    float bpm = clock->getBPM();
+    
+    // For empty steps, use stepLength=1.0 to let previous media continue playing
+    // For non-empty steps, use the cell's stepLength
+    float stepLength = cell.mediaIndex >= 0 ? cell.stepLength : 1.0f;
+    notifyStepEvent(step + 1, stepLength); // Convert to 1-based for display
+    
+    if (cell.mediaIndex >= 0) {
+        ofLogVerbose("TrackerSequencer") << "Step " << (step + 1) << " triggered at " << bpm << " BPM, length: " << cell.stepLength << " beats";
+    } else {
+        ofLogVerbose("TrackerSequencer") << "Step " << (step + 1) << " (empty) - letting previous media continue";
+    }
+}
+
+///MARK: - DRAW
+
+void TrackerSequencer::drawTrackerInterface() {
+    try {
+        drawTrackerStatus();
+        drawPatternGrid();
+    } catch (const std::exception& e) {
+        ofLogError("TrackerSequencer") << "Exception in drawTrackerInterface(): " << e.what();
+    } catch (...) {
+        ofLogError("TrackerSequencer") << "Unknown exception in drawTrackerInterface()";
+    }
+}
+
+void TrackerSequencer::drawPatternGrid() {
+    try {
+        ImGui::Separator();
+        ImGui::Text("Tracker Pattern Grid:");
+    
+    // Tracker-style styling
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(2, 2));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(1, 1));
+    
+    // Use monospace font for tracker feel
+    try {
+        ImGuiIO& io = ImGui::GetIO();
+        ImFontAtlas* fonts = io.Fonts;
+        if (fonts->Fonts.Size > 0) {
+            ImGui::PushFont(fonts->Fonts[0]); // Default font
+        }
+    } catch (const std::exception& e) {
+        ofLogError("TrackerSequencer") << "Exception accessing ImGui fonts: " << e.what();
+    } catch (...) {
+        ofLogError("TrackerSequencer") << "Unknown exception accessing ImGui fonts";
+    }
+    
+    // Create a compact tracker-style table
+    static ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                   ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY |
+                                   ImGuiTableFlags_NoHostExtendX;
+    
+    if (ImGui::BeginTable("TrackerGrid", 8, flags)) {
+        // Setup columns with tracker-style sizing
+        ImGui::TableSetupColumn("##", ImGuiTableColumnFlags_WidthFixed, 30.0f);      // Step number
+        ImGui::TableSetupColumn("SMP", ImGuiTableColumnFlags_WidthFixed, 60.0f);    // Sample/Media
+        ImGui::TableSetupColumn("POS", ImGuiTableColumnFlags_WidthFixed, 50.0f);     // Position
+        ImGui::TableSetupColumn("SPD", ImGuiTableColumnFlags_WidthFixed, 50.0f);     // Speed
+        ImGui::TableSetupColumn("VOL", ImGuiTableColumnFlags_WidthFixed, 50.0f);     // Volume
+        ImGui::TableSetupColumn("LEN", ImGuiTableColumnFlags_WidthFixed, 50.0f);      // Length
+        ImGui::TableSetupColumn("A", ImGuiTableColumnFlags_WidthFixed, 25.0f);       // Audio
+        ImGui::TableSetupColumn("V", ImGuiTableColumnFlags_WidthFixed, 25.0f);       // Video
+        ImGui::TableSetupScrollFreeze(0, 1); // Freeze header row
+        
+        // Header row with tracker styling
+        ImGui::TableHeadersRow();
+        
+        // Draw pattern rows
+        for (int step = 0; step < numSteps; step++) {
+            drawPatternRow(step, step == currentStep);
+        }
+        
+        ImGui::EndTable();
+    }
+    
+    ImGui::PopFont();
+    ImGui::PopStyleVar(2);
+    ImGui::Separator();
+    
+    } catch (const std::exception& e) {
+        ofLogError("TrackerSequencer") << "Exception in drawPatternGrid(): " << e.what();
+    } catch (...) {
+        ofLogError("TrackerSequencer") << "Unknown exception in drawPatternGrid()";
+    }
+}
+
+
+
+void TrackerSequencer::drawTrackerStatus() {
+    try {
+        // Status section with sequencer info only
+        ImGui::Text("Status:");
+        ImGui::Text("Current Step: %d", currentStep + 1); // Display 1-16 instead of 0-15
+        ImGui::Text("Pattern Steps: %d", numSteps);
+        bool patternEmpty = isPatternEmpty();
+        ImGui::Text("Pattern Empty: %s", patternEmpty ? "Yes" : "No");
+    
+    ImGui::Separator();
+    
+    // Pattern controls
+    ImGui::Text("Pattern Controls:");
+    ImGui::Text("Pattern Length:");
+    
+    int newNumSteps = numSteps; // Sync with current value
+    if (ImGui::SliderInt("Steps", &newNumSteps, 4, 64)) {
+        if (newNumSteps != numSteps) {
+            setNumSteps(newNumSteps);
+        }
+    }
+    
+    // Steps per beat control
+    ImGui::Text("Steps Per Beat:");
+    int newStepsPerBeat = getStepsPerBeat(); // Sync with current value
+    if (ImGui::SliderInt("SPB", &newStepsPerBeat, 1, 96)) {
+        setStepsPerBeat(newStepsPerBeat);
+    }
+    // Display step size info
+    int currentSPB = getStepsPerBeat();
+    if (currentSPB == 1) {
+        ImGui::Text("(Step size = 1)");
+    } else {
+        ImGui::Text("(Step size = 1/%d)", currentSPB);
+    }
+    
+    if (ImGui::Button("Clear Pattern")) {
+        clearPattern();
+    }
+    
+    ImGui::SameLine();
+    
+    if (ImGui::Button("Randomize Pattern")) {
+        randomizePattern();
+    }
+    
+    ImGui::Separator();
+    
+    } catch (const std::exception& e) {
+        ofLogError("TrackerSequencer") << "Exception in drawTrackerStatus(): " << e.what();
+    } catch (...) {
+        ofLogError("TrackerSequencer") << "Unknown exception in drawTrackerStatus()";
+    }
+}
+
+void TrackerSequencer::handleMouseClick(int x, int y, int button) {
+    // Handle pattern grid clicks
+    if (showGUI) {
+        handlePatternGridClick(x, y);
+    }
+}
+
+bool TrackerSequencer::handleKeyPress(int key) {
+    // Handle keyboard shortcuts for pattern editing
+    switch (key) {
+        // Navigation
+        case OF_KEY_UP:
+            if (currentStep > 0) {
+                currentStep--;
+                // Trigger the step event when navigating
+                triggerStep(currentStep); // Use default BPM for manual navigation
+                return true;
+            }
+            break;
+            
+        case OF_KEY_DOWN:
+            if (currentStep < numSteps - 1) {
+                currentStep++;
+                // Trigger the step event when navigating
+                triggerStep(currentStep); // Use default BPM for manual navigation
+                return true;
+            }
+            break;
+            
+        case OF_KEY_LEFT:
+        case OF_KEY_RIGHT:
+            // Reserved for future track navigation
+            return false;
+            
+        // Pattern editing
+        case 'c':
+        case 'C':
+            if (isValidStep(currentStep)) {
+                clearCell(currentStep);
+                return true;
+            }
+            break;
+            
+        case 'x':
+        case 'X':
+            // Copy from previous step
+            if (isValidStep(currentStep) && currentStep > 0) {
+                pattern[currentStep] = pattern[currentStep - 1];
+                ofLogNotice("TrackerSequencer") << "Copied from previous step";
+                return true;
+            }
+            break;
+            
+        // Audio/Video toggles
+        case 'a':
+        case 'A':
+            if (isValidStep(currentStep)) {
+                toggleAudio(currentStep);
+                return true;
+            }
+            break;
+            
+        case 'v':
+        case 'V':
+            if (isValidStep(currentStep)) {
+                toggleVideo(currentStep);
+                return true;
+            }
+            break;
+            
+        // Media selection (1-9, 0)
+        case '1': case '2': case '3': case '4': case '5': 
+        case '6': case '7': case '8': case '9': {
+            int mediaIndex = key - '1';
+            if (indexRangeCallback && mediaIndex < indexRangeCallback()) {
+                pattern[currentStep].mediaIndex = mediaIndex;
+                ofLogNotice("TrackerSequencer") << "Set step " << (currentStep + 1) << " to media " << mediaIndex;
+                return true;
+            }
+            break;
+        }
+            
+        case '0':
+            // Clear media index (rest)
+            pattern[currentStep].mediaIndex = -1;
+            ofLogNotice("TrackerSequencer") << "Set step " << (currentStep + 1) << " to rest";
+            return true;
+            
+        // Parameter editing
+        case 'p':
+        case 'P':
+            // Cycle position
+            if (isValidStep(currentStep) && pattern[currentStep].mediaIndex >= 0) {
+                float& pos = pattern[currentStep].position;
+                if (pos < 0.25f) pos = 0.25f;
+                else if (pos < 0.5f) pos = 0.5f;
+                else if (pos < 0.75f) pos = 0.75f;
+                else pos = 0.0f;
+                ofLogNotice("TrackerSequencer") << "Set position to " << pos;
+                return true;
+            }
+            break;
+            
+        case 's':
+        case 'S':
+            // Cycle speed
+            if (isValidStep(currentStep) && pattern[currentStep].mediaIndex >= 0) {
+                float& spd = pattern[currentStep].speed;
+                if (spd < 1.0f) spd = 1.0f;
+                else if (spd < 1.5f) spd = 1.5f;
+                else if (spd < 2.0f) spd = 2.0f;
+                else spd = 0.5f;
+                ofLogNotice("TrackerSequencer") << "Set speed to " << spd;
+                return true;
+            }
+            break;
+            
+        case 'w':
+        case 'W':
+            // Cycle volume
+            if (isValidStep(currentStep) && pattern[currentStep].mediaIndex >= 0) {
+                float& vol = pattern[currentStep].volume;
+                if (vol < 0.5f) vol = 0.5f;
+                else if (vol < 0.75f) vol = 0.75f;
+                else if (vol < 1.0f) vol = 1.0f;
+                else vol = 0.25f;
+                ofLogNotice("TrackerSequencer") << "Set volume to " << vol;
+                return true;
+            }
+            break;
+            
+        case 'l':
+        case 'L':
+            // Cycle step length
+            if (isValidStep(currentStep) && pattern[currentStep].mediaIndex >= 0) {
+                int stepCount = (int)pattern[currentStep].stepLength;
+                stepCount = std::max(1, std::min(16, stepCount));
+                stepCount = (stepCount % 16) + 1;
+                pattern[currentStep].stepLength = (float)stepCount;
+                ofLogNotice("TrackerSequencer") << "Set step length to " << stepCount;
+                return true;
+            }
+            break;
+            
+        // Fine control shortcuts for precise 0-127 range adjustment
+        case 'q':
+        case 'Q':
+            // Fine position control
+            if (isValidStep(currentStep) && pattern[currentStep].mediaIndex >= 0) {
+                cyclePosition(currentStep);
+                return true;
+            }
+            break;
+            
+        case 'e':
+        case 'E':
+            // Fine speed control  
+            if (isValidStep(currentStep) && pattern[currentStep].mediaIndex >= 0) {
+                cycleSpeed(currentStep);
+                return true;
+            }
+            break;
+            
+        case 'r':
+        case 'R':
+            // Fine volume control
+            if (isValidStep(currentStep) && pattern[currentStep].mediaIndex >= 0) {
+                cycleVolume(currentStep);
+                return true;
+            }
+            break;
+    }
+    return false;
+}
+
+// Private methods
+//--------------------------------------------------------------
+
+
+
+void TrackerSequencer::drawPatternRow(int step, bool isCurrentStep) {
+    ImGui::TableNextRow();
+    
+    // Highlight current step with intense background
+    if (isCurrentStep) {
+        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.9f, 0.5f, 0.0f, 0.4f))); // Yellow highlight
+    }
+    
+    // Draw all columns for this step
+    drawStepNumber(step, isCurrentStep);
+    drawMediaIndex(step);
+    drawPosition(step);
+    drawSpeed(step);
+    drawVolume(step);
+    drawStepLength(step);
+    drawAudioEnabled(step);
+    drawVideoEnabled(step);
+}
+
+void TrackerSequencer::drawStepNumber(int step, bool isCurrentStep) {
+    ImGui::TableNextColumn();
+    ImGui::Text("%02d", step + 1); // Decimal display (1-16)
+    if (ImGui::IsItemClicked()) {
+        currentStep = step;
+    }
+}
+
+void TrackerSequencer::drawMediaIndex(int step) {
+    ImGui::TableNextColumn();
+    ImGui::PushID(step);
+    
+    const auto& cell = pattern[step];
+    int currentMediaIdx = cell.mediaIndex;
+    
+    if (currentMediaIdx >= 0 && indexRangeCallback) {
+        try {
+            int maxIndex = indexRangeCallback();
+            if (currentMediaIdx < maxIndex) {
+                // Show as decimal index
+                ImGui::Text("%02d", currentMediaIdx + 1);
+                if (ImGui::IsItemClicked()) {
+                    cycleMediaIndex(step);
+                }
+            } else {
+                ImGui::Text("--"); // Rest
+                if (ImGui::IsItemClicked()) {
+                    cycleMediaIndex(step);
+                }
+            }
+        } catch (const std::exception& e) {
+            ofLogError("TrackerSequencer") << "Exception in indexRangeCallback: " << e.what();
+            ImGui::Text("--"); // Show rest on error
+        }
+    } else {
+        ImGui::Text("--"); // Rest
+        if (ImGui::IsItemClicked()) {
+            cycleMediaIndex(step);
+        }
+    }
+    
+    ImGui::PopID();
+}
+
+void TrackerSequencer::drawPosition(int step) {
+    ImGui::TableNextColumn();
+    ImGui::PushID(step);
+    
+    const auto& cell = pattern[step];
+    int posDec = (int)(cell.position * 127.0f);
+    ImGui::Text("%03d", posDec);
+    if (ImGui::IsItemClicked()) {
+        cyclePosition(step);
+    }
+    
+    ImGui::PopID();
+}
+
+void TrackerSequencer::drawSpeed(int step) {
+    ImGui::TableNextColumn();
+    ImGui::PushID(step);
+    
+    const auto& cell = pattern[step];
+    int spdDec = (int)((cell.speed + 4.0f) / 8.0f * 127.0f);
+    spdDec = std::max(0, std::min(127, spdDec));
+    ImGui::Text("%03d", spdDec);
+    if (ImGui::IsItemClicked()) {
+        cycleSpeed(step);
+    }
+    
+    ImGui::PopID();
+}
+
+void TrackerSequencer::drawVolume(int step) {
+    ImGui::TableNextColumn();
+    ImGui::PushID(step);
+    
+    const auto& cell = pattern[step];
+    int volDec = (int)(cell.volume * 127.0f);
+    ImGui::Text("%03d", volDec);
+    if (ImGui::IsItemClicked()) {
+        cycleVolume(step);
+    }
+    
+    ImGui::PopID();
+}
+
+void TrackerSequencer::drawStepLength(int step) {
+    ImGui::TableNextColumn();
+    ImGui::PushID(step);
+    
+    const auto& cell = pattern[step];
+    int stepCount = (int)cell.stepLength;
+    stepCount = std::max(1, std::min(16, stepCount));
+    ImGui::Text("%02d", stepCount);
+    if (ImGui::IsItemClicked()) {
+        cycleStepLength(step);
+    }
+    
+    ImGui::PopID();
+}
+
+void TrackerSequencer::drawAudioEnabled(int step) {
+    ImGui::TableNextColumn();
+    ImGui::PushID(step);
+    
+    const auto& cell = pattern[step];
+    ImGui::Text("%s", cell.audioEnabled ? "01" : "00");
+    if (ImGui::IsItemClicked()) {
+        toggleAudio(step);
+    }
+    
+    ImGui::PopID();
+}
+
+void TrackerSequencer::drawVideoEnabled(int step) {
+    ImGui::TableNextColumn();
+    ImGui::PushID(step);
+    
+    const auto& cell = pattern[step];
+    ImGui::Text("%s", cell.videoEnabled ? "01" : "00");
+    if (ImGui::IsItemClicked()) {
+        toggleVideo(step);
+    }
+    
+    ImGui::PopID();
+}
+
+bool TrackerSequencer::handlePatternGridClick(int x, int y) {
+    // Calculate grid position (simplified - would need proper coordinate mapping)
+    // This is a placeholder implementation
+    return false;
+}
+
+bool TrackerSequencer::handlePatternRowClick(int step, int column) {
+    if (!isValidStep(step)) return false;
+    
+    // Handle column-specific clicks
+    switch (column) {
+        case 1: cycleMediaIndex(step); break;
+        case 2: cyclePosition(step); break;
+        case 3: cycleSpeed(step); break;
+        case 4: cycleVolume(step); break;
+        case 5: cycleStepLength(step); break;
+        case 6: toggleAudio(step); break;
+        case 7: toggleVideo(step); break;
+        default: return false;
+    }
+    
+    return true;
+}
+
+void TrackerSequencer::cycleMediaIndex(int step) {
+    if (!isValidStep(step)) return;
+    
+    auto& cell = pattern[step];
+    int currentMediaIdx = cell.mediaIndex;
+    
+    // Cycle through available media
+    if (indexRangeCallback) {
+        int numMedia = indexRangeCallback();
+        currentMediaIdx = (currentMediaIdx + 1) % (numMedia + 1);
+        if (currentMediaIdx == numMedia) {
+            cell.mediaIndex = -1; // Rest
+        } else {
+            cell.mediaIndex = currentMediaIdx;
+        }
+    }
+    
+    setCell(step, cell);
+}
+
+void TrackerSequencer::cyclePosition(int step) {
+    if (!isValidStep(step)) return;
+    
+    auto& cell = pattern[step];
+    int posDec = (int)(cell.position * 127.0f);
+    posDec = (posDec + 1) % 128; // Increment by 1 for full 0-127 range
+    cell.position = posDec / 127.0f;
+    
+    setCell(step, cell);
+}
+
+void TrackerSequencer::cycleSpeed(int step) {
+    if (!isValidStep(step)) return;
+    
+    auto& cell = pattern[step];
+    int spdDec = (int)((cell.speed + 4.0f) / 8.0f * 127.0f);
+    spdDec = (spdDec + 1) % 128; // Increment by 1 for full 0-127 range
+    cell.speed = -4.0f + (spdDec / 127.0f) * 8.0f;
+    
+    setCell(step, cell);
+}
+
+void TrackerSequencer::cycleVolume(int step) {
+    if (!isValidStep(step)) return;
+    
+    auto& cell = pattern[step];
+    int volDec = (int)(cell.volume * 127.0f);
+    volDec = (volDec + 1) % 128; // Increment by 1 for full 0-127 range
+    cell.volume = volDec / 127.0f;
+    
+    setCell(step, cell);
+}
+
+void TrackerSequencer::cycleStepLength(int step) {
+    if (!isValidStep(step)) return;
+    
+    auto& cell = pattern[step];
+    // Cycle through step length values (how many sequencer steps the media plays for)
+    int stepCount = (int)cell.stepLength;
+    stepCount = (stepCount % numSteps) + 1; // Cycle 1 to pattern length
+    cell.stepLength = (float)stepCount;
+    
+    setCell(step, cell);
+}
+
+void TrackerSequencer::toggleAudio(int step) {
+    if (!isValidStep(step)) return;
+    
+    auto& cell = pattern[step];
+    cell.audioEnabled = !cell.audioEnabled;
+    
+    setCell(step, cell);
+}
+
+void TrackerSequencer::toggleVideo(int step) {
+    if (!isValidStep(step)) return;
+    
+    auto& cell = pattern[step];
+    cell.videoEnabled = !cell.videoEnabled;
+    
+    setCell(step, cell);
+}
+
+// Additional missing method implementations
+//--------------------------------------------------------------
+bool TrackerSequencer::isValidStep(int step) const {
+    return step >= 0 && step < numSteps;
+}
+
+bool TrackerSequencer::isPatternEmpty() const {
+    for (int i = 0; i < numSteps; i++) {
+        if (!pattern[i].isEmpty()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void TrackerSequencer::notifyStepEvent(int step, float stepLength) {
+    // step is 1-based from PatternSequencer, convert to 0-based for internal access
+    const PatternCell& cell = getCell(step - 1);
+    float bpm = clock ? clock->getBPM() : 120.0f;
+    
+    // Calculate duration in seconds using patternSequencer's stepsPerBeat
+    int spb = stepsPerBeat;
+    float stepDuration = (60.0f / bpm) / spb;  // Duration of ONE step
+    float noteDuration = stepDuration * stepLength;     // Duration for THIS note
+    
+    for (auto& callback : stepEventListeners) {
+        callback(step, noteDuration, cell);  // Pass 1-based step number for display
+    }
+}
+
+float TrackerSequencer::getCurrentBpm() const {
+    return clock ? clock->getBPM() : 120.0f;
+}
+
+
+#pragma once
+
+#include "ofMain.h"
+#include <functional>
+
+// Forward declarations
+class MediaPool;
+class Clock;
+
+class TrackerSequencer {
+public:
+    struct PatternCell {
+        int mediaIndex = -1;
+        float position = 0.0f;
+        float speed = 1.0f;
+        float volume = 1.0f;
+        float stepLength = 1.0f; // In beats
+        bool audioEnabled = true;
+        bool videoEnabled = true;
+
+        PatternCell() = default;
+        PatternCell(int mediaIdx, float pos, float spd, float vol, float len)
+            : mediaIndex(mediaIdx), position(pos), speed(spd), volume(vol), stepLength(len) {}
+
+        bool isEmpty() const { return mediaIndex < 0; }
+        
+        // Additional methods
+        void clear();
+        bool operator==(const PatternCell& other) const;
+        bool operator!=(const PatternCell& other) const;
+        std::string toString() const;
+    };
+
+    // Event for step triggers - using ofEvent with multiple parameters via lambda/std::function
+    ofEvent<void> stepEvent;
+    
+    TrackerSequencer();
+    ~TrackerSequencer();
+
+    // Callback types for querying external state
+    using IndexRangeCallback = std::function<int()>;
+    
+    void setup(Clock* clockRef, int steps = 16);
+    void setIndexRangeCallback(IndexRangeCallback callback);
+    void processAudioBuffer(ofSoundBuffer& buffer);
+    void onStepEvent(); // Sample-accurate step event from Clock
+    
+    // Event listener system
+    void addStepEventListener(std::function<void(int, float, const PatternCell&)> listener);
+    
+    // Pattern management
+    void setCell(int step, const PatternCell& cell);
+    PatternCell getCell(int step) const;
+    void setNumSteps(int steps);
+    void clearCell(int step);
+    void clearPattern();
+    void randomizePattern();
+    
+    // Playback control
+    void play();
+    void pause();
+    void stop();
+    void reset();
+    void setCurrentStep(int step);
+    void advanceStep();
+    void triggerStep(int step);
+    
+    // State management
+    bool loadState(const std::string& filename);
+    bool saveState(const std::string& filename) const;
+    
+    // UI interaction
+    bool handleKeyPress(int key);
+    void handleMouseClick(int x, int y, int button);
+    void drawTrackerInterface();
+    
+    // Getters
+    int getNumSteps() const { return numSteps; }
+    int getCurrentStep() const { return currentStep; }
+    bool isPlaying() const { return playing; }
+    float getCurrentBpm() const;
+    int getStepsPerBeat() const { return stepsPerBeat; }
+    
+    // Setters
+    void setStepsPerBeat(int steps);
+
+private:
+    bool isValidStep(int step) const;
+    bool isPatternEmpty() const;
+    void notifyStepEvent(int step, float stepLength);
+    void updateStepInterval();
+    
+    // UI drawing methods
+    void drawTrackerStatus();
+    void drawPatternGrid();
+    void drawPatternRow(int step, bool isCurrentStep);
+    void drawStepNumber(int step, bool isCurrentStep);
+    void drawMediaIndex(int step);
+    void drawPosition(int step);
+    void drawSpeed(int step);
+    void drawVolume(int step);
+    void drawStepLength(int step);
+    void drawAudioEnabled(int step);
+    void drawVideoEnabled(int step);
+    
+    // Pattern interaction methods
+    bool handlePatternGridClick(int x, int y);
+    bool handlePatternRowClick(int step, int column);
+    void cycleMediaIndex(int step);
+    void cyclePosition(int step);
+    void cycleSpeed(int step);
+    void cycleVolume(int step);
+    void cycleStepLength(int step);
+    void toggleAudio(int step);
+    void toggleVideo(int step);
+    
+    Clock* clock;
+    
+    // Pattern sequencer state (app-specific)
+    int stepsPerBeat = 4;
+    bool gatingEnabled = true;
+    std::vector<float> stepLengths;  // Per-step gate lengths
+    
+    std::vector<PatternCell> pattern;
+    int numSteps;
+    int currentStep;
+    int lastTriggeredStep;
+    bool playing;  // Renamed from isPlaying to avoid conflict
+    
+    // Track current media playback
+    int currentMediaStartStep;
+    float currentMediaStepLength;
+    
+    // Audio-rate timing system
+    double sampleAccumulator; // Sample accumulator for step timing
+    float lastBpm; // Last known BPM for timing calculations
+    
+    // Media playback timing (separate from sequencer timing)
+    float currentStepStartTime;
+    float currentStepDuration;
+    bool stepActive;
+    
+    // Step event listeners
+    std::vector<std::function<void(int, float, const PatternCell&)>> stepEventListeners;
+    
+    // Callback for querying external state
+    IndexRangeCallback indexRangeCallback;
+    
+    // UI state
+    bool showGUI;
+};
+
+
+
+
+
+
+
+
+//
+//  main.cpp
+//
+//  Audiovisual Sequencer Example
+//
+
+#include "ofMain.h"
+#include "ofApp.h"
+
+int main() {
+    ofSetupOpenGL(1280, 720, OF_WINDOW);
+    ofRunApp(new ofApp());
+}
+//
+//  ofApp.cpp
+//
+//  Audiovisual Sequencer Example - Time + Sound + Video coordination
+//
+
+#include "ofApp.h"
+
+//--------------------------------------------------------------
+ofApp::~ofApp() noexcept {
+    // No auto-save - use menu buttons instead
+}
+
+//--------------------------------------------------------------
+void ofApp::setup() {
+    ofSetFrameRate(60);
+    ofSetVerticalSync(true);
+    ofSetLogLevel(OF_LOG_NOTICE);
+    
+    // Setup media library with correct path for app bundle
+    std::string absolutePath;
+    
+    // Try multiple possible paths
+    // Try to load saved media directory first
+    std::string savedMediaDir = loadMediaDirectory();
+    bool foundDataDir = false;
+    
+    if (!savedMediaDir.empty() && ofDirectory(savedMediaDir).exists()) {
+        mediaPool.setDataDirectory(savedMediaDir);
+        foundDataDir = true;
+    } else {
+        // Fallback to default paths
+        std::vector<std::string> possiblePaths;
+        possiblePaths.push_back(ofFilePath::getCurrentWorkingDirectory() + "/bin/data");
+        possiblePaths.push_back(ofFilePath::getCurrentWorkingDirectory() + "/data");
+        possiblePaths.push_back("/Users/jaufre/works/of_v0.12.1_osx_release/addons/ofxMediaObjects/example-audiovisualSequencer/bin/data");
+        
+        for (const auto& path : possiblePaths) {
+            if (ofDirectory(path).exists()) {
+                mediaPool.setDataDirectory(path);
+                saveMediaDirectory(path); // Save for next launch
+                foundDataDir = true;
+                break;
+            }
+        }
+        
+        if (!foundDataDir) {
+            ofLogError("ofApp") << "❌ No data directory found in any of the tried paths";
+        }
+    }
+    
+    
+    // Setup TrackerSequencer with clock reference
+    trackerSequencer.setup(&clock, numSteps);
+    
+    // Auto-load saved state if it exists
+    trackerSequencer.loadState("tracker_sequencer_state.json");
+    
+    // Setup MediaPool directory change callback
+    mediaPool.setDirectoryChangeCallback([this](const std::string& path) {
+        saveMediaDirectory(path);
+    });
+    
+    // Register step event listener
+    trackerSequencer.addStepEventListener([this](int step, float duration, const TrackerSequencer::PatternCell& cell) {
+        onTrackerStepEvent(step, duration, cell);
+    });
+    
+    // Setup time objects using Clock wrapper
+    clock.setup();
+    
+    // Setup MediaPool with clock reference
+    mediaPool.setup(&clock);
+    
+    // Setup TrackerSequencer callbacks for UI queries
+    trackerSequencer.setIndexRangeCallback([this]() {
+        return mediaPool.getNumPlayers();
+    });
+    
+    // TrackerSequencer now uses Clock's beat events for sample-accurate timing
+    // Add step event listener for visual feedback
+    trackerSequencer.addStepEventListener([this](int step, float duration, const TrackerSequencer::PatternCell& cell) {
+        lastTriggeredStep = step;
+    });
+    
+    
+    // Setup sound objects
+    setupSoundObjects();
+    
+    // Setup visual objects
+    setupVisualObjects();
+    
+    // Set output references in MediaPool (connection will happen when player becomes active)
+    mediaPool.setOutputs(soundOutput, visualOutput);
+    
+    
+    // Setup GUI
+    setupGUI();
+    
+    // Try to load saved state, otherwise use default pattern
+    if (!trackerSequencer.loadState("tracker_sequencer_state.json")) {
+        // Initialize pattern with some default steps if no saved state
+        if (mediaPool.getNumPlayers() > 0) {
+            TrackerSequencer::PatternCell cell0(0, 0.0f, 1.0f, 1.0f, 1.0f);
+            cell0.audioEnabled = true;
+            cell0.videoEnabled = true;
+            trackerSequencer.setCell(0, cell0);
+            
+            if (mediaPool.getNumPlayers() > 1) {
+                TrackerSequencer::PatternCell cell4(1, 0.0f, 1.2f, 1.0f, 1.0f);
+                cell4.audioEnabled = true;
+                cell4.videoEnabled = true;
+                trackerSequencer.setCell(4, cell4);
+                
+                TrackerSequencer::PatternCell cell8(0, 0.5f, 1.0f, 1.0f, 1.0f);
+                cell8.audioEnabled = true;
+                cell8.videoEnabled = true;
+                trackerSequencer.setCell(8, cell8);
+            }
+            
+            // Save the default pattern
+            trackerSequencer.saveState("tracker_sequencer_state.json");
+        } else {
+            ofLogWarning("ofApp") << "No media items available for pattern initialization";
+        }
+    }
+    
+    // Clock listener is set up in setupTimeObjects()
+    
+    // Load default layout on startup
+    loadLayout();
+}
+
+//--------------------------------------------------------------
+void ofApp::update() {
+    // Update all media players (this is crucial for video processing)
+    for (size_t i = 0; i < mediaPool.getNumPlayers(); i++) {
+        auto player = mediaPool.getMediaPlayer(i);
+        if (player) {
+            player->update();
+        }
+    }
+    
+    // Process visual pipeline - simplified for direct texture drawing
+    auto currentPlayer = mediaPool.getActivePlayer();
+    if (currentPlayer && currentPlayer->videoEnabled.get()) {
+        auto& videoPlayer = currentPlayer->getVideoPlayer();
+        videoPlayer.update();  // Just update, no FBO processing needed
+    }
+    
+    // REMOVED: BPM update logic moved to GUI slider only
+    // The clock BPM should only be updated by user interaction, not automatically
+    
+    // Update pattern display
+    // Pattern display is now handled by TrackerSequencer
+    
+    // Periodic auto-save every 30 seconds
+    static float lastAutoSave = 0.0f;
+    if (ofGetElapsedTimef() - lastAutoSave > 30.0f) {
+        trackerSequencer.saveState("tracker_sequencer_state.json");
+        lastAutoSave = ofGetElapsedTimef();
+        ofLogVerbose("ofApp") << "Periodic auto-save completed";
+    }
+}
+
+//--------------------------------------------------------------
+void ofApp::draw() {
+    try {
+        ofBackground(0, 0, 0);
+        
+        // Draw video if available and currently playing
+        auto currentPlayer = mediaPool.getActivePlayer();
+        if (currentPlayer && currentPlayer->isVideoLoaded() && 
+            currentPlayer->videoEnabled.get() && currentPlayer->isPlaying()) {
+            ofSetColor(255, 255, 255);
+            currentPlayer->getVideoPlayer().getVideoFile().getTexture().draw(0, 0, ofGetWidth(), ofGetHeight());
+        }
+        
+        // Draw GUI
+        if (showGUI) {
+            drawGUI();
+        }
+    } catch (const std::exception& e) {
+        ofLogError("ofApp") << "Exception in draw(): " << e.what();
+    } catch (...) {
+        ofLogError("ofApp") << "Unknown exception in draw()";
+    }
+}
+
+//--------------------------------------------------------------
+void ofApp::exit() {
+    // Auto-save TrackerSequencer state before exiting
+    if (trackerSequencer.saveState("tracker_sequencer_state.json")) {
+        ofLogNotice("ofApp") << "TrackerSequencer state saved to file";
+    }
+    
+    clock.stop();
+    soundStream.close();
+}
+
+//--------------------------------------------------------------
+void ofApp::audioOut(ofSoundBuffer& buffer) {
+    // Process audio-rate clock first (sample-accurate timing)
+    clock.audioOut(buffer);
+    
+    // Audio processing happens in sound objects
+    soundOutput.audioOut(buffer);
+    
+    // Apply global volume AFTER sound processing
+    buffer *= globalVolume;
+    
+    // Simple audio level calculation for visualization
+    float maxLevel = 0.0f;
+    for (size_t i = 0; i < buffer.getNumFrames() * buffer.getNumChannels(); i++) {
+        maxLevel = std::max(maxLevel, std::abs(buffer[i]));
+    }
+    currentAudioLevel = maxLevel;
+}
+
+//--------------------------------------------------------------
+void ofApp::keyPressed(int key) {
+    // Handle Alt+Spacebar for triggering current step only (check this first)
+    if (key == ' ' && ofGetKeyPressed(OF_KEY_ALT)) {
+        // Trigger current step manually without starting sequencer (force retrigger)
+        ofLogNotice("ofApp") << "Manual trigger of step " << (currentStep + 1);
+        // Step triggering is now handled by TrackerSequencer event system
+        return; // Exit early to avoid regular spacebar handling
+    }
+    
+    switch (key) {
+        case ' ':
+            if (isPlaying) {
+                clock.stop();
+                trackerSequencer.pause();
+                isPlaying = false;
+                ofLogNotice("ofApp") << "Paused playback at step " << currentStep;
+            } else {
+                // Stop all media before starting pattern playback
+                mediaPool.stopAllMedia();
+                
+                // Reset TrackerSequencer to beginning when starting playback
+                trackerSequencer.reset();
+                clock.start();
+                trackerSequencer.play();
+                isPlaying = true;
+                
+                // Initialize tracking variables
+                lastTriggeredStep = 0;  // First step (0-based)
+                currentStep = 0;         // Visual feedback
+                
+                // Sync TrackerSequencer with global playback state
+                trackerSequencer.setCurrentStep(0);
+                
+                // Trigger first step immediately (step 1)
+                trackerSequencer.triggerStep(0);
+                
+                ofLogNotice("ofApp") << "Started playback from beginning (step 1)";
+            }
+            break;
+            
+        case 'r':
+            clock.reset();
+            trackerSequencer.reset();
+            trackerSequencer.stop();
+            currentStep = 0;
+            lastTriggeredStep = 0;
+            
+            // Sync TrackerSequencer with global reset state
+            trackerSequencer.setCurrentStep(0);
+            
+            ofLogNotice("ofApp") << "Reset sequencer";
+            break;
+            
+        case 'g':
+            showGUI = !showGUI;
+            break;
+            
+        case 'n':
+            // Next media player
+            mediaPool.nextPlayer();
+            ofLogNotice("ofApp") << "Switched to next player";
+            break;
+            
+        case 'm':
+            // Previous media player
+            mediaPool.previousPlayer();
+            ofLogNotice("ofApp") << "Switched to previous player";
+            break;
+            
+        // Global save state (capital S to distinguish from speed)
+        case 'S':
+            trackerSequencer.saveState("pattern.json");
+            break;
+            
+        // All pattern editing is delegated to TrackerSequencer
+        default:
+            // Let TrackerSequencer handle all pattern editing and navigation
+            if (trackerSequencer.handleKeyPress(key)) {
+                currentStep = trackerSequencer.getCurrentStep();
+            }
+            break;
+    }
+}
+
+//--------------------------------------------------------------
+void ofApp::mousePressed(int x, int y, int button) {
+    // Handle mouse clicks through TrackerSequencer
+    if (showGUI) {
+        trackerSequencer.handleMouseClick(x, y, button);
+    }
+}
+
+//--------------------------------------------------------------
+void ofApp::windowResized(int w, int h) {
+    // Window resize handled by ImGui docking automatically
+    
+    // Update visual output dimensions
+    visualOutput.width.set(w);
+    visualOutput.height.set(h);
+    
+    ofLogNotice("ofApp") << "Window resized to " << w << "x" << h;
+}
+
+
+
+
+//--------------------------------------------------------------
+void ofApp::onTrackerStepEvent(int step, float duration, const TrackerSequencer::PatternCell& cell) {
+    ofLogNotice("ofApp") << "TrackerSequencer step event: step=" << step << ", duration=" << duration << "s, stepLength=" << cell.stepLength;
+    
+    // Synchronize ofApp::currentStep with TrackerSequencer::currentStep
+    currentStep = step;
+    
+    // Only trigger MediaPool for non-empty steps
+    // Empty steps should be silent and let previous step's duration complete naturally
+    if (cell.mediaIndex >= 0) {
+        // Extract parameters from PatternCell and pass to MediaPool
+        // Pass duration in seconds instead of stepLength in beats
+        mediaPool.onStepTrigger(step, cell.mediaIndex, cell.position, 
+                               cell.speed, cell.volume, duration, 
+                               cell.audioEnabled, cell.videoEnabled);
+    } else {
+        ofLogNotice("ofApp") << "Step " << step << " is empty (rest) - no media trigger";
+    }
+}
+
+//--------------------------------------------------------------
+void ofApp::setupSoundObjects() {
+    // Setup sound output
+    soundOutput.setName("Sound Output");
+    
+    
+    // Global volume will be applied in audioOut callback
+    
+    // Get available audio devices
+    audioDevices = soundStream.getDeviceList();
+    
+    // Find default output device
+    for (size_t i = 0; i < audioDevices.size(); i++) {
+        if (audioDevices[i].isDefaultOutput) {
+            selectedAudioDevice = i;
+            break;
+        }
+    }
+    
+    // Setup audio stream with selected device
+    setupAudioStream();
+}
+
+//--------------------------------------------------------------
+void ofApp::setupAudioStream() {
+    if (audioDevices.empty()) {
+        ofLogError("ofApp") << "No audio devices available";
+        return;
+    }
+    
+    // Close existing stream if open
+    soundStream.close();
+    
+    // Setup audio stream with selected device
+    ofSoundStreamSettings settings;
+    settings.setOutListener(this);
+    settings.sampleRate = 44100;
+    settings.numOutputChannels = 2;
+    settings.numInputChannels = 0;
+    settings.bufferSize = 512;
+    
+    if (selectedAudioDevice < audioDevices.size()) {
+        settings.setOutDevice(audioDevices[selectedAudioDevice]);
+    }
+    
+    soundStream.setup(settings);
+}
+
+//--------------------------------------------------------------
+void ofApp::setupVisualObjects() {
+    // Setup visual output
+    visualOutput.setName("Visual Output");
+    
+    // Initialize visual output with proper dimensions
+    visualOutput.width.set(ofGetWidth());
+    visualOutput.height.set(ofGetHeight());
+    visualOutput.enabled.set(true);
+    
+    // Note: Visual output will allocate its own buffer when needed
+    
+    // Video connection handled by mediaSequencer
+}
+
+// No bridge setup needed - direct connections only
+
+//--------------------------------------------------------------
+void ofApp::setupGUI() {
+    // Setup ImGui with docking enabled and proper ini file handling
+    gui.setup(nullptr, true, ImGuiConfigFlags_DockingEnable);
+    
+    // Set up ImGui with keyboard navigation
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    ImGuiStyle& style = ImGui::GetStyle();
+ 
+    style.Colors[ImGuiCol_DockingEmptyBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.7f);        // Dark neutral grey panels
+    style.Colors[ImGuiCol_ChildBg] = ImVec4(0.15f, 0.15f, 0.15f, 0.6f);  
+    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.95f);
+    style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.5f); // Modal dimming
+
+    style.Colors[ImGuiCol_MenuBarBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.8f);     
+
+    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.75f);          // Window title background
+    // style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.15f, 0.15f, 0.15f, 0.9f); // Active title background
+    // style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.05f, 0.05f, 0.05f, 0.7f); // Collapsed title background
+    
+    style.Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);      // Scrollbar background
+    style.Colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.3f, 0.3f, 0.3f, 0.8f);    // Scrollbar grab
+    style.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.4f, 0.4f, 0.4f, 0.9f); // Scrollbar hover
+    style.Colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.5f, 0.5f, 0.5f, 1.0f); // Scrollbar active
+    
+    style.Colors[ImGuiCol_ResizeGrip] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);       // Resize grip
+    // style.Colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.3f, 0.3f, 0.3f, 0.9f); // Resize grip hover
+    //style.Colors[ImGuiCol_ResizeGripActive] = ImVec4(0.4f, 0.4f, 0.4f, 1.0f); // Resize grip active
+    
+    style.Colors[ImGuiCol_Tab] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);              // Tab background
+    style.Colors[ImGuiCol_TabHovered] = ImVec4(0.3f, 0.3f, 0.3f, 0.9f);      // Tab hover
+    style.Colors[ImGuiCol_TabActive] = ImVec4(0.2f, 0.2f, 0.2f, 1.0f);        // Tab active
+    style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.05f, 0.05f, 0.05f, 0.7f);  // Tab unfocused
+    style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.15f, 0.15f, 0.15f, 0.8f); // Tab unfocused active
+    
+    style.Colors[ImGuiCol_Separator] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);         // Dark separator
+    style.Colors[ImGuiCol_SeparatorHovered] = ImVec4(0.3f, 0.3f, 0.3f, 0.9f);   // Dark hover
+    style.Colors[ImGuiCol_SeparatorActive] = ImVec4(0.4f, 0.4f, 0.4f, 1.0f);    // Dark active
+    
+    // Table / Grid colors
+    style.Colors[ImGuiCol_TableHeaderBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.8f);   // Dark table headers
+    style.Colors[ImGuiCol_TableBorderStrong] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f); // Dark borders
+    style.Colors[ImGuiCol_TableBorderLight] = ImVec4(0.4f, 0.4f, 0.4f, 0.6f);  // Lighter borders
+    style.Colors[ImGuiCol_TableRowBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);       // Transparent row backgrounds
+    style.Colors[ImGuiCol_TableRowBgAlt] = ImVec4(0.05f, 0.05f, 0.05f, 0.5f); // Subtle alternating rows
+
+    style.Colors[ImGuiCol_Header] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);          // Dark headers
+    // style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);   // Dark hover
+    // style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.3f, 0.3f, 0.3f, 0.9f);    // Dark active
+    
+    style.Colors[ImGuiCol_Button] = ImVec4(0.3f, 0.3f, 0.3f, 0.8f);          // Dark buttons
+    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.1f, 0.1f, 0.9f, 0.9f);   // Dark hover
+    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.04f, 0.04f, 0.04f, 1.0f);    // Dark active
+   
+    style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.5f, 0.5f, 0.5f, 0.8f);      // Gray sliders
+    style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.6f, 0.6f, 0.6f, 1.0f); // Gray active
+    
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.03f, 0.03f, 0.03f, 0.75f);     // Dark frames
+    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);  // Dark hover
+    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.15f, 0.15f, 0.15f, 0.9f); // Dark active
+    
+    style.Colors[ImGuiCol_Text] = ImVec4(0.9f, 0.9f, 0.9f, 1.0f);            // Light text
+    style.Colors[ImGuiCol_TextDisabled] = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);    // Disabled text
+    
+    style.Colors[ImGuiCol_Border] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);         // Dark borders
+    style.Colors[ImGuiCol_BorderShadow] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);    // No shadow
+    
+}
+
+//--------------------------------------------------------------
+void ofApp::drawGUI() {
+    try {
+        gui.begin();
+        
+        // Layout loading will be handled manually via menu buttons
+        
+        // Menu bar at top of main window
+        drawMenuBar();
+
+        ImGuiViewport* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(viewport->WorkSize);
+        ImGui::SetNextWindowViewport(viewport->ID);
+        ImGui::SetNextWindowBgAlpha(0.0f);  // ✅ THIS ACTUALLY WORKS!
+        
+        ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | 
+                                       ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                       ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
+        
+        if (ImGui::Begin("DockSpace", nullptr, window_flags)) {
+            ImGui::DockSpace(ImGui::GetID("MyDockSpace"), ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
+
+            // Draw 3 main panels - ImGui handles positioning
+            drawClockPanel();
+            drawTrackerPanel();
+            drawMediaPoolPanel();
+        }
+        ImGui::End();
+
+        gui.end();
+    } catch (const std::exception& e) {
+        ofLogError("ofApp") << "Exception in drawGUI(): " << e.what();
+    } catch (...) {
+        ofLogError("ofApp") << "Unknown exception in drawGUI()";
+    }
+}
+
+//--------------------------------------------------------------
+void ofApp::drawMenuBar() {
+    if (ImGui::BeginMainMenuBar()) {
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Save Pattern")) {
+                trackerSequencer.saveState("tracker_sequencer_state.json");
+            }
+            if (ImGui::MenuItem("Load Pattern")) {
+                trackerSequencer.loadState("tracker_sequencer_state.json");
+            }
+            ImGui::EndMenu();
+        }
+        
+        if (ImGui::BeginMenu("Layout")) {
+            if (ImGui::MenuItem("Save Layout as Default")) {
+                saveLayout();
+            }
+            if (ImGui::MenuItem("Load Default Layout")) {
+                loadLayout();
+            }
+            ImGui::EndMenu();
+        }
+        
+        if (ImGui::BeginMenu("Help")) {
+            if (ImGui::MenuItem("Controls")) {
+                // Show controls help in a popup or window
+                ImGui::OpenPopup("Controls Help");
+            }
+            ImGui::EndMenu();
+        }
+        
+        // Controls help popup - this needs to be called every frame
+        if (ImGui::BeginPopupModal("Controls Help", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Controls:");
+            ImGui::Text("SPACE: Play/Stop");
+            ImGui::Text("R: Reset");
+            ImGui::Text("G: Toggle GUI");
+            ImGui::Text("N: Next media");
+            ImGui::Text("M: Previous media");
+            ImGui::Text("S: Save pattern");
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Pattern Editing:");
+            ImGui::Text("Click cells to edit");
+            ImGui::Text("Drag to set values");
+            ImGui::Text("Right-click for options");
+            ImGui::Separator();
+            if (ImGui::Button("Close")) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+        
+        ImGui::EndMainMenuBar();
+    }
+}
+
+//--------------------------------------------------------------
+void ofApp::saveLayout() {
+    try {
+        // Set the ini filename for saving
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = "imgui.ini";
+        
+        std::string iniPath = ofToDataPath("imgui.ini", true);
+        ImGui::SaveIniSettingsToDisk(iniPath.c_str());
+    } catch (const std::exception& e) {
+        ofLogError("ofApp") << "Exception in saveLayout(): " << e.what();
+    } catch (...) {
+        ofLogError("ofApp") << "Unknown exception in saveLayout()";
+    }
+}
+
+//--------------------------------------------------------------
+void ofApp::loadLayout() {
+    try {
+        // Set the ini filename for loading
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = "imgui.ini";
+        
+        std::string iniPath = ofToDataPath("imgui.ini", true);
+        
+        if (ofFile::doesFileExist(iniPath)) {
+            ImGui::LoadIniSettingsFromDisk(iniPath.c_str());
+        }
+    } catch (const std::exception& e) {
+        ofLogError("ofApp") << "Exception in loadLayout(): " << e.what();
+    } catch (...) {
+        ofLogError("ofApp") << "Unknown exception in loadLayout()";
+    }
+}
+
+
+//--------------------------------------------------------------
+void ofApp::drawClockPanel() {
+    if (ImGui::Begin("Clock & Audio")) {
+        // Clock controls
+        clock.drawGUI();
+        ImGui::Separator();
+
+        // Audio device selection
+        if (ImGui::Combo("Device", &selectedAudioDevice, [](void* data, int idx, const char** out_text) {
+            auto* devices = static_cast<std::vector<ofSoundDevice>*>(data);
+            if (idx >= 0 && idx < devices->size()) {
+                *out_text = (*devices)[idx].name.c_str();
+                return true;
+            }
+            return false;
+        }, &audioDevices, audioDevices.size())) {
+            audioDeviceChanged = true;
+        }
+        
+        if (audioDeviceChanged) {
+            setupAudioStream();
+            audioDeviceChanged = false;
+        }
+        
+        // Volume control
+        ImGui::SliderFloat("Volume", &globalVolume, 0.0f, 1.0f, "%.2f");
+        
+        // Audio level visualization
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.0f, 1.0f, 0.0f, 1.0f));
+        ImGui::ProgressBar(currentAudioLevel, ImVec2(-1, 0), "");
+        ImGui::PopStyleColor();
+        ImGui::Text("Level: %.3f", currentAudioLevel);
+        
+        ImGui::Separator();
+    }
+    ImGui::End();
+}
+
+//--------------------------------------------------------------
+void ofApp::drawTrackerPanel() {
+    if (ImGui::Begin("Tracker Sequencer")) {
+        trackerSequencer.drawTrackerInterface();
+    }
+    ImGui::End();
+}
+
+//--------------------------------------------------------------
+void ofApp::drawMediaPoolPanel() {
+    if (ImGui::Begin("Media Pool")) {
+        mediaPool.drawMediaPoolGUI();
+    }
+    ImGui::End();
+}
+
+
+//--------------------------------------------------------------
+std::string ofApp::loadMediaDirectory() {
+    ofFile settingsFile("media_settings.json");
+    if (settingsFile.exists()) {
+        ofJson settings = ofJson::parse(settingsFile.readToBuffer().getText());
+        if (settings.contains("mediaDirectory")) {
+            return settings["mediaDirectory"].get<std::string>();
+        }
+    }
+    return "";
+}
+
+//--------------------------------------------------------------
+void ofApp::saveMediaDirectory(const std::string& path) {
+    ofJson settings;
+    settings["mediaDirectory"] = path;
+    
+    ofFile settingsFile("media_settings.json", ofFile::WriteOnly);
+    settingsFile << settings.dump(4);
+    ofLogNotice("ofApp") << "Saved media directory: " << path;
+}
+
+
+
+
+
+// Old methods removed - now handled by ofxMediaSequencer
+
+
+//
+//  ofApp.h
+//
+//  Audiovisual Sequencer Example - Time + Sound + Video coordination
+//
+
+#pragma once
+
+#include "ofMain.h"
+#include "ofxSoundObjects.h"
+#include "ofxVisualObjects.h"
+#include "MediaPlayer.h"
+#include "MediaPool.h"
+#include "TrackerSequencer.h"
+#include "Clock.h"
+#include "ofxImGui.h"
+#include "imgui_internal.h" // For DockBuilder API
+
+class ofApp : public ofBaseApp {
+public:
+    ~ofApp() noexcept;
+    void setup();
+    void update();
+    void draw();
+    void exit();
+    
+    void keyPressed(int key);
+    void mousePressed(int x, int y, int button);
+    void windowResized(int w, int h);
+    
+    // Audio callbacks
+    void audioOut(ofSoundBuffer& buffer);
+    
+    // Step event handler for TrackerSequencer
+    void onTrackerStepEvent(int step, float duration, const TrackerSequencer::PatternCell& cell);
+    
+private:
+    // Time objects
+    Clock clock;
+    
+    // Media pool system
+    MediaPool mediaPool;
+    
+    // TrackerSequencer for pattern management
+    TrackerSequencer trackerSequencer;
+    
+    // Sound objects
+    ofxSoundOutput soundOutput;
+    
+    // Visual objects
+    ofxVisualOutput visualOutput;
+    
+    // No bridge system needed - direct connections only
+    
+    // Audio system
+    ofSoundStream soundStream;
+    ofSoundBuffer soundBuffer;
+    
+    // GUI system
+    ofxImGui::Gui gui;
+    
+    // GUI state
+    bool showGUI = true;
+    bool isPlaying = false;
+    float globalVolume = 1.0f;  // Global volume control
+    int numSteps = 16;
+    
+    
+    // BPM control is now handled by Clock
+    
+    // Audio level for visualization
+    float currentAudioLevel = 0.0f;
+    
+    // Audio device selection
+    std::vector<ofSoundDevice> audioDevices;
+    int selectedAudioDevice = 0;
+    bool audioDeviceChanged = false;
+    
+    // Current step for GUI display (last triggered step)
+    int currentStep = 0;
+    int lastTriggeredStep = 0;  // Track the last step that was actually triggered
+    
+    // Media directory persistence
+    std::string loadMediaDirectory();
+    void saveMediaDirectory(const std::string& path);
+    
+    // Methods
+    void setupSoundObjects();
+    void setupAudioStream();
+    void setupVisualObjects();
+    void setupGUI();
+    
+    void drawGUI();
+    void drawMenuBar();
+    void setupDefaultLayout(bool forceReset = false);
+    
+    // Layout management
+    void saveLayout();
+    void loadLayout();
+    
+    // Panel methods
+    void drawClockPanel();
+    void drawTrackerPanel();
+    void drawMediaPoolPanel();
+    
+    // GUI callbacks
+    void onBPMChanged(float& value);
+    void onStepChanged(int& value);
+};

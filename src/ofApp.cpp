@@ -8,6 +8,7 @@
 
 //--------------------------------------------------------------
 ofApp::~ofApp() noexcept {
+    // No auto-save - use menu buttons instead
 }
 
 //--------------------------------------------------------------
@@ -15,8 +16,6 @@ void ofApp::setup() {
     ofSetFrameRate(60);
     ofSetVerticalSync(true);
     ofSetLogLevel(OF_LOG_NOTICE);
-    
-    ofLogNotice("ofApp") << "Setting up Audiovisual Sequencer";
     
     // Setup media library with correct path for app bundle
     std::string absolutePath;
@@ -27,7 +26,6 @@ void ofApp::setup() {
     bool foundDataDir = false;
     
     if (!savedMediaDir.empty() && ofDirectory(savedMediaDir).exists()) {
-        ofLogNotice("ofApp") << "✅ Using saved media directory: " << savedMediaDir;
         mediaPool.setDataDirectory(savedMediaDir);
         foundDataDir = true;
     } else {
@@ -37,12 +35,8 @@ void ofApp::setup() {
         possiblePaths.push_back(ofFilePath::getCurrentWorkingDirectory() + "/data");
         possiblePaths.push_back("/Users/jaufre/works/of_v0.12.1_osx_release/addons/ofxMediaObjects/example-audiovisualSequencer/bin/data");
         
-        ofLogNotice("ofApp") << "Trying to find data directory...";
-        
         for (const auto& path : possiblePaths) {
-            ofLogNotice("ofApp") << "Trying path: " << path;
             if (ofDirectory(path).exists()) {
-                ofLogNotice("ofApp") << "✅ Found data directory: " << path;
                 mediaPool.setDataDirectory(path);
                 saveMediaDirectory(path); // Save for next launch
                 foundDataDir = true;
@@ -57,12 +51,10 @@ void ofApp::setup() {
     
     
     // Setup TrackerSequencer with clock reference
-    trackerSequencer.setup(&mediaPool, &clock, numSteps);
+    trackerSequencer.setup(&clock, numSteps);
     
     // Auto-load saved state if it exists
-    if (trackerSequencer.loadState("tracker_sequencer_state.json")) {
-        ofLogNotice("ofApp") << "TrackerSequencer state loaded from file";
-    }
+    trackerSequencer.loadState("tracker_sequencer_state.json");
     
     // Setup MediaPool directory change callback
     mediaPool.setDirectoryChangeCallback([this](const std::string& path) {
@@ -70,8 +62,8 @@ void ofApp::setup() {
     });
     
     // Register step event listener
-    trackerSequencer.addStepEventListener([this](int step, float bpm, const TrackerSequencer::PatternCell& cell) {
-        onTrackerStepEvent(step, bpm, cell);
+    trackerSequencer.addStepEventListener([this](int step, float duration, const TrackerSequencer::PatternCell& cell) {
+        onTrackerStepEvent(step, duration, cell);
     });
     
     // Setup time objects using Clock wrapper
@@ -80,21 +72,20 @@ void ofApp::setup() {
     // Setup MediaPool with clock reference
     mediaPool.setup(&clock);
     
-    // Setup clock → TrackerSequencer connection (DIRECT step event system)
-    clock.addTickListener([this](const ofxTimeBuffer& tick) {
-        // Process clock tick directly through TrackerSequencer
-        trackerSequencer.update(tick);
-        
-        // Update last triggered step for visual feedback
-        lastTriggeredStep = trackerSequencer.getCurrentStep();
-        
-        // Debug: Log when we get clock ticks (only when playing)
-        if (isPlaying) {
-            ofLogVerbose("ofApp") << "Clock tick - Step: " << trackerSequencer.getCurrentStep();
-        }
+    // Initialize MediaPoolGUI with reference to mediaPool
+    mediaPoolGUI.setMediaPool(mediaPool);
+    
+    // Setup TrackerSequencer callbacks for UI queries
+    trackerSequencer.setIndexRangeCallback([this]() {
+        return mediaPool.getNumPlayers();
     });
     
-    ofLogNotice("ofApp") << "Time objects setup complete";
+    // TrackerSequencer now uses Clock's beat events for sample-accurate timing
+    // Add step event listener for visual feedback
+    trackerSequencer.addStepEventListener([this](int step, float duration, const TrackerSequencer::PatternCell& cell) {
+        lastTriggeredStep = step;
+    });
+    
     
     // Setup sound objects
     setupSoundObjects();
@@ -105,10 +96,6 @@ void ofApp::setup() {
     // Set output references in MediaPool (connection will happen when player becomes active)
     mediaPool.setOutputs(soundOutput, visualOutput);
     
-    // Debug: Log audio routing
-    ofLogNotice("ofApp") << "Audio routing: MediaPool -> soundOutput -> audioOut callback";
-    ofLogNotice("ofApp") << "Sound output name: " << soundOutput.getName();
-    ofLogNotice("ofApp") << "Sound stream setup complete";
     
     // Setup GUI
     setupGUI();
@@ -117,8 +104,6 @@ void ofApp::setup() {
     if (!trackerSequencer.loadState("tracker_sequencer_state.json")) {
         // Initialize pattern with some default steps if no saved state
         if (mediaPool.getNumPlayers() > 0) {
-            ofLogNotice("ofApp") << "Initializing default pattern with " << mediaPool.getNumPlayers() << " media items";
-            
             TrackerSequencer::PatternCell cell0(0, 0.0f, 1.0f, 1.0f, 1.0f);
             cell0.audioEnabled = true;
             cell0.videoEnabled = true;
@@ -138,7 +123,6 @@ void ofApp::setup() {
             
             // Save the default pattern
             trackerSequencer.saveState("tracker_sequencer_state.json");
-            ofLogNotice("ofApp") << "Default pattern saved";
         } else {
             ofLogWarning("ofApp") << "No media items available for pattern initialization";
         }
@@ -146,7 +130,8 @@ void ofApp::setup() {
     
     // Clock listener is set up in setupTimeObjects()
     
-    ofLogNotice("ofApp") << "Audiovisual Sequencer setup complete";
+    // Load default layout on startup
+    loadLayout();
 }
 
 //--------------------------------------------------------------
@@ -183,19 +168,25 @@ void ofApp::update() {
 
 //--------------------------------------------------------------
 void ofApp::draw() {
-    ofBackground(20, 20, 30);
-    
-    // Draw video if available and currently playing
-    auto currentPlayer = mediaPool.getActivePlayer();
-    if (currentPlayer && currentPlayer->isVideoLoaded() && 
-        currentPlayer->videoEnabled.get() && currentPlayer->isPlaying()) {
-        ofSetColor(255, 255, 255);
-        currentPlayer->getVideoPlayer().getVideoFile().getTexture().draw(0, 0, ofGetWidth(), ofGetHeight());
-    }
-    
-    // Draw GUI
-    if (showGUI) {
-        drawGUI();
+    try {
+        ofBackground(0, 0, 0);
+        
+        // Draw video if available and currently playing
+        auto currentPlayer = mediaPool.getActivePlayer();
+        if (currentPlayer && currentPlayer->isVideoLoaded() && 
+            currentPlayer->videoEnabled.get() && currentPlayer->isPlaying()) {
+            ofSetColor(255, 255, 255);
+            currentPlayer->getVideoPlayer().getVideoFile().getTexture().draw(0, 0, ofGetWidth(), ofGetHeight());
+        }
+        
+        // Draw GUI
+        if (showGUI) {
+            drawGUI();
+        }
+    } catch (const std::exception& e) {
+        ofLogError("ofApp") << "Exception in draw(): " << e.what();
+    } catch (...) {
+        ofLogError("ofApp") << "Unknown exception in draw()";
     }
 }
 
@@ -212,11 +203,8 @@ void ofApp::exit() {
 
 //--------------------------------------------------------------
 void ofApp::audioOut(ofSoundBuffer& buffer) {
-    // Debug: Log audio callback frequency
-    static int debugCounter = 0;
-    if (++debugCounter % 100 == 0) {
-        ofLogNotice("ofApp") << "audioOut callback called - buffer size: " << buffer.getNumFrames() << " frames, " << buffer.getNumChannels() << " channels";
-    }
+    // Process audio-rate clock first (sample-accurate timing)
+    clock.audioOut(buffer);
     
     // Audio processing happens in sound objects
     soundOutput.audioOut(buffer);
@@ -230,30 +218,6 @@ void ofApp::audioOut(ofSoundBuffer& buffer) {
         maxLevel = std::max(maxLevel, std::abs(buffer[i]));
     }
     currentAudioLevel = maxLevel;
-    
-    // Debug: Log audio levels (only occasionally to avoid spam)
-    if (debugCounter % 1000 == 0) {
-        ofLogNotice("ofApp") << "Audio processing - Global volume: " << globalVolume;
-        
-        // Additional debugging for audio routing
-        auto currentPlayer = mediaPool.getActivePlayer();
-        if (currentPlayer) {
-            ofLogNotice("ofApp") << "Active player audio enabled: " << currentPlayer->audioEnabled.get() 
-                                 << ", volume: " << currentPlayer->volume.get()
-                                 << ", isPlaying: " << currentPlayer->isPlaying()
-                                 << ", audio loaded: " << currentPlayer->isAudioLoaded();
-        }
-        
-        // Check if soundOutput is connected
-        ofLogNotice("ofApp") << "SoundOutput connected: " << (soundOutput.getInputObject() != nullptr);
-    }
-    
-    // Debug: Log when global volume changes
-    static float lastGlobalVolume = globalVolume;
-    if (globalVolume != lastGlobalVolume) {
-        ofLogNotice("ofApp") << "Global volume changed from " << lastGlobalVolume << " to " << globalVolume;
-        lastGlobalVolume = globalVolume;
-    }
 }
 
 //--------------------------------------------------------------
@@ -349,21 +313,38 @@ void ofApp::mousePressed(int x, int y, int button) {
     }
 }
 
+//--------------------------------------------------------------
+void ofApp::windowResized(int w, int h) {
+    // Window resize handled by ImGui docking automatically
+    
+    // Update visual output dimensions
+    visualOutput.width.set(w);
+    visualOutput.height.set(h);
+    
+    ofLogNotice("ofApp") << "Window resized to " << w << "x" << h;
+}
+
 
 
 
 //--------------------------------------------------------------
-void ofApp::onTrackerStepEvent(int step, float bpm, const TrackerSequencer::PatternCell& cell) {
-    ofLogNotice("ofApp") << "TrackerSequencer step event: step=" << step << ", bpm=" << bpm << ", stepLength=" << cell.stepLength;
+void ofApp::onTrackerStepEvent(int step, float duration, const TrackerSequencer::PatternCell& cell) {
+    ofLogNotice("ofApp") << "TrackerSequencer step event: step=" << step << ", duration=" << duration << "s, stepLength=" << cell.stepLength;
     
     // Synchronize ofApp::currentStep with TrackerSequencer::currentStep
     currentStep = step;
     
-    // Extract parameters from PatternCell and pass to MediaPool
-    // stepLength is already in beats (converted by TrackerSequencer)
-    mediaPool.onStepTrigger(step, cell.mediaIndex, cell.position, 
-                           cell.speed, cell.volume, cell.stepLength, 
-                           cell.audioEnabled, cell.videoEnabled);
+    // Only trigger MediaPool for non-empty steps
+    // Empty steps should be silent and let previous step's duration complete naturally
+    if (cell.mediaIndex >= 0) {
+        // Extract parameters from PatternCell and pass to MediaPool
+        // Pass duration in seconds instead of stepLength in beats
+        mediaPool.onStepTrigger(step, cell.mediaIndex, cell.position, 
+                               cell.speed, cell.volume, duration, 
+                               cell.audioEnabled, cell.videoEnabled);
+    } else {
+        ofLogNotice("ofApp") << "Step " << step << " is empty (rest) - no media trigger";
+    }
 }
 
 //--------------------------------------------------------------
@@ -376,21 +357,17 @@ void ofApp::setupSoundObjects() {
     
     // Get available audio devices
     audioDevices = soundStream.getDeviceList();
-    ofLogNotice("ofApp") << "Found " << audioDevices.size() << " audio devices";
     
     // Find default output device
     for (size_t i = 0; i < audioDevices.size(); i++) {
         if (audioDevices[i].isDefaultOutput) {
             selectedAudioDevice = i;
-            ofLogNotice("ofApp") << "Using default audio device: " << audioDevices[i].name;
             break;
         }
     }
     
     // Setup audio stream with selected device
     setupAudioStream();
-    
-    ofLogNotice("ofApp") << "Sound objects setup complete";
 }
 
 //--------------------------------------------------------------
@@ -413,12 +390,9 @@ void ofApp::setupAudioStream() {
     
     if (selectedAudioDevice < audioDevices.size()) {
         settings.setOutDevice(audioDevices[selectedAudioDevice]);
-        ofLogNotice("ofApp") << "Using audio device: " << audioDevices[selectedAudioDevice].name;
     }
     
     soundStream.setup(settings);
-    
-    ofLogNotice("ofApp") << "Audio stream setup complete";
 }
 
 //--------------------------------------------------------------
@@ -434,229 +408,273 @@ void ofApp::setupVisualObjects() {
     // Note: Visual output will allocate its own buffer when needed
     
     // Video connection handled by mediaSequencer
-    ofLogNotice("ofApp") << "Video setup complete";
-    
-    ofLogNotice("ofApp") << "Visual objects setup complete";
 }
 
 // No bridge setup needed - direct connections only
 
 //--------------------------------------------------------------
 void ofApp::setupGUI() {
-    // Setup ImGui
-    gui.setup();
+    // Setup ImGui with docking enabled and proper ini file handling
+    gui.setup(nullptr, true, ImGuiConfigFlags_DockingEnable);
     
-    ofLogNotice("ofApp") << "GUI setup complete";
+    // Initialize ImPlot
+    ImPlot::CreateContext();
+    
+    // Set up ImGui with keyboard navigation
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    ImGuiStyle& style = ImGui::GetStyle();
+ 
+    style.Colors[ImGuiCol_DockingEmptyBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.7f);        // Dark neutral grey panels
+    style.Colors[ImGuiCol_ChildBg] = ImVec4(0.15f, 0.15f, 0.15f, 0.6f);  
+    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.95f);
+    style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.5f); // Modal dimming
+
+    style.Colors[ImGuiCol_MenuBarBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.8f);     
+
+    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.75f);          // Window title background
+    // style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.15f, 0.15f, 0.15f, 0.9f); // Active title background
+    // style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.05f, 0.05f, 0.05f, 0.7f); // Collapsed title background
+    
+    style.Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);      // Scrollbar background
+    style.Colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.3f, 0.3f, 0.3f, 0.8f);    // Scrollbar grab
+    style.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.4f, 0.4f, 0.4f, 0.9f); // Scrollbar hover
+    style.Colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.5f, 0.5f, 0.5f, 1.0f); // Scrollbar active
+    
+    style.Colors[ImGuiCol_ResizeGrip] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);       // Resize grip
+    // style.Colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.3f, 0.3f, 0.3f, 0.9f); // Resize grip hover
+    //style.Colors[ImGuiCol_ResizeGripActive] = ImVec4(0.4f, 0.4f, 0.4f, 1.0f); // Resize grip active
+    
+    style.Colors[ImGuiCol_Tab] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);              // Tab background
+    // style.Colors[ImGuiCol_TabHovered] = ImVec4(0.2f, 0.2f, 0.2f, 0.9f);      // Tab hover
+    // style.Colors[ImGuiCol_TabActive] = ImVec4(0.2f, 0.2f, 0.2f, 1.0f);        // Tab active
+    style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.05f, 0.05f, 0.05f, 0.7f);  // Tab unfocused
+    style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.15f, 0.15f, 0.15f, 0.8f); // Tab unfocused active
+    
+    style.Colors[ImGuiCol_Separator] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);         // Dark separator
+    style.Colors[ImGuiCol_SeparatorHovered] = ImVec4(0.3f, 0.3f, 0.3f, 0.9f);   // Dark hover
+    style.Colors[ImGuiCol_SeparatorActive] = ImVec4(0.4f, 0.4f, 0.4f, 1.0f);    // Dark active
+    
+    // Table / Grid colors
+    style.Colors[ImGuiCol_TableHeaderBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.8f);   // Dark table headers
+    style.Colors[ImGuiCol_TableBorderStrong] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f); // Dark borders
+    style.Colors[ImGuiCol_TableBorderLight] = ImVec4(0.4f, 0.4f, 0.4f, 0.6f);  // Lighter borders
+    style.Colors[ImGuiCol_TableRowBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);       // Transparent row backgrounds
+    style.Colors[ImGuiCol_TableRowBgAlt] = ImVec4(0.05f, 0.05f, 0.05f, 0.5f); // Subtle alternating rows
+
+    style.Colors[ImGuiCol_Header] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);          // Dark headers
+    // style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);   // Dark hover
+    // style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.3f, 0.3f, 0.3f, 0.9f);    // Dark active
+    
+    style.Colors[ImGuiCol_Button] = ImVec4(0.3f, 0.3f, 0.3f, 0.8f);          // Dark buttons
+    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.1f, 0.1f, 0.9f, 0.9f);   // Dark hover
+    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.04f, 0.04f, 0.04f, 1.0f);    // Dark active
+   
+    style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.5f, 0.5f, 0.5f, 0.8f);      // Gray sliders
+    style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.6f, 0.6f, 0.6f, 1.0f); // Gray active
+    
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.03f, 0.03f, 0.03f, 0.75f);     // Dark frames
+    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.2f, 0.2f, 0.8f, 0.8f);  // Dark hover
+    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.15f, 0.15f, 0.15f, 0.9f); // Dark active
+    
+    style.Colors[ImGuiCol_Text] = ImVec4(0.9f, 0.9f, 0.9f, 1.0f);            // Light text
+    style.Colors[ImGuiCol_TextDisabled] = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);    // Disabled text
+    
+    style.Colors[ImGuiCol_Border] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);         // Dark borders
+    style.Colors[ImGuiCol_BorderShadow] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);    // No shadow
+    
 }
 
 //--------------------------------------------------------------
 void ofApp::drawGUI() {
-    gui.begin();
-    
-    // Clock panel - position at bottom left
-    ImGui::SetNextWindowPos(ImVec2(10, ofGetHeight() - 100), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Clock", &showGUI);
-    
-    // Clock controls
-    drawClockControls();
-    
-    ImGui::End();
-    
-    // Audio Output panel - position next to Clock
-    ImGui::SetNextWindowPos(ImVec2(250, ofGetHeight() - 100), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Audio Output", &showGUI);
-    
-    // Audio controls
-    drawAudioOutput();
-    
-    ImGui::End();
-    
-    // Save/Load panel - position next to Audio Output
-    ImGui::SetNextWindowPos(ImVec2(490, ofGetHeight() - 200), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Save/Load", &showGUI);
-    
-    if (ImGui::Button("Save Pattern")) {
-        if (trackerSequencer.saveState("tracker_sequencer_state.json")) {
-            ofLogNotice("ofApp") << "Pattern saved successfully";
+    try {
+        gui.begin();
+        
+        // Layout loading will be handled manually via menu buttons
+        
+        // Menu bar at top of main window
+        drawMenuBar();
+
+        ImGuiViewport* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(viewport->WorkSize);
+        ImGui::SetNextWindowViewport(viewport->ID);
+        ImGui::SetNextWindowBgAlpha(0.0f);
+        
+        ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | 
+                                       ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                       ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
+        
+        if (ImGui::Begin("DockSpace", nullptr, window_flags)) {
+            ImGui::DockSpace(ImGui::GetID("MyDockSpace"), ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
+
+            // Draw 3 main panels - ImGui handles positioning
+            drawClockPanel();
+            drawAudioOutputPanel();
+            drawTrackerPanel();
+            drawMediaPoolPanel();
         }
+        ImGui::End();
+
+        gui.end();
+    } catch (const std::exception& e) {
+        ofLogError("ofApp") << "Exception in drawGUI(): " << e.what();
+    } catch (...) {
+        ofLogError("ofApp") << "Unknown exception in drawGUI()";
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Load Pattern")) {
-        if (trackerSequencer.loadState("tracker_sequencer_state.json")) {
-            ofLogNotice("ofApp") << "Pattern loaded successfully";
-        }
-    }
-    
-    ImGui::Text("Auto-save on exit enabled");
-    ImGui::Text("Auto-load on start enabled");
-    
-    ImGui::End();
-    
-    // Draw tracker interface using TrackerSequencer
-    trackerSequencer.drawTrackerInterface();
-    
-    // Draw media library interface using MediaPool
-    mediaPool.drawMediaPoolGUI();
-    
-    // Draw controls overlay
-    drawControlsOverlay();
-    
-    gui.end();
 }
 
 //--------------------------------------------------------------
-void ofApp::drawClockControls() {
-    // BPM control with proper clock synchronization and debouncing
-    static float bpmSlider = clock.getBPM();
-    static float lastBpmUpdate = 0.0f;
-    static float bpmChangeThreshold = 3.0f; // Increased threshold to prevent rapid changes
-    static bool isDragging = false;
-    
-    if (ImGui::SliderFloat("BPM", &bpmSlider, 60.0f, 240.0f)) {
-        isDragging = true;
-        float currentTime = ofGetElapsedTimef();
-        
-        // More aggressive debouncing during playback to prevent timing disruption
-        float debounceTime = isPlaying ? 0.3f : 0.1f;
-        float currentBpm = clock.getBPM();
-        
-        if (currentTime - lastBpmUpdate > debounceTime && abs(bpmSlider - currentBpm) > bpmChangeThreshold) {
-            lastBpmUpdate = currentTime;
-            
-            // Update the clock's BPM directly
-            clock.setBPM(bpmSlider);
-            
-            // If playing, log the BPM change for debugging
-            if (isPlaying) {
-                ofLogNotice("ofApp") << "BPM changed during playback to: " << bpmSlider;
-            } else {
-                ofLogNotice("ofApp") << "BPM slider changed to: " << bpmSlider;
+void ofApp::drawMenuBar() {
+    if (ImGui::BeginMainMenuBar()) {
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Save Pattern")) {
+                trackerSequencer.saveState("tracker_sequencer_state.json");
             }
+            if (ImGui::MenuItem("Load Pattern")) {
+                trackerSequencer.loadState("tracker_sequencer_state.json");
+            }
+            ImGui::EndMenu();
         }
-    } else if (isDragging && !ImGui::IsItemActive()) {
-        // User finished dragging, apply final value
-        isDragging = false;
-        clock.setBPM(bpmSlider);
-        ofLogNotice("ofApp") << "BPM drag finished at: " << bpmSlider;
-    }
-    
-    // REMOVED: Clock sync to prevent feedback loop
-    // The slider should be the source of truth, not the clock
-    
-    ImGui::Separator();
-    
-    // Play/Stop button with improved thread safety
-    if (ImGui::Button(isPlaying ? "Stop" : "Play")) {
-        if (isPlaying) {
-            // Stop in proper order to prevent thread conflicts
-            trackerSequencer.stop();
-            clock.stop();
-            isPlaying = false;
-            ofLogNotice("ofApp") << "Stopped playback";
-        } else {
-            // Start in proper order to prevent thread conflicts
-            trackerSequencer.reset();
-            currentStep = 0;
-            clock.start();
-            trackerSequencer.play();
-            isPlaying = true;
-            ofLogNotice("ofApp") << "Started playback at BPM: " << clock.getBPM();
+        
+        if (ImGui::BeginMenu("Layout")) {
+            if (ImGui::MenuItem("Save Layout as Default")) {
+                saveLayout();
+            }
+            if (ImGui::MenuItem("Load Default Layout")) {
+                loadLayout();
+            }
+            ImGui::EndMenu();
         }
+        
+        if (ImGui::BeginMenu("Help")) {
+            if (ImGui::MenuItem("Controls")) {
+                // Show controls help in a popup or window
+                ImGui::OpenPopup("Controls Help");
+            }
+            ImGui::EndMenu();
+        }
+        
+        // Controls help popup - this needs to be called every frame
+        if (ImGui::BeginPopupModal("Controls Help", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Controls:");
+            ImGui::Text("SPACE: Play/Stop");
+            ImGui::Text("R: Reset");
+            ImGui::Text("G: Toggle GUI");
+            ImGui::Text("N: Next media");
+            ImGui::Text("M: Previous media");
+            ImGui::Text("S: Save pattern");
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Pattern Editing:");
+            ImGui::Text("Click cells to edit");
+            ImGui::Text("Drag to set values");
+            ImGui::Text("Right-click for options");
+            ImGui::Separator();
+            if (ImGui::Button("Close")) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+        
+        ImGui::EndMainMenuBar();
     }
-    
-    ImGui::SameLine();
-    if (ImGui::Button("Reset")) {
-        clock.reset();
-        trackerSequencer.reset();
-        currentStep = 0;
-        // Don't trigger step 0 - let TrackerSequencer handle first step naturally
-    }
-    
-    // Status
-    ImGui::Text("Status: %s", isPlaying ? "Playing" : "Stopped");
-    ImGui::Text("Current Step: %d", currentStep + 1); // Display 1-16 instead of 0-15
-    ImGui::Text("Direct connections: Active");
 }
 
 //--------------------------------------------------------------
-void ofApp::drawAudioOutput() {
-    // Audio device selection
-    if (ImGui::Combo("Device", &selectedAudioDevice, [](void* data, int idx, const char** out_text) {
-        auto* devices = static_cast<std::vector<ofSoundDevice>*>(data);
-        if (idx >= 0 && idx < devices->size()) {
-            *out_text = (*devices)[idx].name.c_str();
-            return true;
+void ofApp::saveLayout() {
+    try {
+        // Set the ini filename for saving
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = "imgui.ini";
+        
+        std::string iniPath = ofToDataPath("imgui.ini", true);
+        ImGui::SaveIniSettingsToDisk(iniPath.c_str());
+    } catch (const std::exception& e) {
+        ofLogError("ofApp") << "Exception in saveLayout(): " << e.what();
+    } catch (...) {
+        ofLogError("ofApp") << "Unknown exception in saveLayout()";
+    }
+}
+
+//--------------------------------------------------------------
+void ofApp::loadLayout() {
+    try {
+        // Set the ini filename for loading
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = "imgui.ini";
+        
+        std::string iniPath = ofToDataPath("imgui.ini", true);
+        
+        if (ofFile::doesFileExist(iniPath)) {
+            ImGui::LoadIniSettingsFromDisk(iniPath.c_str());
         }
-        return false;
-    }, &audioDevices, audioDevices.size())) {
-        audioDeviceChanged = true;
-    }
-    
-    if (audioDeviceChanged) {
-        setupAudioStream();
-        audioDeviceChanged = false;
-        ofLogNotice("ofApp") << "Audio device changed to: " << audioDevices[selectedAudioDevice].name;
-    }
-    
-    // Global volume control with better feedback
-    static float lastGlobalVolume = globalVolume;
-    if (ImGui::SliderFloat("Global Volume", &globalVolume, 0.0f, 1.0f, "%.2f")) {
-        // Global volume will be applied in audioOut callback
-        ofLogNotice("ofApp") << "Global volume changed to: " << globalVolume;
-        lastGlobalVolume = globalVolume;
-    }
-    
-    // Simple audio level visualization with green color
-    ImGui::Text("Audio Level:");
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.0f, 1.0f, 0.0f, 1.0f)); // Green color
-    ImGui::ProgressBar(currentAudioLevel, ImVec2(-1, 0), "");
-    ImGui::PopStyleColor();
-    ImGui::Text("Level: %.3f | Volume: %.2f", currentAudioLevel, globalVolume);
-    
-    // Debug: Show if volume is actually changing
-    if (globalVolume != lastGlobalVolume) {
-        ofLogNotice("ofApp") << "Global volume slider value changed from " << lastGlobalVolume << " to " << globalVolume;
-        lastGlobalVolume = globalVolume;
+    } catch (const std::exception& e) {
+        ofLogError("ofApp") << "Exception in loadLayout(): " << e.what();
+    } catch (...) {
+        ofLogError("ofApp") << "Unknown exception in loadLayout()";
     }
 }
 
 
-
-
 //--------------------------------------------------------------
-void ofApp::drawControlsOverlay() {
-    // Draw controls overlay with transparent black background
-    // Position at bottom-left of the window
-    float windowHeight = ofGetHeight();
-    ImGui::SetNextWindowPos(ImVec2(10, windowHeight - 10), ImGuiCond_Appearing);
-    ImGui::SetNextWindowBgAlpha(0.8f); // Semi-transparent background
-    
-    if (ImGui::Begin("Controls Overlay", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings)) {
-        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Controls:");
-        ImGui::Text("SPACE: Play/Stop");
-        ImGui::Text("R: Reset");
-        ImGui::Text("G: Toggle GUI");
-        ImGui::Text("N/M: Next/Prev Player");
-        ImGui::Text("S: Save State");
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.0f, 1.0f, 1.0f, 1.0f), "Tracker Navigation:");
-        ImGui::Text("Arrow Keys: Navigate steps");
-        ImGui::Text("1-9: Set media index");
-        ImGui::Text("0: Clear (rest)");
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), "Tracker Editing:");
-        ImGui::Text("C: Clear current step");
-        ImGui::Text("X: Copy from previous");
-        ImGui::Text("V: Paste to current");
-        ImGui::Text("P: Cycle position");
-        ImGui::Text("S: Cycle speed");
-        ImGui::Text("W: Cycle volume");
-        ImGui::Text("L: Cycle step length");
-        ImGui::Text("A: Toggle audio");
-        ImGui::Text("V: Toggle video");
+void ofApp::drawClockPanel() {
+    if (ImGui::Begin("Clock ")) {
+        // Clock controls
+        clockGUI.draw(clock);
     }
     ImGui::End();
 }
+//--------------------------------------------------------------
+void ofApp::drawAudioOutputPanel() {
+    if (ImGui::Begin("Audio Output")) {
+        // Audio device selection
+        if (ImGui::Combo("Device", &selectedAudioDevice, [](void* data, int idx, const char** out_text) {
+            auto* devices = static_cast<std::vector<ofSoundDevice>*>(data);
+            if (idx >= 0 && idx < devices->size()) {
+                *out_text = (*devices)[idx].name.c_str();
+                return true;
+            }
+            return false;
+        }, &audioDevices, audioDevices.size())) {
+            audioDeviceChanged = true;
+        }
+        
+        if (audioDeviceChanged) {
+            setupAudioStream();
+            audioDeviceChanged = false;
+        }
+        
+        // Volume control
+        ImGui::SliderFloat("Volume", &globalVolume, 0.0f, 1.0f, "%.2f");
+        
+        // Audio level visualization
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.0f, 1.0f, 0.0f, 1.0f));
+        ImGui::ProgressBar(currentAudioLevel, ImVec2(-1, 0), "");
+        ImGui::PopStyleColor();
+        ImGui::Text("Level: %.3f", currentAudioLevel);
+    }
+    ImGui::End();
+}
+
+//--------------------------------------------------------------
+void ofApp::drawTrackerPanel() {
+    if (ImGui::Begin("Tracker Sequencer")) {
+        trackerSequencer.drawTrackerInterface();
+    }
+    ImGui::End();
+}
+
+//--------------------------------------------------------------
+void ofApp::drawMediaPoolPanel() {
+    if (ImGui::Begin("Media Pool")) {
+        mediaPoolGUI.draw();  // Delegate to separate GUI
+    }
+    ImGui::End();
+}
+
 
 //--------------------------------------------------------------
 std::string ofApp::loadMediaDirectory() {
@@ -685,3 +703,5 @@ void ofApp::saveMediaDirectory(const std::string& path) {
 
 
 // Old methods removed - now handled by ofxMediaSequencer
+
+

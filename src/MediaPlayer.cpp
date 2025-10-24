@@ -20,8 +20,8 @@ void MediaPlayer::setup() {
     
     // Setup synchronized parameters
     position.set("Position", 0.0f, 0.0f, 1.0f);
-    speed.set("Speed", 1.0f, -4.0f, 4.0f);  // Support negative speeds for backward playback
-    loop.set("Loop", false);
+    speed.set("Speed", 1.0f, -10.0f, 10.0f);  // Support negative speeds for backward playback
+    loop.set("Loop", true);
     
     // Setup enable/disable toggles
     audioEnabled.set("Audio Enabled", true);
@@ -113,6 +113,9 @@ bool MediaPlayer::loadVideo(const std::string& videoPath) {
 
 void MediaPlayer::play() {
     if (audioEnabled.get() && isAudioLoaded()) {
+
+        audioEnabled.set(true);
+
         ofLogNotice("ofxMediaPlayer") << "Playing audio - enabled: " << audioEnabled.get() 
                                       << ", loaded: " << isAudioLoaded() 
                                       << ", volume: " << volume.get();
@@ -120,28 +123,16 @@ void MediaPlayer::play() {
     }
     
     if (videoEnabled.get() && isVideoLoaded()) {
+        videoEnabled.set(true);
         ofLogNotice("ofxMediaPlayer") << "Playing video - enabled: " << videoEnabled.get() 
                                       << ", loaded: " << isVideoLoaded();
-        
-        // Ensure video is not paused before playing
-        videoPlayer.setPaused(false);
-        
-        // Play the video player
         videoPlayer.play();
-        
-        // Also ensure the underlying video file is playing
-        auto& videoFile = videoPlayer.getVideoFile();
-        videoFile.play();
-        
-        // Set position to the parameter value
-        videoFile.setPosition(position.get());
-        
-        // Force texture update to ensure frame is available
-        videoFile.forceTextureUpdate();
+        videoPlayer.getVideoFile().setPosition(position.get());
+        videoPlayer.getVideoFile().forceTextureUpdate();
         
         ofLogNotice("ofxMediaPlayer") << "Video play called - isPlaying: " << videoPlayer.isPlaying()
-                                      << ", video file playing: " << videoFile.isPlaying()
-                                      << ", video file position: " << videoFile.getPosition();
+                                      << ", video file playing: " << videoPlayer.getVideoFile().isPlaying()
+                                      << ", video file position: " << videoPlayer.getVideoFile().getPosition();
     } else {
         ofLogNotice("ofxMediaPlayer") << "Video not played - enabled: " << videoEnabled.get() 
                                       << ", loaded: " << isVideoLoaded();
@@ -151,7 +142,14 @@ void MediaPlayer::play() {
 void MediaPlayer::stop() {
     audioPlayer.stop();
     videoPlayer.stop();
+    if (audioEnabled.get()) {
+        audioEnabled.set(false);
+    }
+    if (videoEnabled.get()) {
+        videoEnabled.set(false);
+    }
 }
+
 
 void MediaPlayer::pause() {
     audioPlayer.setPaused(true);
@@ -160,15 +158,8 @@ void MediaPlayer::pause() {
 
 void MediaPlayer::setPosition(float pos) {
     position.set(pos);
-    
-    if (isAudioLoaded()) {
-        // Use the underlying sound player's setPosition method
-        audioPlayer.setPosition(pos);
-    }
-    
-    if (isVideoLoaded()) {
-        videoPlayer.getVideoFile().setPosition(pos);
-    }
+    if (isAudioLoaded()) {audioPlayer.setPosition(pos);}
+    if (isVideoLoaded()) {videoPlayer.getVideoFile().setPosition(pos);}
 }
 
 bool MediaPlayer::isAudioLoaded() const {
@@ -275,39 +266,13 @@ void MediaPlayer::onVolumeChanged(float& vol) {
     }
 }
 
-// Gating system implementation
+// Simple gating - just play and schedule a stop
 void MediaPlayer::playWithGate(float durationSeconds) {
-    // Cancel any existing scheduled stop
-    cancelScheduledStop();
-    
-    // Start playback
     play();
-    
-    // Schedule stop
-    scheduleStop(durationSeconds);
-    
-    ofLogNotice("ofxMediaPlayer") << "Playing with gate for " << durationSeconds << " seconds";
-}
-
-void MediaPlayer::scheduleStop(float delaySeconds) {
     scheduledStopActive = true;
-    stopTime = ofGetElapsedTimef() + delaySeconds;
-    gateDuration = delaySeconds;
-    
-    ofLogNotice("ofxMediaPlayer") << "Scheduled stop in " << delaySeconds << " seconds";
+    stopTime = ofGetElapsedTimef() + durationSeconds;
 }
 
-void MediaPlayer::cancelScheduledStop() {
-    scheduledStopActive = false;
-    stopTime = 0.0f;
-    gateDuration = 0.0f;
-    
-    ofLogNotice("ofxMediaPlayer") << "Cancelled scheduled stop";
-}
-
-bool MediaPlayer::hasScheduledStop() const {
-    return scheduledStopActive;
-}
 
 
 

@@ -1,7 +1,7 @@
 //
 //  Clock.cpp
 //
-//  Clock wrapper for ofxTimeObjects - single source of truth for BPM
+//  Audio-rate clock - sample-accurate timing without PPQN
 //
 
 #include "Clock.h"
@@ -11,11 +11,15 @@
 Clock::Clock() 
     : playing(false)
     , currentBpm(120.0f)
-    , ticksPerBeat(4)
-    , bpmSlider(120.0f)
-    , lastBpmUpdate(0.0f)
-    , bpmChangeThreshold(3.0f)
-    , isDragging(false) {
+    , targetBpm(120.0f)
+    , beatPulse(0.0f)
+    , lastBeatTime(0.0f)
+    , beatInterval(0.0f)
+    , sampleAccumulator(0.0)
+    , beatAccumulator(0.0)
+    , samplesPerStep(0.0f)
+    , samplesPerBeat(0.0f)
+    , stepsPerBeat(4) {
 }
 
 //--------------------------------------------------------------
@@ -25,81 +29,79 @@ Clock::~Clock() {
 
 //--------------------------------------------------------------
 void Clock::setup() {
-    // Setup clock with default values
-    clock.setBpm(currentBpm);
-    clock.setTicksPerBeat(ticksPerBeat);
+    // Audio-rate clock doesn't need to connect to sound system
+    // It will be called directly from ofApp::audioOut()
     
-    // Setup internal tick listener that forwards to external listeners
-    clock.addListener([this](const ofxTimeBuffer& tick) {
-        if (tickListener) {
-            tickListener(tick);
-        }
-    });
-    
-    ofLogNotice("Clock") << "Clock setup complete - BPM: " << currentBpm << ", Ticks per beat: " << ticksPerBeat;
+    ofLogNotice("Clock") << "Audio-rate clock setup complete - BPM: " << currentBpm.load();
 }
 
 //--------------------------------------------------------------
 void Clock::setBPM(float bpm) {
-    if (bpm != currentBpm && bpm > 0) {
-        currentBpm = bpm;
-        clock.setBpm(bpm);
-        bpmSlider = bpm; // Sync GUI slider
+    // Silent clamping using config
+    float clampedBpm = ofClamp(bpm, config.minBPM, config.maxBPM);
+    if (clampedBpm > 0 && clampedBpm != targetBpm.load()) {
+        targetBpm.store(clampedBpm);
         onBPMChanged();
     }
 }
 
 //--------------------------------------------------------------
 float Clock::getBPM() const {
-    return currentBpm;
-}
-
-//--------------------------------------------------------------
-void Clock::setTicksPerBeat(int ticks) {
-    if (ticks > 0 && ticks != ticksPerBeat) {
-        ticksPerBeat = ticks;
-        clock.setTicksPerBeat(ticks);
-        ofLogNotice("Clock") << "Ticks per beat set to: " << ticks;
-    }
-}
-
-//--------------------------------------------------------------
-int Clock::getTicksPerBeat() const {
-    return ticksPerBeat;
+    return currentBpm.load();
 }
 
 //--------------------------------------------------------------
 void Clock::start() {
     if (!playing) {
-        clock.start();
         playing = true;
-        ofLogNotice("Clock") << "Clock started at BPM: " << currentBpm;
+        // Calculate samples per beat for immediate first beat
+        float current = currentBpm.load();
+        float beatsPerSecond = current / 60.0f;
+        samplesPerBeat = sampleRate / beatsPerSecond; // Use current sample rate
+        beatAccumulator = samplesPerBeat; // Trigger first beat immediately
+        ofLogNotice("Clock") << "Audio-rate clock started at BPM: " << currentBpm.load() << " (SR: " << sampleRate << ")";
     }
 }
 
 //--------------------------------------------------------------
 void Clock::stop() {
     if (playing) {
-        clock.stop();
         playing = false;
-        ofLogNotice("Clock") << "Clock stopped";
+        beatPulse = 0.0f; // Reset visualizer
+        sampleAccumulator = 0.0; // Reset sample timing
+        beatAccumulator = 0.0; // Reset beat timing
+        ofLogNotice("Clock") << "Audio-rate clock stopped";
     }
 }
 
 //--------------------------------------------------------------
 void Clock::pause() {
     if (playing) {
-        clock.stop();
         playing = false;
-        ofLogNotice("Clock") << "Clock paused";
+        ofLogNotice("Clock") << "Audio-rate clock paused";
     }
 }
 
 //--------------------------------------------------------------
 void Clock::reset() {
-    clock.reset();
     playing = false;
-    ofLogNotice("Clock") << "Clock reset";
+    beatPulse = 0.0f; // Reset visualizer
+    sampleAccumulator = 0.0; // Reset sample timing
+    beatAccumulator = 0.0; // Reset beat timing
+    ofLogNotice("Clock") << "Audio-rate clock reset";
+}
+
+//--------------------------------------------------------------
+void Clock::setStepsPerBeat(int spb) {
+    // Silent clamping using config
+    int clampedSpb = ofClamp(spb, config.minStepsPerBeat, config.maxStepsPerBeat);
+    stepsPerBeat = clampedSpb;
+    ofLogNotice("Clock") << "Steps per beat set to: " << stepsPerBeat;
+}
+
+//--------------------------------------------------------------
+int Clock::getStepsPerBeat() const {
+    return stepsPerBeat;
 }
 
 //--------------------------------------------------------------
@@ -108,62 +110,129 @@ bool Clock::isPlaying() const {
 }
 
 //--------------------------------------------------------------
-void Clock::addTickListener(std::function<void(const ofxTimeBuffer&)> listener) {
-    tickListener = listener;
+void Clock::addAudioListener(std::function<void(ofSoundBuffer&)> listener) {
+    audioListeners.push_back(listener);
 }
 
 //--------------------------------------------------------------
-void Clock::removeTickListener() {
-    tickListener = nullptr;
+void Clock::removeAudioListener() {
+    audioListeners.clear();
 }
 
 //--------------------------------------------------------------
-void Clock::drawGUI() {
-    // BPM control with proper debouncing
-    if (ImGui::SliderFloat("BPM", &bpmSlider, 60.0f, 444.0f)) {
-        isDragging = true;
-        float currentTime = ofGetElapsedTimef();
+void Clock::audioOut(ofSoundBuffer& buffer) {
+    if (!playing) return;
+    
+    // Auto-detect sample rate from buffer (only when it changes)
+    float bufferSampleRate = buffer.getSampleRate();
+    if (abs(bufferSampleRate - sampleRate) > 1.0f) {
+        sampleRate = bufferSampleRate;
+        ofLogNotice("Clock") << "Sample rate auto-detected: " << sampleRate;
+        // Recalculate timing when sample rate changes
+        float current = currentBpm.load();
+        float beatsPerSecond = current / 60.0f;
+        samplesPerBeat = sampleRate / beatsPerSecond;
+        samplesPerStep = samplesPerBeat / stepsPerBeat;
+    }
+    
+    // Smooth BPM changes for audio-rate transitions using config
+    float current = currentBpm.load();
+    float target = targetBpm.load();
+    if (abs(current - target) > 0.1f) {
+        current = current * (1.0f - config.bpmSmoothFactor) + target * config.bpmSmoothFactor;
+        currentBpm.store(current);
+    }
+    
+    // Update samples per beat and step for sample-accurate timing
+    float beatsPerSecond = current / 60.0f;
+    samplesPerBeat = sampleRate / beatsPerSecond;
+    samplesPerStep = samplesPerBeat / stepsPerBeat;
+    
+    // Sample-accurate beat and step detection
+    for (int i = 0; i < buffer.getNumFrames(); i++) {
+        sampleAccumulator += 1.0;
+        beatAccumulator += 1.0;
         
-        // Debouncing during playback to prevent timing disruption
-        float debounceTime = playing ? 0.3f : 0.1f;
-        
-        if (currentTime - lastBpmUpdate > debounceTime && abs(bpmSlider - currentBpm) > bpmChangeThreshold) {
-            setBPM(bpmSlider);
-            lastBpmUpdate = currentTime;
+        // Check for step event (for TrackerSequencer)
+        if (sampleAccumulator >= samplesPerStep) {
+            sampleAccumulator -= samplesPerStep;
+            stepCounter++;
             
-            if (playing) {
-                ofLogNotice("Clock") << "BPM changed during playback to: " << currentBpm;
-            } else {
-                ofLogNotice("Clock") << "BPM slider changed to: " << currentBpm;
-            }
+            StepEventData stepData;
+            stepData.stepNumber = stepCounter;
+            stepData.beatNumber = beatCounter;
+            stepData.timestamp = ofGetElapsedTimef();
+            stepData.bpm = current;
+            
+            ofNotifyEvent(stepEvent, stepData);
         }
-    } else if (isDragging && !ImGui::IsItemActive()) {
-        // User finished dragging, apply final value
-        isDragging = false;
-        setBPM(bpmSlider);
-        ofLogNotice("Clock") << "BPM drag finished at: " << currentBpm;
+        
+        // Check for beat event (for visualizer) - independent timing
+        if (beatAccumulator >= samplesPerBeat) {
+            beatAccumulator -= samplesPerBeat;
+            beatCounter++;
+            
+            BeatEventData beatData;
+            beatData.beatNumber = beatCounter;
+            beatData.timestamp = ofGetElapsedTimef();
+            beatData.bpm = current;
+            
+            ofNotifyEvent(beatEvent, beatData);
+            beatPulse = 1.0f;
+        }
     }
     
-    ImGui::Separator();
+    // Fade the pulse over time using config
+    beatPulse *= config.pulseFadeFactor;
+    if (beatPulse < config.pulseThreshold) beatPulse = 0.0f;
     
-    // Transport controls
-    if (ImGui::Button(playing ? "Stop" : "Play")) {
+    // Notify all audio listeners
+    for (auto& listener : audioListeners) {
+        listener(buffer);
+    }
+}
+
+
+//--------------------------------------------------------------
+void Clock::setConfig(const ClockConfig& cfg) {
+    config = cfg;
+    ofLogNotice("Clock") << "Configuration updated";
+}
+
+//--------------------------------------------------------------
+void Clock::setSampleRate(float rate) {
+    if (rate > 0 && rate != sampleRate) {
+        sampleRate = rate;
+        ofLogNotice("Clock") << "Sample rate set to: " << sampleRate;
+        
+        // Recalculate timing if playing
         if (playing) {
-            stop();
-        } else {
-            start();
+            float current = currentBpm.load();
+            float beatsPerSecond = current / 60.0f;
+            samplesPerBeat = sampleRate / beatsPerSecond;
+            samplesPerStep = samplesPerBeat / stepsPerBeat;
         }
     }
-    
-    ImGui::SameLine();
-    if (ImGui::Button("Reset")) {
-        reset();
-    }
-    
-    // Status display
-    ImGui::Text("Status: %s", playing ? "Playing" : "Stopped");
-    ImGui::Text("BPM: %.1f", currentBpm);
-    ImGui::Text("Ticks per beat: %d", ticksPerBeat);
+}
+
+//--------------------------------------------------------------
+float Clock::getBeatPulse() const {
+    return beatPulse;
+}
+
+//--------------------------------------------------------------
+float Clock::getMinBPM() const {
+    return config.minBPM;
+}
+
+//--------------------------------------------------------------
+float Clock::getMaxBPM() const {
+    return config.maxBPM;
+}
+
+//--------------------------------------------------------------
+float Clock::getSampleRate() const {
+    return sampleRate;
 }
 
 //--------------------------------------------------------------

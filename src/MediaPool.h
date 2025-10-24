@@ -2,7 +2,6 @@
 
 #include "ofxSoundObjects.h"
 #include "ofxVisualObjects.h"
-#include "ofxImGui.h"
 #include <vector>
 #include <memory>
 #include <string>
@@ -70,8 +69,6 @@ public:
     void disconnectActivePlayer();
     void stopAllMedia();
     
-    // GUI
-    void drawMediaPoolGUI();
     
     // Directory management
     void setDataDirectory(const std::string& path);
@@ -81,6 +78,7 @@ public:
     // Directory change callback
     std::function<void(const std::string&)> onDirectoryChanged;
     void setDirectoryChangeCallback(std::function<void(const std::string&)> callback) { onDirectoryChanged = callback; }
+    
     
 private:
     Clock* clock;
@@ -101,8 +99,10 @@ private:
     std::string getBaseName(const std::string& filename);
     void createPairedPlayers();
     void createStandalonePlayers();
+    void scanMediaFiles(const std::string& path, ofDirectory& dir);  // Extract duplicate logic
     bool isAudioFile(const std::string& filename);
     bool isVideoFile(const std::string& filename);
     std::string findMatchingVideo(const std::string& audioFile);
     std::string findMatchingAudio(const std::string& videoFile);
+    
 };

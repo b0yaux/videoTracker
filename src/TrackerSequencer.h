@@ -1,11 +1,11 @@
 #pragma once
 
 #include "ofMain.h"
-#include "ofxTimeObjects.h"
+#include <functional>
+#include "Clock.h"
 
 // Forward declarations
 class MediaPool;
-class Clock;
 
 class TrackerSequencer {
 public:
@@ -37,8 +37,13 @@ public:
     TrackerSequencer();
     ~TrackerSequencer();
 
-    void setup(MediaPool* pool, Clock* clockRef, int steps = 16);
-    void update(const ofxTimeBuffer& tick);
+    // Callback types for querying external state
+    using IndexRangeCallback = std::function<int()>;
+    
+    void setup(Clock* clockRef, int steps = 16);
+    void setIndexRangeCallback(IndexRangeCallback callback);
+    void processAudioBuffer(ofSoundBuffer& buffer);
+    void onStepEvent(StepEventData& data); // Sample-accurate step event from Clock
     
     // Event listener system
     void addStepEventListener(std::function<void(int, float, const PatternCell&)> listener);
@@ -57,6 +62,7 @@ public:
     void stop();
     void reset();
     void setCurrentStep(int step);
+    void advanceStep();
     void triggerStep(int step);
     
     // State management
@@ -76,10 +82,7 @@ public:
     int getStepsPerBeat() const { return stepsPerBeat; }
     
     // Setters
-    void setStepsPerBeat(int steps) { 
-        stepsPerBeat = std::max(1, std::min(16, steps)); 
-        updateStepInterval();
-    }
+    void setStepsPerBeat(int steps);
 
 private:
     bool isValidStep(int step) const;
@@ -111,8 +114,13 @@ private:
     void toggleAudio(int step);
     void toggleVideo(int step);
     
-    MediaPool* mediaPool;
     Clock* clock;
+    
+    // Pattern sequencer state (app-specific)
+    int stepsPerBeat = 4;
+    bool gatingEnabled = true;
+    std::vector<float> stepLengths;  // Per-step gate lengths
+    
     std::vector<PatternCell> pattern;
     int numSteps;
     int currentStep;
@@ -123,11 +131,9 @@ private:
     int currentMediaStartStep;
     float currentMediaStepLength;
     
-    // Sequencer timing system
-    int stepsPerBeat;  // How many sequencer steps per beat (e.g., 4 = 16th notes)
-    float stepInterval; // Time between sequencer steps in seconds
-    float lastStepTime; // When the last step was triggered
-    uint64_t lastTickCount; // Last clock tick count for synchronization
+    // Audio-rate timing system
+    double sampleAccumulator; // Sample accumulator for step timing
+    float lastBpm; // Last known BPM for timing calculations
     
     // Media playback timing (separate from sequencer timing)
     float currentStepStartTime;
@@ -136,6 +142,9 @@ private:
     
     // Step event listeners
     std::vector<std::function<void(int, float, const PatternCell&)>> stepEventListeners;
+    
+    // Callback for querying external state
+    IndexRangeCallback indexRangeCallback;
     
     // UI state
     bool showGUI;

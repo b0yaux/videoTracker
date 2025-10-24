@@ -47,9 +47,6 @@ public:
     
     // Gating system for tracker-style step control
     void playWithGate(float durationSeconds);
-    void scheduleStop(float delaySeconds);
-    void cancelScheduledStop();
-    bool hasScheduledStop() const;
     
     // File path getters for display purposes
     std::string getAudioFilePath() const { return audioFilePath; }
@@ -70,6 +67,7 @@ public:
     
     // Parameter group accessor
     ofParameterGroup& getParameters() { return parameters; }
+    
     
     // Setup method to initialize parameters and connections
     void setup();

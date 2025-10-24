@@ -4,7 +4,6 @@
 #include "ofxImGui.h"
 #include "ofLog.h"
 #include "ofJson.h"
-#include "ofxTimeObjects.h"
 
 void TrackerSequencer::PatternCell::clear() {
     mediaIndex = -1;
@@ -50,22 +49,20 @@ std::string TrackerSequencer::PatternCell::toString() const {
 // TrackerSequencer implementation
 //--------------------------------------------------------------
 TrackerSequencer::TrackerSequencer() 
-    : mediaPool(nullptr), clock(nullptr), numSteps(16), currentStep(0), lastTriggeredStep(-1), 
+    : clock(nullptr), stepsPerBeat(4), gatingEnabled(true), numSteps(16), currentStep(0), lastTriggeredStep(-1), 
       playing(false), currentMediaStartStep(-1), 
-      currentMediaStepLength(0.0f), stepsPerBeat(4), stepInterval(0.0f), 
-      lastStepTime(0.0f), lastTickCount(0), currentStepStartTime(0.0f), 
-      currentStepDuration(0.0f), stepActive(false), showGUI(true) {
-    updateStepInterval();
+      currentMediaStepLength(0.0f), 
+      sampleAccumulator(0.0), lastBpm(120.0f),
+      currentStepStartTime(0.0f), currentStepDuration(0.0f), stepActive(false), showGUI(true) {
 }
 
 TrackerSequencer::~TrackerSequencer() {
 }
 
-void TrackerSequencer::setup(MediaPool* pool, Clock* clockRef, int steps) {
-    mediaPool = pool;
+void TrackerSequencer::setup(Clock* clockRef, int steps) {
     clock = clockRef;
     numSteps = steps;
-    currentStep = 0;
+    currentStep = 0;  // Start at step 0 (0-based internally)
     
     // Initialize pattern
     pattern.resize(numSteps);
@@ -73,7 +70,21 @@ void TrackerSequencer::setup(MediaPool* pool, Clock* clockRef, int steps) {
         pattern[i] = PatternCell();
     }
     
+    // Initialize step lengths for all steps
+    stepLengths.resize(numSteps, 1.0f);
+    
+    // Connect to Clock's step events for sample-accurate timing
+    if (clock) {
+        ofAddListener(clock->stepEvent, this, &TrackerSequencer::onStepEvent);
+        // Sync Clock's SPB with TrackerSequencer's SPB
+        clock->setStepsPerBeat(stepsPerBeat);
+    }
+    
     ofLogNotice("TrackerSequencer") << "Setup complete with " << numSteps << " steps";
+}
+
+void TrackerSequencer::setIndexRangeCallback(IndexRangeCallback callback) {
+    indexRangeCallback = callback;
 }
 
 
@@ -88,6 +99,8 @@ void TrackerSequencer::setNumSteps(int steps) {
         pattern[i] = PatternCell();
     }
     
+    stepLengths.resize(numSteps, 1.0f);
+
     ofLogNotice("TrackerSequencer") << "Number of steps changed to " << numSteps;
 }
 
@@ -96,7 +109,12 @@ void TrackerSequencer::setCell(int step, const PatternCell& cell) {
     
     pattern[step] = cell;
     
-    ofLogVerbose("TrackerSequencer") << "Step " << step << " updated: " << cell.toString();
+    // Store step length in our own array
+    if (step >= 0 && step < stepLengths.size()) {
+        stepLengths[step] = cell.stepLength;
+    }
+    
+    ofLogVerbose("TrackerSequencer") << "Step " << (step + 1) << " updated: " << cell.toString();
 }
 
 TrackerSequencer::PatternCell TrackerSequencer::getCell(int step) const {
@@ -109,7 +127,7 @@ void TrackerSequencer::clearCell(int step) {
     
     pattern[step].clear();
     
-    ofLogVerbose("TrackerSequencer") << "Step " << step << " cleared";
+    ofLogVerbose("TrackerSequencer") << "Step " << (step + 1) << " cleared";
 }
 
 void TrackerSequencer::clearPattern() {
@@ -121,12 +139,12 @@ void TrackerSequencer::clearPattern() {
 }
 
 void TrackerSequencer::randomizePattern() {
-    if (!mediaPool) {
-        ofLogWarning("TrackerSequencer") << "Cannot randomize pattern: MediaPool not set";
+    if (!indexRangeCallback) {
+        ofLogWarning("TrackerSequencer") << "Cannot randomize pattern: IndexRangeCallback not set";
         return;
     }
     
-    int numMedia = mediaPool->getNumPlayers();
+    int numMedia = indexRangeCallback();
     if (numMedia == 0) {
         ofLogWarning("TrackerSequencer") << "Cannot randomize pattern: No media available";
         return;
@@ -156,42 +174,49 @@ void TrackerSequencer::randomizePattern() {
 }
 
 // Timing and playback control
-void TrackerSequencer::update(const ofxTimeBuffer& tick) {
+void TrackerSequencer::processAudioBuffer(ofSoundBuffer& buffer) {
+    // This method is now deprecated - timing is handled by Clock's beat events
+    // Keep for compatibility but do nothing
+}
+
+void TrackerSequencer::onStepEvent(StepEventData& data) {
     if (!playing) return;
-    
-    // Use clock ticks instead of internal timing to stay synchronized
-    // Each clock tick represents a step advancement
-    uint64_t currentTickCount = tick.getAbsoluteTime();
-    
-    // If this is a new tick, advance to next step
-    if (currentTickCount > lastTickCount) {
-        // Trigger the current step first (for the first tick)
-        if (lastTickCount == 0) {
-            triggerStep(currentStep);
-        } else {
-            // Advance to next step for subsequent ticks
-            currentStep = (currentStep + 1) % numSteps;
-            triggerStep(currentStep);
-        }
-        lastTickCount = currentTickCount;
+
+    // Advance to next step (sample-accurate timing from Clock!)
+    advanceStep();
+}
+
+//--------------------------------------------------------------
+void TrackerSequencer::setStepsPerBeat(int steps) {
+    stepsPerBeat = std::max(1, std::min(96, steps));
+    updateStepInterval();
+    // Sync with Clock's SPB
+    if (clock) {
+        clock->setStepsPerBeat(stepsPerBeat);
     }
 }
 
 void TrackerSequencer::updateStepInterval() {
     if (!clock) return;
     
+    // Get steps per beat from pattern sequencer (single source of truth)
+    int spb = stepsPerBeat;
+    
     // Calculate time between sequencer steps based on BPM and steps per beat
     // For example: 120 BPM with 4 steps per beat = 16th notes
     // Each beat = 60/120 = 0.5 seconds
     // Each step = 0.5 / 4 = 0.125 seconds
     float bpm = clock->getBPM();
-    stepInterval = (60.0f / bpm) / stepsPerBeat;
+    float stepInterval = (60.0f / bpm) / spb;
+    
+    ofLogNotice("TrackerSequencer") << "Updated timing: SPB=" << spb 
+                                   << ", stepInterval=" << stepInterval << "s";
 }
 
 void TrackerSequencer::play() {
     playing = true;
-    // Reset tick counter for fresh start
-    lastTickCount = 0;
+    // Reset audio-rate timing for fresh start
+    sampleAccumulator = 0.0;
 }
 
 void TrackerSequencer::pause() {
@@ -201,16 +226,16 @@ void TrackerSequencer::pause() {
 
 void TrackerSequencer::stop() {
     playing = false;
-    currentStep = 0;
-    // Reset tick counter
-    lastTickCount = 0;
+    currentStep = 0;  // 0-based internally
+    // Reset audio-rate timing
+    sampleAccumulator = 0.0;
 }
 
 void TrackerSequencer::reset() {
-    currentStep = 0;
+    currentStep = 0;  // 0-based internally
     playing = false;
-    // Reset tick counter
-    lastTickCount = 0;
+    // Reset audio-rate timing
+    sampleAccumulator = 0.0;
 }
 
 void TrackerSequencer::setCurrentStep(int step) {
@@ -312,35 +337,70 @@ void TrackerSequencer::addStepEventListener(std::function<void(int, float, const
     stepEventListeners.push_back(listener);
 }
 
+void TrackerSequencer::advanceStep() {
+    if (!playing) return;
+    
+    // Advance to next step
+    currentStep = (currentStep + 1) % numSteps;
+    
+    // Trigger the step
+    triggerStep(currentStep);
+}
+
 void TrackerSequencer::triggerStep(int step) {
+    // step is now 0-based internally
     if (!isValidStep(step)) return;
     if (!clock) return;
 
-    const PatternCell& cell = getCell(step);
+    const PatternCell& cell = getCell(step); // Direct 0-based array access
     float bpm = clock->getBPM();
     
-    // Only trigger if there's media and it's enabled
-    if (cell.mediaIndex >= 0 && mediaPool) {
-        // stepLength is already in beats, no conversion needed
-        notifyStepEvent(step, cell.stepLength);
+    // For empty steps, use stepLength=1.0 to let previous media continue playing
+    // For non-empty steps, use the cell's stepLength
+    float stepLength = cell.mediaIndex >= 0 ? cell.stepLength : 1.0f;
+    notifyStepEvent(step + 1, stepLength); // Convert to 1-based for display
+    
+    if (cell.mediaIndex >= 0) {
         ofLogVerbose("TrackerSequencer") << "Step " << (step + 1) << " triggered at " << bpm << " BPM, length: " << cell.stepLength << " beats";
     } else {
-        // Empty step - still notify but with 0 length
-        notifyStepEvent(step, 0.0f);
-        ofLogVerbose("TrackerSequencer") << "Step " << (step + 1) << " (empty) triggered at " << bpm << " BPM";
+        ofLogVerbose("TrackerSequencer") << "Step " << (step + 1) << " (empty) - letting previous media continue";
+    }
+}
+
+///MARK: - DRAW
+
+void TrackerSequencer::drawTrackerInterface() {
+    try {
+        drawTrackerStatus();
+        drawPatternGrid();
+    } catch (const std::exception& e) {
+        ofLogError("TrackerSequencer") << "Exception in drawTrackerInterface(): " << e.what();
+    } catch (...) {
+        ofLogError("TrackerSequencer") << "Unknown exception in drawTrackerInterface()";
     }
 }
 
 void TrackerSequencer::drawPatternGrid() {
-    ImGui::Separator();
-    ImGui::Text("Tracker Pattern Grid:");
+    try {
+        ImGui::Separator();
+        ImGui::Text("Tracker Pattern Grid:");
     
     // Tracker-style styling
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(2, 2));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(1, 1));
     
     // Use monospace font for tracker feel
-    ImGui::PushFont(ImGui::GetIO().Fonts->Fonts[0]); // Default font
+    try {
+        ImGuiIO& io = ImGui::GetIO();
+        ImFontAtlas* fonts = io.Fonts;
+        if (fonts->Fonts.Size > 0) {
+            ImGui::PushFont(fonts->Fonts[0]); // Default font
+        }
+    } catch (const std::exception& e) {
+        ofLogError("TrackerSequencer") << "Exception accessing ImGui fonts: " << e.what();
+    } catch (...) {
+        ofLogError("TrackerSequencer") << "Unknown exception accessing ImGui fonts";
+    }
     
     // Create a compact tracker-style table
     static ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
@@ -373,38 +433,32 @@ void TrackerSequencer::drawPatternGrid() {
     ImGui::PopFont();
     ImGui::PopStyleVar(2);
     ImGui::Separator();
+    
+    } catch (const std::exception& e) {
+        ofLogError("TrackerSequencer") << "Exception in drawPatternGrid(): " << e.what();
+    } catch (...) {
+        ofLogError("TrackerSequencer") << "Unknown exception in drawPatternGrid()";
+    }
 }
 
-void TrackerSequencer::drawTrackerInterface() {
-    // Create a comprehensive tracker window with all sequencer controls
-    ImGui::SetNextWindowPos(ImVec2(300, 10), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Audiovisual Tracker", &showGUI);
-    
-    // Status section
-    drawTrackerStatus();
-    
-    // Pattern grid
-    drawPatternGrid();
-    
-    ImGui::End();
-}
+
 
 void TrackerSequencer::drawTrackerStatus() {
-    // Status section with sequencer info only
-    ImGui::Text("Status:");
-    ImGui::Text("Current Step: %d", currentStep + 1); // Display 1-16 instead of 0-15
-    ImGui::Text("Pattern Steps: %d", numSteps);
-    ImGui::Text("Pattern Empty: %s", isPatternEmpty() ? "Yes" : "No");
+    try {
+        // Status section with sequencer info only
+        ImGui::Text("Status:");
+        ImGui::Text("Current Step: %d", currentStep + 1); // Display 1-16 instead of 0-15
+        ImGui::Text("Pattern Steps: %d", numSteps);
+        bool patternEmpty = isPatternEmpty();
+        ImGui::Text("Pattern Empty: %s", patternEmpty ? "Yes" : "No");
     
     ImGui::Separator();
     
     // Pattern controls
     ImGui::Text("Pattern Controls:");
-    
-    // Pattern length control
     ImGui::Text("Pattern Length:");
-    static int newNumSteps = 16; // Initialize with default
-    newNumSteps = numSteps; // Sync with current value
+    
+    int newNumSteps = numSteps; // Sync with current value
     if (ImGui::SliderInt("Steps", &newNumSteps, 4, 64)) {
         if (newNumSteps != numSteps) {
             setNumSteps(newNumSteps);
@@ -413,29 +467,35 @@ void TrackerSequencer::drawTrackerStatus() {
     
     // Steps per beat control
     ImGui::Text("Steps Per Beat:");
-    static int newStepsPerBeat = 4; // Initialize with default
-    newStepsPerBeat = stepsPerBeat; // Sync with current value
-    if (ImGui::SliderInt("SPB", &newStepsPerBeat, 1, 16)) {
-        if (newStepsPerBeat != stepsPerBeat) {
-            setStepsPerBeat(newStepsPerBeat);
-        }
+    int newStepsPerBeat = getStepsPerBeat(); // Sync with current value
+    if (ImGui::SliderInt("SPB", &newStepsPerBeat, 1, 96)) {
+        setStepsPerBeat(newStepsPerBeat);
     }
-    ImGui::Text("(Current: %d steps per beat = %s)", stepsPerBeat, 
-                stepsPerBeat == 1 ? "whole notes" :
-                stepsPerBeat == 2 ? "half notes" :
-                stepsPerBeat == 4 ? "quarter notes" :
-                stepsPerBeat == 8 ? "eighth notes" :
-                stepsPerBeat == 16 ? "sixteenth notes" : "custom");
+    // Display step size info
+    int currentSPB = getStepsPerBeat();
+    if (currentSPB == 1) {
+        ImGui::Text("(Step size = 1)");
+    } else {
+        ImGui::Text("(Step size = 1/%d)", currentSPB);
+    }
     
     if (ImGui::Button("Clear Pattern")) {
         clearPattern();
     }
+    
     ImGui::SameLine();
+    
     if (ImGui::Button("Randomize Pattern")) {
         randomizePattern();
     }
     
     ImGui::Separator();
+    
+    } catch (const std::exception& e) {
+        ofLogError("TrackerSequencer") << "Exception in drawTrackerStatus(): " << e.what();
+    } catch (...) {
+        ofLogError("TrackerSequencer") << "Unknown exception in drawTrackerStatus()";
+    }
 }
 
 void TrackerSequencer::handleMouseClick(int x, int y, int button) {
@@ -512,9 +572,9 @@ bool TrackerSequencer::handleKeyPress(int key) {
         case '1': case '2': case '3': case '4': case '5': 
         case '6': case '7': case '8': case '9': {
             int mediaIndex = key - '1';
-            if (mediaPool && mediaIndex < (int)mediaPool->getNumPlayers()) {
+            if (indexRangeCallback && mediaIndex < indexRangeCallback()) {
                 pattern[currentStep].mediaIndex = mediaIndex;
-                ofLogNotice("TrackerSequencer") << "Set step " << currentStep << " to media " << mediaIndex;
+                ofLogNotice("TrackerSequencer") << "Set step " << (currentStep + 1) << " to media " << mediaIndex;
                 return true;
             }
             break;
@@ -523,7 +583,7 @@ bool TrackerSequencer::handleKeyPress(int key) {
         case '0':
             // Clear media index (rest)
             pattern[currentStep].mediaIndex = -1;
-            ofLogNotice("TrackerSequencer") << "Set step " << currentStep << " to rest";
+            ofLogNotice("TrackerSequencer") << "Set step " << (currentStep + 1) << " to rest";
             return true;
             
         // Parameter editing
@@ -623,7 +683,7 @@ void TrackerSequencer::drawPatternRow(int step, bool isCurrentStep) {
     
     // Highlight current step with intense background
     if (isCurrentStep) {
-        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 0.0f, 0.3f))); // Yellow highlight
+        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.9f, 0.5f, 0.0f, 0.4f))); // Yellow highlight
     }
     
     // Draw all columns for this step
@@ -642,7 +702,6 @@ void TrackerSequencer::drawStepNumber(int step, bool isCurrentStep) {
     ImGui::Text("%02d", step + 1); // Decimal display (1-16)
     if (ImGui::IsItemClicked()) {
         currentStep = step;
-        ofLogNotice("TrackerSequencer") << "Selected step: " << step;
     }
 }
 
@@ -653,11 +712,24 @@ void TrackerSequencer::drawMediaIndex(int step) {
     const auto& cell = pattern[step];
     int currentMediaIdx = cell.mediaIndex;
     
-    if (currentMediaIdx >= 0 && mediaPool && currentMediaIdx < (int)mediaPool->getNumPlayers()) {
-        // Show as decimal index
-        ImGui::Text("%02d", currentMediaIdx + 1);
-        if (ImGui::IsItemClicked()) {
-            cycleMediaIndex(step);
+    if (currentMediaIdx >= 0 && indexRangeCallback) {
+        try {
+            int maxIndex = indexRangeCallback();
+            if (currentMediaIdx < maxIndex) {
+                // Show as decimal index
+                ImGui::Text("%02d", currentMediaIdx + 1);
+                if (ImGui::IsItemClicked()) {
+                    cycleMediaIndex(step);
+                }
+            } else {
+                ImGui::Text("--"); // Rest
+                if (ImGui::IsItemClicked()) {
+                    cycleMediaIndex(step);
+                }
+            }
+        } catch (const std::exception& e) {
+            ofLogError("TrackerSequencer") << "Exception in indexRangeCallback: " << e.what();
+            ImGui::Text("--"); // Show rest on error
         }
     } else {
         ImGui::Text("--"); // Rest
@@ -778,17 +850,20 @@ bool TrackerSequencer::handlePatternRowClick(int step, int column) {
 }
 
 void TrackerSequencer::cycleMediaIndex(int step) {
-    if (!isValidStep(step) || !mediaPool) return;
+    if (!isValidStep(step)) return;
     
     auto& cell = pattern[step];
     int currentMediaIdx = cell.mediaIndex;
     
     // Cycle through available media
-    currentMediaIdx = (currentMediaIdx + 1) % (mediaPool->getNumPlayers() + 1);
-    if (currentMediaIdx == (int)mediaPool->getNumPlayers()) {
-        cell.mediaIndex = -1; // Rest
-    } else {
-        cell.mediaIndex = currentMediaIdx;
+    if (indexRangeCallback) {
+        int numMedia = indexRangeCallback();
+        currentMediaIdx = (currentMediaIdx + 1) % (numMedia + 1);
+        if (currentMediaIdx == numMedia) {
+            cell.mediaIndex = -1; // Rest
+        } else {
+            cell.mediaIndex = currentMediaIdx;
+        }
     }
     
     setCell(step, cell);
@@ -873,11 +948,17 @@ bool TrackerSequencer::isPatternEmpty() const {
 }
 
 void TrackerSequencer::notifyStepEvent(int step, float stepLength) {
-    const PatternCell& cell = getCell(step);
+    // step is 1-based from PatternSequencer, convert to 0-based for internal access
+    const PatternCell& cell = getCell(step - 1);
     float bpm = clock ? clock->getBPM() : 120.0f;
     
+    // Calculate duration in seconds using patternSequencer's stepsPerBeat
+    int spb = stepsPerBeat;
+    float stepDuration = (60.0f / bpm) / spb;  // Duration of ONE step
+    float noteDuration = stepDuration * stepLength;     // Duration for THIS note
+    
     for (auto& callback : stepEventListeners) {
-        callback(step, bpm, cell);
+        callback(step, noteDuration, cell);  // Pass 1-based step number for display
     }
 }
 
