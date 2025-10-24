@@ -5,10 +5,36 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <mutex>
 
 // Forward declarations to avoid circular dependency
 class MediaPlayer;
 class Clock;
+
+// Playback state machine enum
+enum class PlaybackMode {
+    IDLE,              // No playback active
+    MANUAL_PREVIEW,    // GUI-triggered preview playback
+    SEQUENCER_ACTIVE   // Sequencer-triggered playback
+};
+
+enum class PreviewMode {
+    STOP_AT_END,    // Stop when media finishes
+    LOOP,           // Loop the current media
+    PLAY_NEXT       // Play next media in pool
+};
+
+// Struct for step trigger parameters to reduce coupling
+struct StepTriggerParams {
+    int step;
+    int mediaIndex;
+    float position;
+    float speed;
+    float volume;
+    float duration;
+    bool audioEnabled;
+    bool videoEnabled;
+};
 
 class MediaPool {
 public:
@@ -61,6 +87,26 @@ public:
                       float speed, float volume, float stepLength, 
                       bool audioEnabled, bool videoEnabled);
     
+    // Overloaded version using struct for cleaner interface
+    void onStepTrigger(const StepTriggerParams& params);
+    
+    // Manual media playback (for GUI preview)
+    bool playMediaManual(size_t index, float position = 0.0f);
+    
+    // Query methods for state checking
+    PlaybackMode getCurrentMode() const;
+    bool isSequencerActive() const;
+    bool isManualPreview() const;
+    bool isIdle() const;
+    
+    // Preview mode control
+    void setPreviewMode(PreviewMode mode);
+    PreviewMode getPreviewMode() const;
+    void onManualPreviewEnd();
+    
+    // Update method for end-of-media detection
+    void update();
+    
     // Connection management (internal)
     void setActivePlayer(size_t index);
     MediaPlayer* getActivePlayer();
@@ -89,6 +135,13 @@ private:
     std::string dataDirectory;
     bool isSetup;
     
+    // Thread safety
+    mutable std::mutex stateMutex;
+    
+    // Playback state machine
+    PlaybackMode currentMode;
+    PreviewMode currentPreviewMode;
+    
     // Connection state
     MediaPlayer* activePlayer;
     bool isConnected;
@@ -97,8 +150,6 @@ private:
     
     // Helper methods
     std::string getBaseName(const std::string& filename);
-    void createPairedPlayers();
-    void createStandalonePlayers();
     void scanMediaFiles(const std::string& path, ofDirectory& dir);  // Extract duplicate logic
     bool isAudioFile(const std::string& filename);
     bool isVideoFile(const std::string& filename);

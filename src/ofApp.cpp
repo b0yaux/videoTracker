@@ -144,6 +144,9 @@ void ofApp::update() {
         }
     }
     
+    // Update MediaPool for end-of-media detection
+    mediaPool.update();
+    
     // Process visual pipeline - simplified for direct texture drawing
     auto currentPlayer = mediaPool.getActivePlayer();
     if (currentPlayer && currentPlayer->videoEnabled.get()) {
@@ -234,28 +237,12 @@ void ofApp::keyPressed(int key) {
         case ' ':
             if (isPlaying) {
                 clock.stop();
-                trackerSequencer.pause();
                 isPlaying = false;
-                ofLogNotice("ofApp") << "Paused playback at step " << currentStep;
+                ofLogNotice("ofApp") << "Paused playback";
             } else {
-                // Stop all media before starting pattern playback
-                mediaPool.stopAllMedia();
-                
-                // Reset TrackerSequencer to beginning when starting playback
-                trackerSequencer.reset();
+                // Clock transport listeners will handle TrackerSequencer and MediaPool automatically
                 clock.start();
-                trackerSequencer.play();
                 isPlaying = true;
-                
-                // Initialize tracking variables
-                lastTriggeredStep = 0;  // First step (0-based)
-                currentStep = 0;         // Visual feedback
-                
-                // Sync TrackerSequencer with global playback state
-                trackerSequencer.setCurrentStep(0);
-                
-                // Trigger first step immediately (step 1)
-                trackerSequencer.triggerStep(0);
                 
                 ofLogNotice("ofApp") << "Started playback from beginning (step 1)";
             }
@@ -264,12 +251,8 @@ void ofApp::keyPressed(int key) {
         case 'r':
             clock.reset();
             trackerSequencer.reset();
-            trackerSequencer.stop();
             currentStep = 0;
             lastTriggeredStep = 0;
-            
-            // Sync TrackerSequencer with global reset state
-            trackerSequencer.setCurrentStep(0);
             
             ofLogNotice("ofApp") << "Reset sequencer";
             break;

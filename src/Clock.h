@@ -59,6 +59,11 @@ public:
     void addAudioListener(std::function<void(ofSoundBuffer&)> listener);
     void removeAudioListener();
     
+    // Transport listener system for play/stop events
+    typedef std::function<void(bool isPlaying)> TransportCallback;
+    void addTransportListener(TransportCallback listener);
+    void removeTransportListener();
+    
     // Beat and step event systems for sample-accurate timing
     ofEvent<BeatEventData> beatEvent;  // For visualizer (once per beat)
     ofEvent<StepEventData> stepEvent;  // For TrackerSequencer (multiple per beat)
@@ -102,6 +107,9 @@ private:
     
     // Audio listeners
     std::vector<std::function<void(ofSoundBuffer&)>> audioListeners;
+    
+    // Transport listeners for play/stop events
+    std::vector<TransportCallback> transportListeners;
     
     // Internal methods
     void onBPMChanged();

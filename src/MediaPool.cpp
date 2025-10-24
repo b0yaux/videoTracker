@@ -5,7 +5,7 @@
 #include "ofSystemUtils.h"
 
 MediaPool::MediaPool(const std::string& dataDir) 
-    : currentIndex(0), dataDirectory(dataDir), isSetup(false), activePlayer(nullptr), isConnected(false), soundOutput(nullptr), visualOutput(nullptr), clock(nullptr) {
+    : currentIndex(0), dataDirectory(dataDir), isSetup(false), currentMode(PlaybackMode::IDLE), currentPreviewMode(PreviewMode::STOP_AT_END), activePlayer(nullptr), isConnected(false), soundOutput(nullptr), visualOutput(nullptr), clock(nullptr) {
     // setup() will be called later with clock reference
 }
 
@@ -279,13 +279,6 @@ std::string MediaPool::getBaseName(const std::string& filename) {
     return baseName;
 }
 
-void MediaPool::createPairedPlayers() {
-    // This is handled in mediaPair()
-}
-
-void MediaPool::createStandalonePlayers() {
-    // This is handled in mediaPair()
-}
 
 bool MediaPool::isAudioFile(const std::string& filename) {
     std::string ext = ofFilePath::getFileExt(filename);
@@ -344,7 +337,8 @@ void MediaPool::setActivePlayer(size_t index) {
     }
     
     activePlayer = players[index].get();
-    ofLogNotice("ofxMediaPool") << "Set active player to index " << index;
+    currentIndex = index;  // Keep currentIndex in sync with activePlayer
+    ofLogNotice("ofxMediaPool") << "Set active player to index " << index << ", currentIndex now=" << currentIndex;
     
     // Connect to outputs when active player changes
     if (soundOutput && visualOutput) {
@@ -413,9 +407,70 @@ void MediaPool::disconnectActivePlayer() {
 }
 
 //--------------------------------------------------------------
+bool MediaPool::playMediaManual(size_t index, float position) {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    
+    if (index >= players.size()) {
+        ofLogWarning("ofxMediaPool") << "Invalid media index for manual playback: " << index;
+        return false;
+    }
+    
+    MediaPlayer* player = players[index].get();
+    if (!player) {
+        ofLogWarning("ofxMediaPool") << "Media player not found for index: " << index;
+        return false;
+    }
+    
+    // Check if player has any media loaded
+    if (!player->isAudioLoaded() && !player->isVideoLoaded()) {
+        ofLogWarning("ofxMediaPool") << "No media loaded for player at index: " << index;
+        return false;
+    }
+    
+    // Stop current playback before starting new one
+    if (activePlayer && activePlayer != player) {
+        activePlayer->stop();
+    }
+    
+    // Set active player and connect to outputs
+    setActivePlayer(index);
+    
+    // Transition to MANUAL_PREVIEW state
+    currentMode = PlaybackMode::MANUAL_PREVIEW;
+    
+    // Stop and reset the player for fresh playback
+    player->stop();  // Stop any current playback
+    player->position.set(position);
+    
+    // Re-enable audio/video if they were loaded (stop() disables them)
+    if (player->isAudioLoaded()) {
+        player->audioEnabled.set(true);
+    }
+    if (player->isVideoLoaded()) {
+        player->videoEnabled.set(true);
+    }
+    
+    // Set loop based on preview mode
+    bool shouldLoop = (currentPreviewMode == PreviewMode::LOOP);
+    player->loop.set(shouldLoop);
+    
+    // Now play
+    player->play();
+    
+    ofLogNotice("ofxMediaPool") << "Manual playback started for media " << index << " at position " << position << " (state: MANUAL_PREVIEW)";
+    ofLogNotice("ofxMediaPool") << "Player state - audio enabled: " << player->audioEnabled.get() 
+                                << ", video enabled: " << player->videoEnabled.get()
+                                << ", audio loaded: " << player->isAudioLoaded()
+                                << ", video loaded: " << player->isVideoLoaded();
+    return true;
+}
+
+//--------------------------------------------------------------
 void MediaPool::onStepTrigger(int step, int mediaIndex, float position, 
                               float speed, float volume, float stepLength, 
                               bool audioEnabled, bool videoEnabled) {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    
     if (!clock) {
         ofLogError("ofxMediaPool") << "Clock reference not set!";
         return;
@@ -450,6 +505,9 @@ void MediaPool::onStepTrigger(int step, int mediaIndex, float position,
     // Set active player and connect to outputs
     setActivePlayer(mediaIndex);
     
+    // Transition to SEQUENCER_ACTIVE state
+    currentMode = PlaybackMode::SEQUENCER_ACTIVE;
+    
     // Apply media-specific parameters from the step event
     if (audioEnabled) {
         player->audioEnabled.set(true);
@@ -480,8 +538,17 @@ void MediaPool::onStepTrigger(int step, int mediaIndex, float position,
                                 << " with duration " << stepDurationSeconds << "s";
 }
 
+// Overloaded version using struct for cleaner interface
+void MediaPool::onStepTrigger(const StepTriggerParams& params) {
+    onStepTrigger(params.step, params.mediaIndex, params.position, 
+                  params.speed, params.volume, params.duration, 
+                  params.audioEnabled, params.videoEnabled);
+}
+
 //--------------------------------------------------------------
 void MediaPool::stopAllMedia() {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    
     for (auto& player : players) {
         if (player) {
             player->stop();
@@ -491,6 +558,11 @@ void MediaPool::stopAllMedia() {
     if (activePlayer) {
         disconnectActivePlayer();
     }
+    
+    // Transition to IDLE state
+    currentMode = PlaybackMode::IDLE;
+    
+    ofLogNotice("ofxMediaPool") << "All media stopped (state: IDLE)";
 }
 
 //--------------------------------------------------------------
@@ -563,5 +635,127 @@ void MediaPool::browseForDirectory() {
         setDataDirectory(selectedPath);
     } else {
         ofLogNotice("ofxMediaPool") << "Directory selection cancelled";
+    }
+}
+
+//--------------------------------------------------------------
+// Query methods for state checking
+PlaybackMode MediaPool::getCurrentMode() const {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    return currentMode;
+}
+
+bool MediaPool::isSequencerActive() const {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    return currentMode == PlaybackMode::SEQUENCER_ACTIVE;
+}
+
+bool MediaPool::isManualPreview() const {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    return currentMode == PlaybackMode::MANUAL_PREVIEW;
+}
+
+bool MediaPool::isIdle() const {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    return currentMode == PlaybackMode::IDLE;
+}
+
+//--------------------------------------------------------------
+// Preview mode control
+void MediaPool::setPreviewMode(PreviewMode mode) {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    currentPreviewMode = mode;
+    ofLogNotice("ofxMediaPool") << "Preview mode set to: " << (int)mode;
+    
+    // Apply the new mode to the currently active player if it's playing
+    if (activePlayer && currentMode == PlaybackMode::MANUAL_PREVIEW) {
+        bool shouldLoop = (mode == PreviewMode::LOOP);
+        activePlayer->loop.set(shouldLoop);
+        ofLogNotice("ofxMediaPool") << "Applied preview mode to active player - loop: " << shouldLoop;
+    }
+}
+
+PreviewMode MediaPool::getPreviewMode() const {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    return currentPreviewMode;
+}
+
+//--------------------------------------------------------------
+void MediaPool::update() {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    
+    // Check for end-of-media in manual preview mode
+    // Use the underlying players' built-in end detection instead of hacky position checking
+    if (currentMode == PlaybackMode::MANUAL_PREVIEW && activePlayer) {
+        // Check if the player has stopped playing (which happens automatically at end)
+        if (!activePlayer->isPlaying() && !activePlayer->loop.get()) {
+            // Media has reached the end and stopped
+            ofLogNotice("ofxMediaPool") << "Media reached end and stopped";
+            onManualPreviewEnd();
+        }
+    }
+}
+
+//--------------------------------------------------------------
+// Handle end-of-media in manual preview mode
+void MediaPool::onManualPreviewEnd() {
+    // No lock needed - caller (update()) already holds stateMutex
+    
+    if (currentMode != PlaybackMode::MANUAL_PREVIEW) return;
+    
+    switch (currentPreviewMode) {
+        case PreviewMode::STOP_AT_END:
+            // Stop the current player
+            if (activePlayer) {
+                activePlayer->stop();
+            }
+            ofLogNotice("ofxMediaPool") << "Stopped at end of media, currentIndex=" << currentIndex << ", going to IDLE";
+            currentMode = PlaybackMode::IDLE;
+            break;
+        case PreviewMode::LOOP:
+            // Already handled by loop=true
+            break;
+        case PreviewMode::PLAY_NEXT:
+            if (players.size() > 1) {
+                size_t nextIndex = (currentIndex + 1) % players.size();
+                ofLogNotice("ofxMediaPool") << "Playing next media: " << nextIndex;
+                
+                // Get next player and validate it's available
+                MediaPlayer* nextPlayer = players[nextIndex].get();
+                if (nextPlayer && (nextPlayer->isAudioLoaded() || nextPlayer->isVideoLoaded())) {
+                    // Set as active player and connect to outputs
+                    setActivePlayer(nextIndex);
+                    
+                    // Reset and prepare for playback
+                    nextPlayer->stop();
+                    nextPlayer->position.set(0.0f);
+                    
+                    // Re-enable audio/video if they were loaded
+                    if (nextPlayer->isAudioLoaded()) {
+                        nextPlayer->audioEnabled.set(true);
+                    }
+                    if (nextPlayer->isVideoLoaded()) {
+                        nextPlayer->videoEnabled.set(true);
+                    }
+                    
+                    // Set loop to false for PLAY_NEXT mode
+                    nextPlayer->loop.set(false);
+                    
+                    // Start playback
+                    nextPlayer->play();
+                    
+                    ofLogNotice("ofxMediaPool") << "Started next media " << nextIndex << " (state: MANUAL_PREVIEW)";
+                } else {
+                    ofLogNotice("ofxMediaPool") << "Next media not available, stopping";
+                    currentMode = PlaybackMode::IDLE;
+                }
+            } else {
+                ofLogNotice("ofxMediaPool") << "No next media to play, stopping";
+                if (activePlayer) {
+                    activePlayer->stop();
+                }
+                currentMode = PlaybackMode::IDLE;
+            }
+            break;
     }
 }

@@ -60,6 +60,11 @@ void Clock::start() {
         samplesPerBeat = sampleRate / beatsPerSecond; // Use current sample rate
         beatAccumulator = samplesPerBeat; // Trigger first beat immediately
         ofLogNotice("Clock") << "Audio-rate clock started at BPM: " << currentBpm.load() << " (SR: " << sampleRate << ")";
+        
+        // Notify transport listeners
+        for (auto& listener : transportListeners) {
+            listener(true);
+        }
     }
 }
 
@@ -71,6 +76,11 @@ void Clock::stop() {
         sampleAccumulator = 0.0; // Reset sample timing
         beatAccumulator = 0.0; // Reset beat timing
         ofLogNotice("Clock") << "Audio-rate clock stopped";
+        
+        // Notify transport listeners
+        for (auto& listener : transportListeners) {
+            listener(false);
+        }
     }
 }
 
@@ -79,6 +89,11 @@ void Clock::pause() {
     if (playing) {
         playing = false;
         ofLogNotice("Clock") << "Audio-rate clock paused";
+        
+        // Notify transport listeners
+        for (auto& listener : transportListeners) {
+            listener(false);
+        }
     }
 }
 
@@ -117,6 +132,18 @@ void Clock::addAudioListener(std::function<void(ofSoundBuffer&)> listener) {
 //--------------------------------------------------------------
 void Clock::removeAudioListener() {
     audioListeners.clear();
+}
+
+//--------------------------------------------------------------
+void Clock::addTransportListener(TransportCallback listener) {
+    transportListeners.push_back(listener);
+    ofLogNotice("Clock") << "Transport listener added (total: " << transportListeners.size() << ")";
+}
+
+//--------------------------------------------------------------
+void Clock::removeTransportListener() {
+    transportListeners.clear();
+    ofLogNotice("Clock") << "All transport listeners removed";
 }
 
 //--------------------------------------------------------------

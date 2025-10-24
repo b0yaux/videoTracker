@@ -4,6 +4,9 @@
 #include "ofxVisualObjects.h"
 #include "ofParameter.h"
 
+// Forward declaration
+class MediaPool;
+
 class MediaPlayer {
 public:
     MediaPlayer();
@@ -43,6 +46,8 @@ public:
     void play();
     void stop();
     void pause();
+    void resume();
+    void reset();
     void setPosition(float pos);
     
     // Gating system for tracker-style step control
@@ -95,4 +100,5 @@ private:
     // File path storage for display purposes
     std::string audioFilePath;
     std::string videoFilePath;
+    
 };

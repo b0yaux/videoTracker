@@ -3,8 +3,7 @@
 #include "MediaPlayer.h"
 
 MediaPoolGUI::MediaPoolGUI() 
-    : mediaPool(nullptr), showAdvancedOptions(false), showFileDetails(true), 
-      waveformHeight(100.0f) {
+    : mediaPool(nullptr), waveformHeight(100.0f) {
     // Initialize search buffer
     memset(searchBuffer, 0, sizeof(searchBuffer));
     searchFilter = "";
@@ -122,43 +121,42 @@ void MediaPoolGUI::drawMediaList() {
                 
                 // Make items selectable and clickable
                 if (ImGui::Selectable(displayName.c_str(), isActive)) {
-                    // Stop all other players first
-                    for (size_t j = 0; j < mediaPool->getNumPlayers(); j++) {
-                        auto otherPlayer = mediaPool->getMediaPlayer(j);
-                        if (otherPlayer && otherPlayer != player) {
-                            otherPlayer->stop();
-                        }
-                    }
-                    
-                    // Set as active player
-                    mediaPool->setActivePlayer(i);
-                    
-                    // Handle play/pause logic
-                    if (player) {
-                        if (player->isPlaying()) {
-                            // If already playing, pause it
-                            player->pause();
-                        } else {
-                            // If paused or stopped, play it
-                            // Enable both audio and video for playback
-                            player->audioEnabled.set(true);
-                            player->videoEnabled.set(true);
-                            player->play();
-                        }
+                    // Use playMediaManual to set MANUAL_PREVIEW mode and play from start
+                    bool success = mediaPool->playMediaManual(i, 0.0f);  // Always play from start (position 0.0)
+                    if (!success) {
+                        ofLogWarning("MediaPoolGUI") << "Failed to play media at index " << i;
                     }
                 }
                 
-                // Add hover tooltip with metadata
+                // Add hover tooltip with video frame preview
                 if (ImGui::IsItemHovered()) {
                     ImGui::BeginTooltip();
-                    ImGui::Text("Index: %zu", i);
-                    ImGui::Text("Player: %s", playerNames[i].c_str());
-                    if (i < playerFileNames.size() && !playerFileNames[i].empty()) {
-                        ImGui::Text("File: %s", playerFileNames[i].c_str());
+                    
+                    // Show video frame if available
+                    if (player->isVideoLoaded()) {
+                        ofTexture videoTexture = player->getVideoPlayer().getVideoFile().getTexture();
+                        if (videoTexture.isAllocated()) {
+                            // Display video frame as tooltip
+                            ImGui::Image((void*)(intptr_t)videoTexture.getTextureData().textureID, 
+                                        ImVec2(160, 90), // Preview size
+                                        ImVec2(0, 0), ImVec2(1, 1)); // Normal orientation (no flip)
+                            
+                            // Show basic info below the frame
+                            ImGui::Text("Index: %zu", i);
+                            ImGui::Text("Status: %s", player->isPlaying() ? "Playing" : "Stopped");
+                        } else {
+                            // Fallback to metadata if no video frame available
+                            ImGui::Text("Index: %zu", i);
+                            ImGui::Text("Video: %s", player->isVideoLoaded() ? "Loaded" : "Not loaded");
+                            ImGui::Text("Status: %s", player->isPlaying() ? "Playing" : "Stopped");
+                        }
+                    } else {
+                        // Show audio-only info
+                        ImGui::Text("Index: %zu", i);
+                        ImGui::Text("Audio: %s", player->isAudioLoaded() ? "Loaded" : "Not loaded");
+                        ImGui::Text("Status: %s", player->isPlaying() ? "Playing" : "Stopped");
                     }
-                    ImGui::Text("Audio: %s", player->isAudioLoaded() ? "Loaded" : "Not loaded");
-                    ImGui::Text("Video: %s", player->isVideoLoaded() ? "Loaded" : "Not loaded");
-                    ImGui::Text("Status: %s", player->isPlaying() ? "Playing" : "Stopped");
+                    
                     ImGui::Text("Click to play/pause");
                     ImGui::EndTooltip();
                 }
@@ -208,12 +206,28 @@ void MediaPoolGUI::drawMediaList() {
             }
         }
     ImGui::Separator();
+    
+    // Preview Mode Controls
+    ImGui::Text("Preview Mode :");
+    PreviewMode currentMode = mediaPool->getPreviewMode();
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Once", currentMode == PreviewMode::STOP_AT_END)) {
+        mediaPool->setPreviewMode(PreviewMode::STOP_AT_END);
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Loop", currentMode == PreviewMode::LOOP)) {
+        mediaPool->setPreviewMode(PreviewMode::LOOP);
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Play Next", currentMode == PreviewMode::PLAY_NEXT)) {
+        mediaPool->setPreviewMode(PreviewMode::PLAY_NEXT);
+    }
     }
 }
+
 void MediaPoolGUI::drawWaveform() {
     auto currentPlayer = mediaPool->getActivePlayer();
     if (currentPlayer && currentPlayer->isAudioLoaded()) {
-        ImGui::Text("Current Media Waveform:");
         
         // Get audio buffer data
         ofSoundBuffer buffer = currentPlayer->getAudioPlayer().getBuffer();
@@ -221,7 +235,7 @@ void MediaPoolGUI::drawWaveform() {
         int numChannels = buffer.getNumChannels();
         
         if (numFrames > 0 && numChannels > 0) {
-            // Prepare data for ImPlot - much more efficient than manual drawing
+            // Prepare data for ImDrawList - much more efficient than manual drawing
             static std::vector<float> timeData;
             static std::vector<std::vector<float>> channelData;
             
@@ -248,71 +262,106 @@ void MediaPoolGUI::drawWaveform() {
                 }
             }
             
-            // Use ImPlot for high-performance waveform rendering
-            if (ImPlot::BeginPlot("Waveform", ImVec2(-1, waveformHeight), 
-                ImPlotFlags_NoTitle | ImPlotFlags_NoMenus | ImPlotFlags_NoBoxSelect | 
-                ImPlotFlags_NoLegend | ImPlotFlags_NoMouseText)) {
-                ImPlot::SetupAxes("", "", ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_NoTickLabels);
-                ImPlot::SetupAxisLimits(ImAxis_X1, 0, 1, ImPlotCond_Always);
-                ImPlot::SetupAxisLimits(ImAxis_Y1, -1, 1, ImPlotCond_Always);
+            // Create invisible button for interaction area
+            ImVec2 canvasSize = ImVec2(-1, waveformHeight);
+            ImGui::InvisibleButton("waveform_canvas", canvasSize);
+            
+            // Get draw list for custom rendering
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            ImVec2 canvasPos = ImGui::GetItemRectMin();
+            ImVec2 canvasMax = ImGui::GetItemRectMax();
+            
+            // Calculate proper playhead position
+            float playheadPosition = 0.0f;
+            bool showPlayhead = false;
+            
+            // Always use the position parameter as the single source of truth
+            // This ensures consistency between playing and non-playing states
+            float mediaPosition = currentPlayer->position.get();
+            if (mediaPosition > 0.0f || currentPlayer->isPlaying()) {
+                playheadPosition = mediaPosition;
+                showPlayhead = true;
+            }
+            
+            // Handle click-to-seek and drag functionality
+            if (ImGui::IsItemHovered()) {
+                // Show cursor as hand when hovering over waveform
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                 
-                // Plot each channel with white color
-                for (int ch = 0; ch < numChannels; ch++) {
-                    ImPlot::SetNextLineStyle(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), 1.0f); // White lines
-                    ImPlot::PlotLine(("Channel " + std::to_string(ch)).c_str(), 
-                                   timeData.data(), channelData[ch].data(), actualPoints);
-                }
-                
-                // Calculate proper playhead position
-                float playheadPosition = 0.0f;
-                bool showPlayhead = false;
-                
-                if (currentPlayer->isPlaying()) {
-                    // Get actual media playback position (0.0-1.0) - this updates in real-time
-                    float mediaPosition = currentPlayer->getAudioPlayer().getPosition();
-                    playheadPosition = mediaPosition;
-                    showPlayhead = true;
-                } else {
-                    // Use tracker sequencer step position when not playing
-                    float stepPosition = currentPlayer->position.get();
-                    if (stepPosition > 0.0f) {
-                        playheadPosition = stepPosition;
-                        showPlayhead = true;
-                    }
-                }
-                
-                // Handle click-to-seek and drag functionality
-                if (ImPlot::IsPlotHovered()) {
-                    // Show cursor as hand when hovering over waveform
-                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                // Check for mouse click or drag
+                if (ImGui::IsMouseClicked(0)) {
+                    // Click: seek to position and handle playback appropriately
+                    ImVec2 mousePos = ImGui::GetMousePos();
+                    float relativeX = (mousePos.x - canvasPos.x) / (canvasMax.x - canvasPos.x);
                     
-                    // Check for mouse click or drag
-                    if (ImGui::IsMouseClicked(0) || ImGui::IsMouseDragging(0)) {
-                        ImPlotPoint mousePos = ImPlot::GetPlotMousePos();
-                        if (mousePos.x >= 0.0 && mousePos.x <= 1.0) {
-                            // Seek to the clicked/dragged position
-                            currentPlayer->getAudioPlayer().setPosition(mousePos.x);
-                            currentPlayer->position.set(mousePos.x);
+                    if (relativeX >= 0.0f && relativeX <= 1.0f) {
+                        auto player = mediaPool->getActivePlayer();
+                        if (player) {
+                            // Always seek to the clicked position first
+                            player->position.set(relativeX);
+                            ofLogNotice("MediaPoolGUI") << "Seeking to position " << relativeX;
                             
-                            // If paused and clicked, start playing
-                            if (!currentPlayer->isPlaying()) {
-                                currentPlayer->play();
+                            // Debug: Check position before play
+                            ofLogNotice("MediaPoolGUI") << "Position before play: " << player->position.get();
+                            
+                            // Check if MediaPool is in IDLE mode and start manual preview if needed
+                            if (mediaPool->isIdle()) {
+                                ofLogNotice("MediaPoolGUI") << "MediaPool is IDLE, starting manual preview from position " << relativeX;
+                                mediaPool->playMediaManual(mediaPool->getCurrentIndex(), relativeX);
+                            } else {
+                                // MediaPool is already active, just play from the new position
+                                player->play();
+                                ofLogNotice("MediaPoolGUI") << "Resumed playback from position " << relativeX;
                             }
+                            
+                            // Debug: Check position after play
+                            ofLogNotice("MediaPoolGUI") << "Position after play: " << player->position.get();
+                        }
+                    }
+                } else if (ImGui::IsMouseDragging(0)) {
+                    // Drag: scrub without restarting playback
+                    ImVec2 mousePos = ImGui::GetMousePos();
+                    float relativeX = (mousePos.x - canvasPos.x) / (canvasMax.x - canvasPos.x);
+                    
+                    if (relativeX >= 0.0f && relativeX <= 1.0f) {
+                        auto player = mediaPool->getActivePlayer();
+                        if (player) {
+                            player->position.set(relativeX);
                         }
                     }
                 }
+            }
+            
+            // Draw waveform using ImDrawList
+            float canvasWidth = canvasMax.x - canvasPos.x;
+            float canvasHeight = canvasMax.y - canvasPos.y;
+            float centerY = canvasPos.y + canvasHeight * 0.5f;
+            float amplitudeScale = canvasHeight * 0.4f; // Use 80% of height for amplitude
+            
+            // Draw each channel with white color
+            for (int ch = 0; ch < numChannels; ch++) {
+                ImU32 lineColor = IM_COL32(255, 255, 255, 255); // White
                 
-                // Draw playhead with green color
-                if (showPlayhead) {
-                    // Create vertical line data for playhead - use local vectors to ensure updates
-                    std::vector<float> playheadX = {playheadPosition, playheadPosition};
-                    std::vector<float> playheadY = {-1.0f, 1.0f};
+                for (int i = 0; i < actualPoints - 1; i++) {
+                    float x1 = canvasPos.x + timeData[i] * canvasWidth;
+                    float y1 = centerY - channelData[ch][i] * amplitudeScale;
+                    float x2 = canvasPos.x + timeData[i + 1] * canvasWidth;
+                    float y2 = centerY - channelData[ch][i + 1] * amplitudeScale;
                     
-                    ImPlot::SetNextLineStyle(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), 3.0f); // Green playhead, thicker
-                    ImPlot::PlotLine("Playhead", playheadX.data(), playheadY.data(), 2);
+                    drawList->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), lineColor, 1.0f);
                 }
+            }
+            
+            // Draw playhead with green color
+            if (showPlayhead) {
+                float playheadX = canvasPos.x + playheadPosition * canvasWidth;
+                ImU32 playheadColor = IM_COL32(0, 255, 0, 255); // Green
                 
-                ImPlot::EndPlot();
+                drawList->AddLine(
+                    ImVec2(playheadX, canvasPos.y),
+                    ImVec2(playheadX, canvasMax.y),
+                    playheadColor, 3.0f
+                );
             }
         }
         
@@ -321,10 +370,3 @@ void MediaPoolGUI::drawWaveform() {
     }
 }
 
-void MediaPoolGUI::setShowAdvancedOptions(bool show) {
-    showAdvancedOptions = show;
-}
-
-void MediaPoolGUI::setShowFileDetails(bool show) {
-    showFileDetails = show;
-}

@@ -48,6 +48,9 @@ public:
     // Event listener system
     void addStepEventListener(std::function<void(int, float, const PatternCell&)> listener);
     
+    // Transport listener for Clock play/stop events
+    void onClockTransportChanged(bool isPlaying);
+    
     // Pattern management
     void setCell(int step, const PatternCell& cell);
     PatternCell getCell(int step) const;

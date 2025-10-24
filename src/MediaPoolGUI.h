@@ -1,7 +1,6 @@
 #pragma once
 #include "ofxImGui.h"
 #include "ofxSoundObjects.h"
-#include "implot.h"
 #include <string>
 #include <vector>
 
@@ -14,13 +13,9 @@ public:
     void draw();
     
     // GUI state controls
-    void setShowAdvancedOptions(bool show);
-    void setShowFileDetails(bool show);
     
 private:
     MediaPool* mediaPool;
-    bool showAdvancedOptions;
-    bool showFileDetails;
     
     // Search functionality
     char searchBuffer[256];
@@ -33,6 +28,5 @@ private:
     void drawDirectoryControls();
     void drawSearchBar();
     void drawMediaList();
-    void drawPlayerStatus();
     void drawWaveform();
 };

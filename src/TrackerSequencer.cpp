@@ -78,6 +78,11 @@ void TrackerSequencer::setup(Clock* clockRef, int steps) {
         ofAddListener(clock->stepEvent, this, &TrackerSequencer::onStepEvent);
         // Sync Clock's SPB with TrackerSequencer's SPB
         clock->setStepsPerBeat(stepsPerBeat);
+        
+        // Subscribe to Clock transport changes
+        clock->addTransportListener([this](bool isPlaying) {
+            this->onClockTransportChanged(isPlaying);
+        });
     }
     
     ofLogNotice("TrackerSequencer") << "Setup complete with " << numSteps << " steps";
@@ -85,6 +90,22 @@ void TrackerSequencer::setup(Clock* clockRef, int steps) {
 
 void TrackerSequencer::setIndexRangeCallback(IndexRangeCallback callback) {
     indexRangeCallback = callback;
+}
+
+//--------------------------------------------------------------
+void TrackerSequencer::onClockTransportChanged(bool isPlaying) {
+    if (isPlaying) {
+        // Clock started - start the sequencer from step 1
+        play();
+        // Reset to step 1 and trigger it
+        currentStep = 0;  // 0-based internally, so step 1 is index 0
+        triggerStep(0);  // Trigger step 1 (0-based)
+        ofLogNotice("TrackerSequencer") << "Clock transport started - sequencer playing from step 1";
+    } else {
+        // Clock stopped - pause the sequencer (don't reset step)
+        pause();
+        ofLogNotice("TrackerSequencer") << "Clock transport stopped - sequencer paused at step " << (currentStep + 1);
+    }
 }
 
 

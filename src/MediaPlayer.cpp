@@ -112,22 +112,56 @@ bool MediaPlayer::loadVideo(const std::string& videoPath) {
 }
 
 void MediaPlayer::play() {
+    // Get the target position before starting any playback
+    float targetPosition = position.get();
+    ofLogNotice("ofxMediaPlayer") << "MediaPlayer::play() called with target position: " << targetPosition << ", loop: " << loop.get();
+    
+    // Sync audio position before starting playback
     if (audioEnabled.get() && isAudioLoaded()) {
-
         audioEnabled.set(true);
-
+        audioPlayer.setPosition(targetPosition);
+        ofLogNotice("ofxMediaPlayer") << "Audio position set to: " << targetPosition;
+        
+        // Always call play() - it will handle paused state internally
+        audioPlayer.play();
+        ofLogNotice("ofxMediaPlayer") << "Audio play() called, actual position now: " << audioPlayer.getPosition();
+        
+        // If the position was reset by play(), set it again
+        if (audioPlayer.getPosition() < targetPosition - 0.01f) {
+            ofLogNotice("ofxMediaPlayer") << "Audio position was reset, setting again to: " << targetPosition;
+            audioPlayer.setPosition(targetPosition);
+        }
+        
         ofLogNotice("ofxMediaPlayer") << "Playing audio - enabled: " << audioEnabled.get() 
                                       << ", loaded: " << isAudioLoaded() 
-                                      << ", volume: " << volume.get();
-        audioPlayer.play();
+                                      << ", volume: " << volume.get()
+                                      << ", position: " << targetPosition;
     }
     
+    // Sync video position before starting playback
     if (videoEnabled.get() && isVideoLoaded()) {
         videoEnabled.set(true);
-        ofLogNotice("ofxMediaPlayer") << "Playing video - enabled: " << videoEnabled.get() 
-                                      << ", loaded: " << isVideoLoaded();
+        videoPlayer.getVideoFile().setPosition(targetPosition);
+        ofLogNotice("ofxMediaPlayer") << "Video position set to: " << targetPosition;
+        
+        // Force decode HAP videos to ensure immediate frame availability
+        videoPlayer.getVideoFile().update();
+        
+        // Always call play() - it will handle paused state internally
         videoPlayer.play();
-        videoPlayer.getVideoFile().setPosition(position.get());
+        ofLogNotice("ofxMediaPlayer") << "Video play() called, actual position now: " << videoPlayer.getVideoFile().getPosition();
+        
+        // If the position was reset by play(), set it again
+        if (videoPlayer.getVideoFile().getPosition() < targetPosition - 0.01f) {
+            ofLogNotice("ofxMediaPlayer") << "Video position was reset, setting again to: " << targetPosition;
+            videoPlayer.getVideoFile().setPosition(targetPosition);
+        }
+        
+        ofLogNotice("ofxMediaPlayer") << "Playing video - enabled: " << videoEnabled.get() 
+                                      << ", loaded: " << isVideoLoaded()
+                                      << ", position: " << targetPosition;
+        
+        // Force texture update after play to ensure HAP videos are properly decoded
         videoPlayer.getVideoFile().forceTextureUpdate();
         
         ofLogNotice("ofxMediaPlayer") << "Video play called - isPlaying: " << videoPlayer.isPlaying()
@@ -154,6 +188,30 @@ void MediaPlayer::stop() {
 void MediaPlayer::pause() {
     audioPlayer.setPaused(true);
     videoPlayer.setPaused(true);
+}
+
+void MediaPlayer::resume() {
+    audioPlayer.setPaused(false);
+    videoPlayer.setPaused(false);
+}
+
+void MediaPlayer::reset() {
+    // Stop all playback
+    audioPlayer.stop();
+    videoPlayer.stop();
+    
+    // Reset position to beginning
+    position.set(0.0f);
+    
+    // Re-enable audio/video if they were loaded
+    if (isAudioLoaded()) {
+        audioEnabled.set(true);
+    }
+    if (isVideoLoaded()) {
+        videoEnabled.set(true);
+    }
+    
+    ofLogNotice("ofxMediaPlayer") << "Player reset - ready for fresh playback";
 }
 
 void MediaPlayer::setPosition(float pos) {
@@ -197,6 +255,28 @@ void MediaPlayer::update() {
     videoPlayer.update();
     
     // Video player state logging removed to reduce console spam
+    
+    // Sync position parameter with actual playback position
+    // This makes position the single source of truth
+    if (isPlaying()) {
+        float currentPosition = 0.0f;
+        
+        // Get position from audio player if available and playing
+        if (isAudioLoaded() && audioPlayer.isPlaying()) {
+            currentPosition = audioPlayer.getPosition();
+        }
+        // Otherwise get position from video player if available and playing
+        else if (isVideoLoaded() && videoPlayer.isPlaying()) {
+            currentPosition = videoPlayer.getVideoFile().getPosition();
+        }
+        
+        // Update the position parameter to reflect actual playback
+        // Only update if the position has actually changed to avoid unnecessary updates
+        if (abs(currentPosition - position.get()) > 0.001f) {
+            position.set(currentPosition);
+        }
+        
+    }
     
     // Check for scheduled stop (gating system)
     if (scheduledStopActive && ofGetElapsedTimef() >= stopTime) {
@@ -272,6 +352,7 @@ void MediaPlayer::playWithGate(float durationSeconds) {
     scheduledStopActive = true;
     stopTime = ofGetElapsedTimef() + durationSeconds;
 }
+
 
 
 
