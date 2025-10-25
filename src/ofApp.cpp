@@ -61,6 +61,7 @@ void ofApp::setup() {
         saveMediaDirectory(path);
     });
     
+    
     // Register step event listener
     trackerSequencer.addStepEventListener([this](int step, float duration, const TrackerSequencer::PatternCell& cell) {
         onTrackerStepEvent(step, duration, cell);
@@ -93,8 +94,11 @@ void ofApp::setup() {
     // Setup visual objects
     setupVisualObjects();
     
-    // Set output references in MediaPool (connection will happen when player becomes active)
-    mediaPool.setOutputs(soundOutput, visualOutput);
+    // Connect Clock transport events to MediaPool for proper state management
+    clock.addTransportListener([this](bool isPlaying) {
+        // Forward transport events to MediaPool
+        mediaPool.onTransportChanged(isPlaying);
+    });
     
     
     // Setup GUI
@@ -130,6 +134,9 @@ void ofApp::setup() {
     
     // Clock listener is set up in setupTimeObjects()
     
+    // Initialize first active player after everything is set up
+    mediaPool.initializeFirstActivePlayer();
+    
     // Load default layout on startup
     loadLayout();
 }
@@ -146,6 +153,12 @@ void ofApp::update() {
     
     // Update MediaPool for end-of-media detection
     mediaPool.update();
+    
+    // Ensure active player is connected to outputs (modular connection management)
+    // Only connect if there's an active player to avoid warning spam
+    if (mediaPool.getActivePlayer()) {
+        mediaPool.connectActivePlayer(soundOutput, visualOutput);
+    }
     
     // Process visual pipeline - simplified for direct texture drawing
     auto currentPlayer = mediaPool.getActivePlayer();
@@ -178,8 +191,18 @@ void ofApp::draw() {
         auto currentPlayer = mediaPool.getActivePlayer();
         if (currentPlayer && currentPlayer->isVideoLoaded() && 
             currentPlayer->videoEnabled.get() && currentPlayer->isPlaying()) {
-            ofSetColor(255, 255, 255);
-            currentPlayer->getVideoPlayer().getVideoFile().getTexture().draw(0, 0, ofGetWidth(), ofGetHeight());
+            try {
+                auto& videoPlayer = currentPlayer->getVideoPlayer();
+                auto& videoFile = videoPlayer.getVideoFile();
+                if (videoFile.isLoaded() && videoFile.getTexture().isAllocated()) {
+                    ofSetColor(255, 255, 255);
+                    videoFile.getTexture().draw(0, 0, ofGetWidth(), ofGetHeight());
+                }
+            } catch (const std::exception& e) {
+                ofLogError("ofApp") << "Exception drawing video: " << e.what();
+            } catch (...) {
+                ofLogError("ofApp") << "Unknown exception drawing video";
+            }
         }
         
         // Draw GUI

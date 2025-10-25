@@ -180,10 +180,7 @@ void TrackerSequencer::randomizePattern() {
             cell.position = ofRandom(0.0f, 1.0f);
             cell.speed = ofRandom(0.5f, 2.0f);
             cell.volume = ofRandom(0.3f, 1.0f);
-            cell.stepLength = ofRandom(0.5f, 2.0f);
-            // Keep A/V toggles unchanged - don't randomize them
-            cell.audioEnabled = true;  // Always enable audio
-            cell.videoEnabled = true;  // Always enable video
+            cell.stepLength = ofRandom(1, numSteps);
         } else {
             cell.clear(); // Empty/rest step
         }

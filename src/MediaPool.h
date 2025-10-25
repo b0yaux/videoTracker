@@ -107,13 +107,21 @@ public:
     // Update method for end-of-media detection
     void update();
     
+    // Transport listener system for Clock play/stop events
+    typedef std::function<void(bool isPlaying)> TransportCallback;
+    void addTransportListener(TransportCallback listener);
+    void removeTransportListener();
+    void onTransportChanged(bool isPlaying);
+    
     // Connection management (internal)
     void setActivePlayer(size_t index);
     MediaPlayer* getActivePlayer();
-    void setOutputs(ofxSoundOutput& soundOut, ofxVisualOutput& visualOut);
     void connectActivePlayer(ofxSoundOutput& soundOut, ofxVisualOutput& visualOut);
     void disconnectActivePlayer();
     void stopAllMedia();
+    
+    // Initialize first active player after setup is complete
+    void initializeFirstActivePlayer();
     
     
     // Directory management
@@ -124,6 +132,7 @@ public:
     // Directory change callback
     std::function<void(const std::string&)> onDirectoryChanged;
     void setDirectoryChangeCallback(std::function<void(const std::string&)> callback) { onDirectoryChanged = callback; }
+    
     
     
 private:
@@ -144,9 +153,10 @@ private:
     
     // Connection state
     MediaPlayer* activePlayer;
-    bool isConnected;
-    ofxSoundOutput* soundOutput;
-    ofxVisualOutput* visualOutput;
+    
+    // Transport listener system
+    TransportCallback transportListener;
+    bool lastTransportState;
     
     // Helper methods
     std::string getBaseName(const std::string& filename);

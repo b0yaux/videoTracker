@@ -16,7 +16,17 @@ void MediaPoolGUI::setMediaPool(MediaPool& pool) {
 void MediaPoolGUI::draw() {
     drawDirectoryControls();
     drawSearchBar();
+    
+    // Reserve space for waveform at bottom, then draw media list in remaining space
+    float availableHeight = ImGui::GetContentRegionAvail().y;
+    int waveformSpace = waveformHeight + 25; // Extra space for waveform controls
+    
+    // Draw media list in scrollable area wita reserved space for waveform
+    ImGui::BeginChild("MediaList", ImVec2(0, availableHeight - waveformSpace), true);
     drawMediaList();
+    ImGui::EndChild();
+    
+    // Draw waveform at bottom
     drawWaveform();
 }
 
@@ -206,78 +216,31 @@ void MediaPoolGUI::drawMediaList() {
             }
         }
     ImGui::Separator();
-    
-    // Preview Mode Controls
-    ImGui::Text("Preview Mode :");
-    PreviewMode currentMode = mediaPool->getPreviewMode();
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Once", currentMode == PreviewMode::STOP_AT_END)) {
-        mediaPool->setPreviewMode(PreviewMode::STOP_AT_END);
     }
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Loop", currentMode == PreviewMode::LOOP)) {
-        mediaPool->setPreviewMode(PreviewMode::LOOP);
-    }
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Play Next", currentMode == PreviewMode::PLAY_NEXT)) {
-        mediaPool->setPreviewMode(PreviewMode::PLAY_NEXT);
-    }
-    }
+
 }
 
 void MediaPoolGUI::drawWaveform() {
+    
     auto currentPlayer = mediaPool->getActivePlayer();
-    if (currentPlayer && currentPlayer->isAudioLoaded()) {
+    if (currentPlayer) {
         
-        // Get audio buffer data
-        ofSoundBuffer buffer = currentPlayer->getAudioPlayer().getBuffer();
-        int numFrames = buffer.getNumFrames();
-        int numChannels = buffer.getNumChannels();
+        // Create invisible button for interaction area
+        ImVec2 canvasSize = ImVec2(-1, waveformHeight);
+        ImGui::InvisibleButton("waveform_canvas", canvasSize);
         
-        if (numFrames > 0 && numChannels > 0) {
-            // Prepare data for ImDrawList - much more efficient than manual drawing
-            static std::vector<float> timeData;
-            static std::vector<std::vector<float>> channelData;
-            
-            // Resize vectors if needed
-            int maxPoints = 2000; // Reasonable number of points for smooth waveform
-            int stepSize = std::max(1, numFrames / maxPoints);
-            int actualPoints = std::min(maxPoints, numFrames / stepSize);
-            
-            timeData.resize(actualPoints);
-            channelData.resize(numChannels);
-            for (int ch = 0; ch < numChannels; ch++) {
-                channelData[ch].resize(actualPoints);
-            }
-            
-            // Downsample audio data
-            for (int i = 0; i < actualPoints; i++) {
-                int sampleIndex = i * stepSize;
-                if (sampleIndex < numFrames) {
-                    timeData[i] = (float)i / (float)actualPoints; // Normalized time 0-1
-                    
-                    for (int ch = 0; ch < numChannels; ch++) {
-                        channelData[ch][i] = buffer.getSample(sampleIndex, ch);
-                    }
-                }
-            }
-            
-            // Create invisible button for interaction area
-            ImVec2 canvasSize = ImVec2(-1, waveformHeight);
-            ImGui::InvisibleButton("waveform_canvas", canvasSize);
-            
-            // Get draw list for custom rendering
-            ImDrawList* drawList = ImGui::GetWindowDrawList();
-            ImVec2 canvasPos = ImGui::GetItemRectMin();
-            ImVec2 canvasMax = ImGui::GetItemRectMax();
-            
-            // Calculate proper playhead position
-            float playheadPosition = 0.0f;
-            bool showPlayhead = false;
-            
-            // Always use the position parameter as the single source of truth
-            // This ensures consistency between playing and non-playing states
-            float mediaPosition = currentPlayer->position.get();
+        // Get draw list for custom rendering
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        ImVec2 canvasPos = ImGui::GetItemRectMin();
+        ImVec2 canvasMax = ImGui::GetItemRectMax();
+        
+        // Calculate proper playhead position
+        float playheadPosition = 0.0f;
+        bool showPlayhead = false;
+        
+        // Always use the position parameter as the single source of truth
+        // This ensures consistency between playing and non-playing states
+        float mediaPosition = currentPlayer->position.get();
             if (mediaPosition > 0.0f || currentPlayer->isPlaying()) {
                 playheadPosition = mediaPosition;
                 showPlayhead = true;
@@ -332,27 +295,78 @@ void MediaPoolGUI::drawWaveform() {
                 }
             }
             
-            // Draw waveform using ImDrawList
+            // Draw waveform area
             float canvasWidth = canvasMax.x - canvasPos.x;
             float canvasHeight = canvasMax.y - canvasPos.y;
             float centerY = canvasPos.y + canvasHeight * 0.5f;
-            float amplitudeScale = canvasHeight * 0.4f; // Use 80% of height for amplitude
             
-            // Draw each channel with white color
-            for (int ch = 0; ch < numChannels; ch++) {
-                ImU32 lineColor = IM_COL32(255, 255, 255, 255); // White
+            // Check if we have audio data to draw waveform
+            bool hasAudioData = false;
+            int numChannels = 0;
+            int actualPoints = 0;
+            static std::vector<float> timeData;
+            static std::vector<std::vector<float>> channelData;
+            
+            if (currentPlayer->isAudioLoaded()) {
+                // Get audio buffer data
+                ofSoundBuffer buffer = currentPlayer->getAudioPlayer().getBuffer();
+                int numFrames = buffer.getNumFrames();
+                numChannels = buffer.getNumChannels();
                 
-                for (int i = 0; i < actualPoints - 1; i++) {
-                    float x1 = canvasPos.x + timeData[i] * canvasWidth;
-                    float y1 = centerY - channelData[ch][i] * amplitudeScale;
-                    float x2 = canvasPos.x + timeData[i + 1] * canvasWidth;
-                    float y2 = centerY - channelData[ch][i + 1] * amplitudeScale;
+                if (numFrames > 0 && numChannels > 0) {
+                    hasAudioData = true;
                     
-                    drawList->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), lineColor, 1.0f);
+                    // Prepare data for ImDrawList - much more efficient than manual drawing
+                    // Resize vectors if needed
+                    int maxPoints = 2000; // Reasonable number of points for smooth waveform
+                    int stepSize = std::max(1, numFrames / maxPoints);
+                    actualPoints = std::min(maxPoints, numFrames / stepSize);
+                    
+                    timeData.resize(actualPoints);
+                    channelData.resize(numChannels);
+                    for (int ch = 0; ch < numChannels; ch++) {
+                        channelData[ch].resize(actualPoints);
+                    }
+                    
+                    // Downsample audio data
+                    for (int i = 0; i < actualPoints; i++) {
+                        int sampleIndex = i * stepSize;
+                        if (sampleIndex < numFrames) {
+                            timeData[i] = (float)i / (float)actualPoints; // Normalized time 0-1
+                            
+                            for (int ch = 0; ch < numChannels; ch++) {
+                                channelData[ch][i] = buffer.getSample(sampleIndex, ch);
+                            }
+                        }
+                    }
                 }
             }
             
-            // Draw playhead with green color
+
+            // Draw fallback transparent black rectangle for video-only players
+            ImU32 bgColor = IM_COL32(0, 0, 0, 100); // Semi-transparent black
+            drawList->AddRectFilled(canvasPos, canvasMax, bgColor);
+            
+            if (hasAudioData) {
+                // Draw actual waveform
+                float amplitudeScale = canvasHeight * 0.4f; // Use 80% of height for amplitude
+                
+                // Draw each channel with white color
+                for (int ch = 0; ch < numChannels; ch++) {
+                    ImU32 lineColor = IM_COL32(255, 255, 255, 255); // White
+                    
+                    for (int i = 0; i < actualPoints - 1; i++) {
+                        float x1 = canvasPos.x + timeData[i] * canvasWidth;
+                        float y1 = centerY - channelData[ch][i] * amplitudeScale;
+                        float x2 = canvasPos.x + timeData[i + 1] * canvasWidth;
+                        float y2 = centerY - channelData[ch][i + 1] * amplitudeScale;
+                        
+                        drawList->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), lineColor, 1.0f);
+                    }
+                }
+            }
+            
+            // Draw playhead with green color (always show if we have a position)
             if (showPlayhead) {
                 float playheadX = canvasPos.x + playheadPosition * canvasWidth;
                 ImU32 playheadColor = IM_COL32(0, 255, 0, 255); // Green
@@ -363,10 +377,23 @@ void MediaPoolGUI::drawWaveform() {
                     playheadColor, 3.0f
                 );
             }
-        }
         
     } else {
-        ImGui::Text("No active player with audio to display waveform.");
+        ImGui::Text("No active player to display waveform.");
+    }
+    // Preview Mode Controls - TEMPORARY : Should be moved to a separate function
+    ImGui::Text("Preview Mode :");
+    PreviewMode currentMode = mediaPool->getPreviewMode();
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Once", currentMode == PreviewMode::STOP_AT_END)) {
+        mediaPool->setPreviewMode(PreviewMode::STOP_AT_END);
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Loop", currentMode == PreviewMode::LOOP)) {
+        mediaPool->setPreviewMode(PreviewMode::LOOP);
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Play Next", currentMode == PreviewMode::PLAY_NEXT)) {
+        mediaPool->setPreviewMode(PreviewMode::PLAY_NEXT);
     }
 }
-

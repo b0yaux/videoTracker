@@ -5,7 +5,7 @@
 #include "ofSystemUtils.h"
 
 MediaPool::MediaPool(const std::string& dataDir) 
-    : currentIndex(0), dataDirectory(dataDir), isSetup(false), currentMode(PlaybackMode::IDLE), currentPreviewMode(PreviewMode::STOP_AT_END), activePlayer(nullptr), isConnected(false), soundOutput(nullptr), visualOutput(nullptr), clock(nullptr) {
+    : currentIndex(0), dataDirectory(dataDir), isSetup(false), currentMode(PlaybackMode::IDLE), currentPreviewMode(PreviewMode::STOP_AT_END), clock(nullptr), activePlayer(nullptr), lastTransportState(false) {
     // setup() will be called later with clock reference
 }
 
@@ -332,7 +332,7 @@ void MediaPool::setActivePlayer(size_t index) {
     }
     
     // Disconnect previous active player
-    if (activePlayer && isConnected) {
+    if (activePlayer) {
         disconnectActivePlayer();
     }
     
@@ -340,23 +340,14 @@ void MediaPool::setActivePlayer(size_t index) {
     currentIndex = index;  // Keep currentIndex in sync with activePlayer
     ofLogNotice("ofxMediaPool") << "Set active player to index " << index << ", currentIndex now=" << currentIndex;
     
-    // Connect to outputs when active player changes
-    if (soundOutput && visualOutput) {
-        ofLogNotice("ofxMediaPool") << "Connecting new active player to outputs";
-        connectActivePlayer(*soundOutput, *visualOutput);
-    }
+    
+    // Note: Output connections are now managed externally by ofApp
 }
 
 MediaPlayer* MediaPool::getActivePlayer() {
     return activePlayer;
 }
 
-void MediaPool::setOutputs(ofxSoundOutput& soundOut, ofxVisualOutput& visualOut) {
-    soundOutput = &soundOut;
-    visualOutput = &visualOut;
-    isConnected = false; // Not connected yet, will connect when player becomes active
-    ofLogNotice("ofxMediaPool") << "Output references set - ready to connect when player becomes active";
-}
 
 void MediaPool::connectActivePlayer(ofxSoundOutput& soundOut, ofxVisualOutput& visualOut) {
     if (!activePlayer) {
@@ -364,10 +355,6 @@ void MediaPool::connectActivePlayer(ofxSoundOutput& soundOut, ofxVisualOutput& v
         return;
     }
     
-    if (isConnected) {
-        ofLogNotice("ofxMediaPool") << "Player already connected, skipping";
-        return;
-    }
     
     // Debug: Log connection details
     ofLogNotice("ofxMediaPool") << "Connecting active player to sound output: " << soundOut.getName();
@@ -383,27 +370,31 @@ void MediaPool::connectActivePlayer(ofxSoundOutput& soundOut, ofxVisualOutput& v
         return;
     }
     
-    visualOut.connectTo(activePlayer->getVideoPlayer());
-    isConnected = true;
-    
-    // Store references for reconnection
-    soundOutput = &soundOut;
-    visualOutput = &visualOut;
+    // Only connect video output if the player has video loaded
+    if (activePlayer->isVideoLoaded()) {
+        visualOut.connectTo(activePlayer->getVideoPlayer());
+    }
     
     ofLogNotice("ofxMediaPool") << "Connected active player to outputs - audio routing: MediaPlayer -> soundOutput";
 }
 
 void MediaPool::disconnectActivePlayer() {
-    if (!activePlayer || !isConnected) {
+    if (!activePlayer) {
         return;
     }
     
     // Disconnect audio and video outputs
     activePlayer->getAudioPlayer().disconnect();
     // Note: visualOutput.disconnect() is called from the sequencer
-    isConnected = false;
     
     ofLogNotice("ofxMediaPool") << "Disconnected active player from outputs";
+}
+
+void MediaPool::initializeFirstActivePlayer() {
+    if (!players.empty() && !activePlayer) {
+        setActivePlayer(0);
+        ofLogNotice("ofxMediaPool") << "Initialized first player as active (index 0)";
+    }
 }
 
 //--------------------------------------------------------------
@@ -757,5 +748,50 @@ void MediaPool::onManualPreviewEnd() {
                 currentMode = PlaybackMode::IDLE;
             }
             break;
+    }
+}
+
+
+//--------------------------------------------------------------
+// Transport listener system for Clock play/stop events
+void MediaPool::addTransportListener(TransportCallback listener) {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    transportListener = listener;
+    ofLogNotice("MediaPool") << "Transport listener added";
+}
+
+void MediaPool::removeTransportListener() {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    transportListener = nullptr;
+    ofLogNotice("MediaPool") << "Transport listener removed";
+}
+
+void MediaPool::onTransportChanged(bool isPlaying) {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    
+    if (isPlaying != lastTransportState) {
+        lastTransportState = isPlaying;
+        
+        if (!isPlaying) {
+            // Transport stopped - transition to IDLE if in SEQUENCER_ACTIVE mode
+            if (currentMode == PlaybackMode::SEQUENCER_ACTIVE) {
+                currentMode = PlaybackMode::IDLE;
+                ofLogNotice("MediaPool") << "Transport stopped - transitioning to IDLE mode";
+                
+                // Stop any active player that was playing under sequencer control
+                if (activePlayer && activePlayer->isPlaying()) {
+                    activePlayer->stop();
+                    ofLogNotice("MediaPool") << "Stopped active player due to transport stop";
+                }
+            }
+        } else {
+            // Transport started - log the state change
+            ofLogNotice("MediaPool") << "Transport started - current mode: " << (int)currentMode;
+        }
+        
+        // Notify any registered transport listener
+        if (transportListener) {
+            transportListener(isPlaying);
+        }
     }
 }
