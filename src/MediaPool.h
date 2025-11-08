@@ -2,10 +2,13 @@
 
 #include "ofxSoundObjects.h"
 #include "ofxVisualObjects.h"
+#include "Module.h"
 #include <vector>
 #include <memory>
 #include <string>
 #include <mutex>
+#include <atomic>
+#include <queue>
 
 // Forward declarations to avoid circular dependency
 class MediaPlayer;
@@ -32,11 +35,21 @@ struct StepTriggerParams {
     float speed;
     float volume;
     float duration;
+};
+
+// Lock-free event queue data structure (for audio thread -> GUI thread communication)
+struct TriggerEventData {
+    int step;
+    int mediaIndex;
+    float position;
+    float speed;
+    float volume;
+    float stepLength;
     bool audioEnabled;
     bool videoEnabled;
 };
 
-class MediaPool {
+class MediaPool : public Module {
 public:
     // Constructor with optional directory
     MediaPool(const std::string& dataDir = "data");
@@ -82,13 +95,31 @@ public:
     // Setup method
     void setup(Clock* clockRef);
     
+    // Subscribe to TrackerSequencer trigger events (modular connection)
+    void subscribeToTrackerSequencer(class TrackerSequencer* sequencer);
+    
     // Step event handling - receives media parameters directly
+    // Audio and video are always enabled if available
     void onStepTrigger(int step, int mediaIndex, float position, 
-                      float speed, float volume, float stepLength, 
+                      float speed, float volume, float stepLength);
+    
+    // Overloaded version with audio/video flags (for lock-free queue)
+    void onStepTrigger(int step, int mediaIndex, float position, 
+                      float speed, float volume, float stepLength,
                       bool audioEnabled, bool videoEnabled);
     
     // Overloaded version using struct for cleaner interface
     void onStepTrigger(const StepTriggerParams& params);
+    
+    // Process lock-free event queue (called from update in GUI thread)
+    void processEventQueue();
+    
+    // Module interface implementation
+    std::string getName() const override;
+    ModuleType getType() const override;
+    std::vector<ParameterDescriptor> getParameters() override;
+    void onTrigger(TriggerEvent& event) override;
+    void setParameter(const std::string& paramName, float value, bool notify = true) override;
     
     // Manual media playback (for GUI preview)
     bool playMediaManual(size_t index, float position = 0.0f);
@@ -105,7 +136,7 @@ public:
     void onManualPreviewEnd();
     
     // Update method for end-of-media detection
-    void update();
+    void update() override;
     
     // Transport listener system for Clock play/stop events
     typedef std::function<void(bool isPlaying)> TransportCallback;
@@ -118,6 +149,7 @@ public:
     MediaPlayer* getActivePlayer();
     void connectActivePlayer(ofxSoundOutput& soundOut, ofxVisualOutput& visualOut);
     void disconnectActivePlayer();
+    bool isPlayerConnected() const { return playerConnected; }
     void stopAllMedia();
     
     // Initialize first active player after setup is complete
@@ -147,16 +179,23 @@ private:
     // Thread safety
     mutable std::mutex stateMutex;
     
-    // Playback state machine
-    PlaybackMode currentMode;
+    // Lock-free event queue for audio thread -> GUI thread communication
+    std::queue<TriggerEventData> eventQueue;
+    
+    // Playback state machine (atomic for lock-free reads)
+    std::atomic<PlaybackMode> currentMode;
     PreviewMode currentPreviewMode;
     
     // Connection state
     MediaPlayer* activePlayer;
+    bool playerConnected;  // Track if player is already connected to avoid reconnecting every frame
     
     // Transport listener system
     TransportCallback transportListener;
     bool lastTransportState;
+    
+    // Parameter change callback (inherited from Module base class)
+    // Note: MediaPool inherits parameterChangeCallback from Module
     
     // Helper methods
     std::string getBaseName(const std::string& filename);

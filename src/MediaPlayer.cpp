@@ -19,7 +19,8 @@ void MediaPlayer::setup() {
     videoPlayer.setName("Video Player");
     
     // Setup synchronized parameters
-    position.set("Position", 0.0f, 0.0f, 1.0f);
+    position.set("Position", 0.0f, 0.0f, 1.0f);  // Current playhead position (updates during playback)
+    startPosition.set("Start Position", 0.0f, 0.0f, 1.0f);  // Start position for playback (synced with tracker)
     speed.set("Speed", 1.0f, -10.0f, 10.0f);  // Support negative speeds for backward playback
     loop.set("Loop", true);
     
@@ -38,6 +39,7 @@ void MediaPlayer::setup() {
     
     // Add all parameters to the parameter group
     parameters.add(position);
+    parameters.add(startPosition);
     parameters.add(speed);
     parameters.add(loop);
     parameters.add(audioEnabled);
@@ -112,70 +114,90 @@ bool MediaPlayer::loadVideo(const std::string& videoPath) {
 }
 
 void MediaPlayer::play() {
-    // Get the target position before starting any playback
-    float targetPosition = position.get();
-    ofLogNotice("ofxMediaPlayer") << "MediaPlayer::play() called with target position: " << targetPosition << ", loop: " << loop.get();
+    // Get the start position (use startPosition - it's set by MediaPool based on trigger event)
+    // Position memory is now handled at MediaPool level when retriggering same media
+    // 0.0 is a valid position (start of media), not a sentinel for position memory
+    float targetPosition = startPosition.get();
+    float currentSpeed = speed.get();
+    bool currentLoop = loop.get();
+    
+    // Ensure loop and speed state are set on underlying players before playing
+    // This ensures backward looping works correctly via the addons' internal handling
+    if (isAudioLoaded()) {
+        audioPlayer.setLoop(currentLoop);
+        audioPlayer.setSpeed(currentSpeed);
+    }
+    
+    if (isVideoLoaded()) {
+        videoPlayer.getVideoFile().setLoopState(currentLoop ? OF_LOOP_NORMAL : OF_LOOP_NONE);
+        videoPlayer.getVideoFile().setSpeed(currentSpeed);
+    }
     
     // Sync audio position before starting playback
     if (audioEnabled.get() && isAudioLoaded()) {
         audioEnabled.set(true);
         audioPlayer.setPosition(targetPosition);
-        ofLogNotice("ofxMediaPlayer") << "Audio position set to: " << targetPosition;
         
         // Always call play() - it will handle paused state internally
         audioPlayer.play();
-        ofLogNotice("ofxMediaPlayer") << "Audio play() called, actual position now: " << audioPlayer.getPosition();
         
         // If the position was reset by play(), set it again
         if (audioPlayer.getPosition() < targetPosition - 0.01f) {
-            ofLogNotice("ofxMediaPlayer") << "Audio position was reset, setting again to: " << targetPosition;
             audioPlayer.setPosition(targetPosition);
         }
-        
-        ofLogNotice("ofxMediaPlayer") << "Playing audio - enabled: " << audioEnabled.get() 
-                                      << ", loaded: " << isAudioLoaded() 
-                                      << ", volume: " << volume.get()
-                                      << ", position: " << targetPosition;
     }
     
     // Sync video position before starting playback
     if (videoEnabled.get() && isVideoLoaded()) {
         videoEnabled.set(true);
-        videoPlayer.getVideoFile().setPosition(targetPosition);
-        ofLogNotice("ofxMediaPlayer") << "Video position set to: " << targetPosition;
         
-        // Force decode HAP videos to ensure immediate frame availability
-        videoPlayer.getVideoFile().update();
+        // PERFORMANCE CRITICAL: Check if position is already correct before expensive setPosition() call
+        // HAP video seeking takes 200ms+, so we should avoid it if possible
+        float currentVideoPos = videoPlayer.getVideoFile().getPosition();
+        bool positionNeedsUpdate = std::abs(currentVideoPos - targetPosition) > 0.01f;
         
-        // Always call play() - it will handle paused state internally
-        videoPlayer.play();
-        ofLogNotice("ofxMediaPlayer") << "Video play() called, actual position now: " << videoPlayer.getVideoFile().getPosition();
-        
-        // If the position was reset by play(), set it again
-        if (videoPlayer.getVideoFile().getPosition() < targetPosition - 0.01f) {
-            ofLogNotice("ofxMediaPlayer") << "Video position was reset, setting again to: " << targetPosition;
+        if (positionNeedsUpdate) {
             videoPlayer.getVideoFile().setPosition(targetPosition);
+            // PERFORMANCE CRITICAL: Only call update() after position change - it's needed for HAP seeking
+            // Removed forceTextureUpdate() - it runs 5 update() calls in a loop (800ms+)
+            // The normal update loop in ofApp will handle texture updates during playback
+            videoPlayer.getVideoFile().update();
         }
         
-        ofLogNotice("ofxMediaPlayer") << "Playing video - enabled: " << videoEnabled.get() 
-                                      << ", loaded: " << isVideoLoaded()
-                                      << ", position: " << targetPosition;
+        // Always call play() - it will handle paused state internally
+        // Note: ofxVideoFile::play() does NOT reset position, so we don't need position correction
+        videoPlayer.play();
         
-        // Force texture update after play to ensure HAP videos are properly decoded
-        videoPlayer.getVideoFile().forceTextureUpdate();
+        // REMOVED: Position correction check - ofxVideoFile::play() doesn't reset position
+        // This was causing a second expensive setPosition() call (another 200ms+)
+        // The position is already set correctly before play(), so no correction needed
         
-        ofLogNotice("ofxMediaPlayer") << "Video play called - isPlaying: " << videoPlayer.isPlaying()
-                                      << ", video file playing: " << videoPlayer.getVideoFile().isPlaying()
-                                      << ", video file position: " << videoPlayer.getVideoFile().getPosition();
-    } else {
-        ofLogNotice("ofxMediaPlayer") << "Video not played - enabled: " << videoEnabled.get() 
-                                      << ", loaded: " << isVideoLoaded();
+        // Update position parameter for UI display (after actual position is set)
+        // This ensures the UI shows the correct position without triggering expensive setPosition()
+        // via the listener (since we already set it above)
+        if (std::abs(position.get() - targetPosition) > 0.001f) {
+            // Temporarily disable listener to avoid triggering expensive setPosition() again
+            // We can't easily disable the listener, so we'll just update it and let the update() loop
+            // sync it during playback. The position is already set correctly above.
+            position.set(targetPosition);
+        }
     }
 }
 
 void MediaPlayer::stop() {
     audioPlayer.stop();
     videoPlayer.stop();
+    
+    // When stopped, immediately sync position with startPosition for display/syncing
+    // This ensures the playhead shows the start position when paused (for sync with tracker)
+    float newPos = startPosition.get();
+    float oldPos = position.get();
+    if (std::abs(oldPos - newPos) > 0.001f) {
+        position.set(newPos);
+        // Note: onPositionChanged will be triggered, but we don't have direct access to MediaPool callback here
+        // The sync will happen via MediaPool's setParameter when it detects the change
+    }
+    
     if (audioEnabled.get()) {
         audioEnabled.set(false);
     }
@@ -251,38 +273,71 @@ float MediaPlayer::getDuration() const {
 }
 
 void MediaPlayer::update() {
-    // Update video player
-    videoPlayer.update();
-    
-    // Video player state logging removed to reduce console spam
+    // PERFORMANCE CRITICAL: Only update video player when actually playing
+    // videoPlayer.update() can be expensive (texture updates, buffer operations)
+    // Don't call it when stopped/paused - this causes lag even with empty patterns
+    if (isPlaying() && isVideoLoaded() && videoEnabled.get()) {
+        videoPlayer.update();  // Only update when actually playing
+    }
     
     // Sync position parameter with actual playback position
-    // This makes position the single source of truth
     if (isPlaying()) {
         float currentPosition = 0.0f;
+        float speedVal = speed.get();
+        bool loopVal = loop.get();
         
         // Get position from audio player if available and playing
         if (isAudioLoaded() && audioPlayer.isPlaying()) {
             currentPosition = audioPlayer.getPosition();
+            
+            // Workaround for addon bug: ofxSingleSoundPlayer uses unsigned size_t for position,
+            // which causes unsigned underflow when playing backward with negative speed.
+            // When position wraps from 0 backwards, it becomes a huge unsigned number, which
+            // after modulo can result in incorrect position values, causing audio glitches.
+            // Fix: Detect and correct backward looping wrap issues
+            if (loopVal && speedVal < 0.0f) {
+                float lastPosition = position.get();
+                
+                // If position is > 1.0 (invalid), it's due to unsigned wrap - wrap it back
+                if (currentPosition > 1.0f) {
+                    currentPosition = fmod(currentPosition, 1.0f);
+                    audioPlayer.setPosition(currentPosition);
+                }
+                // If position jumped from near 0 to near 1 (backward wrap detected incorrectly)
+                else if (currentPosition > 0.9f && lastPosition < 0.1f && lastPosition > 0.0f) {
+                    // Position wrapped incorrectly - set it to near the end for smooth backward playback
+                    currentPosition = 0.99f;
+                    audioPlayer.setPosition(currentPosition);
+                }
+                // If position is very close to 0 and we're going backward, wrap to near end
+                else if (currentPosition <= 0.01f && lastPosition > 0.01f) {
+                    currentPosition = 0.99f;
+                    audioPlayer.setPosition(currentPosition);
+                }
+            }
         }
         // Otherwise get position from video player if available and playing
+        // ofxVideoFile handles backward looping internally in updatePlayback()
         else if (isVideoLoaded() && videoPlayer.isPlaying()) {
             currentPosition = videoPlayer.getVideoFile().getPosition();
         }
         
-        // Update the position parameter to reflect actual playback
+        // Update the position parameter to reflect actual playhead position during playback
         // Only update if the position has actually changed to avoid unnecessary updates
+        // NOTE: This updates the playhead position, not startPosition
         if (abs(currentPosition - position.get()) > 0.001f) {
             position.set(currentPosition);
         }
-        
     }
+    // Note: When stopped, position is synced immediately in stop() method
+    // No need to sync in update loop - this avoids delay
     
     // Check for scheduled stop (gating system)
     if (scheduledStopActive && ofGetElapsedTimef() >= stopTime) {
         stop();
         scheduledStopActive = false;
-        ofLogNotice("ofxMediaPlayer") << "Gated stop triggered after " << gateDuration << " seconds";
+        // Changed to verbose to avoid performance issues during playback
+        ofLogVerbose("ofxMediaPlayer") << "Gated stop triggered after " << gateDuration << " seconds";
     }
 }
 
@@ -300,13 +355,32 @@ void MediaPlayer::onVideoEnabledChanged(bool& enabled) {
 }
 
 void MediaPlayer::onPositionChanged(float& pos) {
+    // CRITICAL FIX: During playback, position parameter is updated by update() to reflect
+    // the actual playhead position. We should NOT seek during playback - only when paused/stopped.
+    // Seeking during playback causes video to freeze at a fixed position.
+    if (isPlaying()) {
+        // Position is being updated by playback - don't seek, just update lastPosition for tracking
+        lastPosition = pos;
+        return;
+    }
+    
+    // PERFORMANCE CRITICAL: Only seek when NOT playing (paused/stopped state)
+    // This is for seeking while paused, not for playback position updates
     if (isAudioLoaded()) {
-        // Use the underlying sound player's setPosition method
-        audioPlayer.setPosition(pos);
+        // Only set audio position if it's significantly different (audio seeking is fast, but still avoid unnecessary calls)
+        float currentAudioPos = audioPlayer.getPosition();
+        if (std::abs(currentAudioPos - pos) > 0.001f) {
+            audioPlayer.setPosition(pos);
+        }
     }
     
     if (isVideoLoaded()) {
-        videoPlayer.getVideoFile().setPosition(pos);
+        // CRITICAL: Only set video position if it's significantly different
+        // HAP video seeking takes 200ms+, so we MUST avoid redundant calls
+        float currentVideoPos = videoPlayer.getVideoFile().getPosition();
+        if (std::abs(currentVideoPos - pos) > 0.01f) {
+            videoPlayer.getVideoFile().setPosition(pos);
+        }
     }
     
     lastPosition = pos;

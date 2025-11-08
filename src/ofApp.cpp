@@ -5,6 +5,8 @@
 //
 
 #include "ofApp.h"
+#include <filesystem>
+#include <future>
 
 //--------------------------------------------------------------
 ofApp::~ofApp() noexcept {
@@ -31,8 +33,17 @@ void ofApp::setup() {
     } else {
         // Fallback to default paths
         std::vector<std::string> possiblePaths;
-        possiblePaths.push_back(ofFilePath::getCurrentWorkingDirectory() + "/bin/data");
-        possiblePaths.push_back(ofFilePath::getCurrentWorkingDirectory() + "/data");
+        try {
+            std::string cwd = ofFilePath::getCurrentWorkingDirectory();
+            possiblePaths.push_back(cwd + "/bin/data");
+            possiblePaths.push_back(cwd + "/data");
+        } catch (const std::filesystem::filesystem_error& e) {
+            ofLogWarning("ofApp") << "Filesystem error getting current directory: " << e.what();
+        } catch (const std::exception& e) {
+            ofLogWarning("ofApp") << "Exception getting current directory: " << e.what();
+        } catch (...) {
+            ofLogWarning("ofApp") << "Unknown exception getting current directory";
+        }
         possiblePaths.push_back("/Users/jaufre/works/of_v0.12.1_osx_release/addons/ofxMediaObjects/example-audiovisualSequencer/bin/data");
         
         for (const auto& path : possiblePaths) {
@@ -63,6 +74,11 @@ void ofApp::setup() {
     
     
     // Register step event listener
+    // Modular connection: MediaPool subscribes to TrackerSequencer trigger events
+    // This replaces the old routing logic in ofApp::onTrackerStepEvent()
+    mediaPool.subscribeToTrackerSequencer(&trackerSequencer);
+    
+    // Legacy: Keep old event listener for backward compatibility (can be removed later)
     trackerSequencer.addStepEventListener([this](int step, float duration, const TrackerSequencer::PatternCell& cell) {
         onTrackerStepEvent(step, duration, cell);
     });
@@ -81,18 +97,57 @@ void ofApp::setup() {
         return mediaPool.getNumPlayers();
     });
     
+    // Setup parameter synchronization between TrackerSequencer and MediaPool
+    // Connect TrackerSequencer currentStepPosition to MediaPool position (bidirectional)
+    // Sync only when clock is paused (for editing)
+    parameterSync.connect(
+        &trackerSequencer,
+        "currentStepPosition",
+        &mediaPool,
+        "position",
+        [this]() {
+            // Only sync when paused (for editing)
+            return !clock.isPlaying();
+        }
+    );
+    
+    // Reverse connection (MediaPool -> TrackerSequencer)
+    parameterSync.connect(
+        &mediaPool,
+        "position",
+        &trackerSequencer,
+        "currentStepPosition",
+        [this]() {
+            // Only sync when paused AND when MediaPool is not in manual preview
+            // This allows manual preview to work independently
+            return !clock.isPlaying() && !mediaPool.isManualPreview();
+        }
+    );
+    
+    // Set up parameter change callbacks for both modules
+    trackerSequencer.setParameterChangeCallback([this](const std::string& paramName, float value) {
+        if (paramName == "currentStepPosition") {
+            parameterSync.notifyParameterChange(&trackerSequencer, paramName, value);
+        }
+    });
+    
+    mediaPool.setParameterChangeCallback([this](const std::string& paramName, float value) {
+        if (paramName == "position") {
+            parameterSync.notifyParameterChange(&mediaPool, paramName, value);
+        }
+    });
+    
     // TrackerSequencer now uses Clock's beat events for sample-accurate timing
-    // Add step event listener for visual feedback
+    // Add step event listener for visual feedback (legacy - can be removed later)
     trackerSequencer.addStepEventListener([this](int step, float duration, const TrackerSequencer::PatternCell& cell) {
         lastTriggeredStep = step;
     });
     
     
-    // Setup sound objects
-    setupSoundObjects();
-    
     // Setup visual objects
     setupVisualObjects();
+    
+    // Note: Audio setup is now handled by ViewManager
     
     // Connect Clock transport events to MediaPool for proper state management
     clock.addTransportListener([this](bool isPlaying) {
@@ -104,24 +159,57 @@ void ofApp::setup() {
     // Setup GUI
     setupGUI();
     
+    // Setup MenuBar with callbacks
+    menuBar.setup(
+        [this]() { trackerSequencer.saveState("tracker_sequencer_state.json"); },
+        [this]() { trackerSequencer.loadState("tracker_sequencer_state.json"); },
+        [this]() { saveLayout(); },
+        [this]() { loadLayout(); }
+    );
+    
+    // Setup ViewManager with panel objects and sound stream
+    viewManager.setup(
+        &clock,
+        &clockGUI,
+        &soundOutput,
+        &trackerSequencer,
+        &trackerSequencerGUI,
+        &mediaPool,
+        &mediaPoolGUI,
+        &soundStream
+    );
+    
+    // Set audio listener and setup initial audio stream
+    viewManager.setAudioListener(this);
+    viewManager.setupAudioStream(this);
+    
+    // Setup InputRouter with system references
+    inputRouter.setup(
+        &clock,
+        &trackerSequencer,
+        &viewManager,
+        &mediaPool,
+        &mediaPoolGUI
+    );
+    
+    // Setup InputRouter state callbacks
+    inputRouter.setPlayState(&isPlaying);
+    inputRouter.setCurrentStep(&currentStep);
+    inputRouter.setLastTriggeredStep(&lastTriggeredStep);
+    inputRouter.setShowGUI(&showGUI);
+    
     // Try to load saved state, otherwise use default pattern
     if (!trackerSequencer.loadState("tracker_sequencer_state.json")) {
         // Initialize pattern with some default steps if no saved state
         if (mediaPool.getNumPlayers() > 0) {
             TrackerSequencer::PatternCell cell0(0, 0.0f, 1.0f, 1.0f, 1.0f);
-            cell0.audioEnabled = true;
-            cell0.videoEnabled = true;
             trackerSequencer.setCell(0, cell0);
             
             if (mediaPool.getNumPlayers() > 1) {
                 TrackerSequencer::PatternCell cell4(1, 0.0f, 1.2f, 1.0f, 1.0f);
-                cell4.audioEnabled = true;
-                cell4.videoEnabled = true;
                 trackerSequencer.setCell(4, cell4);
                 
                 TrackerSequencer::PatternCell cell8(0, 0.5f, 1.0f, 1.0f, 1.0f);
-                cell8.audioEnabled = true;
-                cell8.videoEnabled = true;
                 trackerSequencer.setCell(8, cell8);
             }
             
@@ -143,28 +231,36 @@ void ofApp::setup() {
 
 //--------------------------------------------------------------
 void ofApp::update() {
-    // Update all media players (this is crucial for video processing)
-    for (size_t i = 0; i < mediaPool.getNumPlayers(); i++) {
-        auto player = mediaPool.getMediaPlayer(i);
-        if (player) {
-            player->update();
+    // PERFORMANCE: Only update the active player, not all 117 players
+    // This is critical for performance - updating all players every frame is extremely expensive
+    auto currentPlayer = mediaPool.getActivePlayer();
+    if (currentPlayer) {
+        // Only update the active player (audio and video processing)
+        // PERFORMANCE CRITICAL: Only update when actually playing to avoid expensive operations
+        if (currentPlayer->isPlaying()) {
+            currentPlayer->update();
+            
+            // Process visual pipeline - simplified for direct texture drawing
+            // Only update video player if video is enabled and playing
+            if (currentPlayer->videoEnabled.get() && currentPlayer->isVideoLoaded()) {
+                auto& videoPlayer = currentPlayer->getVideoPlayer();
+                videoPlayer.update();  // Just update, no FBO processing needed
+            }
         }
     }
     
     // Update MediaPool for end-of-media detection
     mediaPool.update();
     
-    // Ensure active player is connected to outputs (modular connection management)
-    // Only connect if there's an active player to avoid warning spam
-    if (mediaPool.getActivePlayer()) {
-        mediaPool.connectActivePlayer(soundOutput, visualOutput);
-    }
+    // Update step active state (clears manually triggered steps when duration expires)
+    trackerSequencer.updateStepActiveState();
     
-    // Process visual pipeline - simplified for direct texture drawing
-    auto currentPlayer = mediaPool.getActivePlayer();
-    if (currentPlayer && currentPlayer->videoEnabled.get()) {
-        auto& videoPlayer = currentPlayer->getVideoPlayer();
-        videoPlayer.update();  // Just update, no FBO processing needed
+    // Connect active player (internal flag check prevents redundant connections)
+    // PERFORMANCE: Only call connectActivePlayer when player is actually playing or just started
+    // The playerConnected flag prevents redundant connections, but we avoid calling it every frame
+    // when nothing is playing to reduce overhead
+    if (currentPlayer && (currentPlayer->isPlaying() || !mediaPool.isPlayerConnected())) {
+        mediaPool.connectActivePlayer(soundOutput, visualOutput);
     }
     
     // REMOVED: BPM update logic moved to GUI slider only
@@ -173,12 +269,46 @@ void ofApp::update() {
     // Update pattern display
     // Pattern display is now handled by TrackerSequencer
     
-    // Periodic auto-save every 30 seconds
+    // SOLUTION 2: Pre-sync tracker edit state from previous frame BEFORE draw
+    // This eliminates one-frame delay when keyboard input happens after GUI draw
+    // The GUI sync happens during draw, but keyboard events can arrive before next draw
+    // By ensuring editStep/editColumn are valid here, keyboard handlers get current state
+    if (viewManager.getCurrentPanelIndex() == 2) {  // Tracker panel
+        // If editStep/editColumn aren't set yet, default to first data cell
+        // This ensures keyboard input works immediately when entering tracker panel
+        if (trackerSequencer.getEditStep() < 0 || trackerSequencer.getEditColumn() < 0) {
+            if (trackerSequencer.getNumSteps() > 0) {
+                // Default to first data cell (step 0, column 1) if not set
+                // This makes keyboard input work immediately when panel is active
+                trackerSequencer.setEditCell(0, 1);
+            }
+        }
+    }
+    
+    // PERFORMANCE: Rate-limit parameter synchronization to 15Hz instead of 60Hz
+    // Most parameters don't change every frame, so we can reduce CPU overhead by checking less frequently
+    static int syncFrameCounter = 0;
+    if (++syncFrameCounter >= 4) {  // Sync every 4 frames (15Hz instead of 60Hz)
+        parameterSync.update();
+        syncFrameCounter = 0;
+    }
+    
+    // PERFORMANCE: Periodic auto-save every 30 seconds (async to avoid frame drops)
+    // File I/O in update loop can cause 10-50ms stuttering every 30 seconds
     static float lastAutoSave = 0.0f;
-    if (ofGetElapsedTimef() - lastAutoSave > 30.0f) {
-        trackerSequencer.saveState("tracker_sequencer_state.json");
-        lastAutoSave = ofGetElapsedTimef();
-        ofLogVerbose("ofApp") << "Periodic auto-save completed";
+    static bool saveInProgress = false;
+    float elapsed = ofGetElapsedTimef();
+    
+    if (elapsed - lastAutoSave > 30.0f && !saveInProgress) {
+        saveInProgress = true;
+        lastAutoSave = elapsed;  // Update immediately to prevent multiple triggers
+        // Async save in background thread to avoid blocking main thread
+        auto future = std::async(std::launch::async, [this]() {
+            trackerSequencer.saveState("tracker_sequencer_state.json");
+            saveInProgress = false;  // Reset flag after save completes
+            ofLogVerbose("ofApp") << "Periodic auto-save completed";
+        });
+        (void)future;  // Explicitly ignore return value to silence warning
     }
 }
 
@@ -235,80 +365,27 @@ void ofApp::audioOut(ofSoundBuffer& buffer) {
     // Audio processing happens in sound objects
     soundOutput.audioOut(buffer);
     
-    // Apply global volume AFTER sound processing
-    buffer *= globalVolume;
+    // Apply global volume AFTER sound processing (from ViewManager)
+    buffer *= viewManager.getGlobalVolume();
     
     // Simple audio level calculation for visualization
     float maxLevel = 0.0f;
     for (size_t i = 0; i < buffer.getNumFrames() * buffer.getNumChannels(); i++) {
         maxLevel = std::max(maxLevel, std::abs(buffer[i]));
     }
-    currentAudioLevel = maxLevel;
+    viewManager.setCurrentAudioLevel(maxLevel);
 }
 
 //--------------------------------------------------------------
-void ofApp::keyPressed(int key) {
-    // Handle Alt+Spacebar for triggering current step only (check this first)
-    if (key == ' ' && ofGetKeyPressed(OF_KEY_ALT)) {
-        // Trigger current step manually without starting sequencer (force retrigger)
-        ofLogNotice("ofApp") << "Manual trigger of step " << (currentStep + 1);
-        // Step triggering is now handled by TrackerSequencer event system
-        return; // Exit early to avoid regular spacebar handling
+void ofApp::keyPressed(ofKeyEventArgs& keyEvent) {
+    // Route all keyboard input through InputRouter
+    // If InputRouter handled the key, return early to prevent ImGui from processing it
+    if (inputRouter.handleKeyPress(keyEvent)) {
+        return;
     }
     
-    switch (key) {
-        case ' ':
-            if (isPlaying) {
-                clock.stop();
-                isPlaying = false;
-                ofLogNotice("ofApp") << "Paused playback";
-            } else {
-                // Clock transport listeners will handle TrackerSequencer and MediaPool automatically
-                clock.start();
-                isPlaying = true;
-                
-                ofLogNotice("ofApp") << "Started playback from beginning (step 1)";
-            }
-            break;
-            
-        case 'r':
-            clock.reset();
-            trackerSequencer.reset();
-            currentStep = 0;
-            lastTriggeredStep = 0;
-            
-            ofLogNotice("ofApp") << "Reset sequencer";
-            break;
-            
-        case 'g':
-            showGUI = !showGUI;
-            break;
-            
-        case 'n':
-            // Next media player
-            mediaPool.nextPlayer();
-            ofLogNotice("ofApp") << "Switched to next player";
-            break;
-            
-        case 'm':
-            // Previous media player
-            mediaPool.previousPlayer();
-            ofLogNotice("ofApp") << "Switched to previous player";
-            break;
-            
-        // Global save state (capital S to distinguish from speed)
-        case 'S':
-            trackerSequencer.saveState("pattern.json");
-            break;
-            
-        // All pattern editing is delegated to TrackerSequencer
-        default:
-            // Let TrackerSequencer handle all pattern editing and navigation
-            if (trackerSequencer.handleKeyPress(key)) {
-                currentStep = trackerSequencer.getCurrentStep();
-            }
-            break;
-    }
+    // If InputRouter didn't handle it, let ImGui process it
+    // This allows normal text input and other ImGui interactions
 }
 
 //--------------------------------------------------------------
@@ -335,22 +412,19 @@ void ofApp::windowResized(int w, int h) {
 
 //--------------------------------------------------------------
 void ofApp::onTrackerStepEvent(int step, float duration, const TrackerSequencer::PatternCell& cell) {
-    ofLogNotice("ofApp") << "TrackerSequencer step event: step=" << step << ", duration=" << duration << "s, stepLength=" << cell.stepLength;
+    // LEGACY: This function is kept for backward compatibility but is no longer needed
+    // MediaPool now subscribes directly to TrackerSequencer trigger events via subscribeToTrackerSequencer()
+    // This removes the tight coupling between ofApp, TrackerSequencer, and MediaPool
     
-    // Synchronize ofApp::currentStep with TrackerSequencer::currentStep
+    // Changed to verbose logging to avoid performance issues during playback
+    ofLogVerbose("ofApp") << "TrackerSequencer step event: step=" << step << ", duration=" << duration << "s, length=" << cell.length;
+    
+    // Synchronize ofApp::currentStep with TrackerSequencer::currentStep (for UI display)
     currentStep = step;
     
-    // Only trigger MediaPool for non-empty steps
-    // Empty steps should be silent and let previous step's duration complete naturally
-    if (cell.mediaIndex >= 0) {
-        // Extract parameters from PatternCell and pass to MediaPool
-        // Pass duration in seconds instead of stepLength in beats
-        mediaPool.onStepTrigger(step, cell.mediaIndex, cell.position, 
-                               cell.speed, cell.volume, duration, 
-                               cell.audioEnabled, cell.videoEnabled);
-    } else {
-        ofLogNotice("ofApp") << "Step " << step << " is empty (rest) - no media trigger";
-    }
+    // NOTE: MediaPool is now triggered via the modular event system
+    // The old routing logic below has been moved to MediaPool::onTrigger()
+    // This function can be removed once we're confident the new system works
 }
 
 //--------------------------------------------------------------
@@ -358,47 +432,8 @@ void ofApp::setupSoundObjects() {
     // Setup sound output
     soundOutput.setName("Sound Output");
     
-    
-    // Global volume will be applied in audioOut callback
-    
-    // Get available audio devices
-    audioDevices = soundStream.getDeviceList();
-    
-    // Find default output device
-    for (size_t i = 0; i < audioDevices.size(); i++) {
-        if (audioDevices[i].isDefaultOutput) {
-            selectedAudioDevice = i;
-            break;
-        }
-    }
-    
-    // Setup audio stream with selected device
-    setupAudioStream();
-}
-
-//--------------------------------------------------------------
-void ofApp::setupAudioStream() {
-    if (audioDevices.empty()) {
-        ofLogError("ofApp") << "No audio devices available";
-        return;
-    }
-    
-    // Close existing stream if open
-    soundStream.close();
-    
-    // Setup audio stream with selected device
-    ofSoundStreamSettings settings;
-    settings.setOutListener(this);
-    settings.sampleRate = 44100;
-    settings.numOutputChannels = 2;
-    settings.numInputChannels = 0;
-    settings.bufferSize = 512;
-    
-    if (selectedAudioDevice < audioDevices.size()) {
-        settings.setOutDevice(audioDevices[selectedAudioDevice]);
-    }
-    
-    soundStream.setup(settings);
+    // Note: Audio device management is now handled by ViewManager
+    // Global volume is applied in audioOut callback using viewManager.getGlobalVolume()
 }
 
 //--------------------------------------------------------------
@@ -426,8 +461,11 @@ void ofApp::setupGUI() {
     // Initialize ImPlot
     ImPlot::CreateContext();
     
-    // Set up ImGui with keyboard navigation
+    // Set ini filename for auto-loading on startup
     ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = "imgui.ini";
+    
+    // Set up ImGui with keyboard navigation
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
     ImGuiStyle& style = ImGui::GetStyle();
@@ -499,10 +537,33 @@ void ofApp::drawGUI() {
     try {
         gui.begin();
         
+        // Ensure ImGui keyboard navigation is enabled (for arrow key navigation)
+        ImGuiIO& io = ImGui::GetIO();
+        
+        // Disable ImGui's Tab key handling - we handle Tab ourselves for panel navigation
+        // This prevents ImGui from capturing Tab before our keyPressed handler
+        io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+        
+        // PERFORMANCE: Cache navigation state - only update ConfigFlags when state actually changes
+        // Changing ConfigFlags every frame forces ImGui to rebuild navigation tables (2-5ms overhead)
+        // Only update when the state transitions, not every frame
+        static bool lastNavState = true;
+        bool shouldEnableNav = !(viewManager.getCurrentPanelIndex() == 2 && trackerSequencer.getIsEditingCell());
+        
+        if (shouldEnableNav != lastNavState) {
+            // State changed - update ConfigFlags only now
+            if (shouldEnableNav) {
+                io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+            } else {
+                io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+            }
+            lastNavState = shouldEnableNav;
+        }
+        
         // Layout loading will be handled manually via menu buttons
         
         // Menu bar at top of main window
-        drawMenuBar();
+        menuBar.draw();
 
         ImGuiViewport* viewport = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(viewport->WorkPos);
@@ -514,78 +575,20 @@ void ofApp::drawGUI() {
                                        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                                        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
         
-        if (ImGui::Begin("DockSpace", nullptr, window_flags)) {
-            ImGui::DockSpace(ImGui::GetID("MyDockSpace"), ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
+                if (ImGui::Begin("DockSpace", nullptr, window_flags)) {
+                    ImGui::DockSpace(ImGui::GetID("MyDockSpace"), ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
 
-            // Draw 3 main panels - ImGui handles positioning
-            drawClockPanel();
-            drawAudioOutputPanel();
-            drawTrackerPanel();
-            drawMediaPoolPanel();
-        }
-        ImGui::End();
+                    // Draw all panels using ViewManager
+                    viewManager.draw();
+                }
+                ImGui::End();
 
+        // Navigation is already enabled (or will be re-enabled next frame if in edit mode)
         gui.end();
     } catch (const std::exception& e) {
         ofLogError("ofApp") << "Exception in drawGUI(): " << e.what();
     } catch (...) {
         ofLogError("ofApp") << "Unknown exception in drawGUI()";
-    }
-}
-
-//--------------------------------------------------------------
-void ofApp::drawMenuBar() {
-    if (ImGui::BeginMainMenuBar()) {
-        if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Save Pattern")) {
-                trackerSequencer.saveState("tracker_sequencer_state.json");
-            }
-            if (ImGui::MenuItem("Load Pattern")) {
-                trackerSequencer.loadState("tracker_sequencer_state.json");
-            }
-            ImGui::EndMenu();
-        }
-        
-        if (ImGui::BeginMenu("Layout")) {
-            if (ImGui::MenuItem("Save Layout as Default")) {
-                saveLayout();
-            }
-            if (ImGui::MenuItem("Load Default Layout")) {
-                loadLayout();
-            }
-            ImGui::EndMenu();
-        }
-        
-        if (ImGui::BeginMenu("Help")) {
-            if (ImGui::MenuItem("Controls")) {
-                // Show controls help in a popup or window
-                ImGui::OpenPopup("Controls Help");
-            }
-            ImGui::EndMenu();
-        }
-        
-        // Controls help popup - this needs to be called every frame
-        if (ImGui::BeginPopupModal("Controls Help", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Controls:");
-            ImGui::Text("SPACE: Play/Stop");
-            ImGui::Text("R: Reset");
-            ImGui::Text("G: Toggle GUI");
-            ImGui::Text("N: Next media");
-            ImGui::Text("M: Previous media");
-            ImGui::Text("S: Save pattern");
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Pattern Editing:");
-            ImGui::Text("Click cells to edit");
-            ImGui::Text("Drag to set values");
-            ImGui::Text("Right-click for options");
-            ImGui::Separator();
-            if (ImGui::Button("Close")) {
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::EndPopup();
-        }
-        
-        ImGui::EndMainMenuBar();
     }
 }
 
@@ -598,6 +601,7 @@ void ofApp::saveLayout() {
         
         std::string iniPath = ofToDataPath("imgui.ini", true);
         ImGui::SaveIniSettingsToDisk(iniPath.c_str());
+        ofLogNotice("ofApp") << "Layout saved to " << iniPath;
     } catch (const std::exception& e) {
         ofLogError("ofApp") << "Exception in saveLayout(): " << e.what();
     } catch (...) {
@@ -616,69 +620,15 @@ void ofApp::loadLayout() {
         
         if (ofFile::doesFileExist(iniPath)) {
             ImGui::LoadIniSettingsFromDisk(iniPath.c_str());
+            ofLogNotice("ofApp") << "Layout loaded from " << iniPath;
+        } else {
+            ofLogNotice("ofApp") << "No saved layout found at " << iniPath;
         }
     } catch (const std::exception& e) {
         ofLogError("ofApp") << "Exception in loadLayout(): " << e.what();
     } catch (...) {
         ofLogError("ofApp") << "Unknown exception in loadLayout()";
     }
-}
-
-
-//--------------------------------------------------------------
-void ofApp::drawClockPanel() {
-    if (ImGui::Begin("Clock ")) {
-        // Clock controls
-        clockGUI.draw(clock);
-    }
-    ImGui::End();
-}
-//--------------------------------------------------------------
-void ofApp::drawAudioOutputPanel() {
-    if (ImGui::Begin("Audio Output")) {
-        // Audio device selection
-        if (ImGui::Combo("Device", &selectedAudioDevice, [](void* data, int idx, const char** out_text) {
-            auto* devices = static_cast<std::vector<ofSoundDevice>*>(data);
-            if (idx >= 0 && idx < devices->size()) {
-                *out_text = (*devices)[idx].name.c_str();
-                return true;
-            }
-            return false;
-        }, &audioDevices, audioDevices.size())) {
-            audioDeviceChanged = true;
-        }
-        
-        if (audioDeviceChanged) {
-            setupAudioStream();
-            audioDeviceChanged = false;
-        }
-        
-        // Volume control
-        ImGui::SliderFloat("Volume", &globalVolume, 0.0f, 1.0f, "%.2f");
-        
-        // Audio level visualization
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.0f, 1.0f, 0.0f, 1.0f));
-        ImGui::ProgressBar(currentAudioLevel, ImVec2(-1, 0), "");
-        ImGui::PopStyleColor();
-        ImGui::Text("Level: %.3f", currentAudioLevel);
-    }
-    ImGui::End();
-}
-
-//--------------------------------------------------------------
-void ofApp::drawTrackerPanel() {
-    if (ImGui::Begin("Tracker Sequencer")) {
-        trackerSequencer.drawTrackerInterface();
-    }
-    ImGui::End();
-}
-
-//--------------------------------------------------------------
-void ofApp::drawMediaPoolPanel() {
-    if (ImGui::Begin("Media Pool")) {
-        mediaPoolGUI.draw();  // Delegate to separate GUI
-    }
-    ImGui::End();
 }
 
 
@@ -703,11 +653,5 @@ void ofApp::saveMediaDirectory(const std::string& path) {
     settingsFile << settings.dump(4);
     ofLogNotice("ofApp") << "Saved media directory: " << path;
 }
-
-
-
-
-
-// Old methods removed - now handled by ofxMediaSequencer
 
 

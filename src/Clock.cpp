@@ -154,7 +154,7 @@ void Clock::audioOut(ofSoundBuffer& buffer) {
     float bufferSampleRate = buffer.getSampleRate();
     if (abs(bufferSampleRate - sampleRate) > 1.0f) {
         sampleRate = bufferSampleRate;
-        ofLogNotice("Clock") << "Sample rate auto-detected: " << sampleRate;
+        // NO LOGGING IN AUDIO THREAD - removed ofLogNotice
         // Recalculate timing when sample rate changes
         float current = currentBpm.load();
         float beatsPerSecond = current / 60.0f;

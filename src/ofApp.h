@@ -13,11 +13,16 @@
 #include "MediaPool.h"
 #include "MediaPoolGUI.h"
 #include "TrackerSequencer.h"
+#include "TrackerSequencerGUI.h"
 #include "Clock.h"
 #include "ClockGUI.h"
 #include "ofxImGui.h"
 #include "imgui_internal.h" // For DockBuilder API
 #include "implot.h"
+#include "gui/MenuBar.h"
+#include "gui/ViewManager.h"
+#include "input/InputRouter.h"
+#include "ParameterSync.h"
 
 class ofApp : public ofBaseApp {
 public:
@@ -27,7 +32,7 @@ public:
     void draw();
     void exit();
     
-    void keyPressed(int key);
+    void keyPressed(ofKeyEventArgs& keyEvent);
     void mousePressed(int x, int y, int button);
     void windowResized(int w, int h);
     
@@ -48,6 +53,7 @@ private:
     
     // TrackerSequencer for pattern management
     TrackerSequencer trackerSequencer;
+    TrackerSequencerGUI trackerSequencerGUI;
     
     // Sound objects
     ofxSoundOutput soundOutput;
@@ -64,22 +70,20 @@ private:
     // GUI system
     ofxImGui::Gui gui;
     
+    // GUI managers
+    MenuBar menuBar;
+    ViewManager viewManager;
+    InputRouter inputRouter;
+    
+    // Parameter synchronization system
+    ParameterSync parameterSync;
+    
     // GUI state
     bool showGUI = true;
     bool isPlaying = false;
-    float globalVolume = 1.0f;  // Global volume control
     int numSteps = 16;
     
-    
-    // BPM control is now handled by Clock
-    
-    // Audio level for visualization
-    float currentAudioLevel = 0.0f;
-    
-    // Audio device selection
-    std::vector<ofSoundDevice> audioDevices;
-    int selectedAudioDevice = 0;
-    bool audioDeviceChanged = false;
+    // Note: Audio state (devices, volume, level) is now managed by ViewManager
     
     // Current step for GUI display (last triggered step)
     int currentStep = 0;
@@ -90,26 +94,14 @@ private:
     void saveMediaDirectory(const std::string& path);
     
     // Methods
-    void setupSoundObjects();
-    void setupAudioStream();
+    void setupSoundObjects();  // Minimal setup - audio device management is in ViewManager
     void setupVisualObjects();
     void setupGUI();
     
     void drawGUI();
-    void drawMenuBar();
     void setupDefaultLayout(bool forceReset = false);
     
     // Layout management
     void saveLayout();
     void loadLayout();
-    
-    // Panel methods
-    void drawClockPanel();
-	void drawAudioOutputPanel();
-	void drawTrackerPanel();
-	void drawMediaPoolPanel();
-    
-    // GUI callbacks
-    void onBPMChanged(float& value);
-    void onStepChanged(int& value);
 };

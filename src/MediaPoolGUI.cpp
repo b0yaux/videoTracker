@@ -3,7 +3,8 @@
 #include "MediaPlayer.h"
 
 MediaPoolGUI::MediaPoolGUI() 
-    : mediaPool(nullptr), waveformHeight(100.0f) {
+    : mediaPool(nullptr), waveformHeight(100.0f), parentWidgetId(0), 
+      isParentWidgetFocused(false), requestFocusMoveToParentWidget(false) {
     // Initialize search buffer
     memset(searchBuffer, 0, sizeof(searchBuffer));
     searchFilter = "";
@@ -55,9 +56,50 @@ void MediaPoolGUI::drawSearchBar() {
 }
 
 void MediaPoolGUI::drawMediaList() {
+    // Create a focusable parent widget BEFORE the list for navigation
+    // This widget can receive focus when exiting the list via Ctrl+Enter or UP key on first item
+    ImGui::PushID("MediaListParent");
+    
+    // Following ImGui pattern: SetKeyboardFocusHere(0) BEFORE creating widget to request focus
+    if (requestFocusMoveToParentWidget) {
+        ImGui::SetKeyboardFocusHere(0); // Request focus for the upcoming widget
+        // Set flag immediately so InputRouter can see it in the same frame
+        // (SetKeyboardFocusHere takes effect next frame, but we want InputRouter to know now)
+        isParentWidgetFocused = true;
+    }
+    
+    // Create an invisible, focusable button that acts as the parent widget
+    // This allows us to move focus here when exiting the list
+    // Arrow keys will navigate to other widgets in the panel when this is focused
+    ImGui::InvisibleButton("##MediaListParent", ImVec2(100, 20));
+    parentWidgetId = ImGui::GetItemID(); // Store ID for potential future use
+    
+    // Following ImGui pattern: SetItemDefaultFocus() AFTER creating widget to mark as default
+    if (requestFocusMoveToParentWidget) {
+        ImGui::SetItemDefaultFocus(); // Mark this widget as the default focus
+        requestFocusMoveToParentWidget = false; // Clear flag after using it
+    }
+    
+    // Check if parent widget is focused right after creating it (ImGui pattern: IsItemFocused() works for last item)
+    // This updates the state if focus has already moved (e.g., from previous frame's request)
+    // If we just requested focus move above, the flag is already set, but we verify here
+    if (!isParentWidgetFocused) {
+        // Only check if we didn't just set it above (to avoid overwriting)
+        isParentWidgetFocused = ImGui::IsItemFocused();
+    }
+    
+    // Label for the media list - make it non-navigable
+    // This prevents clicking on the title from triggering list focus
+    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true); // Prevent navigation to this text
+    ImGui::Text("Available Media:");
+    ImGui::PopItemFlag(); // Restore navigation flag
+    ImGui::PopID();
+    
+    // Track if any list item is focused (to update parent widget focus state)
+    bool anyListItemFocused = false;
+    
     // Show indexed media list with actual file names
     if (mediaPool->getNumPlayers() > 0) {
-        ImGui::Text("Available Media:");
         auto playerNames = mediaPool->getPlayerNames();
         auto playerFileNames = mediaPool->getPlayerFileNames();
         
@@ -136,6 +178,11 @@ void MediaPoolGUI::drawMediaList() {
                     if (!success) {
                         ofLogWarning("MediaPoolGUI") << "Failed to play media at index " << i;
                     }
+                }
+                
+                // Track if any list item is focused
+                if (ImGui::IsItemFocused()) {
+                    anyListItemFocused = true;
                 }
                 
                 // Add hover tooltip with video frame preview
@@ -217,6 +264,20 @@ void MediaPoolGUI::drawMediaList() {
         }
     ImGui::Separator();
     }
+    
+    // CRITICAL: Update parent widget focus state AFTER the list ends
+    // Following ImGui pattern: We can't check IsItemFocused() for a widget created earlier,
+    // so we infer the state based on what we know:
+    // - If any list item was focused, parent widget is definitely not focused
+    // - If no list item is focused, we might be on parent widget
+    // - The state checked right after creating the button is still valid if no items were focused
+    if (anyListItemFocused) {
+        // A list item is focused, so parent widget is definitely not focused
+        isParentWidgetFocused = false;
+    }
+    // Otherwise, keep the state we checked right after creating the button
+    // This follows ImGui's pattern: IsItemFocused() is only valid for the last item,
+    // so we rely on the state we captured when the widget was created
 
 }
 
@@ -247,9 +308,13 @@ void MediaPoolGUI::drawWaveform() {
             }
             
             // Handle click-to-seek and drag functionality
-            if (ImGui::IsItemHovered()) {
+            // IMPORTANT: Check IsItemHovered OR IsItemActive to support dragging
+            // IsItemActive ensures dragging continues even if mouse moves outside hover area
+            if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
                 // Show cursor as hand when hovering over waveform
+                if (ImGui::IsItemHovered()) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                }
                 
                 // Check for mouse click or drag
                 if (ImGui::IsMouseClicked(0)) {
@@ -260,8 +325,15 @@ void MediaPoolGUI::drawWaveform() {
                     if (relativeX >= 0.0f && relativeX <= 1.0f) {
                         auto player = mediaPool->getActivePlayer();
                         if (player) {
-                            // Always seek to the clicked position first
+                            // When scrubbing, update both startPosition and position
+                            // This allows editing the start position while paused
+                            player->startPosition.set(relativeX);
+                            // Only update position if not playing (to avoid triggering onPositionChanged feedback loop)
+                            if (!player->isPlaying()) {
                             player->position.set(relativeX);
+                            }
+                            // Use setParameter to trigger synchronization notifications
+                            mediaPool->setParameter("position", relativeX, true);
                             ofLogNotice("MediaPoolGUI") << "Seeking to position " << relativeX;
                             
                             // Debug: Check position before play
@@ -282,14 +354,37 @@ void MediaPoolGUI::drawWaveform() {
                         }
                     }
                 } else if (ImGui::IsMouseDragging(0)) {
-                    // Drag: scrub without restarting playback
+                    // Drag: scrub - seek to position during playback
                     ImVec2 mousePos = ImGui::GetMousePos();
                     float relativeX = (mousePos.x - canvasPos.x) / (canvasMax.x - canvasPos.x);
+                    
+                    // Clamp to valid range
+                    relativeX = std::max(0.0f, std::min(1.0f, relativeX));
                     
                     if (relativeX >= 0.0f && relativeX <= 1.0f) {
                         auto player = mediaPool->getActivePlayer();
                         if (player) {
+                            // Update startPosition for future triggers
+                            player->startPosition.set(relativeX);
+                            
+                            // IMPORTANT: For scrubbing during playback, we need to seek directly
+                            // onPositionChanged() prevents seeking during playback to avoid feedback loops,
+                            // but scrubbing is an explicit user action, so we bypass it
+                            if (player->isAudioLoaded()) {
+                                player->getAudioPlayer().setPosition(relativeX);
+                            }
+                            if (player->isVideoLoaded()) {
+                                player->getVideoPlayer().getVideoFile().setPosition(relativeX);
+                                // Update video after seeking (needed for HAP codec)
+                                player->getVideoPlayer().getVideoFile().update();
+                            }
+                            
+                            // Update position parameter for UI display (without triggering expensive seek)
+                            // We already set the actual playback position above
                             player->position.set(relativeX);
+                            
+                            // Use setParameter to trigger synchronization notifications
+                            mediaPool->setParameter("position", relativeX, true);
                         }
                     }
                 }

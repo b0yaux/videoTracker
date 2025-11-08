@@ -12,7 +12,9 @@ public:
     void setMediaPool(MediaPool& pool);
     void draw();
     
-    // GUI state controls
+    // Navigation state controls (for InputRouter)
+    bool getIsParentWidgetFocused() const { return isParentWidgetFocused; }
+    void requestFocusMoveToParent() { requestFocusMoveToParentWidget = true; }
     
 private:
     MediaPool* mediaPool;
@@ -23,6 +25,11 @@ private:
     
     // Waveform visualization
     float waveformHeight;
+    
+    // Navigation state (parent widget pattern, similar to TrackerSequencerGUI)
+    ImGuiID parentWidgetId = 0;
+    bool isParentWidgetFocused = false;
+    bool requestFocusMoveToParentWidget = false;
     
     // GUI section methods
     void drawDirectoryControls();

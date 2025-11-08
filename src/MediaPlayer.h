@@ -21,7 +21,8 @@ public:
     ofParameter<bool> videoEnabled;
     
     // Synchronized parameters (control both A/V)
-    ofParameter<float> position;      // 0.0-1.0
+    ofParameter<float> position;      // 0.0-1.0 (current playhead position when playing, start position when paused)
+    ofParameter<float> startPosition; // 0.0-1.0 (start position for playback - synced with tracker)
     ofParameter<float> speed;         // playback rate
     ofParameter<bool> loop;
     
