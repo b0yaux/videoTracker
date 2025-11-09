@@ -1,15 +1,20 @@
 #pragma once
 
 #include "ofMain.h"
-#include <functional>
-#include "Clock.h"
+#include "ofEvents.h"
 #include "Module.h"
+#include <string>
+#include <vector>
+#include <map>
+#include <functional>
 
 // Forward declarations
-class TrackerSequencerGUI;
+class Clock;
+struct StepEventData;
 
 class TrackerSequencer {
     friend class TrackerSequencerGUI;  // Allow GUI to access private members for rendering
+    
 public:
     struct PatternCell {
         // Fixed fields (always present)
@@ -115,20 +120,7 @@ public:
     bool getIsEditingCell() const { return isEditingCell; }
     int getCurrentPlayingStep() const { return currentPlayingStep; }
     int getRemainingSteps() const { return remainingSteps; }
-    void clearCellFocus() {
-        // Guard: Don't clear if already cleared (prevents spam and unnecessary work)
-        if (editStep == -1) {
-            return;
-        }
-        ofLogNotice("TrackerSequencer") << "[DEBUG] [SET editStep] clearCellFocus() - clearing editStep to -1 (was: " << editStep << ")";
-        editStep = -1;
-        editColumn = -1;
-        isEditingCell = false;
-        editBuffer.clear();
-        editBufferInitialized = false;
-        shouldFocusFirstCell = false;
-        shouldRefocusCurrentCell = false;
-    }
+    void clearCellFocus();
     void requestFocusMoveToParentWidget() { requestFocusMoveToParent = true; }  // Request GUI to move focus to parent widget
     bool getIsParentWidgetFocused() const { return isParentWidgetFocused; }  // Check if parent widget is focused
     // Update step active state (clears manually triggered steps when duration expires)
@@ -156,9 +148,6 @@ private:
     bool isPatternEmpty() const;
     void notifyStepEvent(int step, float stepLength);
     void updateStepInterval();
-    
-    // Column configuration (forward declaration for method signatures)
-    struct ColumnConfig;
     
     // Column configuration
     struct ColumnConfig {
@@ -288,4 +277,3 @@ private:
     // Helper to determine if edit should be queued (during playback on current step)
     bool shouldQueueEdit() const;
 };
-

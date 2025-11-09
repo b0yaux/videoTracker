@@ -665,6 +665,21 @@ void TrackerSequencer::handleMouseClick(int x, int y, int button) {
     }
 }
 
+void TrackerSequencer::clearCellFocus() {
+    // Guard: Don't clear if already cleared (prevents spam and unnecessary work)
+    if (editStep == -1) {
+        return;
+    }
+    ofLogNotice("TrackerSequencer") << "[DEBUG] [SET editStep] clearCellFocus() - clearing editStep to -1 (was: " << editStep << ")";
+    editStep = -1;
+    editColumn = -1;
+    isEditingCell = false;
+    editBuffer.clear();
+    editBufferInitialized = false;
+    shouldFocusFirstCell = false;
+    shouldRefocusCurrentCell = false;
+}
+
 bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
     // Handle keyboard shortcuts for pattern editing
     switch (key) {

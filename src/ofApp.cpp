@@ -262,29 +262,8 @@ void ofApp::update() {
     if (currentPlayer && (currentPlayer->isPlaying() || !mediaPool.isPlayerConnected())) {
         mediaPool.connectActivePlayer(soundOutput, visualOutput);
     }
-    
-    // REMOVED: BPM update logic moved to GUI slider only
-    // The clock BPM should only be updated by user interaction, not automatically
-    
-    // Update pattern display
-    // Pattern display is now handled by TrackerSequencer
-    
-    // SOLUTION 2: Pre-sync tracker edit state from previous frame BEFORE draw
-    // This eliminates one-frame delay when keyboard input happens after GUI draw
-    // The GUI sync happens during draw, but keyboard events can arrive before next draw
-    // By ensuring editStep/editColumn are valid here, keyboard handlers get current state
-    if (viewManager.getCurrentPanelIndex() == 2) {  // Tracker panel
-        // If editStep/editColumn aren't set yet, default to first data cell
-        // This ensures keyboard input works immediately when entering tracker panel
-        if (trackerSequencer.getEditStep() < 0 || trackerSequencer.getEditColumn() < 0) {
-            if (trackerSequencer.getNumSteps() > 0) {
-                // Default to first data cell (step 0, column 1) if not set
-                // This makes keyboard input work immediately when panel is active
-                trackerSequencer.setEditCell(0, 1);
-            }
-        }
-    }
-    
+
+
     // PERFORMANCE: Rate-limit parameter synchronization to 15Hz instead of 60Hz
     // Most parameters don't change every frame, so we can reduce CPU overhead by checking less frequently
     static int syncFrameCounter = 0;
@@ -406,8 +385,6 @@ void ofApp::windowResized(int w, int h) {
     
     ofLogNotice("ofApp") << "Window resized to " << w << "x" << h;
 }
-
-
 
 
 //--------------------------------------------------------------
