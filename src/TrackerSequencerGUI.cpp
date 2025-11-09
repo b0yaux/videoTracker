@@ -17,14 +17,11 @@ void TrackerSequencerGUI::draw(TrackerSequencer& sequencer) {
 }
 
 void TrackerSequencerGUI::drawTrackerStatus(TrackerSequencer& sequencer) {
-    // Status section
-    ImGui::Text("Status:");
-    ImGui::Text("Playback Step: %d", sequencer.playbackStep + 1);
-    ImGui::Text("Edit Step: %d", sequencer.editStep + 1);
-    ImGui::Text("Pattern Steps: %d", sequencer.numSteps);
-    
-    ImGui::Separator();
-    
+
+
+    if (ImGui::Button("Clear Pattern")) {
+        sequencer.clearPattern();
+    }
     // Pattern controls
     int newNumSteps = sequencer.numSteps;
     if (ImGui::SliderInt("Steps", &newNumSteps, 4, 64, "%d", ImGuiSliderFlags_AlwaysClamp)) {
@@ -37,15 +34,7 @@ void TrackerSequencerGUI::drawTrackerStatus(TrackerSequencer& sequencer) {
     if (ImGui::SliderInt("Steps Per Beat", &newStepsPerBeat, 1, 96, "%d", ImGuiSliderFlags_AlwaysClamp)) {
         sequencer.setStepsPerBeat(newStepsPerBeat);
     }
-    
-    if (ImGui::Button("Clear Pattern")) {
-        sequencer.clearPattern();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Randomize Pattern")) {
-        sequencer.randomizePattern();
-    }
-    
+
     ImGui::Separator();
 }
 
@@ -54,15 +43,10 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     patternDirty = false;
     lastNumSteps = sequencer.numSteps;
     lastPlaybackStep = sequencer.playbackStep;
-    
-    ImGui::Separator();
-    
     // Create a focusable parent widget BEFORE the table for navigation
     // This widget can receive focus when exiting the table via UP key on header row
     ImGui::PushID("TrackerPatternGridParent");
-    
-    // Create an invisible, focusable button that acts as the parent widget
-    // This allows us to move focus here when exiting the table
+
     // Arrow keys will navigate to other widgets in the panel when this is focused
     // Following ImGui pattern: SetKeyboardFocusHere(0) BEFORE creating widget to request focus
     if (sequencer.requestFocusMoveToParent) {
@@ -73,12 +57,6 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
         sequencer.editStep = -1;
         sequencer.editColumn = -1;
     }
-    
-    // Make invisible button span full width to cover empty space between separator and table
-    // This prevents clicks in empty space from focusing cells
-    float availableWidth = ImGui::GetContentRegionAvail().x;
-    ImGui::InvisibleButton("##TrackerGridParent", ImVec2(availableWidth, 20));
-    parentWidgetId = ImGui::GetItemID(); // Store ID for potential future use
     
     // Handle clicks on parent widget - clear cell focus when clicked
     // This prevents cell focus from being set when clicking in the area before the first row
@@ -120,7 +98,6 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     // Cache active step info ONCE per frame (not per row!)
     bool isPlaying = sequencer.isPlaying();
     int currentPlayingStep = sequencer.getCurrentPlayingStep();
-    int remainingSteps = sequencer.getRemainingSteps();
     int playbackStep = sequencer.playbackStep;
     
     // Cache edit state to avoid repeated member access
@@ -161,14 +138,76 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
         }
         
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableHeadersRow();
+        
+        // Custom header row with randomization buttons
+        ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+        
+        // Step number column header (no button)
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TableHeader("##");
+        
+        // Column headers with randomization buttons
+        for (size_t i = 0; i < sequencer.columnConfig.size(); i++) {
+            ImGui::TableSetColumnIndex((int)i + 1);
+            const auto& colConfig = sequencer.columnConfig[i];
+            
+            ImGui::PushID((int)(i + 1000)); // Unique ID for header buttons
+            
+            // Get cell position and width before drawing header
+            ImVec2 cellStartPos = ImGui::GetCursorScreenPos();
+            float columnWidth = ImGui::GetColumnWidth();
+            float cellMinY = cellStartPos.y;
+            
+            // Draw column name first (left-aligned)
+            ImGui::TableHeader(colConfig.displayName.c_str());
+            
+            // Calculate button sizes
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
+            float buttonWidth = ImGui::CalcTextSize("R").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+            float legatoButtonWidth = 0.0f;
+            if (colConfig.parameterName == "length") {
+                legatoButtonWidth = ImGui::CalcTextSize("L").x + ImGui::GetStyle().FramePadding.x * 2.0f + 2.0f; // +2 for spacing
+            }
+            float totalButtonWidth = buttonWidth + legatoButtonWidth;
+            float padding = ImGui::GetStyle().CellPadding.x;
+            
+            // Position buttons to the right edge of the cell
+            float cellMaxX = cellStartPos.x + columnWidth;
+            float buttonStartX = cellMaxX - totalButtonWidth - padding;
+            ImGui::SetCursorScreenPos(ImVec2(buttonStartX, cellMinY));
+            
+
+            // Add legato button for length column
+            if (colConfig.parameterName == "length") {
+                if (ImGui::SmallButton("L")) {
+                    sequencer.applyLegato();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Legato");
+                }
+                ImGui::SameLine(0.0f, 2.0f);
+            }
+
+            // Small randomization button ("R")
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 0));
+            if (ImGui::SmallButton("R")) {
+                sequencer.randomizeColumn((int)i);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Randomize");
+            }
+            
+            
+            ImGui::PopStyleVar(2);
+            ImGui::PopID();
+        }
         
         // Draw pattern rows
         pendingRowOutline.shouldDraw = false; // Reset row outline state
         anyCellFocusedThisFrame = false; // Reset focus tracking
         for (int step = 0; step < sequencer.numSteps; step++) {
             drawPatternRow(sequencer, step, step == playbackStep, step == cachedEditStep, 
-                          isPlaying, currentPlayingStep, remainingSteps,
+                          isPlaying, currentPlayingStep,
                           maxIndex, paramRanges, paramDefaults, cachedEditStep, cachedEditColumn, cachedIsEditingCell);
         }
         
@@ -247,7 +286,7 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
 }
 
 void TrackerSequencerGUI::drawPatternRow(TrackerSequencer& sequencer, int step, bool isPlaybackStep, bool isEditStep,
-                                         bool isPlaying, int currentPlayingStep, int remainingSteps,
+                                         bool isPlaying, int currentPlayingStep,
                                          int maxIndex, const std::map<std::string, std::pair<float, float>>& paramRanges,
                                          const std::map<std::string, float>& paramDefaults,
                                          int cachedEditStep, int cachedEditColumn, bool cachedIsEditingCell) {
@@ -277,7 +316,7 @@ void TrackerSequencerGUI::drawPatternRow(TrackerSequencer& sequencer, int step, 
     }
     
     // Draw step number column (pass cached values)
-    drawStepNumber(sequencer, step, isPlaybackStep, isPlaying, currentPlayingStep, remainingSteps);
+    drawStepNumber(sequencer, step, isPlaybackStep, isPlaying, currentPlayingStep);
     
     // Draw dynamic columns (pass cached values for performance)
     for (size_t i = 0; i < sequencer.columnConfig.size(); i++) {
@@ -308,7 +347,7 @@ static void syncPlaybackToEditIfPaused(TrackerSequencer& sequencer, int newStep,
 }
 
 void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, bool isPlaybackStep,
-                                         bool isPlaying, int currentPlayingStep, int remainingSteps) {
+                                         bool isPlaying, int currentPlayingStep) {
     ImGui::TableNextColumn();
     
     // Get cell rect for red outline (before drawing button)

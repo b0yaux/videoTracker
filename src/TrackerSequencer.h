@@ -88,6 +88,8 @@ public:
     void clearCell(int step);
     void clearPattern();
     void randomizePattern();
+    void randomizeColumn(int columnIndex);  // Randomize a specific column (0 = index, 1 = length, 2+ = parameter columns)
+    void applyLegato();  // Apply legato to length column (extend lengths to connect steps)
     
     // Playback control
     void play();
@@ -119,7 +121,6 @@ public:
     bool isPlaying() const { return playing; }
     bool getIsEditingCell() const { return isEditingCell; }
     int getCurrentPlayingStep() const { return currentPlayingStep; }
-    int getRemainingSteps() const { return remainingSteps; }
     void clearCellFocus();
     void requestFocusMoveToParentWidget() { requestFocusMoveToParent = true; }  // Request GUI to move focus to parent widget
     bool getIsParentWidgetFocused() const { return isParentWidgetFocused; }  // Check if parent widget is focused
@@ -196,7 +197,6 @@ private:
     // Pattern sequencer state (app-specific)
     int stepsPerBeat = 4;
     bool gatingEnabled = true;
-    std::vector<float> stepLengths;  // Per-step gate lengths
     
     std::vector<PatternCell> pattern;
     int numSteps;
@@ -224,10 +224,9 @@ private:
     double sampleAccumulator; // Sample accumulator for step timing
     float lastBpm; // Last known BPM for timing calculations
     
-    // Media playback timing (separate from sequencer timing)
-    float currentStepStartTime;
-    float currentStepDuration;
-    bool stepActive;
+    // Unified timing system for step duration (works for both manual and playback triggers)
+    float stepStartTime;      // When current step started (unified for manual and playback)
+    float stepEndTime;        // When current step should end (calculated from duration)
     
     // Step event listeners
     std::vector<std::function<void(int, float, const PatternCell&)>> stepEventListeners;
@@ -238,9 +237,8 @@ private:
     // UI state
     bool showGUI;
     
-    // Step length tracking for multi-step cells
-    int remainingSteps;  // Remaining steps for current playing cell
-    int currentPlayingStep;  // Current step that's playing (for multi-step cells)
+    // Step playback tracking
+    int currentPlayingStep;  // Current step that's playing (for GUI visualization)
     
     // Cell focus management
     bool shouldFocusFirstCell;  // Flag to request focus on first cell when entering grid

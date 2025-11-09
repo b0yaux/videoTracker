@@ -80,9 +80,9 @@ TrackerSequencer::TrackerSequencer()
       currentMediaStepLength(0.0f), 
       sampleAccumulator(0.0), lastBpm(120.0f),
       draggingStep(-1), draggingColumn(-1), lastDragValue(-1), dragStartY(0.0f), dragStartX(0.0f),
-      currentStepStartTime(0.0f), currentStepDuration(0.0f), stepActive(false),
+      stepStartTime(0.0f), stepEndTime(0.0f),
       showGUI(true),
-      remainingSteps(0), currentPlayingStep(-1), shouldFocusFirstCell(false), shouldRefocusCurrentCell(false), requestFocusMoveToParent(false), isParentWidgetFocused(false) {
+      currentPlayingStep(-1), shouldFocusFirstCell(false), shouldRefocusCurrentCell(false), requestFocusMoveToParent(false), isParentWidgetFocused(false) {
 }
 
 TrackerSequencer::~TrackerSequencer() {
@@ -106,9 +106,6 @@ void TrackerSequencer::setup(Clock* clockRef, int steps) {
         pattern[i] = PatternCell();
     }
     
-            // Initialize step lengths for all steps
-            stepLengths.resize(numSteps, 1.0f);
-            
             // Initialize default column configuration if empty
             if (columnConfig.empty()) {
                 initializeDefaultColumns();
@@ -140,8 +137,9 @@ void TrackerSequencer::onClockTransportChanged(bool isPlaying) {
         play();
         // Reset to step 1 and trigger it
         playbackStep = 0; // Start playback at step 0 (0-based internally, so step 1 is index 0)
-        remainingSteps = 0;  // Reset remaining steps
         currentPlayingStep = -1;  // Reset current playing step
+        stepStartTime = 0.0f;
+        stepEndTime = 0.0f;
         triggerStep(0);  // Trigger step 1 (0-based)
         ofLogNotice("TrackerSequencer") << "Clock transport started - sequencer playing from step 1";
     } else {
@@ -162,8 +160,6 @@ void TrackerSequencer::setNumSteps(int steps) {
     for (int i = numSteps; i < pattern.size(); i++) {
         pattern[i] = PatternCell();
     }
-    
-    stepLengths.resize(numSteps, 1.0f);
 
     ofLogNotice("TrackerSequencer") << "Number of steps changed to " << numSteps;
 }
@@ -178,11 +174,6 @@ void TrackerSequencer::setCell(int step, const PatternCell& cell) {
     
     // Update the pattern
     pattern[step] = cell;
-    
-    // Store step length in our own array (promote int to float for storage)
-    if (step >= 0 && step < stepLengths.size()) {
-        stepLengths[step] = (float)cell.length;
-    }
     
     // Notify if position changed and this is the current step (edit or playback)
     // BUT only if we're not actively editing the position column (to avoid interfering with edit mode)
@@ -277,6 +268,96 @@ void TrackerSequencer::randomizePattern() {
     ofLogNotice("TrackerSequencer") << "Pattern randomized with " << numMedia << " media items";
 }
 
+void TrackerSequencer::randomizeColumn(int columnIndex) {
+    if (columnIndex < 0 || columnIndex >= (int)columnConfig.size()) {
+        ofLogWarning("TrackerSequencer") << "Invalid column index for randomization: " << columnIndex;
+        return;
+    }
+    
+    const auto& colConfig = columnConfig[columnIndex];
+    
+    if (colConfig.parameterName == "index") {
+        // Randomize index column
+        if (!indexRangeCallback) {
+            ofLogWarning("TrackerSequencer") << "Cannot randomize index column: IndexRangeCallback not set";
+            return;
+        }
+        
+        int numMedia = indexRangeCallback();
+        if (numMedia == 0) {
+            ofLogWarning("TrackerSequencer") << "Cannot randomize index column: No media available";
+            return;
+        }
+        
+        for (int i = 0; i < numSteps; i++) {
+            // 70% chance of having a media item, 30% chance of being empty (rest)
+            if (ofRandom(1.0f) < 0.7f) {
+                pattern[i].index = ofRandom(0, numMedia);
+            } else {
+                pattern[i].index = -1; // Empty/rest
+            }
+        }
+        ofLogNotice("TrackerSequencer") << "Index column randomized";
+    } else if (colConfig.parameterName == "length") {
+        // Randomize length column
+        for (int i = 0; i < numSteps; i++) {
+            if (pattern[i].index >= 0) { // Only randomize if step has a media item
+                pattern[i].length = ofRandom(1, numSteps + 1);
+            }
+        }
+        ofLogNotice("TrackerSequencer") << "Length column randomized";
+    } else {
+        // Randomize parameter column
+        auto range = getParameterRange(colConfig.parameterName);
+        for (int i = 0; i < numSteps; i++) {
+            if (pattern[i].index >= 0) { // Only randomize if step has a media item
+                if (colConfig.parameterName == "volume") {
+                    // Use 25% to 75% of volume range for randomization (avoiding extremes)
+                    float volumeRangeSize = range.second - range.first;
+                    pattern[i].setParameterValue(colConfig.parameterName, ofRandom(
+                        range.first + volumeRangeSize * 0.25f,
+                        range.first + volumeRangeSize * 0.75f
+                    ));
+                } else {
+                    pattern[i].setParameterValue(colConfig.parameterName, ofRandom(range.first, range.second));
+                }
+            }
+        }
+        ofLogNotice("TrackerSequencer") << "Parameter column '" << colConfig.parameterName << "' randomized";
+    }
+}
+
+void TrackerSequencer::applyLegato() {
+    // Apply legato: set each step's length to the number of steps until the next step with a note
+    // This creates smooth transitions between steps (no gaps)
+    for (int i = 0; i < numSteps; i++) {
+        if (pattern[i].index >= 0) {
+            // This step has a note - find the next step with a note
+            int stepsToNext = 1;
+            bool foundNext = false;
+            
+            for (int j = i + 1; j < numSteps; j++) {
+                if (pattern[j].index >= 0) {
+                    // Found the next step with a note
+                    stepsToNext = j - i;
+                    foundNext = true;
+                    break;
+                }
+            }
+            
+            if (foundNext) {
+                // Set length to reach the next step (clamp to max 16)
+                pattern[i].length = std::min(16, stepsToNext);
+            } else {
+                // No next step found - keep current length or set to remaining steps
+                int remainingSteps = numSteps - i;
+                pattern[i].length = std::min(16, remainingSteps);
+            }
+        }
+    }
+    ofLogNotice("TrackerSequencer") << "Legato applied to length column";
+}
+
 // Timing and playback control
 void TrackerSequencer::processAudioBuffer(ofSoundBuffer& buffer) {
     // This method is now deprecated - timing is handled by Clock's beat events
@@ -319,8 +400,10 @@ void TrackerSequencer::updateStepInterval() {
 
 void TrackerSequencer::play() {
     playing = true;
-    remainingSteps = 0;  // Reset remaining steps
-    currentPlayingStep = -1;  // Reset current playing step
+    // Reset timing state
+    currentPlayingStep = -1;
+    stepStartTime = 0.0f;
+    stepEndTime = 0.0f;
     // Reset audio-rate timing for fresh start
     sampleAccumulator = 0.0;
 }
@@ -330,14 +413,15 @@ void TrackerSequencer::pause() {
     // Clear current playing step so GUI shows inactive state when paused
     // This ensures visual feedback matches the paused state
     currentPlayingStep = -1;
-    // Keep playbackStep and remainingSteps for resume
+    // Keep playbackStep and timing state for resume (if needed)
 }
 
 void TrackerSequencer::stop() {
     playing = false;
     playbackStep = 0; // Reset playback step indicator
-    remainingSteps = 0;  // Reset remaining steps
-    currentPlayingStep = -1;  // Reset current playing step
+    currentPlayingStep = -1;
+    stepStartTime = 0.0f;
+    stepEndTime = 0.0f;
     // Reset audio-rate timing
     sampleAccumulator = 0.0;
 }
@@ -345,8 +429,9 @@ void TrackerSequencer::stop() {
 void TrackerSequencer::reset() {
     playbackStep = 0; // Reset playback step indicator
     playing = false;
-    remainingSteps = 0;  // Reset remaining steps
-    currentPlayingStep = -1;  // Reset current playing step
+    currentPlayingStep = -1;
+    stepStartTime = 0.0f;
+    stepEndTime = 0.0f;
     // Reset audio-rate timing
     sampleAccumulator = 0.0;
 }
@@ -524,37 +609,28 @@ void TrackerSequencer::addStepEventListener(std::function<void(int, float, const
 void TrackerSequencer::advanceStep() {
     if (!playing) return;
     
-    // Always advance playback step (steps continue counting)
-    playbackStep = (playbackStep + 1) % numSteps;
+    float currentTime = ofGetElapsedTimef();
     
-    // Decrement remaining steps for currently playing media
-    int previousRemainingSteps = remainingSteps;
-    if (remainingSteps > 0) {
-        remainingSteps--;
-    }
+    // Check if current step duration has expired
+    bool currentStepExpired = (currentPlayingStep >= 0 && stepEndTime > 0.0f && currentTime >= stepEndTime);
     
-    // If remaining steps was > 0 and now reached 0 after decrement, the current step has finished
-    // This handles length>1 steps finishing.
-    if (previousRemainingSteps > 0 && remainingSteps == 0) {
+    if (currentStepExpired) {
+        // Current step finished - clear playing state
         currentPlayingStep = -1;
+        stepStartTime = 0.0f;
+        stepEndTime = 0.0f;
     }
+    
+    // Always advance playback step (for visual indicator)
+    playbackStep = (playbackStep + 1) % numSteps;
     
     // Check if we should trigger the new step
     const PatternCell& newCell = getCell(playbackStep);
     
     // Trigger new step if:
-    // 1. No step is currently playing (remainingSteps == 0), OR
+    // 1. No step is currently playing (currentPlayingStep < 0), OR
     // 2. New step has media (index >= 0) - this overrides current playing step
-    // For length=1 steps, remainingSteps is 0 when triggered, so they will trigger the next step
-    // on the next advanceStep() call. We need to clear currentPlayingStep when advancing to the next step.
-    if (remainingSteps == 0 || newCell.index >= 0) {
-        // Clear currentPlayingStep for the step we're leaving (handles length=1 steps finishing)
-        // This ensures the GUI doesn't show the previous step as active after it finishes
-        if (remainingSteps == 0 && currentPlayingStep >= 0) {
-            // The current step has finished (either length>1 that just finished, or length=1 that was already done)
-            // Clear it before triggering the next step
-            currentPlayingStep = -1;
-        }
+    if (currentPlayingStep < 0 || newCell.index >= 0) {
         triggerStep(playbackStep);
     }
 }
@@ -576,31 +652,21 @@ void TrackerSequencer::triggerStep(int step) {
     
     playbackStep = step;
     
-    // Set remaining steps for this cell (length - 1, since we count current step)
-    // Only set if cell has media (index >= 0), otherwise it's a rest/stop
-    if (cell.index >= 0) {
-        remainingSteps = (cell.length > 1) ? (cell.length - 1) : 0;
-        currentPlayingStep = step;
-    } else {
-        // Empty step - stop current media
-        remainingSteps = 0;
-        currentPlayingStep = -1;
-    }
-    
-    // Calculate duration in seconds
+    // Calculate duration in seconds (same for both manual and playback)
     float stepLength = cell.index >= 0 ? (float)cell.length : 1.0f;
     float duration = (stepLength * 60.0f) / (bpm * stepsPerBeat);
     
-    // Track timing for manually triggered steps (when paused) to clear active state after duration
-    if (!playing && cell.index >= 0) {
-        currentStepStartTime = ofGetElapsedTimef();
-        currentStepDuration = duration;
-        stepActive = true;
-    } else if (playing) {
-        // During playback, step timing is handled by advanceStep()
-        stepActive = false;
-        currentStepStartTime = 0.0f;
-        currentStepDuration = 0.0f;
+    // Set timing for ALL triggers (unified for manual and playback)
+    if (cell.index >= 0) {
+        float currentTime = ofGetElapsedTimef();
+        stepStartTime = currentTime;
+        stepEndTime = currentTime + duration;
+        currentPlayingStep = step;
+    } else {
+        // Empty step - clear playing state
+        currentPlayingStep = -1;
+        stepStartTime = 0.0f;
+        stepEndTime = 0.0f;
     }
     
     // Create TriggerEvent with TrackerSequencer parameters
@@ -1836,19 +1902,17 @@ std::string TrackerSequencer::formatParameterValue(const std::string& paramName,
 }
 
 void TrackerSequencer::updateStepActiveState() {
-    // Clear manually triggered step active state when duration expires (when paused)
+    // Check if current step duration has expired (works for both manual and playback)
     // PERFORMANCE: Early return checks BEFORE expensive system call
-    // Only check when paused and step is active - avoid ofGetElapsedTimef() call when not needed
-    if (!playing && stepActive && currentPlayingStep >= 0 && currentStepDuration > 0.0f) {
-        float elapsed = ofGetElapsedTimef() - currentStepStartTime;
-        if (elapsed >= currentStepDuration) {
-            // Step duration expired - clear active state
+    if (currentPlayingStep >= 0 && stepEndTime > 0.0f) {
+        float currentTime = ofGetElapsedTimef();
+        if (currentTime >= stepEndTime) {
+            // Step duration expired - clear playing state
             currentPlayingStep = -1;
-            remainingSteps = 0;
-            stepActive = false;
-            currentStepStartTime = 0.0f;
-            currentStepDuration = 0.0f;
+            stepStartTime = 0.0f;
+            stepEndTime = 0.0f;
         }
     }
 }
+
 

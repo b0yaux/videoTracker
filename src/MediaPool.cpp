@@ -663,6 +663,93 @@ PreviewMode MediaPool::getPreviewMode() const {
 
 //--------------------------------------------------------------
 void MediaPool::update() {
+    // Update position memory: Store current playback position for active player
+    // Also detect when player stops to capture final position before it's reset
+    if (activePlayer && currentIndex < players.size()) {
+        bool isCurrentlyPlaying = activePlayer->isPlaying();
+        bool wasPlaying = lastPlayingStateByMediaIndex[currentIndex];
+        
+        if (isCurrentlyPlaying) {
+            // Player is playing - store position only when it's actually advancing
+            float currentPosition = activePlayer->position.get();
+            auto it = lastPositionByMediaIndex.find(currentIndex);
+            
+            // SIMPLIFIED LOGIC: Only store position when it's advancing forward
+            // This prevents storing startPosition (near-zero) when playback just started
+            float currentStartPosition = activePlayer->startPosition.get();
+            if (it == lastPositionByMediaIndex.end()) {
+                // First time storing - only store if position is meaningful (> 1% into media)
+                // This prevents storing near-zero startPosition values
+                if (currentPosition > 0.01f) {
+                    lastPositionByMediaIndex[currentIndex] = currentPosition;
+                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Stored initial position for media " << currentIndex 
+                                             << ": " << currentPosition 
+                                             << " | startPosition: " << currentStartPosition;
+                }
+            } else {
+                // Already have stored position - only update if advancing forward
+                // This prevents overwriting good positions with earlier/near-zero values
+                float storedPosition = it->second;
+                if (currentPosition > storedPosition + 0.001f) {
+                    // Position advanced - update stored value
+                    lastPositionByMediaIndex[currentIndex] = currentPosition;
+                    if (std::abs(currentPosition - storedPosition) > 0.01f) {
+                        ofLogNotice("MediaPool") << "[POSITION_MEMORY] Stored advancing position for media " << currentIndex 
+                                                 << ": " << currentPosition << " (was: " << storedPosition << ")"
+                                                 << " | startPosition: " << currentStartPosition;
+                    }
+                }
+                // If position didn't advance or went backward, keep existing stored value
+            }
+        } else if (wasPlaying && !isCurrentlyPlaying) {
+            // Player just stopped - capture final position for position memory
+            // Note: stop() preserves the actual playback position (fixed in MediaPlayer::stop())
+            float stoppedPosition = activePlayer->position.get();
+            float stoppedStartPosition = activePlayer->startPosition.get();
+            
+            ofLogNotice("MediaPool") << "[POSITION_MEMORY] Player stopped for media " << currentIndex
+                                      << " | position: " << stoppedPosition 
+                                      << " | startPosition: " << stoppedStartPosition;
+            
+            // CRITICAL FIX: If position was reset to 0 (or near-zero) after stop(),
+            // it means the underlying players reset their position before stop() could preserve it.
+            // In this case, check if we already have a stored position that's more recent.
+            // If the current position is invalid (< 0.01f) but we have a stored position,
+            // use the stored position instead (it was captured before the reset).
+            if (stoppedPosition < 0.01f) {
+                // Position was reset - check if we have a stored position
+                auto it = lastPositionByMediaIndex.find(currentIndex);
+                if (it != lastPositionByMediaIndex.end() && it->second > 0.01f) {
+                    // Use the stored position (it was captured before the reset)
+                    stoppedPosition = it->second;
+                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Position was reset to " 
+                                             << activePlayer->position.get() 
+                                             << ", using stored position: " << stoppedPosition;
+                }
+            }
+            
+            // Only store if position is meaningful (> 1% into media)
+            // This prevents storing near-zero positions when playback stops immediately
+            if (stoppedPosition > 0.01f) {
+                float oldStored = (lastPositionByMediaIndex.find(currentIndex) != lastPositionByMediaIndex.end()) 
+                                  ? lastPositionByMediaIndex[currentIndex] : 0.0f;
+                lastPositionByMediaIndex[currentIndex] = stoppedPosition;
+                
+                if (std::abs(stoppedPosition - oldStored) > 0.001f) {
+                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Captured position on stop for media " 
+                                             << currentIndex << ": " << stoppedPosition 
+                                             << " (was: " << oldStored << ")";
+                }
+            } else {
+                ofLogNotice("MediaPool") << "[POSITION_MEMORY] Position too small to store on stop: " 
+                                         << stoppedPosition << " (threshold: 0.01)";
+            }
+        }
+        
+        // Update playing state tracking
+        lastPlayingStateByMediaIndex[currentIndex] = isCurrentlyPlaying;
+    }
+    
     // Process lock-free event queue from audio thread (moved to GUI thread)
     processEventQueue();
     
@@ -696,7 +783,30 @@ void MediaPool::processEventQueue() {
         // Handle empty cells (rests) - stop immediately
         if (event.mediaIndex < 0) {
             if (activePlayer) {
+                // Capture position before stopping (for position memory)
+                // Only store if meaningful - update() will handle the actual storage
+                if (activePlayer->isPlaying() && currentIndex < players.size()) {
+                    float currentPosition = activePlayer->position.get();
+                    float currentStartPosition = activePlayer->startPosition.get();
+                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Rest stop for media " << currentIndex
+                                              << " | position: " << currentPosition 
+                                              << " | startPosition: " << currentStartPosition;
+                    // Only store if meaningful (> 1%) - prevents storing near-zero values
+                    if (currentPosition > 0.01f) {
+                        lastPositionByMediaIndex[currentIndex] = currentPosition;
+                        ofLogNotice("MediaPool") << "[POSITION_MEMORY] Captured position before rest stop: media " 
+                                                 << currentIndex << " = " << currentPosition;
+                    }
+                }
                 activePlayer->stop();
+                // After stop, log both positions again to see if they changed
+                if (currentIndex < players.size()) {
+                    float afterStopPosition = activePlayer->position.get();
+                    float afterStopStartPosition = activePlayer->startPosition.get();
+                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] After rest stop for media " << currentIndex
+                                              << " | position: " << afterStopPosition 
+                                              << " | startPosition: " << afterStopStartPosition;
+                }
             }
             localQueue.pop();
             continue;
@@ -718,6 +828,22 @@ void MediaPool::processEventQueue() {
         // Only set active player if it's different (optimization: avoid resetting connection flag)
         bool playerChanged = (currentIndex != event.mediaIndex || activePlayer != player);
         if (playerChanged) {
+            // Capture position of previous player before switching (for position memory)
+            // Only store if meaningful - update() will handle the actual storage during playback
+            if (activePlayer && activePlayer->isPlaying() && currentIndex < players.size()) {
+                float currentPosition = activePlayer->position.get();
+                float currentStartPosition = activePlayer->startPosition.get();
+                ofLogNotice("MediaPool") << "[POSITION_MEMORY] Player switch from media " << currentIndex
+                                          << " | position: " << currentPosition 
+                                          << " | startPosition: " << currentStartPosition
+                                          << " (switching to media " << event.mediaIndex << ")";
+                // Only store if meaningful (> 1%) - prevents storing near-zero values
+                if (currentPosition > 0.01f) {
+                    lastPositionByMediaIndex[currentIndex] = currentPosition;
+                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Captured position before switch: media " 
+                                             << currentIndex << " = " << currentPosition;
+                }
+            }
             setActivePlayer(event.mediaIndex);
         }
         
@@ -754,8 +880,16 @@ void MediaPool::processEventQueue() {
         // because that triggers onPositionChanged() which calls expensive setPosition() (~200ms).
         // The play() method will handle setting the actual video position efficiently.
         // We'll update position parameter after play() for UI display, but without triggering listener.
-        if (std::abs(player->startPosition.get() - event.position) > 0.001f) {
+        float currentStartPos = player->startPosition.get();
+        float currentPos = player->position.get();
+        ofLogNotice("MediaPool") << "[POSITION_MEMORY] Processing trigger for media " << event.mediaIndex 
+                                  << " with position: " << event.position 
+                                  << " (currentIndex: " << currentIndex << ")"
+                                  << " | startPosition: " << currentStartPos 
+                                  << " | position: " << currentPos;
+        if (std::abs(currentStartPos - event.position) > 0.001f) {
             player->startPosition.set(event.position);
+            ofLogNotice("MediaPool") << "[POSITION_MEMORY] Set startPosition to: " << event.position;
         }
         // NOTE: Don't set player->position here - it triggers expensive setPosition() via listener
         // The play() method will set the position correctly based on startPosition
@@ -767,7 +901,17 @@ void MediaPool::processEventQueue() {
         float stepDurationSeconds = event.stepLength;
         
         // Trigger media playback with gating (default behavior for step-based playback)
+        // NOTE: We do NOT store event.position here - that's the START position, not the current playback position.
+        // Position memory should only store the actual playback position during playback (in update()),
+        // or when capturing before stop. Storing event.position here would overwrite the real playback position.
         player->playWithGate(stepDurationSeconds);
+        
+        // Log positions after playWithGate to track any changes
+        float afterPlayPosition = player->position.get();
+        float afterPlayStartPosition = player->startPosition.get();
+        ofLogNotice("MediaPool") << "[POSITION_MEMORY] After playWithGate for media " << event.mediaIndex
+                                  << " | position: " << afterPlayPosition 
+                                  << " | startPosition: " << afterPlayStartPosition;
         
         localQueue.pop();
     }
@@ -864,12 +1008,10 @@ void MediaPool::onTransportChanged(bool isPlaying) {
                 // Stop any active player that was playing under sequencer control
                 if (activePlayer && activePlayer->isPlaying()) {
                     activePlayer->stop();
-                    // Position is now synced with startPosition immediately in stop()
-                    // Immediately trigger parameter change notification for instant sync
-                    if (parameterChangeCallback) {
-                        float currentPos = activePlayer->startPosition.get();
-                        parameterChangeCallback("position", currentPos);
-                    }
+                    // REMOVED: Don't notify position change on transport stop
+                    // The pattern already has the correct position value from when the step was triggered
+                    // Position sync should only happen when user explicitly edits position, not on transport state changes
+                    // This prevents unwanted pattern cell edits when pausing playback
                     ofLogNotice("MediaPool") << "Stopped active player due to transport stop";
                 }
             }
@@ -1028,22 +1170,24 @@ void MediaPool::onTrigger(TriggerEvent& event) {
             finalValue = std::max(param.minValue, std::min(param.maxValue, value));
         } else {
             // Parameter not set - use default OR position memory for position parameter
-            // Position memory: If retriggering same media that was previously playing without specified position,
-            // use latest position (continue from where it left off)
+            // Position memory: If retriggering same media without specified position,
+            // use stored position (continue from where it left off, even after gate ends)
             if (param.name == "position") {
-                // Check if we're retriggering the same media that's currently playing
-                bool isRetriggeringSameMedia = (triggerData.mediaIndex >= 0 && 
-                                                triggerData.mediaIndex < (int)players.size() &&
-                                                activePlayer && 
-                                                activePlayer == players[triggerData.mediaIndex].get() &&
-                                                activePlayer->isPlaying());
-                
-                if (isRetriggeringSameMedia) {
-                    // Retriggering same media - use position memory (continue from current position)
-                    finalValue = activePlayer->position.get();
+                // Check if we have a stored position for this media index
+                // This works even if the media has stopped (gate ended)
+                auto posIt = lastPositionByMediaIndex.find(triggerData.mediaIndex);
+                if (posIt != lastPositionByMediaIndex.end()) {
+                    // Use stored position (position memory)
+                    finalValue = posIt->second;
+                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Using stored position for media " 
+                                             << triggerData.mediaIndex << ": " << finalValue;
                 } else {
-                    // Different media or not playing - use default (start from beginning)
+                    // No stored position - use default (start from beginning)
                     finalValue = param.defaultValue;
+                    // Only log at verbose level to reduce log spam (rests trigger this frequently)
+                    ofLogVerbose("MediaPool") << "[POSITION_MEMORY] No stored position for media " 
+                                              << triggerData.mediaIndex << ", using default: " << finalValue
+                                              << " (map size: " << lastPositionByMediaIndex.size() << ")";
                 }
             } else {
                 // Other parameters (speed, volume, etc.) - use default

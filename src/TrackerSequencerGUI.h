@@ -42,12 +42,12 @@ private:
     void drawTrackerStatus(TrackerSequencer& sequencer);
     void drawPatternGrid(TrackerSequencer& sequencer);
     void drawPatternRow(TrackerSequencer& sequencer, int step, bool isPlaybackStep, bool isEditStep,
-                       bool isPlaying, int currentPlayingStep, int remainingSteps,
+                       bool isPlaying, int currentPlayingStep,
                        int maxIndex, const std::map<std::string, std::pair<float, float>>& paramRanges,
                        const std::map<std::string, float>& paramDefaults,
                        int cachedEditStep, int cachedEditColumn, bool cachedIsEditingCell);
     void drawStepNumber(TrackerSequencer& sequencer, int step, bool isPlaybackStep,
-                       bool isPlaying, int currentPlayingStep, int remainingSteps);
+                       bool isPlaying, int currentPlayingStep);
     void drawParameterCell(TrackerSequencer& sequencer, int step, int colConfigIndex,
                           int maxIndex, const std::map<std::string, std::pair<float, float>>& paramRanges,
                           const std::map<std::string, float>& paramDefaults,

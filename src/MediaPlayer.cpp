@@ -185,17 +185,89 @@ void MediaPlayer::play() {
 }
 
 void MediaPlayer::stop() {
+    // CRITICAL: Capture actual playback position BEFORE stopping underlying players
+    // Once we call stop() on the players, they may reset their position to 0
+    // So we must capture position from the players BEFORE stopping them
+    float actualPlaybackPosition = 0.0f;
+    
+    // CRITICAL FIX: If player is playing, ALWAYS read from players (most accurate source)
+    // The position parameter might not be up-to-date if update() hasn't run recently
+    // Only use position parameter as fallback if player is not playing
+    if (isPlaying()) {
+        // Player is still playing - read position directly from players (most accurate)
+        // Read from audio first (usually more accurate for timing)
+        if (isAudioLoaded() && audioPlayer.isPlaying()) {
+            float audioPos = audioPlayer.getPosition();
+            if (audioPos > 0.001f) {
+                actualPlaybackPosition = audioPos;
+                ofLogVerbose("ofxMediaPlayer") << "Captured audio position before stop: " << actualPlaybackPosition;
+            }
+        }
+        
+        // If audio position wasn't valid, try video
+        if (actualPlaybackPosition < 0.001f && isVideoLoaded() && videoPlayer.isPlaying()) {
+            float videoPos = videoPlayer.getVideoFile().getPosition();
+            if (videoPos > 0.001f) {
+                actualPlaybackPosition = videoPos;
+                ofLogVerbose("ofxMediaPlayer") << "Captured video position before stop: " << actualPlaybackPosition;
+            }
+        }
+        
+        // If still no valid position from players, fall back to position parameter
+        if (actualPlaybackPosition < 0.001f) {
+            float paramPos = position.get();
+            if (paramPos > 0.001f) {
+                actualPlaybackPosition = paramPos;
+                ofLogVerbose("ofxMediaPlayer") << "Using position parameter as fallback: " << actualPlaybackPosition;
+            }
+        }
+    } else {
+        // Not playing - use position parameter (should have correct value from last update())
+        // BUT: If position parameter is valid, use it. Otherwise, try to read from players
+        // (they might still have the position even if not playing)
+        actualPlaybackPosition = position.get();
+        if (actualPlaybackPosition < 0.001f) {
+            // Position parameter is 0 or invalid - try reading from players as last resort
+            if (isAudioLoaded()) {
+                float audioPos = audioPlayer.getPosition();
+                if (audioPos > 0.001f) {
+                    actualPlaybackPosition = audioPos;
+                    ofLogVerbose("ofxMediaPlayer") << "Captured audio position (not playing): " << actualPlaybackPosition;
+                }
+            }
+            if (actualPlaybackPosition < 0.001f && isVideoLoaded()) {
+                float videoPos = videoPlayer.getVideoFile().getPosition();
+                if (videoPos > 0.001f) {
+                    actualPlaybackPosition = videoPos;
+                    ofLogVerbose("ofxMediaPlayer") << "Captured video position (not playing): " << actualPlaybackPosition;
+                }
+            }
+        }
+    }
+    
+    // NOW stop the players (after capturing position)
     audioPlayer.stop();
     videoPlayer.stop();
     
-    // When stopped, immediately sync position with startPosition for display/syncing
-    // This ensures the playhead shows the start position when paused (for sync with tracker)
-    float newPos = startPosition.get();
-    float oldPos = position.get();
-    if (std::abs(oldPos - newPos) > 0.001f) {
-        position.set(newPos);
-        // Note: onPositionChanged will be triggered, but we don't have direct access to MediaPool callback here
-        // The sync will happen via MediaPool's setParameter when it detects the change
+    // CRITICAL: Preserve position IMMEDIATELY after stopping players
+    // The players may have reset their position to 0, and any callbacks/listeners
+    // might try to read from them and reset the position parameter
+    // So we MUST set the position parameter to the captured value right away
+    if (actualPlaybackPosition > 0.001f) {
+        position.set(actualPlaybackPosition);
+        ofLogNotice("ofxMediaPlayer") << "Preserved playback position in stop(): " << actualPlaybackPosition 
+                                       << " (startPosition: " << startPosition.get() << ")";
+    } else {
+        // If position is still 0, check if we had a valid position before (might be a race condition)
+        // In this case, keep the existing position parameter value if it's valid
+        float existingPos = position.get();
+        if (existingPos > 0.001f) {
+            ofLogNotice("ofxMediaPlayer") << "Keeping existing position parameter in stop(): " << existingPos
+                                           << " (startPosition: " << startPosition.get() << ")";
+            // Don't overwrite - position parameter already has a valid value
+        } else {
+            ofLogVerbose("ofxMediaPlayer") << "No valid position to preserve in stop() (was: " << existingPos << ")";
+        }
     }
     
     if (audioEnabled.get()) {
@@ -281,6 +353,9 @@ void MediaPlayer::update() {
     }
     
     // Sync position parameter with actual playback position
+    // CRITICAL: Only update position when actively playing
+    // When stopped, position is preserved by stop() method and should NOT be overwritten
+    // by reading from underlying players (which are reset to 0)
     if (isPlaying()) {
         float currentPosition = 0.0f;
         float speedVal = speed.get();
@@ -325,15 +400,59 @@ void MediaPlayer::update() {
         // Update the position parameter to reflect actual playhead position during playback
         // Only update if the position has actually changed to avoid unnecessary updates
         // NOTE: This updates the playhead position, not startPosition
-        if (abs(currentPosition - position.get()) > 0.001f) {
+        // CRITICAL: Only update if we got a valid position from players
+        // Don't update if currentPosition is 0 (which might happen if players are stopping)
+        if (currentPosition > 0.001f && abs(currentPosition - position.get()) > 0.001f) {
             position.set(currentPosition);
         }
     }
-    // Note: When stopped, position is synced immediately in stop() method
-    // No need to sync in update loop - this avoids delay
+    // CRITICAL: When stopped, position is preserved by stop() method
+    // DO NOT read from underlying players (which are reset to 0) and overwrite the preserved position
+    // The position parameter contains the preserved playback position for position memory
     
     // Check for scheduled stop (gating system)
     if (scheduledStopActive && ofGetElapsedTimef() >= stopTime) {
+        // CRITICAL: Capture position directly from players BEFORE calling stop()
+        // The position parameter might not be up-to-date if update() hasn't synced it yet
+        // So we read directly from the players (most accurate source) while they're still playing
+        float capturedPosition = 0.0f;
+        
+        if (isPlaying()) {
+            // Read from audio player first (usually more accurate for timing)
+            if (isAudioLoaded() && audioPlayer.isPlaying()) {
+                float audioPos = audioPlayer.getPosition();
+                if (audioPos > 0.001f) {
+                    capturedPosition = audioPos;
+                }
+            }
+            
+            // If audio position wasn't valid, try video
+            if (capturedPosition < 0.001f && isVideoLoaded() && videoPlayer.isPlaying()) {
+                float videoPos = videoPlayer.getVideoFile().getPosition();
+                if (videoPos > 0.001f) {
+                    capturedPosition = videoPos;
+                }
+            }
+            
+            // Fallback to position parameter if players didn't give valid position
+            if (capturedPosition < 0.001f) {
+                float paramPos = position.get();
+                if (paramPos > 0.001f) {
+                    capturedPosition = paramPos;
+                }
+            }
+        } else {
+            // Not playing - use position parameter
+            capturedPosition = position.get();
+        }
+        
+        // Update position parameter with captured value BEFORE calling stop()
+        // This ensures stop() will preserve the correct position
+        if (capturedPosition > 0.001f) {
+            position.set(capturedPosition);
+            ofLogVerbose("ofxMediaPlayer") << "Gate ending - captured position before stop: " << capturedPosition;
+        }
+        
         stop();
         scheduledStopActive = false;
         // Changed to verbose to avoid performance issues during playback
@@ -364,24 +483,42 @@ void MediaPlayer::onPositionChanged(float& pos) {
         return;
     }
     
+    // CRITICAL: When stopped, the position parameter contains the preserved playback position
+    // for position memory. We should NOT read from the players (which are reset to 0) and
+    // overwrite the position parameter. Only seek if the position is being explicitly set
+    // (e.g., by user seeking), not if it's being preserved from stop().
+    // 
+    // If position is > 0.01f, it's likely a preserved position from stop() - don't overwrite it
+    // by reading from players (which are at 0). Only seek if we're explicitly setting a new position.
+    // 
+    // However, we still need to allow seeking when paused/stopped for user interaction.
+    // The key is: if position parameter is valid (> 0.01f), trust it and seek to it.
+    // Don't read from players and potentially reset it to 0.
+    
     // PERFORMANCE CRITICAL: Only seek when NOT playing (paused/stopped state)
     // This is for seeking while paused, not for playback position updates
-    if (isAudioLoaded()) {
-        // Only set audio position if it's significantly different (audio seeking is fast, but still avoid unnecessary calls)
-        float currentAudioPos = audioPlayer.getPosition();
-        if (std::abs(currentAudioPos - pos) > 0.001f) {
-            audioPlayer.setPosition(pos);
+    // CRITICAL: Don't read from players and reset position - if pos is valid, seek to it
+    if (pos > 0.001f) {
+        // Position is valid - seek to it (user seeking or preserved position)
+        if (isAudioLoaded()) {
+            // Only set audio position if it's significantly different (audio seeking is fast, but still avoid unnecessary calls)
+            float currentAudioPos = audioPlayer.getPosition();
+            if (std::abs(currentAudioPos - pos) > 0.001f) {
+                audioPlayer.setPosition(pos);
+            }
+        }
+        
+        if (isVideoLoaded()) {
+            // CRITICAL: Only set video position if it's significantly different
+            // HAP video seeking takes 200ms+, so we MUST avoid redundant calls
+            float currentVideoPos = videoPlayer.getVideoFile().getPosition();
+            if (std::abs(currentVideoPos - pos) > 0.01f) {
+                videoPlayer.getVideoFile().setPosition(pos);
+            }
         }
     }
-    
-    if (isVideoLoaded()) {
-        // CRITICAL: Only set video position if it's significantly different
-        // HAP video seeking takes 200ms+, so we MUST avoid redundant calls
-        float currentVideoPos = videoPlayer.getVideoFile().getPosition();
-        if (std::abs(currentVideoPos - pos) > 0.01f) {
-            videoPlayer.getVideoFile().setPosition(pos);
-        }
-    }
+    // If pos is 0 or very small, don't seek - this might be a reset that we want to ignore
+    // (e.g., if players reset to 0 but we want to preserve the position parameter)
     
     lastPosition = pos;
 }

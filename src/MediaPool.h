@@ -9,6 +9,7 @@
 #include <mutex>
 #include <atomic>
 #include <queue>
+#include <map>
 
 // Forward declarations to avoid circular dependency
 class MediaPlayer;
@@ -193,6 +194,13 @@ private:
     // Transport listener system
     TransportCallback transportListener;
     bool lastTransportState;
+    
+    // Position memory: Store last playback position per media index
+    // This allows position consistency when retriggering same media without position instructions
+    std::map<int, float> lastPositionByMediaIndex;
+    
+    // Track last playing state to detect when player stops (for position capture)
+    std::map<int, bool> lastPlayingStateByMediaIndex;
     
     // Parameter change callback (inherited from Module base class)
     // Note: MediaPool inherits parameterChangeCallback from Module
