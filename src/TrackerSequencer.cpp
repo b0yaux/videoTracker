@@ -6,72 +6,6 @@
 #include "ofxImGui.h"  // Add this line for ImGui support
 #include <cmath>  // For std::round
 
-void TrackerSequencer::PatternCell::clear() {
-    index = -1;
-    length = 1;  // Changed to int
-    parameterValues.clear();
-    
-    // Don't set default parameters here - defaults come from MediaPool/MediaPlayer
-    // Empty parameterValues means "use defaults/position memory" when triggering
-}
-
-float TrackerSequencer::PatternCell::getParameterValue(const std::string& paramName, float defaultValue) const {
-    auto it = parameterValues.find(paramName);
-    if (it != parameterValues.end()) {
-        return it->second;
-    }
-    return defaultValue;
-}
-
-void TrackerSequencer::PatternCell::setParameterValue(const std::string& paramName, float value) {
-    parameterValues[paramName] = value;
-}
-
-bool TrackerSequencer::PatternCell::hasParameter(const std::string& paramName) const {
-    return parameterValues.find(paramName) != parameterValues.end();
-}
-
-void TrackerSequencer::PatternCell::removeParameter(const std::string& paramName) {
-    parameterValues.erase(paramName);
-}
-
-
-bool TrackerSequencer::PatternCell::operator==(const PatternCell& other) const {
-    if (index != other.index || length != other.length) {
-        return false;
-    }
-    if (parameterValues.size() != other.parameterValues.size()) {
-        return false;
-    }
-    for (const auto& pair : parameterValues) {
-        auto it = other.parameterValues.find(pair.first);
-        if (it == other.parameterValues.end() || it->second != pair.second) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool TrackerSequencer::PatternCell::operator!=(const PatternCell& other) const {
-    return !(*this == other);
-}
-
-std::string TrackerSequencer::PatternCell::toString() const {
-    if (isEmpty()) {
-        return "---";
-    }
-    
-    std::string result = "[" + ofToString(index) + "]";
-    result += " len:" + ofToString(length);
-    
-    // Add parameter values
-    for (const auto& pair : parameterValues) {
-        result += " " + pair.first + ":" + ofToString(pair.second, 2);
-    }
-    
-    return result;
-}
-
 // TrackerSequencer implementation
 //--------------------------------------------------------------
 TrackerSequencer::TrackerSequencer() 
@@ -82,7 +16,13 @@ TrackerSequencer::TrackerSequencer()
       draggingStep(-1), draggingColumn(-1), lastDragValue(-1), dragStartY(0.0f), dragStartX(0.0f),
       stepStartTime(0.0f), stepEndTime(0.0f),
       showGUI(true),
-      currentPlayingStep(-1), shouldFocusFirstCell(false), shouldRefocusCurrentCell(false), requestFocusMoveToParent(false), isParentWidgetFocused(false) {
+      currentPlayingStep(-1), shouldFocusFirstCell(false), shouldRefocusCurrentCell(false), requestFocusMoveToParent(false), parentWidgetFocused(false),
+      currentPatternIndex(0), currentChainIndex(0), currentChainRepeat(0), usePatternChain(true) {
+    // Initialize with one empty pattern
+    patterns.push_back(Pattern(numSteps));
+    // Initialize pattern chain with first pattern
+    patternChain.push_back(0);
+    patternChainRepeatCounts[0] = 1;
 }
 
 TrackerSequencer::~TrackerSequencer() {
@@ -100,13 +40,18 @@ void TrackerSequencer::setup(Clock* clockRef, int steps) {
     shouldFocusFirstCell = false; // No focus request initially
     shouldRefocusCurrentCell = false; // No refocus request initially
     
-    // Initialize pattern
-    pattern.resize(numSteps);
-    for (int i = 0; i < numSteps; i++) {
-        pattern[i] = PatternCell();
+    // Initialize patterns (ensure at least one pattern exists)
+    if (patterns.empty()) {
+        patterns.push_back(Pattern(numSteps));
+        currentPatternIndex = 0;
+    } else {
+        // Update all existing patterns to match numSteps
+        for (auto& p : patterns) {
+            p.setNumSteps(numSteps);
+        }
     }
     
-            // Initialize default column configuration if empty
+    // Initialize default column configuration if empty
             if (columnConfig.empty()) {
                 initializeDefaultColumns();
             }
@@ -154,26 +99,45 @@ void TrackerSequencer::setNumSteps(int steps) {
     if (steps <= 0) return;
     
     numSteps = steps;
-    pattern.resize(numSteps);
-    
-    // Clear any steps beyond the new size
-    for (int i = numSteps; i < pattern.size(); i++) {
-        pattern[i] = PatternCell();
+    // Update all patterns to match numSteps
+    for (auto& p : patterns) {
+        p.setNumSteps(numSteps);
     }
 
     ofLogNotice("TrackerSequencer") << "Number of steps changed to " << numSteps;
+}
+
+// Helper to get current pattern
+Pattern& TrackerSequencer::getCurrentPattern() {
+    if (patterns.empty()) {
+        // Safety: create a pattern if none exist
+        patterns.push_back(Pattern(numSteps));
+        currentPatternIndex = 0;
+    }
+    if (currentPatternIndex < 0 || currentPatternIndex >= (int)patterns.size()) {
+        currentPatternIndex = 0;
+    }
+    return patterns[currentPatternIndex];
+}
+
+const Pattern& TrackerSequencer::getCurrentPattern() const {
+    if (patterns.empty() || currentPatternIndex < 0 || currentPatternIndex >= (int)patterns.size()) {
+        static Pattern emptyPattern(16);
+        return emptyPattern;
+    }
+    return patterns[currentPatternIndex];
 }
 
 void TrackerSequencer::setCell(int step, const PatternCell& cell) {
     if (!isValidStep(step)) return;
     
     // Check if position parameter changed and notify if it's the current edit/playback step
-    const PatternCell& oldCell = pattern[step];
+    const PatternCell& oldCell = getCurrentPattern().getCell(step);
     float oldPosition = oldCell.getParameterValue("position", 0.0f);
     float newPosition = cell.getParameterValue("position", 0.0f);
     
     // Update the pattern
-    pattern[step] = cell;
+    getCurrentPattern().setCell(step, cell);
     
     // Notify if position changed and this is the current step (edit or playback)
     // BUT only if we're not actively editing the position column (to avoid interfering with edit mode)
@@ -204,23 +168,21 @@ void TrackerSequencer::setCell(int step, const PatternCell& cell) {
     // Removed verbose logging for performance
 }
 
-TrackerSequencer::PatternCell TrackerSequencer::getCell(int step) const {
+PatternCell TrackerSequencer::getCell(int step) const {
     if (!isValidStep(step)) return PatternCell();
-    return pattern[step];
+    return getCurrentPattern().getCell(step);
 }
 
 void TrackerSequencer::clearCell(int step) {
     if (!isValidStep(step)) return;
     
-    pattern[step].clear();
+    getCurrentPattern().clearCell(step);
     
     // Removed verbose logging for performance
 }
 
 void TrackerSequencer::clearPattern() {
-    for (int i = 0; i < numSteps; i++) {
-        pattern[i].clear();
-    }
+    getCurrentPattern().clear();
     
     ofLogNotice("TrackerSequencer") << "Pattern cleared";
 }
@@ -262,7 +224,7 @@ void TrackerSequencer::randomizePattern() {
             cell.clear(); // Empty/rest step
         }
         
-        pattern[i] = cell;
+        getCurrentPattern().setCell(i, cell);
     }
     
     ofLogNotice("TrackerSequencer") << "Pattern randomized with " << numMedia << " media items";
@@ -292,17 +254,17 @@ void TrackerSequencer::randomizeColumn(int columnIndex) {
         for (int i = 0; i < numSteps; i++) {
             // 70% chance of having a media item, 30% chance of being empty (rest)
             if (ofRandom(1.0f) < 0.7f) {
-                pattern[i].index = ofRandom(0, numMedia);
+                getCurrentPattern()[i].index = ofRandom(0, numMedia);
             } else {
-                pattern[i].index = -1; // Empty/rest
+                getCurrentPattern()[i].index = -1; // Empty/rest
             }
         }
         ofLogNotice("TrackerSequencer") << "Index column randomized";
     } else if (colConfig.parameterName == "length") {
         // Randomize length column
         for (int i = 0; i < numSteps; i++) {
-            if (pattern[i].index >= 0) { // Only randomize if step has a media item
-                pattern[i].length = ofRandom(1, numSteps + 1);
+            if (getCurrentPattern()[i].index >= 0) { // Only randomize if step has a media item
+                getCurrentPattern()[i].length = ofRandom(1, numSteps + 1);
             }
         }
         ofLogNotice("TrackerSequencer") << "Length column randomized";
@@ -310,16 +272,16 @@ void TrackerSequencer::randomizeColumn(int columnIndex) {
         // Randomize parameter column
         auto range = getParameterRange(colConfig.parameterName);
         for (int i = 0; i < numSteps; i++) {
-            if (pattern[i].index >= 0) { // Only randomize if step has a media item
+            if (getCurrentPattern()[i].index >= 0) { // Only randomize if step has a media item
                 if (colConfig.parameterName == "volume") {
                     // Use 25% to 75% of volume range for randomization (avoiding extremes)
                     float volumeRangeSize = range.second - range.first;
-                    pattern[i].setParameterValue(colConfig.parameterName, ofRandom(
+                    getCurrentPattern()[i].setParameterValue(colConfig.parameterName, ofRandom(
                         range.first + volumeRangeSize * 0.25f,
                         range.first + volumeRangeSize * 0.75f
                     ));
                 } else {
-                    pattern[i].setParameterValue(colConfig.parameterName, ofRandom(range.first, range.second));
+                    getCurrentPattern()[i].setParameterValue(colConfig.parameterName, ofRandom(range.first, range.second));
                 }
             }
         }
@@ -331,13 +293,13 @@ void TrackerSequencer::applyLegato() {
     // Apply legato: set each step's length to the number of steps until the next step with a note
     // This creates smooth transitions between steps (no gaps)
     for (int i = 0; i < numSteps; i++) {
-        if (pattern[i].index >= 0) {
+        if (getCurrentPattern()[i].index >= 0) {
             // This step has a note - find the next step with a note
             int stepsToNext = 1;
             bool foundNext = false;
             
             for (int j = i + 1; j < numSteps; j++) {
-                if (pattern[j].index >= 0) {
+                if (getCurrentPattern()[j].index >= 0) {
                     // Found the next step with a note
                     stepsToNext = j - i;
                     foundNext = true;
@@ -347,15 +309,20 @@ void TrackerSequencer::applyLegato() {
             
             if (foundNext) {
                 // Set length to reach the next step (clamp to max 16)
-                pattern[i].length = std::min(16, stepsToNext);
+                getCurrentPattern()[i].length = std::min(16, stepsToNext);
             } else {
                 // No next step found - keep current length or set to remaining steps
                 int remainingSteps = numSteps - i;
-                pattern[i].length = std::min(16, remainingSteps);
+                getCurrentPattern()[i].length = std::min(16, remainingSteps);
             }
         }
     }
     ofLogNotice("TrackerSequencer") << "Legato applied to length column";
+}
+
+bool TrackerSequencer::duplicateRange(int fromStep, int toStep, int destinationStep) {
+    // Delegate to Pattern class
+    return getCurrentPattern().duplicateRange(fromStep, toStep, destinationStep);
 }
 
 // Timing and playback control
@@ -460,22 +427,31 @@ bool TrackerSequencer::saveState(const std::string& filename) const {
     }
     json["columnConfig"] = columnArray;
     
-    ofJson patternArray = ofJson::array();
-    for (int i = 0; i < numSteps; i++) {
-        ofJson cellJson;
-        const auto& cell = pattern[i];
-        cellJson["index"] = cell.index;
-        cellJson["length"] = cell.length;
-        
-        // Save parameter values
-        ofJson paramJson = ofJson::object();
-        for (const auto& pair : cell.parameterValues) {
-            paramJson[pair.first] = pair.second;
-        }
-        cellJson["parameters"] = paramJson;
-        patternArray.push_back(cellJson);
+    // Save multi-pattern support
+    json["currentPatternIndex"] = currentPatternIndex;
+    json["usePatternChain"] = usePatternChain;
+    json["currentChainIndex"] = currentChainIndex;
+    
+    // Save all patterns
+    ofJson patternsArray = ofJson::array();
+    for (const auto& p : patterns) {
+        patternsArray.push_back(p.toJson());
     }
-    json["pattern"] = patternArray;
+    json["patterns"] = patternsArray;
+    
+    // Save pattern chain with repeat counts
+    ofJson chainArray = ofJson::array();
+    for (size_t i = 0; i < patternChain.size(); i++) {
+        ofJson entryJson;
+        entryJson["patternIndex"] = patternChain[i];
+        entryJson["repeatCount"] = getPatternChainRepeatCount((int)i);
+        chainArray.push_back(entryJson);
+    }
+    json["patternChain"] = chainArray;
+    json["currentChainRepeat"] = currentChainRepeat;
+    
+    // Legacy: Save single pattern for backward compatibility
+    json["pattern"] = getCurrentPattern().toJson();
     
     ofFile file(filename, ofFile::WriteOnly);
     if (file.is_open()) {
@@ -556,45 +532,150 @@ bool TrackerSequencer::loadState(const std::string& filename) {
         initializeDefaultColumns();
     }
     
-    // Load pattern data
-    if (json.contains("pattern") && json["pattern"].is_array()) {
-        auto patternArray = json["pattern"];
-        int maxSteps = std::min(numSteps, (int)patternArray.size());
-        
-        for (int i = 0; i < maxSteps; i++) {
-            if (i < patternArray.size()) {
-                auto cellJson = patternArray[i];
-                PatternCell cell;
-                
-                // Load fixed fields
-                if (cellJson.contains("index")) {
-                    cell.index = cellJson["index"];
-                } else if (cellJson.contains("mediaIndex")) {
-                    cell.index = cellJson["mediaIndex"]; // Legacy support
-                }
-                
-                if (cellJson.contains("length")) {
-                    cell.length = cellJson["length"];
-                } else if (cellJson.contains("stepLength")) {
-                    cell.length = cellJson["stepLength"]; // Legacy support
-                }
-                
-                // Load parameter values (new format)
-                if (cellJson.contains("parameters") && cellJson["parameters"].is_object()) {
-                    auto paramJson = cellJson["parameters"];
-                    for (auto it = paramJson.begin(); it != paramJson.end(); ++it) {
-                        cell.setParameterValue(it.key(), it.value());
-                    }
-                } else {
-                    // Legacy: migrate old format to new parameter map
-                    if (cellJson.contains("position")) cell.setParameterValue("position", cellJson["position"]);
-                    if (cellJson.contains("speed")) cell.setParameterValue("speed", cellJson["speed"]);
-                    if (cellJson.contains("volume")) cell.setParameterValue("volume", cellJson["volume"]);
-                }
-                // Legacy: audioEnabled/videoEnabled fields are ignored (backward compatibility)
-                
-                pattern[i] = cell;
+    // Load multi-pattern support (new format)
+    if (json.contains("patterns") && json["patterns"].is_array()) {
+        patterns.clear();
+        auto patternsArray = json["patterns"];
+        for (const auto& patternJson : patternsArray) {
+            Pattern p(numSteps);
+            p.fromJson(patternJson);
+            // Ensure pattern size matches numSteps
+            if (p.getNumSteps() != numSteps) {
+                p.setNumSteps(numSteps);
             }
+            patterns.push_back(p);
+        }
+        
+        // Load current pattern index
+        if (json.contains("currentPatternIndex")) {
+            int loadedIndex = json["currentPatternIndex"];
+            if (loadedIndex >= 0 && loadedIndex < (int)patterns.size()) {
+                currentPatternIndex = loadedIndex;
+            } else {
+                currentPatternIndex = 0;
+            }
+        }
+        
+        // Load pattern chain with repeat counts (support both new and legacy keys)
+        ofJson chainArray;
+        if (json.contains("patternChain") && json["patternChain"].is_array()) {
+            chainArray = json["patternChain"];
+        } else if (json.contains("orderList") && json["orderList"].is_array()) {
+            // Legacy: support old "orderList" key
+            chainArray = json["orderList"];
+        }
+        
+        if (!chainArray.is_null() && chainArray.is_array()) {
+            patternChain.clear();
+            patternChainRepeatCounts.clear();
+            for (size_t i = 0; i < chainArray.size(); i++) {
+                const auto& chainEntry = chainArray[i];
+                int patternIdx = -1;
+                int repeatCount = 1;
+                
+                // Support both old format (int) and new format (object)
+                if (chainEntry.is_number()) {
+                    // Legacy format: just pattern index
+                    patternIdx = chainEntry;
+                } else if (chainEntry.is_object()) {
+                    // New format: object with patternIndex and repeatCount
+                    if (chainEntry.contains("patternIndex")) {
+                        patternIdx = chainEntry["patternIndex"];
+                    }
+                    if (chainEntry.contains("repeatCount")) {
+                        repeatCount = chainEntry["repeatCount"];
+                        repeatCount = std::max(1, std::min(99, repeatCount));
+                    }
+                }
+                
+                if (patternIdx >= 0 && patternIdx < (int)patterns.size()) {
+                    patternChain.push_back(patternIdx);
+                    patternChainRepeatCounts[(int)i] = repeatCount;
+                    patternChainDisabled[(int)i] = false;  // Default to enabled when loading
+                }
+            }
+        }
+        
+        // Load pattern chain settings (support both new and legacy keys)
+        if (json.contains("usePatternChain")) {
+            usePatternChain = json["usePatternChain"];
+        } else if (json.contains("useOrderList")) {
+            // Legacy: support old "useOrderList" key
+            usePatternChain = json["useOrderList"];
+        } else {
+            // Default to enabled for new files
+            usePatternChain = true;
+        }
+        
+        if (json.contains("currentChainIndex")) {
+            int loadedChainIndex = json["currentChainIndex"];
+            if (loadedChainIndex >= 0 && loadedChainIndex < (int)patternChain.size()) {
+                currentChainIndex = loadedChainIndex;
+            } else {
+                currentChainIndex = 0;
+            }
+        } else if (json.contains("currentOrderIndex")) {
+            // Legacy: support old "currentOrderIndex" key
+            int loadedChainIndex = json["currentOrderIndex"];
+            if (loadedChainIndex >= 0 && loadedChainIndex < (int)patternChain.size()) {
+                currentChainIndex = loadedChainIndex;
+            } else {
+                currentChainIndex = 0;
+            }
+        }
+        
+        if (json.contains("currentChainRepeat")) {
+            currentChainRepeat = json["currentChainRepeat"];
+        } else if (json.contains("currentOrderRepeat")) {
+            // Legacy: support old "currentOrderRepeat" key
+            currentChainRepeat = json["currentOrderRepeat"];
+        } else {
+            currentChainRepeat = 0;
+        }
+        
+        // If pattern chain is empty but enabled, initialize with all patterns
+        if (usePatternChain && patternChain.empty() && !patterns.empty()) {
+            for (size_t i = 0; i < patterns.size(); i++) {
+                patternChain.push_back((int)i);
+                patternChainRepeatCounts[(int)i] = 1;
+            }
+            currentChainIndex = 0;
+            currentChainRepeat = 0;
+        }
+        
+        ofLogNotice("TrackerSequencer") << "Loaded " << patterns.size() << " patterns, current pattern: " << currentPatternIndex;
+    } else if (json.contains("pattern") && json["pattern"].is_array()) {
+        // Legacy: Load single pattern (backward compatibility)
+        patterns.clear();
+        Pattern p(numSteps);
+        p.fromJson(json["pattern"]);
+        if (p.getNumSteps() != numSteps) {
+            p.setNumSteps(numSteps);
+        }
+        patterns.push_back(p);
+        currentPatternIndex = 0;
+        patternChain.clear();
+        patternChainRepeatCounts.clear();
+        // Initialize pattern chain with the single pattern for legacy files
+        patternChain.push_back(0);
+        patternChainRepeatCounts[0] = 1;
+        usePatternChain = true;  // Enable by default
+        currentChainIndex = 0;
+        currentChainRepeat = 0;
+        ofLogNotice("TrackerSequencer") << "Loaded legacy single pattern format";
+    } else {
+        // No pattern data - ensure we have at least one empty pattern
+        if (patterns.empty()) {
+            patterns.push_back(Pattern(numSteps));
+            currentPatternIndex = 0;
+        }
+        // Initialize pattern chain with the first pattern
+        if (patternChain.empty() && !patterns.empty()) {
+            patternChain.push_back(0);
+            patternChainRepeatCounts[0] = 1;
+            usePatternChain = true;  // Enable by default
+            currentChainIndex = 0;
+            currentChainRepeat = 0;
         }
     }
     
@@ -622,7 +703,47 @@ void TrackerSequencer::advanceStep() {
     }
     
     // Always advance playback step (for visual indicator)
+    int previousStep = playbackStep;
     playbackStep = (playbackStep + 1) % numSteps;
+    
+    // Check if we wrapped around (pattern finished)
+    bool patternFinished = (playbackStep == 0 && previousStep == numSteps - 1);
+    
+    // If pattern finished and using pattern chain, handle repeat counts
+    if (patternFinished && usePatternChain && !patternChain.empty()) {
+        // Increment repeat counter
+        currentChainRepeat++;
+        
+        // Get repeat count for current chain entry (default to 1 if not set)
+        int repeatCount = 1;
+        auto it = patternChainRepeatCounts.find(currentChainIndex);
+        if (it != patternChainRepeatCounts.end()) {
+            repeatCount = it->second;
+        }
+        
+        // Check if we've finished all repeats for current chain entry
+        if (currentChainRepeat >= repeatCount) {
+            // Move to next chain entry (skip disabled entries)
+            currentChainRepeat = 0;
+            int startIndex = currentChainIndex;
+            do {
+                currentChainIndex = (currentChainIndex + 1) % (int)patternChain.size();
+                // If we've looped back to start and all are disabled, break to avoid infinite loop
+                if (currentChainIndex == startIndex) break;
+            } while (isPatternChainEntryDisabled(currentChainIndex) && currentChainIndex != startIndex);
+        }
+        
+        // Update current pattern index (only if not disabled)
+        if (!isPatternChainEntryDisabled(currentChainIndex)) {
+            int nextPatternIdx = patternChain[currentChainIndex];
+            if (nextPatternIdx >= 0 && nextPatternIdx < (int)patterns.size()) {
+                currentPatternIndex = nextPatternIdx;
+                ofLogVerbose("TrackerSequencer") << "Pattern finished, advancing to pattern " << nextPatternIdx 
+                                                 << " (chain position " << currentChainIndex 
+                                                 << ", repeat " << (currentChainRepeat + 1) << "/" << repeatCount << ")";
+            }
+        }
+    }
     
     // Check if we should trigger the new step
     const PatternCell& newCell = getCell(playbackStep);
@@ -961,7 +1082,7 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
         case 'X':
             // Copy from previous step
             if (isValidStep(editStep) && editStep > 0) {
-                pattern[editStep] = pattern[editStep - 1];
+                        getCurrentPattern().setCell(editStep, getCurrentPattern().getCell(editStep - 1));
                 return true;
             }
             break;
@@ -970,25 +1091,11 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
         case '0': case '1': case '2': case '3': case '4': case '5': 
         case '6': case '7': case '8': case '9': {
             // Auto-enter edit mode if we have a valid cell focused (Blender-style)
+            // CRITICAL: Only auto-enter edit mode if a cell is actually focused
+            // Don't default to first cell - user must explicitly focus a cell first
             if (!isEditingCell) {
-                // If editStep/editColumn aren't set yet, default to first data cell
-                if (!isValidStep(editStep) || editColumn <= 0 || editColumn > (int)columnConfig.size()) {
-                    // No valid cell focused - default to first data cell and enter edit mode
-                    if (numSteps > 0 && !columnConfig.empty()) {
-                        ofLogNotice("TrackerSequencer") << "[DEBUG] [SET editStep] Digit key - setting editStep to 0, editColumn to 1 (default to first cell)";
-                        editStep = 0;
-                        editColumn = 1;
-                        isEditingCell = true;
-                        editBuffer.clear();
-                        editBufferInitialized = false;
-                        
-                        // Disable ImGui keyboard navigation when entering edit mode
-                        ImGuiIO& io = ImGui::GetIO();
-                        io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-                    } else {
-                        return false;
-                    }
-                } else {
+                // Check if we have a valid cell focused
+                if (isValidStep(editStep) && editColumn > 0 && editColumn <= (int)columnConfig.size()) {
                     // We have a valid cell: enter edit mode immediately
                     isEditingCell = true;
                     editBuffer.clear();
@@ -997,6 +1104,11 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                     // Disable ImGui keyboard navigation when entering edit mode
                     ImGuiIO& io = ImGui::GetIO();
                     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+                } else {
+                    // No valid cell focused - don't auto-enter edit mode
+                    // User must explicitly focus a cell (click or navigate with arrow keys/Enter) first
+                    ofLogNotice("TrackerSequencer") << "[DEBUG] Digit key ignored - no cell focused (editStep=" << editStep << ", editColumn=" << editColumn << ")";
+                    return false;
                 }
             } else {
                 // Already in edit mode: if buffer was initialized from cell value, replace on first digit
@@ -1068,12 +1180,12 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 if (editColumn == 1) { // Index column
                     if (key == '0') {
                         // Clear media index (rest)
-                        pattern[editStep].index = -1;
+                        getCurrentPattern()[editStep].index = -1;
                         return true;
                     } else {
                         int mediaIndex = key - '1';
                         if (indexRangeCallback && mediaIndex < indexRangeCallback()) {
-                            pattern[editStep].index = mediaIndex;
+                            getCurrentPattern()[editStep].index = mediaIndex;
                             return true;
                         }
                     }
@@ -1086,30 +1198,23 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
         case '.':
         case '-': {
             // Auto-enter edit mode if we have a valid cell focused
+            // CRITICAL: Only auto-enter edit mode if a cell is actually focused
+            // Don't default to first cell - user must explicitly focus a cell first
             if (!isEditingCell) {
-                // If editStep/editColumn aren't set yet, default to first data cell
-                if (!isValidStep(editStep) || editColumn <= 0 || editColumn > (int)columnConfig.size()) {
-                    // No valid cell focused - default to first data cell and enter edit mode
-                    if (numSteps > 0 && !columnConfig.empty()) {
-                        ofLogNotice("TrackerSequencer") << "[DEBUG] [SET editStep] Decimal key - setting editStep to 0, editColumn to 1 (default to first cell)";
-                        editStep = 0;
-                        editColumn = 1; // First data column
-                        isEditingCell = true;
-                        editBuffer.clear();
-                        
-                        // Disable ImGui keyboard navigation when entering edit mode
-                        ImGuiIO& io = ImGui::GetIO();
-                        io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-                    } else {
-                        return false;
-                    }
-                } else {
+                // Check if we have a valid cell focused
+                if (isValidStep(editStep) && editColumn > 0 && editColumn <= (int)columnConfig.size()) {
+                    // We have a valid cell: enter edit mode immediately
                     isEditingCell = true;
                     editBuffer.clear();
                     
                     // Disable ImGui keyboard navigation when entering edit mode
                     ImGuiIO& io = ImGui::GetIO();
                     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+                } else {
+                    // No valid cell focused - don't auto-enter edit mode
+                    // User must explicitly focus a cell (click or navigate with arrow keys/Enter) first
+                    ofLogNotice("TrackerSequencer") << "[DEBUG] Decimal/minus key ignored - no cell focused (editStep=" << editStep << ", editColumn=" << editColumn << ")";
+                    return false;
                 }
             }
             
@@ -1336,7 +1441,7 @@ void TrackerSequencer::adjustParameterValue(int delta) {
     }
     
     const auto& col = columnConfig[colIdx];
-    auto& cell = pattern[editStep];
+    auto& cell = getCurrentPattern()[editStep];
     
     // MODULAR: Handle fixed columns (index/length) - use isFixed flag
     if (col.isFixed && col.parameterName == "length") {
@@ -1438,7 +1543,7 @@ void TrackerSequencer::applyEditValue(int displayValue) {
     }
     
     const auto& col = columnConfig[colIdx];
-    auto& cell = pattern[editStep];
+    auto& cell = getCurrentPattern()[editStep];
     
     // MODULAR: Handle fixed columns (index/length) - use isFixed flag
     if (col.isFixed && col.parameterName == "length") {
@@ -1483,7 +1588,7 @@ void TrackerSequencer::applyEditValueFloat(float value, const std::string& param
     float clampedValue = std::max(minVal, std::min(maxVal, value));
     
     // Apply directly to the parameter (no display value conversion)
-    auto& cell = pattern[editStep];
+    auto& cell = getCurrentPattern()[editStep];
     cell.setParameterValue(parameterName, clampedValue);
     setCell(editStep, cell);
 }
@@ -1524,7 +1629,7 @@ bool TrackerSequencer::parseAndApplyEditBuffer(int step, int column, bool queueF
                 pendingEdit.parameterName = col.parameterName;
                 pendingEdit.shouldRemove = true;
             } else {
-                auto& cell = pattern[step];
+                auto& cell = getCurrentPattern()[step];
                 cell.removeParameter(col.parameterName);
                 setCell(step, cell);
             }
@@ -1547,7 +1652,7 @@ bool TrackerSequencer::parseAndApplyEditBuffer(int step, int column, bool queueF
                 pendingEdit.parameterName = col.parameterName;
                 pendingEdit.shouldRemove = true;
             } else {
-                auto& cell = pattern[step];
+                auto& cell = getCurrentPattern()[step];
                 cell.removeParameter(col.parameterName);
                 setCell(step, cell);
             }
@@ -1567,7 +1672,7 @@ bool TrackerSequencer::parseAndApplyEditBuffer(int step, int column, bool queueF
                 pendingEdit.isLength = true;
                 pendingEdit.lengthValue = lengthValue;
             } else {
-                auto& cell = pattern[step];
+                auto& cell = getCurrentPattern()[step];
                 cell.length = lengthValue;
                 setCell(step, cell);
             }
@@ -1584,7 +1689,7 @@ bool TrackerSequencer::parseAndApplyEditBuffer(int step, int column, bool queueF
                 pendingEdit.isIndex = true;
                 pendingEdit.indexValue = finalIndex;
             } else {
-                auto& cell = pattern[step];
+                auto& cell = getCurrentPattern()[step];
                 cell.index = finalIndex;
                 setCell(step, cell);
             }
@@ -1612,7 +1717,7 @@ bool TrackerSequencer::parseAndApplyEditBuffer(int step, int column, bool queueF
                 pendingEdit.parameterName = col.parameterName;
                 pendingEdit.shouldRemove = true;
             } else {
-                auto& cell = pattern[step];
+                auto& cell = getCurrentPattern()[step];
                 cell.removeParameter(col.parameterName);
                 setCell(step, cell);
             }
@@ -1632,7 +1737,7 @@ void TrackerSequencer::applyPendingEdit() {
         return;
     }
     
-    auto& cell = pattern[pendingEdit.step];
+    auto& cell = getCurrentPattern()[pendingEdit.step];
     
     if (pendingEdit.shouldRemove) {
         cell.removeParameter(pendingEdit.parameterName);
@@ -1658,7 +1763,7 @@ void TrackerSequencer::initializeEditBuffer() {
         return;
     }
     
-    const auto& cell = pattern[editStep];
+    const auto& cell = getCurrentPattern()[editStep];
     int colIdx = editColumn - 1;
     if (colIdx < 0 || colIdx >= (int)columnConfig.size()) {
         editBuffer.clear();
@@ -1716,12 +1821,7 @@ std::vector<ParameterDescriptor> TrackerSequencer::getAvailableParameters() cons
 }
 
 bool TrackerSequencer::isPatternEmpty() const {
-    for (int i = 0; i < numSteps; i++) {
-        if (!pattern[i].isEmpty()) {
-            return false;
-        }
-    }
-    return true;
+    return getCurrentPattern().isEmpty();
 }
 
 void TrackerSequencer::notifyStepEvent(int step, float stepLength) {
@@ -1760,7 +1860,7 @@ float TrackerSequencer::getCurrentStepPosition() const {
         return 0.0f;
     }
     
-    const PatternCell& cell = pattern[step];
+    const PatternCell& cell = getCurrentPattern()[step];
     return cell.getParameterValue("position", 0.0f);
 }
 
@@ -1797,7 +1897,7 @@ void TrackerSequencer::setCurrentStepPosition(float position) {
         return;
     }
     
-    PatternCell& cell = pattern[step];
+    PatternCell& cell = getCurrentPattern()[step];
     float oldValue = cell.getParameterValue("position", 0.0f);
     
     // Only update if value actually changed to avoid unnecessary notifications
@@ -1913,6 +2013,249 @@ void TrackerSequencer::updateStepActiveState() {
             stepEndTime = 0.0f;
         }
     }
+}
+
+// Multi-pattern support implementation
+//--------------------------------------------------------------
+void TrackerSequencer::setCurrentPatternIndex(int index) {
+    if (index >= 0 && index < (int)patterns.size()) {
+        currentPatternIndex = index;
+        ofLogNotice("TrackerSequencer") << "Switched to pattern " << index;
+    } else {
+        ofLogWarning("TrackerSequencer") << "Invalid pattern index: " << index;
+    }
+}
+
+int TrackerSequencer::addPattern() {
+    Pattern newPattern(numSteps);
+    patterns.push_back(newPattern);
+    int newIndex = (int)patterns.size() - 1;
+    ofLogNotice("TrackerSequencer") << "Added new pattern at index " << newIndex;
+    return newIndex;
+}
+
+void TrackerSequencer::removePattern(int index) {
+    if (patterns.size() <= 1) {
+        ofLogWarning("TrackerSequencer") << "Cannot remove pattern: must have at least one pattern";
+        return;
+    }
+    
+    if (index < 0 || index >= (int)patterns.size()) {
+        ofLogWarning("TrackerSequencer") << "Invalid pattern index for removal: " << index;
+        return;
+    }
+    
+    patterns.erase(patterns.begin() + index);
+    
+    // Adjust current pattern index if necessary
+    if (currentPatternIndex >= (int)patterns.size()) {
+        currentPatternIndex = (int)patterns.size() - 1;
+    }
+    
+    // Adjust pattern chain indices
+    for (size_t i = 0; i < patternChain.size(); i++) {
+        if (patternChain[i] == index) {
+            // Remove entry from pattern chain
+            patternChain.erase(patternChain.begin() + i);
+            i--; // Adjust index after removal
+        } else if (patternChain[i] > index) {
+            // Decrement indices greater than removed index
+            patternChain[i]--;
+        }
+    }
+    
+    // Adjust current chain index if necessary
+    if (currentChainIndex >= (int)patternChain.size()) {
+        currentChainIndex = std::max(0, (int)patternChain.size() - 1);
+    }
+    
+    ofLogNotice("TrackerSequencer") << "Removed pattern at index " << index;
+}
+
+void TrackerSequencer::copyPattern(int sourceIndex, int destIndex) {
+    if (sourceIndex < 0 || sourceIndex >= (int)patterns.size()) {
+        ofLogWarning("TrackerSequencer") << "Invalid source pattern index: " << sourceIndex;
+        return;
+    }
+    
+    if (destIndex < 0 || destIndex >= (int)patterns.size()) {
+        ofLogWarning("TrackerSequencer") << "Invalid destination pattern index: " << destIndex;
+        return;
+    }
+    
+    // Copy pattern data
+    patterns[destIndex] = patterns[sourceIndex];
+    ofLogNotice("TrackerSequencer") << "Copied pattern " << sourceIndex << " to pattern " << destIndex;
+}
+
+void TrackerSequencer::duplicatePattern(int index) {
+    if (index < 0 || index >= (int)patterns.size()) {
+        ofLogWarning("TrackerSequencer") << "Invalid pattern index for duplication: " << index;
+        return;
+    }
+    
+    Pattern newPattern = patterns[index];
+    patterns.push_back(newPattern);
+    int newIndex = (int)patterns.size() - 1;
+    ofLogNotice("TrackerSequencer") << "Duplicated pattern " << index << " to new pattern " << newIndex;
+}
+
+// Pattern chain (pattern chaining) implementation
+//--------------------------------------------------------------
+void TrackerSequencer::setCurrentChainIndex(int index) {
+    if (index >= 0 && index < (int)patternChain.size()) {
+        currentChainIndex = index;
+        currentChainRepeat = 0;  // Reset repeat counter
+        // Update current pattern index based on pattern chain
+        if (usePatternChain) {
+            int patternIdx = patternChain[currentChainIndex];
+            if (patternIdx >= 0 && patternIdx < (int)patterns.size()) {
+                currentPatternIndex = patternIdx;
+            }
+        }
+        ofLogNotice("TrackerSequencer") << "Set chain index to " << index;
+    } else {
+        ofLogWarning("TrackerSequencer") << "Invalid chain index: " << index;
+    }
+}
+
+void TrackerSequencer::addToPatternChain(int patternIndex) {
+    if (patternIndex < 0 || patternIndex >= (int)patterns.size()) {
+        ofLogWarning("TrackerSequencer") << "Invalid pattern index for chain: " << patternIndex;
+        return;
+    }
+    
+    int newIndex = (int)patternChain.size();
+    patternChain.push_back(patternIndex);
+    patternChainRepeatCounts[newIndex] = 1;  // Default repeat count
+    ofLogNotice("TrackerSequencer") << "Added pattern " << patternIndex << " to chain";
+}
+
+void TrackerSequencer::removeFromPatternChain(int chainIndex) {
+    if (chainIndex < 0 || chainIndex >= (int)patternChain.size()) {
+        ofLogWarning("TrackerSequencer") << "Invalid chain index for removal: " << chainIndex;
+        return;
+    }
+    
+    patternChain.erase(patternChain.begin() + chainIndex);
+    
+    // Remove repeat count and adjust indices
+    patternChainRepeatCounts.erase(chainIndex);
+    std::map<int, int> newRepeatCounts;
+    for (const auto& pair : patternChainRepeatCounts) {
+        if (pair.first < chainIndex) {
+            newRepeatCounts[pair.first] = pair.second;
+        } else if (pair.first > chainIndex) {
+            newRepeatCounts[pair.first - 1] = pair.second;
+        }
+    }
+    patternChainRepeatCounts = newRepeatCounts;
+    
+    // Adjust current chain index if necessary
+    bool wasCurrentIndex = (currentChainIndex == chainIndex);
+    if (currentChainIndex > chainIndex) {
+        // If current index is after the removed one, decrement it
+        // (the pattern that was at currentChainIndex is now at currentChainIndex - 1)
+        currentChainIndex--;
+    }
+    // If we removed the current index, currentChainIndex stays the same
+    // (it now points to the pattern that was at chainIndex+1, which shifted down)
+    // If current index is out of bounds, clamp to last valid index
+    if (currentChainIndex >= (int)patternChain.size()) {
+        currentChainIndex = std::max(0, (int)patternChain.size() - 1);
+    }
+    if (wasCurrentIndex) {
+        // If we removed the current index, reset repeat counter
+        currentChainRepeat = 0;
+    }
+    
+    // Switch to the pattern at the new current chain index
+    if (!patternChain.empty() && currentChainIndex >= 0 && currentChainIndex < (int)patternChain.size()) {
+        int newPatternIndex = patternChain[currentChainIndex];
+        setCurrentPatternIndex(newPatternIndex);
+    }
+    
+    ofLogNotice("TrackerSequencer") << "Removed chain entry at index " << chainIndex;
+}
+
+void TrackerSequencer::clearPatternChain() {
+    patternChain.clear();
+    patternChainRepeatCounts.clear();
+    patternChainDisabled.clear();
+    currentChainIndex = 0;
+    currentChainRepeat = 0;
+    usePatternChain = false;
+    ofLogNotice("TrackerSequencer") << "Pattern chain cleared";
+}
+
+int TrackerSequencer::getPatternChainEntry(int chainIndex) const {
+    if (chainIndex >= 0 && chainIndex < (int)patternChain.size()) {
+        return patternChain[chainIndex];
+    }
+    return -1;
+}
+
+void TrackerSequencer::setPatternChainEntry(int chainIndex, int patternIndex) {
+    if (chainIndex < 0) {
+        ofLogWarning("TrackerSequencer") << "Invalid chain index: " << chainIndex;
+        return;
+    }
+    
+    if (patternIndex < 0 || patternIndex >= (int)patterns.size()) {
+        ofLogWarning("TrackerSequencer") << "Invalid pattern index: " << patternIndex;
+        return;
+    }
+    
+    // Resize pattern chain if necessary
+    if (chainIndex >= (int)patternChain.size()) {
+        patternChain.resize(chainIndex + 1, 0);
+        // Set default repeat count for new entries
+        if (patternChainRepeatCounts.find(chainIndex) == patternChainRepeatCounts.end()) {
+            patternChainRepeatCounts[chainIndex] = 1;
+        }
+    }
+    
+    patternChain[chainIndex] = patternIndex;
+    ofLogNotice("TrackerSequencer") << "Set chain entry " << chainIndex << " to pattern " << patternIndex;
+}
+
+int TrackerSequencer::getPatternChainRepeatCount(int chainIndex) const {
+    if (chainIndex < 0 || chainIndex >= (int)patternChain.size()) {
+        return 1;  // Default repeat count
+    }
+    auto it = patternChainRepeatCounts.find(chainIndex);
+    if (it != patternChainRepeatCounts.end()) {
+        return it->second;
+    }
+    return 1;  // Default repeat count
+}
+
+void TrackerSequencer::setPatternChainRepeatCount(int chainIndex, int repeatCount) {
+    if (chainIndex < 0 || chainIndex >= (int)patternChain.size()) {
+        ofLogWarning("TrackerSequencer") << "Invalid chain index: " << chainIndex;
+        return;
+    }
+    
+    repeatCount = std::max(1, std::min(99, repeatCount));  // Clamp to 1-99
+    patternChainRepeatCounts[chainIndex] = repeatCount;
+    ofLogNotice("TrackerSequencer") << "Set chain entry " << chainIndex << " repeat count to " << repeatCount;
+}
+
+bool TrackerSequencer::isPatternChainEntryDisabled(int chainIndex) const {
+    if (chainIndex < 0 || chainIndex >= (int)patternChain.size()) {
+        return false;
+    }
+    auto it = patternChainDisabled.find(chainIndex);
+    return (it != patternChainDisabled.end() && it->second);
+}
+
+void TrackerSequencer::setPatternChainEntryDisabled(int chainIndex, bool disabled) {
+    if (chainIndex < 0 || chainIndex >= (int)patternChain.size()) {
+        ofLogWarning("TrackerSequencer") << "Invalid chain index: " << chainIndex;
+        return;
+    }
+    patternChainDisabled[chainIndex] = disabled;
+    ofLogVerbose("TrackerSequencer") << "Set chain entry " << chainIndex << " disabled: " << (disabled ? "true" : "false");
 }
 
 

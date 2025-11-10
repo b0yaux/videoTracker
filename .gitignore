@@ -1,0 +1,89 @@
+# Build artifacts
+bin/
+obj/
+*.o
+*.d
+*.a
+*.dylib
+*.so
+*.dll
+*.exe
+*.app/
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+*.xcuserdata/
+*.xcscheme
+Project.xcconfig
+*.pbxproj
+
+# Makefiles and build configs
+Makefile
+config.make
+addons.make
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dev-debug.log
+
+# Dependency directories
+node_modules/
+libs/
+
+# Environment variables
+.env
+.env.example
+
+# Editor directories and files
+.idea
+.vscode
+.cursor/
+.zed/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Documentation/planning files (not source code)
+*.md
+!README.md
+*.txt
+*.prd
+*.plan
+ANALYSIS_AND_FIXES.md
+BUILD_INSTRUCTIONS.md
+DEBUGGING_EVALUATION.txt
+PERFORMANCE_*.md
+POSITION_*.md
+SHORT_TERM_PLAN.txt
+*-refactoring-plan.txt
+*-refactor-prd.txt
+*-refactoring-plan.txt
+cleanup-worktrees.sh
+test_include.cpp
+
+# Taskmaster
+.taskmaster/
+
+# Entitlements and plists (usually generated)
+of.entitlements
+openFrameworks-Info.plist
+
+# Keep source files in src/ directory
+!src/
+!src/**/*.cpp
+!src/**/*.h
+!src/**/*.hpp 

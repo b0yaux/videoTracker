@@ -3,6 +3,7 @@
 #include "ofMain.h"
 #include "ofEvents.h"
 #include "Module.h"
+#include "Pattern.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -16,39 +17,6 @@ class TrackerSequencer {
     friend class TrackerSequencerGUI;  // Allow GUI to access private members for rendering
     
 public:
-    struct PatternCell {
-        // Fixed fields (always present)
-        int index = -1;              // Media index (-1 = empty/rest, 0+ = media index)
-        int length = 1;              // Step length in sequencer steps (1-16, integer count)
-        
-        // Dynamic parameter values (keyed by parameter name)
-        // These use float for precision (position: 0-1, speed: -10 to 10, volume: 0-2)
-        std::map<std::string, float> parameterValues;
-
-        PatternCell() = default;
-        // Legacy constructor for backward compatibility during migration
-        PatternCell(int mediaIdx, float pos, float spd, float vol, float len)
-            : index(mediaIdx), length((int)len) {
-            // Store old parameters in map for migration
-            parameterValues["position"] = pos;
-            parameterValues["speed"] = spd;
-            parameterValues["volume"] = vol;
-        }
-
-        bool isEmpty() const { return index < 0; }
-        
-        // Parameter access methods
-        float getParameterValue(const std::string& paramName, float defaultValue = 0.0f) const;
-        void setParameterValue(const std::string& paramName, float value);
-        bool hasParameter(const std::string& paramName) const;
-        void removeParameter(const std::string& paramName);
-        
-        // Additional methods
-        void clear();
-        bool operator==(const PatternCell& other) const;
-        bool operator!=(const PatternCell& other) const;
-        std::string toString() const;
-    };
 
     // Event for step triggers - broadcasts TriggerEvent to all subscribers
     // This makes TrackerSequencer truly modular - receivers subscribe via ofAddListener
@@ -91,6 +59,49 @@ public:
     void randomizeColumn(int columnIndex);  // Randomize a specific column (0 = index, 1 = length, 2+ = parameter columns)
     void applyLegato();  // Apply legato to length column (extend lengths to connect steps)
     
+    // Multi-step duplication: copy a range of steps to a destination
+    // fromStep: inclusive start of source range
+    // toStep: inclusive end of source range
+    // destinationStep: where to copy the range (overwrites existing cells)
+    // Returns true if successful, false if range is invalid
+    bool duplicateRange(int fromStep, int toStep, int destinationStep);
+    
+    // Multi-pattern support
+    int getNumPatterns() const { return (int)patterns.size(); }
+    int getCurrentPatternIndex() const { return currentPatternIndex; }
+    void setCurrentPatternIndex(int index);
+    int addPattern();  // Add a new empty pattern, returns its index
+    void removePattern(int index);  // Remove a pattern (cannot remove if it's the only one)
+    void copyPattern(int sourceIndex, int destIndex);  // Copy one pattern to another
+    void duplicatePattern(int index);  // Duplicate a pattern (adds new pattern)
+    
+    // Pattern chain (pattern chaining) support
+    int getPatternChainSize() const { return (int)patternChain.size(); }
+    int getCurrentChainIndex() const { return currentChainIndex; }
+    void setCurrentChainIndex(int index);
+    void addToPatternChain(int patternIndex);  // Add pattern to chain
+    void removeFromPatternChain(int chainIndex);  // Remove entry from chain
+    void clearPatternChain();  // Clear pattern chain
+    int getPatternChainEntry(int chainIndex) const;  // Get pattern index at chain position
+    void setPatternChainEntry(int chainIndex, int patternIndex);  // Set pattern at chain position
+    const std::vector<int>& getPatternChain() const { return patternChain; }
+    
+    // Pattern chain repeat counts
+    int getPatternChainRepeatCount(int chainIndex) const;  // Get repeat count for chain entry (1-99)
+    void setPatternChainRepeatCount(int chainIndex, int repeatCount);  // Set repeat count (1-99)
+    
+    // Pattern chain toggle
+    bool getUsePatternChain() const { return usePatternChain; }
+    void setUsePatternChain(bool use) { usePatternChain = use; }
+    
+    // Pattern chain disable (temporary disable during playback for performance)
+    bool isPatternChainEntryDisabled(int chainIndex) const;
+    void setPatternChainEntryDisabled(int chainIndex, bool disabled);
+    
+    // Helper to get current pattern (for internal use)
+    Pattern& getCurrentPattern();
+    const Pattern& getCurrentPattern() const;
+    
     // Playback control
     void play();
     void pause();
@@ -110,20 +121,49 @@ public:
     
     // Getters
     int getNumSteps() const { return numSteps; }
+    int getStepCount() const { return numSteps; }  // GUI compatibility alias
     int getCurrentStep() const { return playbackStep; }  // Backward compatibility: returns playback step
     int getPlaybackStep() const { return playbackStep; }
+    int getPlaybackStepIndex() const { return playbackStep; }  // GUI compatibility alias
     int getEditStep() const { return editStep; }
     int getEditColumn() const { return editColumn; }
+    int getEditingStepIndex() const { return editStep; }  // GUI compatibility alias
+    int getEditingColumnIndex() const { return editColumn; }  // GUI compatibility alias
     void setEditCell(int step, int column) { 
         editStep = step; 
         editColumn = column; 
     }
+    void setEditingStepIndex(int step) { editStep = step; }  // GUI compatibility
+    void setEditingColumnIndex(int column) { editColumn = column; }  // GUI compatibility
     bool isPlaying() const { return playing; }
     bool getIsEditingCell() const { return isEditingCell; }
+    bool isInEditMode() const { return isEditingCell; }  // GUI compatibility alias
     int getCurrentPlayingStep() const { return currentPlayingStep; }
     void clearCellFocus();
+    
+    // Edit buffer accessors for GUI
+    void setInEditMode(bool editing) { isEditingCell = editing; }
+    std::string& getEditInputBuffer() { return editBuffer; }
+    const std::string& getEditInputBuffer() const { return editBuffer; }
+    void setEditBufferInitialized(bool init) { editBufferInitialized = init; }
+    bool getEditBufferInitialized() const { return editBufferInitialized; }
+    
+    // Pattern cell accessor for GUI
+    PatternCell& getPatternCell(int step) { return getCurrentPattern()[step]; }
+    const PatternCell& getPatternCell(int step) const { return getCurrentPattern()[step]; }
+    
+    // Drag state accessors for GUI
+    float getDragStartY() const { return dragStartY; }
+    float getDragStartX() const { return dragStartX; }
+    int getLastDragValue() const { return lastDragValue; }
+    void setLastDragValue(int value) { lastDragValue = value; }
+    
     void requestFocusMoveToParentWidget() { requestFocusMoveToParent = true; }  // Request GUI to move focus to parent widget
-    bool getIsParentWidgetFocused() const { return isParentWidgetFocused; }  // Check if parent widget is focused
+    bool shouldMoveFocusToParent() const { return requestFocusMoveToParent; }  // GUI compatibility alias
+    void setShouldMoveFocusToParent(bool value) { requestFocusMoveToParent = value; }  // GUI compatibility
+    bool getIsParentWidgetFocused() const { return parentWidgetFocused; }  // Check if parent widget is focused
+    bool isParentWidgetFocused() const { return parentWidgetFocused; }  // GUI compatibility alias
+    void setParentWidgetFocused(bool value) { parentWidgetFocused = value; }  // GUI compatibility
     // Update step active state (clears manually triggered steps when duration expires)
     void updateStepActiveState();
     float getCurrentBpm() const;
@@ -170,6 +210,7 @@ private:
     bool isColumnFixed(int columnIndex) const;
     const ColumnConfig& getColumnConfig(int columnIndex) const;
     int getColumnCount() const;
+    const std::vector<ColumnConfig>& getColumnConfiguration() const { return columnConfig; }  // GUI compatibility
     
     // Pattern interaction methods
     bool handlePatternGridClick(int x, int y);
@@ -198,7 +239,16 @@ private:
     int stepsPerBeat = 4;
     bool gatingEnabled = true;
     
-    std::vector<PatternCell> pattern;
+    // Multi-pattern support
+    std::vector<Pattern> patterns;  // Pattern bank
+    int currentPatternIndex = 0;  // Currently active pattern
+    std::vector<int> patternChain;  // Pattern chain for pattern chaining (sequence of pattern indices)
+    std::map<int, int> patternChainRepeatCounts;  // Repeat counts for each chain entry (default: 1)
+    std::map<int, bool> patternChainDisabled;  // Disabled state for each chain entry (temporary disable during playback)
+    int currentChainIndex = 0;  // Current position in pattern chain
+    int currentChainRepeat = 0;  // Current repeat count for current chain entry
+    bool usePatternChain = true;  // If true, use pattern chain for playback; if false, use currentPatternIndex
+    
     int numSteps;
     int playbackStep;  // Currently playing step (for visual indicator)
     int editStep;      // Currently selected row for editing
@@ -244,7 +294,7 @@ private:
     bool shouldFocusFirstCell;  // Flag to request focus on first cell when entering grid
     bool shouldRefocusCurrentCell;  // Flag to request focus on current cell after exiting edit mode
     bool requestFocusMoveToParent;  // Flag to request GUI to move focus to parent widget (when UP pressed on header row)
-    bool isParentWidgetFocused;  // True when parent widget (outside table) is focused, false when on header row (inside table)
+    bool parentWidgetFocused;  // True when parent widget (outside table) is focused, false when on header row (inside table)
     
     // Parameter change callback (for ParameterSync system)
     std::function<void(const std::string&, float)> parameterChangeCallback;

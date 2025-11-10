@@ -12,8 +12,247 @@ TrackerSequencerGUI::TrackerSequencerGUI()
 }
 
 void TrackerSequencerGUI::draw(TrackerSequencer& sequencer) {
+    drawPatternChain(sequencer);
     drawTrackerStatus(sequencer);
     drawPatternGrid(sequencer);
+}
+
+void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
+    ImGui::PushID("PatternChain");
+        
+    // Pattern chain toggle checkbox
+    bool useChain = sequencer.getUsePatternChain();
+    if (ImGui::Checkbox("##chainToggle", &useChain)) {
+        sequencer.setUsePatternChain(useChain);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Enable/disable pattern chain");
+    }
+    ImGui::SameLine();
+    // Pattern chain header with toggle
+    ImGui::Text("Pattern Chain");
+    ImGui::SameLine();
+
+    
+    ImGui::Spacing();
+    
+    // Pattern chain visual list (horizontal layout, Renoise-style)
+    const auto& chain = sequencer.getPatternChain();
+    int currentChainIndex = sequencer.getCurrentChainIndex();
+    int currentPatternIndex = sequencer.getCurrentPatternIndex();
+    bool isPlaying = sequencer.isPlaying();
+    
+    // Compact styling for pattern chain
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 2));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4, 2));
+    
+    // Store starting Y position to align buttons with pattern cells
+    const float patternCellHeight = 22.0f;
+    const float buttonHeight = 16.0f;
+    const float buttonsStartY = ImGui::GetCursorPosY();
+    
+    // Draw pattern chain entries (top row)
+    for (size_t i = 0; i < chain.size(); i++) {
+        int patternIdx = chain[i];
+        bool isCurrentChainEntry = ((int)i == currentChainIndex);
+        bool isCurrentPattern = (patternIdx == currentPatternIndex);
+        bool isDisabled = sequencer.isPatternChainEntryDisabled((int)i);
+        
+        ImGui::PushID((int)i);
+        
+        // Pattern cell - clickable to select pattern (Renoise-style)
+        ImVec2 cellSize(32, 22);
+        
+        // Color coding: blue for current pattern, gray for current chain position, dark for others, red tint if disabled
+        ImU32 bgColor;
+        if (isDisabled) {
+            bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.4f, 0.2f, 0.2f, 1.0f));  // Red tint for disabled
+        } else if (isCurrentPattern && isPlaying) {
+            bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.0f, 0.9f, 0.0f, 0.6f));  // Bright blue when playing
+        } else if (isCurrentPattern) {
+            bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.9f, 0.5f, 0.0f, 0.8f));  // Blue for current pattern
+        } else if (isCurrentChainEntry) {
+            bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.4f, 0.4f, 0.4f, 1.0f));  // Gray for current chain entry
+        } else {
+            bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.25f, 0.25f, 0.25f, 1.0f));  // Dark for others
+        }
+        
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        ImVec2 cursorPos = ImGui::GetCursorScreenPos();
+        
+        // Draw background
+        drawList->AddRectFilled(cursorPos, ImVec2(cursorPos.x + cellSize.x, cursorPos.y + cellSize.y), bgColor);
+        
+        // Draw border for current chain entry
+        if (isCurrentChainEntry) {
+            ImU32 borderColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
+            drawList->AddRect(cursorPos, ImVec2(cursorPos.x + cellSize.x, cursorPos.y + cellSize.y), borderColor, 0.0f, 0, 1.5f);
+        }
+        
+        // Draw diagonal line if disabled
+        if (isDisabled) {
+            ImU32 lineColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+            drawList->AddLine(cursorPos, ImVec2(cursorPos.x + cellSize.x, cursorPos.y + cellSize.y), lineColor, 2.0f);
+        }
+        
+        // Pattern number text (2-digit format: 01, 02, 03, etc.)
+        // Display chain position (1-based) instead of actual pattern index for sequential numbering
+        char patternLabel[8];
+        snprintf(patternLabel, sizeof(patternLabel), "%02d", (int)i + 1);
+        ImVec2 textSize = ImGui::CalcTextSize(patternLabel);
+        ImVec2 textPos(cursorPos.x + (cellSize.x - textSize.x) * 0.5f, cursorPos.y + (cellSize.y - textSize.y) * 0.5f);
+        drawList->AddText(textPos, IM_COL32_WHITE, patternLabel);
+        
+        // Make it clickable
+        ImGui::InvisibleButton("pattern", cellSize);
+        if (ImGui::IsItemClicked(0)) {
+            if (isPlaying && useChain) {
+                // During playback with chain enabled: toggle disable state
+                sequencer.setPatternChainEntryDisabled((int)i, !isDisabled);
+            } else {
+                // Normal behavior: select pattern
+                sequencer.setCurrentPatternIndex(patternIdx);
+                sequencer.setCurrentChainIndex((int)i);
+            }
+        }
+        
+        if (ImGui::IsItemHovered()) {
+            if (isPlaying && useChain) {
+                ImGui::SetTooltip("Chain position %02d (Pattern %02d)\nLeft-click: Toggle disable\nRight-click: Remove from chain", (int)i + 1, patternIdx);
+            } else {
+                ImGui::SetTooltip("Chain position %02d (Pattern %02d)\nLeft-click: Select", (int)i + 1, patternIdx);
+            }
+        }
+        
+        ImGui::SameLine();
+        ImGui::PopID();
+    }
+    
+    // Small buttons for duplicate, add, and remove (same size, compact, distinct from pattern cells)
+    // Note: We keep the same style vars for buttons (they're already pushed above)
+    // Center buttons vertically relative to pattern cells
+    const float verticalOffset = (patternCellHeight - buttonHeight) * 0.5f;
+    const float buttonsY = buttonsStartY + verticalOffset;
+    
+    // 'D' button for duplicate current pattern
+    ImGui::SetCursorPosY(buttonsY);
+    if (ImGui::Button("D", ImVec2(buttonHeight, buttonHeight))) {
+        int currentPattern = sequencer.getCurrentPatternIndex();
+        sequencer.duplicatePattern(currentPattern);
+        int newPatternIndex = sequencer.getNumPatterns() - 1;
+        // Add new pattern to chain
+        sequencer.addToPatternChain(newPatternIndex);
+        // Switch to new pattern if not playing with pattern chaining enabled
+        if (!(isPlaying && useChain)) {
+            sequencer.setCurrentPatternIndex(newPatternIndex);
+            sequencer.setCurrentChainIndex(sequencer.getPatternChainSize() - 1);
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Duplicate current pattern");
+    }
+    
+    ImGui::SameLine();
+    ImGui::SetCursorPosY(buttonsY);  // Set Y after SameLine() to ensure alignment
+    
+    // '+' button to add new pattern
+    if (ImGui::Button("+", ImVec2(buttonHeight, buttonHeight))) {
+        int newPatternIndex = sequencer.addPattern();
+        sequencer.addToPatternChain(newPatternIndex);
+        // Switch to new pattern if not playing with pattern chaining enabled
+        if (!(isPlaying && useChain)) {
+            sequencer.setCurrentPatternIndex(newPatternIndex);
+            sequencer.setCurrentChainIndex(sequencer.getPatternChainSize() - 1);
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Add new pattern");
+    }
+    
+    ImGui::SameLine();
+    ImGui::SetCursorPosY(buttonsY);  // Set Y after SameLine() to ensure alignment
+    
+    // '-' button to remove currently selected pattern from chain (if chain has more than one entry)
+    bool canRemove = sequencer.getPatternChainSize() > 1;
+    if (!canRemove) {
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f);
+    }
+    if (ImGui::Button("-", ImVec2(buttonHeight, buttonHeight)) && canRemove) {
+        int chainSize = sequencer.getPatternChainSize();
+        int currentIndex = sequencer.getCurrentChainIndex();
+        if (chainSize > 1 && currentIndex >= 0 && currentIndex < chainSize) {
+            // Remove the currently selected pattern
+            // removeFromPatternChain will handle adjusting currentChainIndex appropriately
+            sequencer.removeFromPatternChain(currentIndex);
+        }
+    }
+    if (ImGui::IsItemHovered() && canRemove) {
+        ImGui::SetTooltip("Remove currently selected pattern from chain");
+    }
+    if (!canRemove) {
+        ImGui::PopStyleVar();  // Pop the alpha style var
+    }
+    
+    // Pop pattern chain style vars (used for both pattern cells and buttons)
+    ImGui::PopStyleVar(2);
+    
+
+    // Draw repeat count cells below pattern cells
+    // Push style vars for repeat count cells
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 2));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4, 2));
+    
+    for (size_t i = 0; i < chain.size(); i++) {
+        ImGui::PushID((int)(i + 1000));  // Different ID range to avoid conflicts
+        
+        int repeatCount = sequencer.getPatternChainRepeatCount((int)i);
+        bool isCurrentChainEntry = ((int)i == currentChainIndex);
+        
+        ImVec2 repeatCellSize(32, 18);
+        ImGui::PushItemWidth(repeatCellSize.x);
+        
+        // Editable repeat count (small input field, similar to pattern grid cells)
+        char repeatBuf[8];
+        snprintf(repeatBuf, sizeof(repeatBuf), "%d", repeatCount);
+        
+        // Style the repeat count cell to match pattern cell
+        if (isCurrentChainEntry) {
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
+        }
+        
+        if (ImGui::InputText("##repeat", repeatBuf, sizeof(repeatBuf), 
+                             ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_EnterReturnsTrue | 
+                             ImGuiInputTextFlags_AutoSelectAll)) {
+            try {
+                int newRepeat = std::stoi(repeatBuf);
+                newRepeat = std::max(1, std::min(99, newRepeat));
+                sequencer.setPatternChainRepeatCount((int)i, newRepeat);
+            } catch (...) {
+                // Invalid input, ignore
+            }
+        }
+        
+        if (isCurrentChainEntry) {
+            ImGui::PopStyleColor();
+        }
+        
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Repeat count: %d (1-99)", repeatCount);
+        }
+        
+        ImGui::PopItemWidth();
+        ImGui::SameLine();
+        ImGui::PopID();
+    }
+    
+    // Pop repeat count style vars
+    ImGui::PopStyleVar(2);
+    
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    
+    ImGui::PopID();
 }
 
 void TrackerSequencerGUI::drawTrackerStatus(TrackerSequencer& sequencer) {
@@ -23,9 +262,9 @@ void TrackerSequencerGUI::drawTrackerStatus(TrackerSequencer& sequencer) {
         sequencer.clearPattern();
     }
     // Pattern controls
-    int newNumSteps = sequencer.numSteps;
+    int newNumSteps = sequencer.getStepCount();
     if (ImGui::SliderInt("Steps", &newNumSteps, 4, 64, "%d", ImGuiSliderFlags_AlwaysClamp)) {
-        if (newNumSteps != sequencer.numSteps) {
+        if (newNumSteps != sequencer.getStepCount()) {
             sequencer.setNumSteps(newNumSteps);
         }
     }
@@ -41,45 +280,45 @@ void TrackerSequencerGUI::drawTrackerStatus(TrackerSequencer& sequencer) {
 void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     // Track changes for optimization
     patternDirty = false;
-    lastNumSteps = sequencer.numSteps;
-    lastPlaybackStep = sequencer.playbackStep;
+    lastNumSteps = sequencer.getStepCount();
+    lastPlaybackStep = sequencer.getPlaybackStepIndex();
     // Create a focusable parent widget BEFORE the table for navigation
     // This widget can receive focus when exiting the table via UP key on header row
     ImGui::PushID("TrackerPatternGridParent");
 
     // Arrow keys will navigate to other widgets in the panel when this is focused
     // Following ImGui pattern: SetKeyboardFocusHere(0) BEFORE creating widget to request focus
-    if (sequencer.requestFocusMoveToParent) {
+    if (sequencer.shouldMoveFocusToParent()) {
         ImGui::SetKeyboardFocusHere(0); // Request focus for the upcoming widget
         // Set flag immediately so InputRouter can see it in the same frame
         // (SetKeyboardFocusHere takes effect next frame, but we want InputRouter to know now)
-        sequencer.isParentWidgetFocused = true;
-        sequencer.editStep = -1;
-        sequencer.editColumn = -1;
+        sequencer.setParentWidgetFocused(true);
+        sequencer.setEditingStepIndex(-1);
+        sequencer.setEditingColumnIndex(-1);
     }
     
     // Handle clicks on parent widget - clear cell focus when clicked
     // This prevents cell focus from being set when clicking in the area before the first row
     if (ImGui::IsItemClicked(0)) {
         sequencer.clearCellFocus();
-        sequencer.isParentWidgetFocused = true;
+        sequencer.setParentWidgetFocused(true);
     }
     
     // Following ImGui pattern: SetItemDefaultFocus() AFTER creating widget to mark as default
-    if (sequencer.requestFocusMoveToParent) {
+    if (sequencer.shouldMoveFocusToParent()) {
         ImGui::SetItemDefaultFocus(); // Mark this widget as the default focus
-        sequencer.requestFocusMoveToParent = false; // Clear flag after using it
+        sequencer.setShouldMoveFocusToParent(false); // Clear flag after using it
     }
     
     // Check if parent widget is focused right after creating it (ImGui pattern: IsItemFocused() works for last item)
     // This updates the state if focus has already moved (e.g., from previous frame's request)
     // If we just requested focus move above, the flag is already set, but we verify here
-    if (!sequencer.isParentWidgetFocused) {
+    if (!sequencer.isParentWidgetFocused()) {
         // Only check if we didn't just set it above (to avoid overwriting)
-        sequencer.isParentWidgetFocused = ImGui::IsItemFocused();
-        if (sequencer.isParentWidgetFocused) {
-            sequencer.editStep = -1;
-            sequencer.editColumn = -1;
+        sequencer.setParentWidgetFocused(ImGui::IsItemFocused());
+        if (sequencer.isParentWidgetFocused()) {
+            sequencer.setEditingStepIndex(-1);
+            sequencer.setEditingColumnIndex(-1);
         }
     }
     
@@ -90,7 +329,7 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(1, 1));
     
     // Ensure column configuration is initialized
-    if (sequencer.columnConfig.empty()) {
+    if (sequencer.getColumnConfiguration().empty()) {
         sequencer.initializeDefaultColumns();
     }
     
@@ -98,12 +337,12 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     // Cache active step info ONCE per frame (not per row!)
     bool isPlaying = sequencer.isPlaying();
     int currentPlayingStep = sequencer.getCurrentPlayingStep();
-    int playbackStep = sequencer.playbackStep;
+    int playbackStep = sequencer.getPlaybackStepIndex();
     
     // Cache edit state to avoid repeated member access
-    int cachedEditStep = sequencer.editStep;
-    int cachedEditColumn = sequencer.editColumn;
-    bool cachedIsEditingCell = sequencer.isEditingCell;
+    int cachedEditStep = sequencer.getEditingStepIndex();
+    int cachedEditColumn = sequencer.getEditingColumnIndex();
+    bool cachedIsEditingCell = sequencer.isInEditMode();
     
     // Cache indexRangeCallback result (expensive callback - called once instead of 16+ times)
     int maxIndex = sequencer.indexRangeCallback ? sequencer.indexRangeCallback() : 127;
@@ -111,7 +350,7 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     // Cache parameter ranges and defaults for all parameter columns (expensive lookups - called once instead of 48+ times)
     std::map<std::string, std::pair<float, float>> paramRanges;
     std::map<std::string, float> paramDefaults;
-    for (const auto& col : sequencer.columnConfig) {
+    for (const auto& col : sequencer.getColumnConfiguration()) {
         // Only cache for dynamic parameters (not fixed columns like "index" or "length")
         if (col.parameterName != "index" && col.parameterName != "length") {
             if (paramRanges.find(col.parameterName) == paramRanges.end()) {
@@ -126,13 +365,13 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
                                    ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY |
                                    ImGuiTableFlags_SizingFixedFit;
     
-    int totalColumns = 1 + (int)sequencer.columnConfig.size();
+    int totalColumns = 1 + (int)sequencer.getColumnConfiguration().size();
     
     if (ImGui::BeginTable("TrackerGrid", totalColumns, flags)) {
         ImGui::TableSetupColumn("##", ImGuiTableColumnFlags_WidthFixed, 30.0f);
         
         // MODULAR: Use isFixed flag to determine column width instead of hardcoded names
-        for (const auto& col : sequencer.columnConfig) {
+        for (const auto& col : sequencer.getColumnConfiguration()) {
             float colWidth = col.isFixed ? 45.0f : 60.0f; // Fixed columns (index/length) are narrower
             ImGui::TableSetupColumn(col.displayName.c_str(), ImGuiTableColumnFlags_WidthFixed, colWidth);
         }
@@ -147,9 +386,9 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
         ImGui::TableHeader("##");
         
         // Column headers with randomization buttons
-        for (size_t i = 0; i < sequencer.columnConfig.size(); i++) {
+        for (size_t i = 0; i < sequencer.getColumnConfiguration().size(); i++) {
             ImGui::TableSetColumnIndex((int)i + 1);
-            const auto& colConfig = sequencer.columnConfig[i];
+            const auto& colConfig = sequencer.getColumnConfiguration()[i];
             
             ImGui::PushID((int)(i + 1000)); // Unique ID for header buttons
             
@@ -205,7 +444,7 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
         // Draw pattern rows
         pendingRowOutline.shouldDraw = false; // Reset row outline state
         anyCellFocusedThisFrame = false; // Reset focus tracking
-        for (int step = 0; step < sequencer.numSteps; step++) {
+        for (int step = 0; step < sequencer.getStepCount(); step++) {
             drawPatternRow(sequencer, step, step == playbackStep, step == cachedEditStep, 
                           isPlaying, currentPlayingStep,
                           maxIndex, paramRanges, paramDefaults, cachedEditStep, cachedEditColumn, cachedIsEditingCell);
@@ -273,9 +512,9 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     // - If any cell was focused, parent widget is definitely not focused
     // - If no cell is focused and editStep == -1, we might be on header row or parent widget
     // - The state checked right after creating the button is still valid if no cells were focused
-    if (anyCellFocusedThisFrame || sequencer.editStep >= 0) {
+    if (anyCellFocusedThisFrame || sequencer.getEditingStepIndex() >= 0) {
         // A cell is focused, so parent widget is definitely not focused
-        sequencer.isParentWidgetFocused = false;
+        sequencer.setParentWidgetFocused(false);
     }
     // Otherwise, keep the state we checked right after creating the button
     // This follows ImGui's pattern: IsItemFocused() is only valid for the last item,
@@ -319,7 +558,7 @@ void TrackerSequencerGUI::drawPatternRow(TrackerSequencer& sequencer, int step, 
     drawStepNumber(sequencer, step, isPlaybackStep, isPlaying, currentPlayingStep);
     
     // Draw dynamic columns (pass cached values for performance)
-    for (size_t i = 0; i < sequencer.columnConfig.size(); i++) {
+    for (size_t i = 0; i < sequencer.getColumnConfiguration().size(); i++) {
         drawParameterCell(sequencer, step, (int)i, maxIndex, paramRanges, paramDefaults,
                          cachedEditStep, cachedEditColumn, cachedIsEditingCell);
     }
@@ -404,8 +643,8 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
         sequencer.triggerStep(step);
         // Note: editStep/editColumn will be synced below when ImGui::IsItemFocused() is true
         // If focus doesn't happen immediately, we still need to set it here for immediate keyboard input
-        sequencer.editStep = step;
-        sequencer.editColumn = 0;
+        sequencer.setEditingStepIndex(step);
+        sequencer.setEditingColumnIndex(0);
     }
     
     // ONE-WAY SYNC: ImGui focus → Sequencer state
@@ -424,18 +663,18 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
         // Only sync if this is an intentional focus (click, keyboard nav, or refocus)
         if (itemWasClicked || keyboardNavActive || shouldRefocus) {
             anyCellFocusedThisFrame = true; // Track that a cell is focused
-            bool cellChanged = (sequencer.editStep != step || sequencer.editColumn != 0);
+            bool cellChanged = (sequencer.getEditingStepIndex() != step || sequencer.getEditingColumnIndex() != 0);
             
             // CRITICAL: When in edit mode, prevent focus from changing to a different cell
             // This prevents arrow keys (used for value adjustment) from accidentally changing focus
-            if (sequencer.isEditingCell && cellChanged) {
+            if (sequencer.isInEditMode() && cellChanged) {
                 // Don't sync focus changes when in edit mode - keep focus locked to editing cell
                 // NOTE: Don't return early here - we need to pop styles below
                 shouldExitEarly = true;
             } else {
-                int previousStep = sequencer.editStep;
-                sequencer.editStep = step;
-                sequencer.editColumn = 0;
+                int previousStep = sequencer.getEditingStepIndex();
+                sequencer.setEditingStepIndex(step);
+                sequencer.setEditingColumnIndex(0);
                 
                 // When paused, sync playback position and trigger step (walk through)
                 // Trigger if step changed OR if we're navigating from header row (previousStep == -1) to a step
@@ -443,15 +682,15 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
                 bool fromHeaderRow = (previousStep == -1);
                 if (fromHeaderRow || stepChanged) {
                     // Force trigger when coming from header row (even if same step)
-                    syncPlaybackToEditIfPaused(sequencer, sequencer.editStep, stepChanged, fromHeaderRow);
+                    syncPlaybackToEditIfPaused(sequencer, sequencer.getEditingStepIndex(), stepChanged, fromHeaderRow);
                 }
                 
                 // If navigating to a different cell while in edit mode, exit edit mode
                 // (This shouldn't happen now due to the check above, but keep as safety)
-                if (cellChanged && sequencer.isEditingCell) {
-                    sequencer.isEditingCell = false;
-                    sequencer.editBuffer.clear();
-                    sequencer.editBufferInitialized = false;
+                if (cellChanged && sequencer.isInEditMode()) {
+                    sequencer.setInEditMode(false);
+                    sequencer.getEditInputBuffer().clear();
+                    sequencer.setEditBufferInitialized(false);
                 }
             }
         }
@@ -466,9 +705,9 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
     // Draw outline for selected cells only (not hover)
     // When step number cell is selected, draw outline around entire row
     // Don't draw outline if we're on header row (editStep == -1)
-    bool isSelected = (sequencer.editStep == step && sequencer.editColumn == 0 && sequencer.editStep >= 0);
+    bool isSelected = (sequencer.getEditingStepIndex() == step && sequencer.getEditingColumnIndex() == 0 && sequencer.getEditingStepIndex() >= 0);
     bool isFocused = ImGui::IsItemFocused();
-    bool shouldShowOutline = isSelected || (isFocused && !sequencer.isEditingCell && sequencer.editStep >= 0);
+    bool shouldShowOutline = isSelected || (isFocused && !sequencer.isInEditMode() && sequencer.getEditingStepIndex() >= 0);
     
     if (shouldShowOutline) {
         if (isSelected) {
@@ -486,7 +725,7 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
             static ImU32 rowRedOutlineColor = ImGui::GetColorU32(ImVec4(1.0f, 0.0f, 0.0f, 1.0f));
             
             // Orange outline when in edit mode, red outline when just selected (use cached colors)
-            pendingRowOutline.color = (isSelected && sequencer.isEditingCell)
+            pendingRowOutline.color = (isSelected && sequencer.isInEditMode())
                 ? rowOrangeOutlineColor  // Orange outline in edit mode
                 : rowRedOutlineColor; // Red outline when not editing
         } else if (isFocused) {
@@ -507,16 +746,16 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
                                             int maxIndex, const std::map<std::string, std::pair<float, float>>& paramRanges,
                                             const std::map<std::string, float>& paramDefaults,
                                             int cachedEditStep, int cachedEditColumn, bool cachedIsEditingCell) {
-    if (colConfigIndex < 0 || colConfigIndex >= (int)sequencer.columnConfig.size()) {
+    if (colConfigIndex < 0 || colConfigIndex >= (int)sequencer.getColumnConfiguration().size()) {
         return;
     }
     
-    const auto& colConfig = sequencer.columnConfig[colConfigIndex];
+    const auto& colConfig = sequencer.getColumnConfiguration()[colConfigIndex];
     ImGui::TableNextColumn();
     ImGui::PushID(step * 1000 + colConfig.columnIndex);
     
     int editColumnValue = colConfigIndex + 1;
-    auto& cell = sequencer.pattern[step];
+    auto& cell = sequencer.getPatternCell(step);
     // Use cached edit state instead of accessing sequencer members repeatedly
     bool isSelected = (cachedEditStep == step && cachedEditColumn == editColumnValue);
     
@@ -534,7 +773,7 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
         int currentMediaIdx = cell.index;
         // Show edit buffer when editing (even if empty, to show edit mode is active)
         if (cachedIsEditingCell && isSelected) {
-            displayText = sequencer.editBuffer.empty() ? "00" : sequencer.editBuffer;
+            displayText = sequencer.getEditInputBuffer().empty() ? "00" : sequencer.getEditInputBuffer();
         } else if (currentMediaIdx >= 0) {
             // Use cached maxIndex instead of calling callback
             if (currentMediaIdx < maxIndex) {
@@ -556,8 +795,8 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
         } else {
         int stepCount = std::max(1, std::min(16, cell.length));
         char buf[8];
-        if (cachedIsEditingCell && isSelected && !sequencer.editBuffer.empty()) {
-            snprintf(buf, sizeof(buf), "%s", sequencer.editBuffer.c_str());
+        if (cachedIsEditingCell && isSelected && !sequencer.getEditInputBuffer().empty()) {
+            snprintf(buf, sizeof(buf), "%s", sequencer.getEditInputBuffer().c_str());
         } else {
             snprintf(buf, sizeof(buf), "%02d", stepCount);
         }
@@ -586,8 +825,8 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
                 char buf[16];
                 if (cachedIsEditingCell && isSelected) {
                     // Show edit buffer when editing (use current value if buffer empty)
-                    if (!sequencer.editBuffer.empty()) {
-                        snprintf(buf, sizeof(buf), "%s", sequencer.editBuffer.c_str());
+                    if (!sequencer.getEditInputBuffer().empty()) {
+                        snprintf(buf, sizeof(buf), "%s", sequencer.getEditInputBuffer().c_str());
                     } else {
                         // Buffer empty - show current value as fallback
                         snprintf(buf, sizeof(buf), "%.2f", value);
@@ -707,20 +946,20 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
                 shouldExitEarly = true;
             } else {
                 // Sync focus state
-                int previousStep = sequencer.editStep;
-                sequencer.editStep = step;
-                sequencer.editColumn = editColumnValue;
+                int previousStep = sequencer.getEditingStepIndex();
+                sequencer.setEditingStepIndex(step);
+                sequencer.setEditingColumnIndex(editColumnValue);
                 
                 // When paused, sync playback position and trigger step (walk through)
                 // Trigger if step changed OR if we're navigating from header row (previousStep == -1) to a step
                 bool fromHeaderRow = (previousStep == -1);
                 if (fromHeaderRow || stepChanged) {
                     // Force trigger when coming from header row (even if same step)
-                    syncPlaybackToEditIfPaused(sequencer, sequencer.editStep, stepChanged, fromHeaderRow);
+                    syncPlaybackToEditIfPaused(sequencer, sequencer.getEditingStepIndex(), stepChanged, fromHeaderRow);
                 }
                 
                 // Don't consider selected if we're on header row (editStep == -1)
-                isSelected = (sequencer.editStep == step && sequencer.editColumn == editColumnValue && sequencer.editStep >= 0);
+                isSelected = (sequencer.getEditingStepIndex() == step && sequencer.getEditingColumnIndex() == editColumnValue && sequencer.getEditingStepIndex() >= 0);
             }
         }
         // If focus is set but not from click/keyboard/refocus, don't sync (prevents auto-selection)
@@ -742,16 +981,16 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
     bool isItemClicked = ImGui::IsItemClicked(0);
     
     if (buttonClicked && !ImGui::IsMouseDragging(0) && !spacebarPressed && isItemClicked) {
-        sequencer.editStep = step;
-        sequencer.editColumn = editColumnValue;
+        sequencer.setEditingStepIndex(step);
+        sequencer.setEditingColumnIndex(editColumnValue);
         // Update isSelected after syncing
         isSelected = true;
         
         // DON'T enter edit mode on click - just focus the cell
         // User can type numbers directly (auto-enters edit mode) or hit Enter to enter edit mode
-        sequencer.isEditingCell = false;
-        sequencer.editBuffer.clear();
-        sequencer.editBufferInitialized = false;
+        sequencer.setInEditMode(false);
+        sequencer.getEditInputBuffer().clear();
+        sequencer.setEditBufferInitialized(false);
     }
     
     // Simplified drag handling (unified for all column types)
@@ -784,10 +1023,10 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
 // Unified drag handling for all column types
 void TrackerSequencerGUI::handleDragEditing(TrackerSequencer& sequencer, int step, int editColumnValue,
                                              const TrackerSequencer::ColumnConfig& colConfig, 
-                                             TrackerSequencer::PatternCell& cell,
+                                             PatternCell& cell,
                                              const std::map<std::string, std::pair<float, float>>& paramRanges,
                                              const std::map<std::string, float>& paramDefaults) {
-    bool isSelected = (sequencer.editStep == step && sequencer.editColumn == editColumnValue);
+    bool isSelected = (sequencer.getEditingStepIndex() == step && sequencer.getEditingColumnIndex() == editColumnValue);
     bool isDraggingThis = (sequencer.draggingStep == step && sequencer.draggingColumn == editColumnValue);
     
     // If we're already dragging this cell, process the drag globally (works even if mouse is not over cell)
@@ -796,8 +1035,8 @@ void TrackerSequencerGUI::handleDragEditing(TrackerSequencer& sequencer, int ste
             // Continue processing drag - mouse can be anywhere on screen
             // Calculate total delta from original drag start position
             ImVec2 currentPos = ImGui::GetMousePos();
-            float totalDragDeltaY = sequencer.dragStartY - currentPos.y; // Up = positive (increase)
-            float totalDragDeltaX = currentPos.x - sequencer.dragStartX; // Right = positive (increase)
+            float totalDragDeltaY = sequencer.getDragStartY() - currentPos.y; // Up = positive (increase)
+            float totalDragDeltaX = currentPos.x - sequencer.getDragStartX(); // Right = positive (increase)
             // Use the direction with the most movement (vertical or horizontal)
             // Both directions work: vertical (up/down) and horizontal (left/right)
             float totalDragDelta = std::abs(totalDragDeltaX) > std::abs(totalDragDeltaY) ? totalDragDeltaX : totalDragDeltaY;
@@ -808,7 +1047,7 @@ void TrackerSequencerGUI::handleDragEditing(TrackerSequencer& sequencer, int ste
             float valueDelta = totalDragDelta / dragSensitivity;
             
             // Get initial value to calculate new value from
-            int initialValue = sequencer.lastDragValue;
+            int initialValue = sequencer.getLastDragValue();
             float newValueFloat = initialValue + valueDelta;
             int newValue = (int)std::round(newValueFloat);
             
@@ -849,10 +1088,10 @@ void TrackerSequencerGUI::handleDragEditing(TrackerSequencer& sequencer, int ste
     // 3. Mouse is dragging (moved after click)
     if (isSelected && ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
         // Exit edit mode when dragging starts
-        if (sequencer.isEditingCell) {
-            sequencer.isEditingCell = false;
-            sequencer.editBuffer.clear();
-            sequencer.editBufferInitialized = false;
+        if (sequencer.isInEditMode()) {
+            sequencer.setInEditMode(false);
+            sequencer.getEditInputBuffer().clear();
+            sequencer.setEditBufferInitialized(false);
         }
         
         // Start drag - initialize drag state
@@ -906,8 +1145,8 @@ void TrackerSequencerGUI::drawValueBar(float fillPercent) {
 // Sync edit state from ImGui focus - called from InputRouter when keys are pressed
 bool TrackerSequencerGUI::syncEditStateFromImGuiFocus(TrackerSequencer& sequencer) {
     // Check if editStep/editColumn are already valid (GUI sync already happened)
-    if (sequencer.editStep >= 0 && sequencer.editStep < sequencer.numSteps && 
-        sequencer.editColumn >= 0) {
+    if (sequencer.getEditingStepIndex() >= 0 && sequencer.getEditingStepIndex() < sequencer.getStepCount() && 
+        sequencer.getEditingColumnIndex() >= 0) {
         return true; // Already synced
     }
     

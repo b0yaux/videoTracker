@@ -304,8 +304,23 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         } else {
             // Not in edit mode: Route numeric keys to tracker for direct typing
             // This allows typing numbers to auto-enter edit mode
-            // CRITICAL: Route these even if ImGui wants keyboard, because we need to enter edit mode
+            // BUT: Don't route if an ImGui input field is active (e.g., repeat count inputs)
             if ((key >= '0' && key <= '9') || key == '.' || key == '-') {
+                // Check if any ImGui widget is active (including InputText fields like repeat count)
+                // If so, let ImGui handle the key instead of routing to tracker
+                // This prevents interference when editing pattern chain repeat counts
+                if (ImGui::IsAnyItemActive()) {
+                    ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - ImGui item active (e.g., repeat count InputText), letting ImGui handle it";
+                    return false; // Let ImGui handle it
+                }
+                
+                // Also check WantTextInput as a fallback (for cases where item might not be "active" yet)
+                ImGuiIO& io = ImGui::GetIO();
+                if (io.WantTextInput) {
+                    ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - ImGui text input active, letting ImGui handle it";
+                    return false; // Let ImGui handle it
+                }
+                
                 ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' detected (not in edit mode)";
                 // CRITICAL: Sync editStep/editColumn from ImGui focus BEFORE calling handleKeyPress
                 // This ensures the tracker knows which cell is focused even if GUI sync hasn't happened yet
@@ -326,14 +341,11 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
                     logKeyPress(key, "Tracker: Numeric key (auto-enter edit mode)");
                     return true;
                 } else {
-                    // Numeric key not handled - might be because no cell is focused
-                    // The tracker should have defaulted to first cell if editStep/editColumn weren't set
-                    ofLogWarning("InputRouter") << "  Numeric key '" << (char)key << "' NOT handled by tracker. "
+                    // Numeric key not handled - no cell is focused
+                    // Don't consume the key - let ImGui or other handlers process it
+                    ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' NOT handled by tracker (no cell focused). "
                         << "editStep=" << editStep << ", editColumn=" << editColumn;
-                    
-                    // Still consume it to prevent ImGui from processing
-                    // The tracker should handle it next frame once GUI sync happens
-                    return true; // Consume to prevent ImGui from processing
+                    return false; // Let other handlers process the key
                 }
             }
         }

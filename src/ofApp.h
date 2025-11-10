@@ -14,6 +14,7 @@
 #include "MediaPoolGUI.h"
 #include "TrackerSequencer.h"
 #include "TrackerSequencerGUI.h"
+#include "Pattern.h"
 #include "Clock.h"
 #include "ClockGUI.h"
 #include "ofxImGui.h"
@@ -40,7 +41,7 @@ public:
     void audioOut(ofSoundBuffer& buffer);
     
     // Step event handler for TrackerSequencer
-    void onTrackerStepEvent(int step, float duration, const TrackerSequencer::PatternCell& cell);
+    void onTrackerStepEvent(int step, float duration, const PatternCell& cell);
     
 private:
     // Time objects

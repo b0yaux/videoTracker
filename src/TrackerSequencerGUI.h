@@ -1,6 +1,7 @@
 #pragma once
 
 #include "TrackerSequencer.h"
+#include "Pattern.h"
 
 // Forward declarations for ImGui types
 typedef unsigned int ImGuiID;
@@ -39,6 +40,7 @@ private:
     RowOutlineState pendingRowOutline;
     
     // Drawing methods
+    void drawPatternChain(TrackerSequencer& sequencer);
     void drawTrackerStatus(TrackerSequencer& sequencer);
     void drawPatternGrid(TrackerSequencer& sequencer);
     void drawPatternRow(TrackerSequencer& sequencer, int step, bool isPlaybackStep, bool isEditStep,
@@ -56,7 +58,7 @@ private:
     // Unified drag handling for all column types
     void handleDragEditing(TrackerSequencer& sequencer, int step, int editColumnValue,
                           const TrackerSequencer::ColumnConfig& colConfig, 
-                          TrackerSequencer::PatternCell& cell,
+                          PatternCell& cell,
                           const std::map<std::string, std::pair<float, float>>& paramRanges,
                           const std::map<std::string, float>& paramDefaults);
     

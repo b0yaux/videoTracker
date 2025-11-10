@@ -79,7 +79,7 @@ void ofApp::setup() {
     mediaPool.subscribeToTrackerSequencer(&trackerSequencer);
     
     // Legacy: Keep old event listener for backward compatibility (can be removed later)
-    trackerSequencer.addStepEventListener([this](int step, float duration, const TrackerSequencer::PatternCell& cell) {
+    trackerSequencer.addStepEventListener([this](int step, float duration, const PatternCell& cell) {
         onTrackerStepEvent(step, duration, cell);
     });
     
@@ -139,7 +139,7 @@ void ofApp::setup() {
     
     // TrackerSequencer now uses Clock's beat events for sample-accurate timing
     // Add step event listener for visual feedback (legacy - can be removed later)
-    trackerSequencer.addStepEventListener([this](int step, float duration, const TrackerSequencer::PatternCell& cell) {
+    trackerSequencer.addStepEventListener([this](int step, float duration, const PatternCell& cell) {
         lastTriggeredStep = step;
     });
     
@@ -202,14 +202,14 @@ void ofApp::setup() {
     if (!trackerSequencer.loadState("tracker_sequencer_state.json")) {
         // Initialize pattern with some default steps if no saved state
         if (mediaPool.getNumPlayers() > 0) {
-            TrackerSequencer::PatternCell cell0(0, 0.0f, 1.0f, 1.0f, 1.0f);
+            PatternCell cell0(0, 0.0f, 1.0f, 1.0f, 1.0f);
             trackerSequencer.setCell(0, cell0);
             
             if (mediaPool.getNumPlayers() > 1) {
-                TrackerSequencer::PatternCell cell4(1, 0.0f, 1.2f, 1.0f, 1.0f);
+                PatternCell cell4(1, 0.0f, 1.2f, 1.0f, 1.0f);
                 trackerSequencer.setCell(4, cell4);
                 
-                TrackerSequencer::PatternCell cell8(0, 0.5f, 1.0f, 1.0f, 1.0f);
+                PatternCell cell8(0, 0.5f, 1.0f, 1.0f, 1.0f);
                 trackerSequencer.setCell(8, cell8);
             }
             
@@ -388,7 +388,7 @@ void ofApp::windowResized(int w, int h) {
 
 
 //--------------------------------------------------------------
-void ofApp::onTrackerStepEvent(int step, float duration, const TrackerSequencer::PatternCell& cell) {
+void ofApp::onTrackerStepEvent(int step, float duration, const PatternCell& cell) {
     // LEGACY: This function is kept for backward compatibility but is no longer needed
     // MediaPool now subscribes directly to TrackerSequencer trigger events via subscribeToTrackerSequencer()
     // This removes the tight coupling between ofApp, TrackerSequencer, and MediaPool
