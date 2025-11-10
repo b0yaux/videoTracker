@@ -103,8 +103,8 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
         ImVec2 textPos(cursorPos.x + (cellSize.x - textSize.x) * 0.5f, cursorPos.y + (cellSize.y - textSize.y) * 0.5f);
         drawList->AddText(textPos, IM_COL32_WHITE, patternLabel);
         
-        // Make it clickable
-        ImGui::InvisibleButton("pattern", cellSize);
+        // Make it clickable and navigable with keyboard
+        ImGui::InvisibleButton("pattern", cellSize, ImGuiButtonFlags_EnableNav);
         if (ImGui::IsItemClicked(0)) {
             if (isPlaying && useChain) {
                 // During playback with chain enabled: toggle disable state
@@ -262,11 +262,21 @@ void TrackerSequencerGUI::drawTrackerStatus(TrackerSequencer& sequencer) {
         sequencer.clearPattern();
     }
     // Pattern controls
-    int newNumSteps = sequencer.getStepCount();
+    int newNumSteps = sequencer.getCurrentPattern().getStepCount();
     if (ImGui::SliderInt("Steps", &newNumSteps, 4, 64, "%d", ImGuiSliderFlags_AlwaysClamp)) {
-        if (newNumSteps != sequencer.getStepCount()) {
-            sequencer.setNumSteps(newNumSteps);
+        if (newNumSteps != sequencer.getCurrentPattern().getStepCount()) {
+            sequencer.getCurrentPattern().setStepCount(newNumSteps);
         }
+    }
+    
+    ImGui::SameLine();
+    
+    // 'D' button to double steps (duplicate all steps to double pattern length)
+    if (ImGui::Button("D", ImVec2(20, 20))) {
+        sequencer.getCurrentPattern().doubleSteps();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Double pattern length (duplicate all steps)");
     }
     
     int newStepsPerBeat = sequencer.getStepsPerBeat();
@@ -280,7 +290,7 @@ void TrackerSequencerGUI::drawTrackerStatus(TrackerSequencer& sequencer) {
 void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     // Track changes for optimization
     patternDirty = false;
-    lastNumSteps = sequencer.getStepCount();
+    lastNumSteps = sequencer.getCurrentPattern().getStepCount();
     lastPlaybackStep = sequencer.getPlaybackStepIndex();
     // Create a focusable parent widget BEFORE the table for navigation
     // This widget can receive focus when exiting the table via UP key on header row
@@ -444,7 +454,7 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
         // Draw pattern rows
         pendingRowOutline.shouldDraw = false; // Reset row outline state
         anyCellFocusedThisFrame = false; // Reset focus tracking
-        for (int step = 0; step < sequencer.getStepCount(); step++) {
+        for (int step = 0; step < sequencer.getCurrentPattern().getStepCount(); step++) {
             drawPatternRow(sequencer, step, step == playbackStep, step == cachedEditStep, 
                           isPlaying, currentPlayingStep,
                           maxIndex, paramRanges, paramDefaults, cachedEditStep, cachedEditColumn, cachedIsEditingCell);
@@ -1145,7 +1155,7 @@ void TrackerSequencerGUI::drawValueBar(float fillPercent) {
 // Sync edit state from ImGui focus - called from InputRouter when keys are pressed
 bool TrackerSequencerGUI::syncEditStateFromImGuiFocus(TrackerSequencer& sequencer) {
     // Check if editStep/editColumn are already valid (GUI sync already happened)
-    if (sequencer.getEditingStepIndex() >= 0 && sequencer.getEditingStepIndex() < sequencer.getStepCount() && 
+    if (sequencer.getEditingStepIndex() >= 0 && sequencer.getEditingStepIndex() < sequencer.getCurrentPattern().getStepCount() && 
         sequencer.getEditingColumnIndex() >= 0) {
         return true; // Already synced
     }

@@ -64,8 +64,11 @@ public:
     bool duplicateRange(int fromStep, int toStep, int destinationStep);
     
     // Pattern info
-    int getNumSteps() const { return (int)cells.size(); }
-    void setNumSteps(int steps);
+    int getStepCount() const { return (int)cells.size(); }
+    void setStepCount(int steps);
+    
+    // Double the pattern length by duplicating all steps
+    void doubleSteps();
     
     // Direct access for performance-critical code (used by GUI)
     PatternCell& operator[](int step) { return cells[step]; }

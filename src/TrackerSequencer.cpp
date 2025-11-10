@@ -9,7 +9,7 @@
 // TrackerSequencer implementation
 //--------------------------------------------------------------
 TrackerSequencer::TrackerSequencer() 
-    : clock(nullptr), stepsPerBeat(4), gatingEnabled(true), numSteps(16), playbackStep(0), editStep(-1), lastTriggeredStep(-1), 
+    : clock(nullptr), stepsPerBeat(4), gatingEnabled(true), playbackStep(0), editStep(-1), lastTriggeredStep(-1), 
       playing(false), currentMediaStartStep(-1), 
       currentMediaStepLength(0.0f), 
       sampleAccumulator(0.0), lastBpm(120.0f),
@@ -18,8 +18,8 @@ TrackerSequencer::TrackerSequencer()
       showGUI(true),
       currentPlayingStep(-1), shouldFocusFirstCell(false), shouldRefocusCurrentCell(false), requestFocusMoveToParent(false), parentWidgetFocused(false),
       currentPatternIndex(0), currentChainIndex(0), currentChainRepeat(0), usePatternChain(true) {
-    // Initialize with one empty pattern
-    patterns.push_back(Pattern(numSteps));
+    // Initialize with one empty pattern (default 16 steps)
+    patterns.push_back(Pattern(16));
     // Initialize pattern chain with first pattern
     patternChain.push_back(0);
     patternChainRepeatCounts[0] = 1;
@@ -30,7 +30,6 @@ TrackerSequencer::~TrackerSequencer() {
 
 void TrackerSequencer::setup(Clock* clockRef, int steps) {
     clock = clockRef;
-    numSteps = steps;
     playbackStep = 0; // Initialize playback step
     editStep = -1;    // No cell selected initially (user must click to select)
     editColumn = -1;  // No column selected initially
@@ -42,13 +41,11 @@ void TrackerSequencer::setup(Clock* clockRef, int steps) {
     
     // Initialize patterns (ensure at least one pattern exists)
     if (patterns.empty()) {
-        patterns.push_back(Pattern(numSteps));
+        patterns.push_back(Pattern(steps));
         currentPatternIndex = 0;
     } else {
-        // Update all existing patterns to match numSteps
-        for (auto& p : patterns) {
-            p.setNumSteps(numSteps);
-        }
+        // Set step count for current pattern only (per-pattern step count)
+        getCurrentPattern().setStepCount(steps);
     }
     
     // Initialize default column configuration if empty
@@ -68,7 +65,7 @@ void TrackerSequencer::setup(Clock* clockRef, int steps) {
         });
     }
     
-    ofLogNotice("TrackerSequencer") << "Setup complete with " << numSteps << " steps";
+    ofLogNotice("TrackerSequencer") << "Setup complete with " << getCurrentPattern().getStepCount() << " steps";
 }
 
 void TrackerSequencer::setIndexRangeCallback(IndexRangeCallback callback) {
@@ -95,23 +92,25 @@ void TrackerSequencer::onClockTransportChanged(bool isPlaying) {
 }
 
 
-void TrackerSequencer::setNumSteps(int steps) {
+void TrackerSequencer::setStepCount(int steps) {
     if (steps <= 0) return;
     
-    numSteps = steps;
-    // Update all patterns to match numSteps
-    for (auto& p : patterns) {
-        p.setNumSteps(numSteps);
-    }
+    // Only update current pattern (per-pattern step count)
+    getCurrentPattern().setStepCount(steps);
 
-    ofLogNotice("TrackerSequencer") << "Number of steps changed to " << numSteps;
+    ofLogNotice("TrackerSequencer") << "Step count changed to " << steps << " for current pattern";
+}
+
+int TrackerSequencer::getStepCount() const {
+    // Returns current pattern's step count
+    return getCurrentPattern().getStepCount();
 }
 
 // Helper to get current pattern
 Pattern& TrackerSequencer::getCurrentPattern() {
     if (patterns.empty()) {
-        // Safety: create a pattern if none exist
-        patterns.push_back(Pattern(numSteps));
+        // Safety: create a pattern if none exist (default 16 steps)
+        patterns.push_back(Pattern(16));
         currentPatternIndex = 0;
     }
     if (currentPatternIndex < 0 || currentPatternIndex >= (int)patterns.size()) {
@@ -199,7 +198,8 @@ void TrackerSequencer::randomizePattern() {
         return;
     }
     
-    for (int i = 0; i < numSteps; i++) {
+    int stepCount = getCurrentPattern().getStepCount();
+    for (int i = 0; i < stepCount; i++) {
         PatternCell cell;
         
         // 70% chance of having a media item, 30% chance of being empty (rest)
@@ -219,7 +219,7 @@ void TrackerSequencer::randomizePattern() {
                 volumeRange.first + volumeRangeSize * 0.25f,
                 volumeRange.first + volumeRangeSize * 0.75f
             ));
-            cell.length = ofRandom(1, numSteps);
+            cell.length = ofRandom(1, stepCount);
         } else {
             cell.clear(); // Empty/rest step
         }
@@ -251,7 +251,8 @@ void TrackerSequencer::randomizeColumn(int columnIndex) {
             return;
         }
         
-        for (int i = 0; i < numSteps; i++) {
+        int stepCount = getCurrentPattern().getStepCount();
+        for (int i = 0; i < stepCount; i++) {
             // 70% chance of having a media item, 30% chance of being empty (rest)
             if (ofRandom(1.0f) < 0.7f) {
                 getCurrentPattern()[i].index = ofRandom(0, numMedia);
@@ -262,16 +263,18 @@ void TrackerSequencer::randomizeColumn(int columnIndex) {
         ofLogNotice("TrackerSequencer") << "Index column randomized";
     } else if (colConfig.parameterName == "length") {
         // Randomize length column
-        for (int i = 0; i < numSteps; i++) {
+        int stepCount = getCurrentPattern().getStepCount();
+        for (int i = 0; i < stepCount; i++) {
             if (getCurrentPattern()[i].index >= 0) { // Only randomize if step has a media item
-                getCurrentPattern()[i].length = ofRandom(1, numSteps + 1);
+                getCurrentPattern()[i].length = ofRandom(1, stepCount + 1);
             }
         }
         ofLogNotice("TrackerSequencer") << "Length column randomized";
     } else {
         // Randomize parameter column
         auto range = getParameterRange(colConfig.parameterName);
-        for (int i = 0; i < numSteps; i++) {
+        int stepCount = getCurrentPattern().getStepCount();
+        for (int i = 0; i < stepCount; i++) {
             if (getCurrentPattern()[i].index >= 0) { // Only randomize if step has a media item
                 if (colConfig.parameterName == "volume") {
                     // Use 25% to 75% of volume range for randomization (avoiding extremes)
@@ -292,13 +295,14 @@ void TrackerSequencer::randomizeColumn(int columnIndex) {
 void TrackerSequencer::applyLegato() {
     // Apply legato: set each step's length to the number of steps until the next step with a note
     // This creates smooth transitions between steps (no gaps)
-    for (int i = 0; i < numSteps; i++) {
+    int stepCount = getCurrentPattern().getStepCount();
+    for (int i = 0; i < stepCount; i++) {
         if (getCurrentPattern()[i].index >= 0) {
             // This step has a note - find the next step with a note
             int stepsToNext = 1;
             bool foundNext = false;
             
-            for (int j = i + 1; j < numSteps; j++) {
+            for (int j = i + 1; j < stepCount; j++) {
                 if (getCurrentPattern()[j].index >= 0) {
                     // Found the next step with a note
                     stepsToNext = j - i;
@@ -312,7 +316,7 @@ void TrackerSequencer::applyLegato() {
                 getCurrentPattern()[i].length = std::min(16, stepsToNext);
             } else {
                 // No next step found - keep current length or set to remaining steps
-                int remainingSteps = numSteps - i;
+                int remainingSteps = stepCount - i;
                 getCurrentPattern()[i].length = std::min(16, remainingSteps);
             }
         }
@@ -411,7 +415,6 @@ void TrackerSequencer::setCurrentStep(int step) {
 
 bool TrackerSequencer::saveState(const std::string& filename) const {
     ofJson json;
-    json["numSteps"] = numSteps;
     json["currentStep"] = playbackStep;  // Save playback step for backward compatibility
     json["editStep"] = editStep;
     
@@ -484,13 +487,6 @@ bool TrackerSequencer::loadState(const std::string& filename) {
     }
     
     // Load basic properties
-    if (json.contains("numSteps")) {
-        int loadedSteps = json["numSteps"];
-        if (loadedSteps > 0) {
-            setNumSteps(loadedSteps);
-        }
-    }
-    
     if (json.contains("currentStep")) {
         playbackStep = json["currentStep"];
     }
@@ -537,12 +533,10 @@ bool TrackerSequencer::loadState(const std::string& filename) {
         patterns.clear();
         auto patternsArray = json["patterns"];
         for (const auto& patternJson : patternsArray) {
-            Pattern p(numSteps);
+            Pattern p(16);  // Default step count - actual count comes from JSON array size
             p.fromJson(patternJson);
-            // Ensure pattern size matches numSteps
-            if (p.getNumSteps() != numSteps) {
-                p.setNumSteps(numSteps);
-            }
+            // Pattern size is now per-pattern, so we don't force it to match
+            // Each pattern keeps its own step count from JSON
             patterns.push_back(p);
         }
         
@@ -647,11 +641,9 @@ bool TrackerSequencer::loadState(const std::string& filename) {
     } else if (json.contains("pattern") && json["pattern"].is_array()) {
         // Legacy: Load single pattern (backward compatibility)
         patterns.clear();
-        Pattern p(numSteps);
+        Pattern p(16);  // Default step count - actual count comes from JSON array size
         p.fromJson(json["pattern"]);
-        if (p.getNumSteps() != numSteps) {
-            p.setNumSteps(numSteps);
-        }
+        // Pattern size is now per-pattern, so we don't force it to match
         patterns.push_back(p);
         currentPatternIndex = 0;
         patternChain.clear();
@@ -666,7 +658,7 @@ bool TrackerSequencer::loadState(const std::string& filename) {
     } else {
         // No pattern data - ensure we have at least one empty pattern
         if (patterns.empty()) {
-            patterns.push_back(Pattern(numSteps));
+            patterns.push_back(Pattern(16));  // Default step count
             currentPatternIndex = 0;
         }
         // Initialize pattern chain with the first pattern
@@ -703,11 +695,12 @@ void TrackerSequencer::advanceStep() {
     }
     
     // Always advance playback step (for visual indicator)
+    int stepCount = getCurrentPattern().getStepCount();
     int previousStep = playbackStep;
-    playbackStep = (playbackStep + 1) % numSteps;
+    playbackStep = (playbackStep + 1) % stepCount;
     
     // Check if we wrapped around (pattern finished)
-    bool patternFinished = (playbackStep == 0 && previousStep == numSteps - 1);
+    bool patternFinished = (playbackStep == 0 && previousStep == stepCount - 1);
     
     // If pattern finished and using pattern chain, handle repeat counts
     if (patternFinished && usePatternChain && !patternChain.empty()) {
@@ -932,7 +925,8 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                     return false;
                 }
                 // No cell selected: Enter grid and select first data cell
-                if (numSteps > 0 && !columnConfig.empty()) {
+                int stepCount = getCurrentPattern().getStepCount();
+                if (stepCount > 0 && !columnConfig.empty()) {
                     ofLogNotice("TrackerSequencer") << "[DEBUG] [SET editStep] Enter key - setting editStep to 0, editColumn to 1 (Enter grid)";
                     editStep = 0;
                     editColumn = 1;
@@ -992,7 +986,8 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             if (ctrlPressed && !isEditingCell) {
                 // Cmd+Up: Move playback step up
                 if (isValidStep(editStep)) {
-                    playbackStep = (playbackStep - 1 + numSteps) % numSteps;
+                    int stepCount = getCurrentPattern().getStepCount();
+                    playbackStep = (playbackStep - 1 + stepCount) % stepCount;
                     triggerStep(playbackStep);
                     return true;
                 }
@@ -1023,11 +1018,12 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             // Not in edit mode: Let ImGui handle navigation
             return false;
             
-        case OF_KEY_DOWN:
+        case OF_KEY_DOWN: {
             if (ctrlPressed && !isEditingCell) {
                 // Cmd+Down: Move playback step down
                 if (isValidStep(editStep)) {
-                    playbackStep = (playbackStep + 1) % numSteps;
+                    int stepCount = getCurrentPattern().getStepCount();
+                    playbackStep = (playbackStep + 1) % stepCount;
                     triggerStep(playbackStep);
                     return true;
                 }
@@ -1043,13 +1039,15 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 return true;
             }
             // Not in edit mode: Check if at bottom boundary - exit grid focus
-            if (isValidStep(editStep) && editStep == numSteps - 1) {
+            int stepCount = getCurrentPattern().getStepCount();
+            if (isValidStep(editStep) && editStep == stepCount - 1) {
                 // At bottom of grid - exit grid focus to allow navigation to other widgets
                 clearCellFocus();
                 return false; // Let ImGui handle navigation to other widgets
             }
             // Not in edit mode: Let ImGui handle navigation
             return false;
+        }
             
         case OF_KEY_LEFT:
             if (isEditingCell) {
@@ -1329,7 +1327,7 @@ bool TrackerSequencer::handlePatternRowClick(int step, int column) {
 // Additional missing method implementations
 //--------------------------------------------------------------
 bool TrackerSequencer::isValidStep(int step) const {
-    return step >= 0 && step < numSteps;
+    return step >= 0 && step < getCurrentPattern().getStepCount();
 }
 
 // Column configuration methods
@@ -2027,10 +2025,12 @@ void TrackerSequencer::setCurrentPatternIndex(int index) {
 }
 
 int TrackerSequencer::addPattern() {
-    Pattern newPattern(numSteps);
+    // New pattern uses same step count as current pattern
+    int stepCount = getCurrentPattern().getStepCount();
+    Pattern newPattern(stepCount);
     patterns.push_back(newPattern);
     int newIndex = (int)patterns.size() - 1;
-    ofLogNotice("TrackerSequencer") << "Added new pattern at index " << newIndex;
+    ofLogNotice("TrackerSequencer") << "Added new pattern at index " << newIndex << " with " << stepCount << " steps";
     return newIndex;
 }
 

@@ -72,7 +72,7 @@ std::string PatternCell::toString() const {
 // Pattern implementation
 //--------------------------------------------------------------
 Pattern::Pattern(int numSteps) {
-    setNumSteps(numSteps);
+    setStepCount(numSteps);
 }
 
 PatternCell& Pattern::getCell(int step) {
@@ -181,7 +181,7 @@ bool Pattern::duplicateRange(int fromStep, int toStep, int destinationStep) {
     return true;
 }
 
-void Pattern::setNumSteps(int steps) {
+void Pattern::setStepCount(int steps) {
     if (steps <= 0) {
         ofLogWarning("Pattern") << "Invalid number of steps: " << steps;
         return;
@@ -194,6 +194,24 @@ void Pattern::setNumSteps(int steps) {
     for (size_t i = oldSize; i < cells.size(); i++) {
         cells[i] = PatternCell();
     }
+}
+
+void Pattern::doubleSteps() {
+    int currentSize = (int)cells.size();
+    if (currentSize <= 0) {
+        ofLogWarning("Pattern") << "Cannot double steps: pattern is empty";
+        return;
+    }
+    
+    // Resize to double the current size
+    cells.resize(currentSize * 2);
+    
+    // Duplicate existing cells
+    for (int i = 0; i < currentSize; i++) {
+        cells[currentSize + i] = cells[i];
+    }
+    
+    ofLogNotice("Pattern") << "Doubled pattern steps from " << currentSize << " to " << (currentSize * 2);
 }
 
 ofJson Pattern::toJson() const {

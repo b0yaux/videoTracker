@@ -113,7 +113,7 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         int editStep = tracker->getEditStep();
         int editColumn = tracker->getEditColumn();
         // Check if a valid cell is focused (indicates user is interacting with tracker)
-        trackerCellFocused = (editStep >= 0 && editStep < tracker->getNumSteps() && editColumn >= 0);
+        trackerCellFocused = (editStep >= 0 && editStep < tracker->getStepCount() && editColumn >= 0);
         // Check if on header row (editStep == -1 AND parent widget is NOT focused)
         // This distinguishes "on header row" (inside table) from "on parent widget" (outside table)
         onHeaderRow = (editStep == -1 && !tracker->getIsEditingCell() && !tracker->getIsParentWidgetFocused());

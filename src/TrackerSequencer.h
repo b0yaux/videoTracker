@@ -52,7 +52,7 @@ public:
     // Pattern management
     void setCell(int step, const PatternCell& cell);
     PatternCell getCell(int step) const;
-    void setNumSteps(int steps);
+    void setStepCount(int steps);  // Set step count for current pattern only
     void clearCell(int step);
     void clearPattern();
     void randomizePattern();
@@ -120,8 +120,7 @@ public:
     void handleMouseClick(int x, int y, int button);
     
     // Getters
-    int getNumSteps() const { return numSteps; }
-    int getStepCount() const { return numSteps; }  // GUI compatibility alias
+    int getStepCount() const;  // Returns current pattern's step count
     int getCurrentStep() const { return playbackStep; }  // Backward compatibility: returns playback step
     int getPlaybackStep() const { return playbackStep; }
     int getPlaybackStepIndex() const { return playbackStep; }  // GUI compatibility alias
@@ -249,7 +248,7 @@ private:
     int currentChainRepeat = 0;  // Current repeat count for current chain entry
     bool usePatternChain = true;  // If true, use pattern chain for playback; if false, use currentPatternIndex
     
-    int numSteps;
+    // Note: numSteps removed - step count is now per-pattern (use getCurrentPattern().getStepCount())
     int playbackStep;  // Currently playing step (for visual indicator)
     int editStep;      // Currently selected row for editing
     int editColumn;    // Currently selected column for editing (-1 = none, 0 = step number, 1+ = column index)
