@@ -16,6 +16,13 @@ class MediaPlayer;
 class Clock;
 
 // Playback state machine enum
+// NOTE: This represents MediaPool's LOCAL playback mode, NOT global transport state.
+// MediaPool can be in different modes regardless of Clock transport state:
+// - IDLE: No media playing (can occur while Clock is playing or stopped)
+// - MANUAL_PREVIEW: User-triggered preview (can occur while Clock is stopped)
+// - SEQUENCER_ACTIVE: Sequencer-triggered playback (requires Clock to be playing)
+// This is a different concern than transport state - it answers "What is MediaPool doing?"
+// rather than "Is the global transport playing?" (which comes from Clock).
 enum class PlaybackMode {
     IDLE,              // No playback active
     MANUAL_PREVIEW,    // GUI-triggered preview playback
@@ -28,34 +35,7 @@ enum class PreviewMode {
     PLAY_NEXT       // Play next media in pool
 };
 
-// Struct for step trigger parameters to reduce coupling
-struct StepTriggerParams {
-    int step;
-    int mediaIndex;
-    float position;
-    float speed;
-    float volume;
-    float duration;
-};
-
-// Lock-free event queue data structure (for audio thread -> GUI thread communication)
-struct TriggerEventData {
-    int step;
-    int mediaIndex;
-    float position;
-    float speed;
-    float volume;
-    float stepLength;
-    bool audioEnabled;
-    bool videoEnabled;
-    
-    // Parameter control flags: track which parameters were explicitly set by sequencer
-    // When false, MediaPool should NOT apply the parameter (leave MediaPlayer's value unchanged)
-    // This allows user-editable parameters when sequencer doesn't send values
-    bool positionSet;  // true if sequencer explicitly set position (not '--')
-    bool speedSet;     // true if sequencer explicitly set speed (not '--')
-    bool volumeSet;    // true if sequencer explicitly set volume (not '--')
-};
+// Note: StepTriggerParams and TriggerEventData removed - using TriggerEvent directly from Module.h
 
 class MediaPool : public Module {
 public:
@@ -106,20 +86,8 @@ public:
     // Subscribe to TrackerSequencer trigger events (modular connection)
     void subscribeToTrackerSequencer(class TrackerSequencer* sequencer);
     
-    // Step event handling - receives media parameters directly
-    // Audio and video are always enabled if available
-    void onStepTrigger(int step, int mediaIndex, float position, 
-                      float speed, float volume, float stepLength);
-    
-    // Overloaded version with audio/video flags (for lock-free queue)
-    void onStepTrigger(int step, int mediaIndex, float position, 
-                      float speed, float volume, float stepLength,
-                      bool audioEnabled, bool videoEnabled);
-    
-    // Overloaded version using struct for cleaner interface
-    void onStepTrigger(const StepTriggerParams& params);
-    
     // Process lock-free event queue (called from update in GUI thread)
+    // Queue contains TriggerEvent instances from sequencer
     void processEventQueue();
     
     // Module interface implementation
@@ -189,7 +157,8 @@ private:
     mutable std::mutex stateMutex;
     
     // Lock-free event queue for audio thread -> GUI thread communication
-    std::queue<TriggerEventData> eventQueue;
+    // Uses TriggerEvent directly (from Module.h) - no redundant data structures
+    std::queue<TriggerEvent> eventQueue;
     
     // Playback state machine (atomic for lock-free reads)
     std::atomic<PlaybackMode> currentMode;

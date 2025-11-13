@@ -62,6 +62,9 @@ private:
     float dragStartX = 0.0f;
     float lastDragValue = 0.0f;
     
+    // Scroll sync state - track previous index to only sync when it changes
+    size_t previousMediaIndex = SIZE_MAX;  // Initialize to invalid value
+    
     // Helper methods for focus management
     bool isCellFocused() const { return editingColumnIndex >= 0; }
     

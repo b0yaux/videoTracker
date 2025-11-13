@@ -12,7 +12,7 @@
 
 // Forward declarations
 class Clock;
-struct StepEventData;
+struct TimeEvent;
 
 class TrackerSequencer {
     friend class TrackerSequencerGUI;  // Allow GUI to access private members for rendering
@@ -23,8 +23,6 @@ public:
     // This makes TrackerSequencer truly modular - receivers subscribe via ofAddListener
     ofEvent<TriggerEvent> triggerEvent;
     
-    // Legacy event (kept for backward compatibility during migration)
-    ofEvent<void> stepEvent;
     
     TrackerSequencer();
     ~TrackerSequencer();
@@ -35,7 +33,7 @@ public:
     void setup(Clock* clockRef, int steps = 16);
     void setIndexRangeCallback(IndexRangeCallback callback);
     void processAudioBuffer(ofSoundBuffer& buffer);
-    void onStepEvent(StepEventData& data); // Sample-accurate step event from Clock
+    void onTimeEvent(TimeEvent& data); // Sample-accurate time event from Clock (filters for STEP type)
     
     // Event listener system
     void addStepEventListener(std::function<void(int, float, const PatternCell&)> listener);
@@ -122,56 +120,46 @@ public:
     bool saveState(const std::string& filename) const;
     
     // UI interaction
-    bool handleKeyPress(int key, bool ctrlPressed = false, bool shiftPressed = false);
-    bool handleKeyPress(ofKeyEventArgs& keyEvent); // Overload for ofKeyEventArgs
+    // Note: GUI state (editStep, editColumn, isEditingCell, editBufferCache) is now managed by TrackerSequencerGUI
+    // These methods accept GUI state as parameters instead of using member variables
+    struct GUIState {
+        int editStep = -1;
+        int editColumn = -1;
+        bool isEditingCell = false;
+        std::string editBufferCache;
+        bool editBufferInitializedCache = false;
+    };
+    bool handleKeyPress(int key, bool ctrlPressed, bool shiftPressed, GUIState& guiState);
+    bool handleKeyPress(ofKeyEventArgs& keyEvent, GUIState& guiState); // Overload for ofKeyEventArgs
     void handleMouseClick(int x, int y, int button);
-    bool isKeyboardFocused() const; // Check if keyboard input should be routed here
     
     // Getters
     int getStepCount() const;  // Returns current pattern's step count
     int getCurrentStep() const { return playbackStep; }  // Backward compatibility: returns playback step
     int getPlaybackStep() const { return playbackStep; }
     int getPlaybackStepIndex() const { return playbackStep; }  // GUI compatibility alias
-    int getEditStep() const { return editStep; }
-    int getEditColumn() const { return editColumn; }
-    int getEditingStepIndex() const { return editStep; }  // GUI compatibility alias
-    int getEditingColumnIndex() const { return editColumn; }  // GUI compatibility alias
-    void setEditCell(int step, int column) { 
-        editStep = step; 
-        editColumn = column; 
-    }
-    void setEditingStepIndex(int step) { editStep = step; }  // GUI compatibility
-    void setEditingColumnIndex(int column) { editColumn = column; }  // GUI compatibility
+    // Sequencer playback state - derived from Clock transport state
+    // This represents whether the sequencer is actively advancing steps.
+    // It's synchronized with Clock via onClockTransportChanged() listener.
+    // NOTE: This is sequencer-specific state, not global transport state.
+    // For global transport state, query clock->isPlaying() instead.
     bool isPlaying() const { return playing; }
-    bool getIsEditingCell() const { return isEditingCell; }
-    bool isInEditMode() const { return isEditingCell; }  // GUI compatibility alias
     int getCurrentPlayingStep() const { return currentPlayingStep; }
-    void clearCellFocus();
     
-    // Edit mode accessors for GUI
-    void setInEditMode(bool editing) { isEditingCell = editing; }
-    // Edit buffer cache accessors (for persistence across frames - ParameterCell owns the logic)
-    std::string& getEditBufferCache() { return editBufferCache; }
-    const std::string& getEditBufferCache() const { return editBufferCache; }
-    void setEditBufferInitializedCache(bool init) { editBufferInitializedCache = init; }
-    bool getEditBufferInitializedCache() const { return editBufferInitializedCache; }
+    // Note: GUI state accessors (editStep, editColumn, isEditingCell, editBufferCache) removed
+    // Use TrackerSequencerGUI::getEditStep(), etc. instead
     
     // Pattern cell accessor for GUI
     PatternCell& getPatternCell(int step) { return getCurrentPattern()[step]; }
     const PatternCell& getPatternCell(int step) const { return getCurrentPattern()[step]; }
     
-    // Drag state accessors for GUI
+    // Drag state accessors for GUI (still needed for ParameterCell interaction)
     float getDragStartY() const { return dragStartY; }
     float getDragStartX() const { return dragStartX; }
     float getLastDragValue() const { return lastDragValue; }
     void setLastDragValue(float value) { lastDragValue = value; }
     
-    void requestFocusMoveToParentWidget() { requestFocusMoveToParent = true; }  // Request GUI to move focus to parent widget
-    bool shouldMoveFocusToParent() const { return requestFocusMoveToParent; }  // GUI compatibility alias
-    void setShouldMoveFocusToParent(bool value) { requestFocusMoveToParent = value; }  // GUI compatibility
-    bool getIsParentWidgetFocused() const { return parentWidgetFocused; }  // Check if parent widget is focused
-    bool isParentWidgetFocused() const { return parentWidgetFocused; }  // GUI compatibility alias
-    void setParentWidgetFocused(bool value) { parentWidgetFocused = value; }  // GUI compatibility
+    // Note: Focus management flags removed - these are GUI concerns managed by TrackerSequencerGUI
     // Update step active state (clears manually triggered steps when duration expires)
     void updateStepActiveState();
     float getCurrentBpm() const;
@@ -251,11 +239,7 @@ private:
     
     // Note: numSteps removed - step count is now per-pattern (use getCurrentPattern().getStepCount())
     int playbackStep;  // Currently playing step (for visual indicator)
-    int editStep;      // Currently selected row for editing
-    int editColumn;    // Currently selected column for editing (-1 = none, 0 = step number, 1+ = column index)
-    bool isEditingCell; // True when in edit mode (typing numeric value) - derived from ParameterCell state
-    std::string editBufferCache; // Cache for edit buffer to persist across frames (ParameterCell owns the logic, this is just persistence)
-    bool editBufferInitializedCache; // Cache for edit buffer initialized state
+    // Note: GUI state (editStep, editColumn, isEditingCell, editBufferCache) moved to TrackerSequencerGUI
     
     // Drag state for parameter cell editing (moved from static variables to avoid loop issues)
     int draggingStep;      // Step being dragged (-1 if not dragging)
@@ -290,11 +274,7 @@ private:
     // Step playback tracking
     int currentPlayingStep;  // Current step that's playing (for GUI visualization)
     
-    // Cell focus management
-    bool shouldFocusFirstCell;  // Flag to request focus on first cell when entering grid
-    bool shouldRefocusCurrentCell;  // Flag to request focus on current cell after exiting edit mode
-    bool requestFocusMoveToParent;  // Flag to request GUI to move focus to parent widget (when UP pressed on header row)
-    bool parentWidgetFocused;  // True when parent widget (outside table) is focused, false when on header row (inside table)
+    // Note: Cell focus management flags removed - these are GUI concerns managed by TrackerSequencerGUI
     
     // Parameter change callback (for ParameterSync system)
     std::function<void(const std::string&, float)> parameterChangeCallback;
@@ -320,7 +300,8 @@ private:
     void applyPendingEdit();
     
     // Helper to determine if edit should be queued (during playback on current step)
-    bool shouldQueueEdit() const;
+    // Note: GUI state parameters added - editStep and editColumn are now passed in
+    bool shouldQueueEdit(int editStep, int editColumn) const;
     
     // ParameterCell adapter methods - bridge PatternCell to ParameterCell
     // Creates and configures a ParameterCell for a specific step/column

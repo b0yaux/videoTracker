@@ -8,8 +8,13 @@
 #include <cctype>
 #include <limits>
 
+// Constants for expression evaluation (used by static function)
+namespace {
+    constexpr float EPSILON_DIVISION = 1e-9f;
+}
+
 ParameterCell::ParameterCell() 
-    : isEditing(false), isSelected(false), editBufferInitialized(false), shouldRefocus(false),
+    : isSelected(false), shouldRefocus(false), isEditing(false), editBufferInitialized(false),
       isDragging(false), dragStartY(0.0f), dragStartX(0.0f), lastDragValue(0.0f) {
 }
 
@@ -40,7 +45,7 @@ static float evaluateExpression(const std::string& expr) {
             case '-': values.push(a - b); break;
             case '*': values.push(a * b); break;
             case '/': 
-                if (std::abs(b) < 1e-9f) throw std::runtime_error("Division by zero");
+                if (std::abs(b) < EPSILON_DIVISION) throw std::runtime_error("Division by zero");
                 values.push(a / b); 
                 break;
         }
@@ -154,10 +159,46 @@ static float evaluateExpression(const std::string& expr) {
     return values.top();
 }
 
+// Helper function implementations
+bool ParameterCell::isOnlyDashes(const std::string& str) {
+    if (str.empty()) return false;
+    for (char c : str) {
+        if (c != '-') return false;
+    }
+    return true;
+}
+
+std::string ParameterCell::trimWhitespace(const std::string& str) {
+    size_t first = str.find_first_not_of(" \t");
+    if (first == std::string::npos) return "";
+    size_t last = str.find_last_not_of(" \t");
+    return str.substr(first, (last - first + 1));
+}
+
+void ParameterCell::disableImGuiKeyboardNav() {
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+}
+
+void ParameterCell::enableImGuiKeyboardNav() {
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+}
+
+void ParameterCell::removeParameter() {
+    if (onValueRemoved) {
+        onValueRemoved(parameterName);
+    }
+}
+
 void ParameterCell::setValueRange(float min, float max, float defaultValue) {
+    if (min > max) {
+        ofLogWarning("ParameterCell") << "Invalid range: min > max, swapping values";
+        std::swap(min, max);
+    }
     minVal = min;
     maxVal = max;
-    this->defaultValue = defaultValue;
+    this->defaultValue = std::max(min, std::min(max, defaultValue));
 }
 
 void ParameterCell::calculateStepIncrement() {
@@ -201,8 +242,21 @@ void ParameterCell::setEditBuffer(const std::string& buffer) {
             isEditing = true;
             // Don't call enterEditMode() here as it would re-initialize the buffer
             // Just disable ImGui keyboard navigation
-            ImGuiIO& io = ImGui::GetIO();
-            io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+            disableImGuiKeyboardNav();
+        }
+    }
+}
+
+void ParameterCell::setEditBuffer(const std::string& buffer, bool initialized) {
+    editBuffer = buffer;
+    editBufferInitialized = initialized;
+    if (!editBuffer.empty()) {
+        // If setting a non-empty buffer, ensure we're in edit mode
+        if (!isEditing) {
+            isEditing = true;
+            // Don't call enterEditMode() here as it would re-initialize the buffer
+            // Just disable ImGui keyboard navigation
+            disableImGuiKeyboardNav();
         }
     }
 }
@@ -213,8 +267,7 @@ void ParameterCell::enterEditMode() {
     editBufferInitialized = true;
     
     // Disable ImGui keyboard navigation when entering edit mode
-    ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+    disableImGuiKeyboardNav();
 }
 
 void ParameterCell::exitEditMode() {
@@ -223,8 +276,7 @@ void ParameterCell::exitEditMode() {
     editBufferInitialized = false;
     
     // Re-enable ImGui keyboard navigation when exiting edit mode
-    ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    enableImGuiKeyboardNav();
 }
 
 bool ParameterCell::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
@@ -267,38 +319,18 @@ bool ParameterCell::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed)
             
             // Re-apply value after backspace (Blender-style reactive editing)
             // This allows the value to update as the user corrects their input
-            if (editBuffer.empty()) {
-                // Buffer is now empty - remove parameter (set to "none")
-                if (onValueRemoved) {
-                    onValueRemoved(parameterName);
-                }
+            if (editBuffer.empty() || isOnlyDashes(editBuffer)) {
+                // Buffer is empty or only dashes - remove parameter (set to "none")
+                removeParameter();
             } else {
-                // Check if buffer contains only dashes (indicates "none" state, e.g., "-", "--")
-                bool onlyDashes = true;
-                for (char c : editBuffer) {
-                    if (c != '-') {
-                        onlyDashes = false;
-                        break;
-                    }
-                }
-                
-                if (onlyDashes) {
-                    // Buffer is only dashes - remove parameter (set to "none")
-                    if (onValueRemoved) {
-                        onValueRemoved(parameterName);
-                    }
-                } else {
-                    try {
-                        // Try to evaluate as expression (supports operations)
-                        float floatValue = evaluateExpression(editBuffer);
-                        applyEditValueFloat(floatValue);
-                    } catch (...) {
-                        // Expression invalid - remove parameter (set to "none")
-                        // This handles invalid expressions
-                        if (onValueRemoved) {
-                            onValueRemoved(parameterName);
-                        }
-                    }
+                try {
+                    // Try to evaluate as expression (supports operations)
+                    float floatValue = evaluateExpression(editBuffer);
+                    applyEditValueFloat(floatValue);
+                } catch (...) {
+                    // Expression invalid - remove parameter (set to "none")
+                    // This handles invalid expressions
+                    removeParameter();
                 }
             }
             return true;
@@ -342,27 +374,16 @@ bool ParameterCell::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed)
         
         // Append digit to buffer
         editBuffer += (char)key;
-        if (editBuffer.length() > 50) {  // Increased limit for expressions
-            editBuffer = editBuffer.substr(editBuffer.length() - 50);
+        if (editBuffer.length() > MAX_EDIT_BUFFER_LENGTH) {
+            editBuffer = editBuffer.substr(editBuffer.length() - MAX_EDIT_BUFFER_LENGTH);
         }
         
         // Apply value immediately (Blender-style reactive editing)
         // Try to evaluate as expression (supports operations like "2*3", "10/2", etc.)
         if (!editBuffer.empty()) {
-            // Check if buffer is only dashes (including "--")
-            bool onlyDashes = true;
-            for (char c : editBuffer) {
-                if (c != '-') {
-                    onlyDashes = false;
-                    break;
-                }
-            }
-            
-            if (onlyDashes) {
+            if (isOnlyDashes(editBuffer)) {
                 // Only dashes (e.g., "-", "--") - remove parameter (set to "none")
-                if (onValueRemoved) {
-                    onValueRemoved(parameterName);
-                }
+                removeParameter();
             } else {
                 try {
                     float floatValue = evaluateExpression(editBuffer);
@@ -394,28 +415,26 @@ bool ParameterCell::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed)
         
         // Append operator to buffer
         editBuffer += (char)key;
-        if (editBuffer.length() > 50) {  // Increased limit for expressions
-            editBuffer = editBuffer.substr(editBuffer.length() - 50);
+        if (editBuffer.length() > MAX_EDIT_BUFFER_LENGTH) {
+            editBuffer = editBuffer.substr(editBuffer.length() - MAX_EDIT_BUFFER_LENGTH);
         }
         
         // Try to evaluate expression if it's complete
         // For operators, we wait for the next number before evaluating
         // But we can try to evaluate if the expression is already valid
         if (!editBuffer.empty()) {
-            // Check if buffer is only dashes (including "--")
-            bool onlyDashes = true;
+            // Check if buffer contains only operators/dashes
+            bool onlyOpsOrDashes = true;
             for (char c : editBuffer) {
                 if (c != '-' && c != '+' && c != '*' && c != '/') {
-                    onlyDashes = false;
+                    onlyOpsOrDashes = false;
                     break;
                 }
             }
             
-            if (onlyDashes) {
+            if (onlyOpsOrDashes) {
                 // Only operators/dashes - remove parameter (set to "none")
-                if (onValueRemoved) {
-                    onValueRemoved(parameterName);
-                }
+                removeParameter();
             } else {
                 try {
                     float floatValue = evaluateExpression(editBuffer);
@@ -431,7 +450,6 @@ bool ParameterCell::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed)
     
     // Decimal point and minus sign (can be negative number or subtraction)
     if (key == '.' || key == '-') {
-        bool justEnteredEditMode = false;
         if (!isEditing) {
             // Auto-enter edit mode if cell is selected
             if (isSelected) {
@@ -439,13 +457,11 @@ bool ParameterCell::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed)
                 // Clear buffer when entering edit mode via decimal/minus (replaces current value)
                 editBuffer.clear();
                 editBufferInitialized = false;
-                justEnteredEditMode = true;
             } else {
                 return false;  // Not selected, don't handle
             }
         }
         
-        // Only clear buffer if we just entered edit mode
         // If already in edit mode, don't clear - this allows typing decimals after numbers (e.g., "1.5")
         // and using backspace to correct input
         // NOTE: We do NOT clear the buffer if already in edit mode
@@ -469,61 +485,24 @@ bool ParameterCell::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed)
         }
         
         editBuffer += (char)key;
-        if (editBuffer.length() > 50) {  // Increased limit for expressions
-            editBuffer = editBuffer.substr(editBuffer.length() - 50);
+        if (editBuffer.length() > MAX_EDIT_BUFFER_LENGTH) {
+            editBuffer = editBuffer.substr(editBuffer.length() - MAX_EDIT_BUFFER_LENGTH);
         }
         
         // Apply value immediately (Blender-style)
         // Check if buffer is empty, single '.', or contains only dashes
-        bool shouldRemoveParameter = false;
-        if (editBuffer.empty() || editBuffer == ".") {
-            shouldRemoveParameter = true;
-        } else {
-            // Check if buffer contains only dashes
-            bool onlyDashes = true;
-            for (char c : editBuffer) {
-                if (c != '-') {
-                    onlyDashes = false;
-                    break;
-                }
-            }
-            if (onlyDashes) {
-                shouldRemoveParameter = true;
-            }
-        }
-        
-        if (shouldRemoveParameter) {
+        if (editBuffer.empty() || editBuffer == "." || isOnlyDashes(editBuffer)) {
             // Buffer is only dashes, empty, or single '.' - remove parameter (set to "none")
-            if (onValueRemoved) {
-                onValueRemoved(parameterName);
-            }
+            removeParameter();
         } else {
-            // Check if buffer is only dashes (including "--")
-            bool onlyDashes = true;
-            for (char c : editBuffer) {
-                if (c != '-') {
-                    onlyDashes = false;
-                    break;
-                }
-            }
-            
-            if (onlyDashes) {
-                // Only dashes (e.g., "-", "--") - remove parameter (set to "none")
-                if (onValueRemoved) {
-                    onValueRemoved(parameterName);
-                }
-            } else {
-                try {
-                    // Try to evaluate as expression (supports operations)
-                    float floatValue = evaluateExpression(editBuffer);
-                    applyEditValueFloat(floatValue);
-                } catch (...) {
-                    // Expression invalid - remove parameter (set to "none")
-                    // This handles invalid expressions like "abc", "2**3", etc.
-                    if (onValueRemoved) {
-                        onValueRemoved(parameterName);
-                    }
-                }
+            try {
+                // Try to evaluate as expression (supports operations)
+                float floatValue = evaluateExpression(editBuffer);
+                applyEditValueFloat(floatValue);
+            } catch (...) {
+                // Expression invalid - remove parameter (set to "none")
+                // This handles invalid expressions like "abc", "2**3", etc.
+                removeParameter();
             }
         }
         return true;
@@ -555,8 +534,8 @@ void ParameterCell::appendDigit(char digit) {
         enterEditMode();
     }
     editBuffer += digit;
-    if (editBuffer.length() > 15) {
-        editBuffer = editBuffer.substr(editBuffer.length() - 15);
+    if (editBuffer.length() > MAX_EDIT_BUFFER_LENGTH) {
+        editBuffer = editBuffer.substr(editBuffer.length() - MAX_EDIT_BUFFER_LENGTH);
     }
 }
 
@@ -565,8 +544,8 @@ void ParameterCell::appendChar(char c) {
         enterEditMode();
     }
     editBuffer += c;
-    if (editBuffer.length() > 15) {
-        editBuffer = editBuffer.substr(editBuffer.length() - 15);
+    if (editBuffer.length() > MAX_EDIT_BUFFER_LENGTH) {
+        editBuffer = editBuffer.substr(editBuffer.length() - MAX_EDIT_BUFFER_LENGTH);
     }
 }
 
@@ -644,7 +623,7 @@ void ParameterCell::initializeEditBuffer() {
     
     float currentVal = getCurrentValue();
     
-    if (isFixed && fixedType == "index") {
+    if (isFixed && fixedType == FIXED_TYPE_INDEX) {
         // Index column: 1-based display (01-99), 0 = rest
         // currentVal is already in 1-based display format (0 = rest, 1+ = media index)
         int indexVal = (int)std::round(currentVal);
@@ -655,7 +634,7 @@ void ParameterCell::initializeEditBuffer() {
             snprintf(buf, sizeof(buf), "%02d", indexVal);
             editBuffer = buf;
         }
-    } else if (isFixed && fixedType == "length") {
+    } else if (isFixed && fixedType == FIXED_TYPE_LENGTH) {
         // Length column: 1-16 range
         int lengthVal = (int)std::round(currentVal);
         char buf[8];
@@ -684,7 +663,7 @@ std::string ParameterCell::formatDisplayText(float value) const {
         return value > 0.5f ? "ON" : "OFF";
     }
     
-    if (isFixed && fixedType == "index") {
+    if (isFixed && fixedType == FIXED_TYPE_INDEX) {
         // Index: 1-based display (01-99)
         // For fixed columns, we still use -1.0f to indicate rest (compatibility)
         if (value < 0.0f) {
@@ -699,13 +678,13 @@ std::string ParameterCell::formatDisplayText(float value) const {
         return buf;
     }
     
-    if (isFixed && fixedType == "length") {
+    if (isFixed && fixedType == FIXED_TYPE_LENGTH) {
         // Length: 1-16 range, formatted as "02"
         // For fixed columns, we still use -1.0f to indicate rest (compatibility)
         if (value < 0.0f) {
             return "--";
         }
-        int len = std::max(1, std::min(16, (int)std::round(value)));
+        int len = std::max(LENGTH_MIN, std::min(LENGTH_MAX, (int)std::round(value)));
         char buf[8];
         snprintf(buf, sizeof(buf), "%02d", len);
         return buf;
@@ -737,15 +716,15 @@ float ParameterCell::calculateFillPercent(float value) const {
 }
 
 void ParameterCell::applyEditValueFloat(float floatValue) {
-    if (isFixed && fixedType == "length") {
+    if (isFixed && fixedType == FIXED_TYPE_LENGTH) {
         // Length must be integer between 1-16
         // For fixed columns, clamp to valid range
-        int newValue = std::max(1, std::min(16, (int)std::round(floatValue)));
+        int newValue = std::max(LENGTH_MIN, std::min(LENGTH_MAX, (int)std::round(floatValue)));
         applyEditValueInt(newValue);
-    } else if (isFixed && fixedType == "index") {
+    } else if (isFixed && fixedType == FIXED_TYPE_INDEX) {
         // Index: 0 = rest, 1+ = media index (1-based display)
         // For fixed columns, clamp to valid range
-        int maxIdx = getMaxIndex ? getMaxIndex() : 127;
+        int maxIdx = getMaxIndex ? getMaxIndex() : INDEX_MAX_DEFAULT;
         int newValue = std::max(0, std::min(maxIdx, (int)std::round(floatValue)));
         applyEditValueInt(newValue);
     } else {
@@ -754,9 +733,7 @@ void ParameterCell::applyEditValueFloat(float floatValue) {
         // This allows users to clear invalid values by typing out-of-range numbers
         if (floatValue < minVal || floatValue > maxVal) {
             // Value is outside valid range - remove parameter
-            if (onValueRemoved) {
-                onValueRemoved(parameterName);
-            }
+            removeParameter();
         } else {
             // Value is within range - apply it
             if (onValueApplied) {
@@ -767,16 +744,16 @@ void ParameterCell::applyEditValueFloat(float floatValue) {
 }
 
 void ParameterCell::applyEditValueInt(int intValue) {
-    if (isFixed && fixedType == "index") {
+    if (isFixed && fixedType == FIXED_TYPE_INDEX) {
         // Index: 0 = rest (-1 in storage), 1+ = media index (0-based in storage)
         // But we work with 1-based display values here
         // The callback should handle the conversion
         if (onValueApplied) {
             onValueApplied(parameterName, (float)intValue);
         }
-    } else if (isFixed && fixedType == "length") {
+    } else if (isFixed && fixedType == FIXED_TYPE_LENGTH) {
         // Length: 1-16 range
-        int clampedValue = std::max(1, std::min(16, intValue));
+        int clampedValue = std::max(LENGTH_MIN, std::min(LENGTH_MAX, intValue));
         if (onValueApplied) {
             onValueApplied(parameterName, (float)clampedValue);
         }
@@ -797,46 +774,24 @@ bool ParameterCell::parseAndApplyEditBuffer() {
     // Handle empty buffer or invalid input for dynamic parameters (removes parameter)
     if (!isFixed) {
         // Trim whitespace for comparison
-        std::string trimmed = editBuffer;
-        while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.back() == ' ')) {
-            if (trimmed.front() == ' ') trimmed.erase(0, 1);
-            if (!trimmed.empty() && trimmed.back() == ' ') trimmed.pop_back();
-        }
+        std::string trimmed = trimWhitespace(editBuffer);
         
         // Check for clear patterns: empty, or strings containing only dashes
-        if (trimmed.empty()) {
-            // Empty buffer - remove parameter
-            if (onValueRemoved) {
-                onValueRemoved(parameterName);
-            }
-            return true;
-        }
-        
-        // Check if string contains only dashes
-        bool onlyDashes = true;
-        for (char c : trimmed) {
-            if (c != '-') {
-                onlyDashes = false;
-                break;
-            }
-        }
-        if (onlyDashes) {
-            // Only dashes - remove parameter
-            if (onValueRemoved) {
-                onValueRemoved(parameterName);
-            }
+        if (trimmed.empty() || isOnlyDashes(trimmed)) {
+            // Empty buffer or only dashes - remove parameter
+            removeParameter();
             return true;
         }
     }
     
     // Try to parse the buffer
     try {
-        if (isFixed && fixedType == "length") {
-            int lengthValue = std::max(1, std::min(16, (int)std::round(std::stof(editBuffer))));
+        if (isFixed && fixedType == FIXED_TYPE_LENGTH) {
+            int lengthValue = std::max(LENGTH_MIN, std::min(LENGTH_MAX, (int)std::round(std::stof(editBuffer))));
             applyEditValueInt(lengthValue);
             return true;
-        } else if (isFixed && fixedType == "index") {
-            int maxIdx = getMaxIndex ? getMaxIndex() : 127;
+        } else if (isFixed && fixedType == FIXED_TYPE_INDEX) {
+            int maxIdx = getMaxIndex ? getMaxIndex() : INDEX_MAX_DEFAULT;
             int indexValue = std::max(0, std::min(maxIdx, (int)std::round(std::stof(editBuffer))));
             applyEditValueInt(indexValue);
             return true;
@@ -848,9 +803,7 @@ bool ParameterCell::parseAndApplyEditBuffer() {
                     floatValue = parseValue(editBuffer);
                 } catch (...) {
                     // Parse failed - remove parameter (set to "none")
-                    if (onValueRemoved) {
-                        onValueRemoved(parameterName);
-                    }
+                    removeParameter();
                     return true;
                 }
             } else {
@@ -863,9 +816,7 @@ bool ParameterCell::parseAndApplyEditBuffer() {
                         floatValue = std::stof(editBuffer);
                     } catch (...) {
                         // All parsing failed - remove parameter (set to "none")
-                        if (onValueRemoved) {
-                            onValueRemoved(parameterName);
-                        }
+                        removeParameter();
                         return true;
                     }
                 }
@@ -877,9 +828,7 @@ bool ParameterCell::parseAndApplyEditBuffer() {
     } catch (...) {
         // Parse failed - for dynamic parameters, remove it (set to "none")
         if (!isFixed) {
-            if (onValueRemoved) {
-                onValueRemoved(parameterName);
-            }
+            removeParameter();
             return true;
         }
         // Invalid value for fixed column
@@ -910,17 +859,17 @@ float ParameterCell::getDefaultParseValue(const std::string& str) const {
     }
 }
 
-ImU32 ParameterCell::getFillBarColor() {
+ImU32 ParameterCell::getFillBarColor() const {
     static ImU32 color = ImGui::GetColorU32(ImVec4(0.5f, 0.5f, 0.5f, 0.25f));
     return color;
 }
 
-ImU32 ParameterCell::getRedOutlineColor() {
+ImU32 ParameterCell::getRedOutlineColor() const {
     static ImU32 color = ImGui::GetColorU32(ImVec4(0.9f, 0.05f, 0.1f, 1.0f));
     return color;
 }
 
-ImU32 ParameterCell::getOrangeOutlineColor() {
+ImU32 ParameterCell::getOrangeOutlineColor() const {
     static ImU32 color = ImGui::GetColorU32(ImVec4(1.0f, 0.5f, 0.0f, 1.0f));
     return color;
 }
@@ -1146,8 +1095,7 @@ void ParameterCell::startDrag() {
     }
     
     // Disable keyboard navigation during drag
-    ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+    disableImGuiKeyboardNav();
 }
 
 void ParameterCell::updateDrag() {
@@ -1170,12 +1118,11 @@ void ParameterCell::updateDrag() {
     float totalDragDelta = std::abs(dragDeltaY) > std::abs(dragDeltaX) ? dragDeltaY : dragDeltaX;
     
     // Direct range mapping: map pixel movement directly to value range
-    // Sensitivity: pixels needed to traverse full range (200 pixels = full range)
+    // Sensitivity: pixels needed to traverse full range
     float rangeSize = maxVal - minVal;
-    float sensitivity = 200.0f; // pixels to traverse full range
     
     // Calculate value change directly from pixel movement (maximum precision)
-    float valueDelta = (totalDragDelta / sensitivity) * rangeSize;
+    float valueDelta = (totalDragDelta / DRAG_SENSITIVITY_PIXELS) * rangeSize;
     float newValue = lastDragValue + valueDelta;
     
     // Clamp to valid range
@@ -1199,8 +1146,7 @@ void ParameterCell::endDrag() {
     lastDragValue = 0.0f;
     
     // Re-enable keyboard navigation when drag ends
-    ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    enableImGuiKeyboardNav();
 }
 
 void ParameterCell::applyDragValue(float newValue) {

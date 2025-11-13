@@ -187,13 +187,15 @@ void ofApp::setup() {
     inputRouter.setup(
         &clock,
         &trackerSequencer,
+        &trackerSequencerGUI,
         &viewManager,
         &mediaPool,
         &mediaPoolGUI
     );
     
     // Setup InputRouter state callbacks
-    inputRouter.setPlayState(&isPlaying);
+    // Note: Play state now comes directly from Clock (single source of truth)
+    // InputRouter has Clock reference from setup() call above
     inputRouter.setCurrentStep(&currentStep);
     inputRouter.setLastTriggeredStep(&lastTriggeredStep);
     inputRouter.setShowGUI(&showGUI);
@@ -553,11 +555,11 @@ void ofApp::drawGUI() {
             }
             
             // Clear TrackerSequencer cell focus if it's stale
-            if (trackerSequencer.getEditingStepIndex() >= 0) {
+            if (trackerSequencerGUI.getEditStep() >= 0) {
                 ofLogNotice("ofApp") << "[FOCUS_DEBUG] Clearing TrackerSequencer cell focus (step: " 
-                                     << trackerSequencer.getEditingStepIndex() 
-                                     << ", column: " << trackerSequencer.getEditingColumnIndex() << ")";
-                trackerSequencer.clearCellFocus();
+                                     << trackerSequencerGUI.getEditStep() 
+                                     << ", column: " << trackerSequencerGUI.getEditColumn() << ")";
+                trackerSequencerGUI.clearCellFocus();
             }
             
             // Clear MediaPoolGUI cell focus if it's stale
@@ -595,7 +597,7 @@ void ofApp::drawGUI() {
         // Changing ConfigFlags every frame forces ImGui to rebuild navigation tables (2-5ms overhead)
         // Only update when the state transitions, not every frame
         static bool lastNavState = true;
-        bool shouldEnableNav = !(viewManager.getCurrentPanelIndex() == 2 && trackerSequencer.getIsEditingCell());
+        bool shouldEnableNav = !(viewManager.getCurrentPanelIndex() == 2 && trackerSequencerGUI.getIsEditingCell());
         
         if (shouldEnableNav != lastNavState) {
             // State changed - update ConfigFlags only now

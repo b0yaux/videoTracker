@@ -513,37 +513,7 @@ void MediaPool::stopManualPreview() {
     ofLogNotice("ofxMediaPool") << "Manual preview stopped (state: IDLE)";
 }
 
-//--------------------------------------------------------------
-void MediaPool::onStepTrigger(int step, int mediaIndex, float position, 
-                              float speed, float volume, float stepLength, 
-                              bool audioEnabled, bool videoEnabled) {
-    // LOCK-FREE: Push event to queue from audio thread (no mutex, no logging)
-    // This is called from audio thread via ofNotifyEvent, so we must not block
-    TriggerEventData event;
-    event.step = step;
-    event.mediaIndex = mediaIndex;
-    event.position = position;
-    event.speed = speed;
-    event.volume = volume;
-    event.stepLength = stepLength;
-    event.audioEnabled = audioEnabled;
-    event.videoEnabled = videoEnabled;
-    
-    // Lock-free queue push (std::queue is thread-safe for single producer, single consumer)
-    // We use a mutex only for queue access, but this is minimal overhead
-    {
-        std::lock_guard<std::mutex> queueLock(stateMutex);
-        eventQueue.push(event);
-    }
-}
-
-// Overloaded version using struct for cleaner interface
-// Note: StepTriggerParams doesn't have audioEnabled/videoEnabled, so we default to true
-void MediaPool::onStepTrigger(const StepTriggerParams& params) {
-    onStepTrigger(params.step, params.mediaIndex, params.position, 
-                  params.speed, params.volume, params.duration, 
-                  true, true);  // Audio and video always enabled for sequencer triggers
-}
+// Note: Old onStepTrigger methods removed - now using onTrigger() which receives TriggerEvent directly
 
 //--------------------------------------------------------------
 void MediaPool::stopAllMedia() {
@@ -805,7 +775,7 @@ void MediaPool::update() {
 //--------------------------------------------------------------
 void MediaPool::processEventQueue() {
     // Process all queued events from audio thread (called from update in GUI thread)
-    std::queue<TriggerEventData> localQueue;
+    std::queue<TriggerEvent> localQueue;
     
     // Swap queue under lock (fast operation)
     {
@@ -813,12 +783,26 @@ void MediaPool::processEventQueue() {
         localQueue.swap(eventQueue);
     }
     
+    // Get parameter descriptors for defaults and validation
+    auto paramDescriptors = getParameters();
+    std::map<std::string, float> defaults;
+    for (const auto& param : paramDescriptors) {
+        defaults[param.name] = param.defaultValue;
+    }
+    
     // Process events without lock (we're in GUI thread now)
     while (!localQueue.empty()) {
-        const TriggerEventData& event = localQueue.front();
+        const TriggerEvent& event = localQueue.front();
+        
+        // Extract mediaIndex from "note" parameter
+        int mediaIndex = -1;
+        auto noteIt = event.parameters.find("note");
+        if (noteIt != event.parameters.end()) {
+            mediaIndex = (int)noteIt->second;
+        }
         
         // Handle empty cells (rests) - stop immediately
-        if (event.mediaIndex < 0) {
+        if (mediaIndex < 0) {
             if (activePlayer) {
                 // Capture position before stopping (for position memory)
                 // Only store if meaningful - update() will handle the actual storage
@@ -850,20 +834,20 @@ void MediaPool::processEventQueue() {
         }
         
         // Validate media index
-        if (event.mediaIndex >= (int)players.size()) {
+        if (mediaIndex >= (int)players.size()) {
             localQueue.pop();
             continue;
         }
         
         // Get the media player for this step
-        MediaPlayer* player = players[event.mediaIndex].get();
+        MediaPlayer* player = players[mediaIndex].get();
         if (!player) {
             localQueue.pop();
             continue;
         }
         
         // Only set active player if it's different (optimization: avoid resetting connection flag)
-        bool playerChanged = (currentIndex != event.mediaIndex || activePlayer != player);
+        bool playerChanged = (currentIndex != mediaIndex || activePlayer != player);
         if (playerChanged) {
             // Capture position of previous player before switching (for position memory)
             // Only store if meaningful - update() will handle the actual storage during playback
@@ -873,7 +857,7 @@ void MediaPool::processEventQueue() {
                 ofLogNotice("MediaPool") << "[POSITION_MEMORY] Player switch from media " << currentIndex
                                           << " | position: " << currentPosition 
                                           << " | startPosition: " << currentStartPosition
-                                          << " (switching to media " << event.mediaIndex << ")";
+                                          << " (switching to media " << mediaIndex << ")";
                 // Only store if meaningful (> 1%) - prevents storing near-zero values
                 if (currentPosition > 0.01f) {
                     lastPositionByMediaIndex[currentIndex] = currentPosition;
@@ -881,32 +865,47 @@ void MediaPool::processEventQueue() {
                                              << currentIndex << " = " << currentPosition;
                 }
             }
-            setActivePlayer(event.mediaIndex);
+            setActivePlayer(mediaIndex);
         }
         
-        // Apply media-specific parameters from the step event
-        // PERFORMANCE: Only set parameters if values actually changed to avoid triggering expensive callbacks
-        if (event.audioEnabled) {
-            if (!player->audioEnabled.get()) {
-                player->audioEnabled.set(true);
+        // Extract parameters from TriggerEvent map with defaults and proper clamping
+        // Helper lambda to get parameter value with validation
+        auto getParamValue = [&](const std::string& paramName, float defaultValue) -> float {
+            // Find parameter descriptor for range validation
+            auto descIt = std::find_if(paramDescriptors.begin(), paramDescriptors.end(),
+                [&](const ParameterDescriptor& desc) { return desc.name == paramName; });
+            
+            float minVal = 0.0f;
+            float maxVal = 1.0f;
+            if (descIt != paramDescriptors.end()) {
+                minVal = descIt->minValue;
+                maxVal = descIt->maxValue;
             }
-            if (std::abs(player->volume.get() - event.volume) > 0.001f) {
-                player->volume.set(event.volume);
+            
+            // Get value from event or use default
+            auto eventIt = event.parameters.find(paramName);
+            if (eventIt != event.parameters.end()) {
+                // Clamp to parameter range
+                return std::max(minVal, std::min(maxVal, eventIt->second));
             }
-        } else {
-            if (player->audioEnabled.get()) {
-                player->audioEnabled.set(false);
-            }
+            return defaultValue;
+        };
+        
+        float position = getParamValue("position", defaults.count("position") > 0 ? defaults["position"] : 0.0f);
+        float speed = getParamValue("speed", defaults.count("speed") > 0 ? defaults["speed"] : 1.0f);
+        float volume = getParamValue("volume", defaults.count("volume") > 0 ? defaults["volume"] : 1.0f);
+        
+        // Audio/video always enabled for sequencer triggers
+        if (!player->audioEnabled.get()) {
+            player->audioEnabled.set(true);
+        }
+        if (!player->videoEnabled.get()) {
+            player->videoEnabled.set(true);
         }
         
-        if (event.videoEnabled) {
-            if (!player->videoEnabled.get()) {
-                player->videoEnabled.set(true);
-            }
-        } else {
-            if (player->videoEnabled.get()) {
-                player->videoEnabled.set(false);
-            }
+        // Set volume (audio parameter)
+        if (std::abs(player->volume.get() - volume) > 0.001f) {
+            player->volume.set(volume);
         }
         
         // Set playback parameters (only if changed)
@@ -916,23 +915,23 @@ void MediaPool::processEventQueue() {
         // We'll update position parameter after play() for UI display, but without triggering listener.
         float currentStartPos = player->startPosition.get();
         float currentPos = player->position.get();
-        ofLogNotice("MediaPool") << "[POSITION_MEMORY] Processing trigger for media " << event.mediaIndex 
-                                  << " with position: " << event.position 
+        ofLogNotice("MediaPool") << "[POSITION_MEMORY] Processing trigger for media " << mediaIndex 
+                                  << " with position: " << position 
                                   << " (currentIndex: " << currentIndex << ")"
                                   << " | startPosition: " << currentStartPos 
                                   << " | position: " << currentPos;
-        if (std::abs(currentStartPos - event.position) > 0.001f) {
-            player->startPosition.set(event.position);
-            ofLogNotice("MediaPool") << "[POSITION_MEMORY] Set startPosition to: " << event.position;
+        if (std::abs(currentStartPos - position) > 0.001f) {
+            player->startPosition.set(position);
+            ofLogNotice("MediaPool") << "[POSITION_MEMORY] Set startPosition to: " << position;
         }
         // NOTE: Don't set player->position here - it triggers expensive setPosition() via listener
         // The play() method will set the position correctly based on startPosition
-        if (std::abs(player->speed.get() - event.speed) > 0.001f) {
-            player->speed.set(event.speed);
+        if (std::abs(player->speed.get() - speed) > 0.001f) {
+            player->speed.set(speed);
         }
         
-        // Use duration directly (already calculated in seconds by TrackerSequencer)
-        float stepDurationSeconds = event.stepLength;
+        // Use duration directly from TriggerEvent (already calculated in seconds by TrackerSequencer)
+        float stepDurationSeconds = event.duration;
         
         // Trigger media playback with gating (default behavior for step-based playback)
         // NOTE: We do NOT store event.position here - that's the START position, not the current playback position.
@@ -955,7 +954,7 @@ void MediaPool::processEventQueue() {
         // Log positions after playWithGate to track any changes
         float afterPlayPosition = player->position.get();
         float afterPlayStartPosition = player->startPosition.get();
-        ofLogNotice("MediaPool") << "[POSITION_MEMORY] After playWithGate for media " << event.mediaIndex
+        ofLogNotice("MediaPool") << "[POSITION_MEMORY] After playWithGate for media " << mediaIndex
                                   << " | position: " << afterPlayPosition 
                                   << " | startPosition: " << afterPlayStartPosition;
         
@@ -1193,98 +1192,30 @@ void MediaPool::onTrigger(TriggerEvent& event) {
     // LOCK-FREE: Push event to queue from audio thread (minimal logging only)
     // This is called from audio thread via ofNotifyEvent, so we must not block
     
-    // Map TriggerEvent to TriggerEventData and queue it
-    TriggerEventData triggerData;
-    triggerData.step = 0; // TriggerEvent doesn't have step info, but we don't need it
-    
-    // Map "note" parameter to mediaIndex
+    // Apply position memory: If retriggering same media without specified position,
+    // use stored position (continue from where it left off, even after gate ends)
     auto noteIt = event.parameters.find("note");
-    if (noteIt == event.parameters.end()) {
-        // No note parameter - treat as rest
-        triggerData.mediaIndex = -1;
-    } else {
-        triggerData.mediaIndex = (int)noteIt->second;
-    }
-    
-    // MODULAR: Get parameter defaults from MediaPool's own getParameters()
-    // This ensures defaults come from the module that owns the parameters, not TrackerSequencer
-    auto paramDescriptors = getParameters();
-    std::map<std::string, float> defaults;
-    for (const auto& param : paramDescriptors) {
-        defaults[param.name] = param.defaultValue;
-    }
-    
-    // Map parameters with defaults and position memory support
-    // Note: TriggerEventData has fixed fields (position, speed, volume) - this is MediaPool-specific
-    // We map generic parameter names to these fields. Future: could use std::map or pointer-to-member
-    for (const auto& param : paramDescriptors) {
-        // Skip "note" - it's handled separately above
-        if (param.name == "note") continue;
+    if (noteIt != event.parameters.end() && noteIt->second >= 0) {
+        int mediaIndex = (int)noteIt->second;
         
-        auto it = event.parameters.find(param.name);
-        float finalValue;
-        bool isExplicitlySet = (it != event.parameters.end());
-        
-        if (isExplicitlySet) {
-            // Parameter explicitly set - validate/clamp to range
-            float value = it->second;
-            finalValue = std::max(param.minValue, std::min(param.maxValue, value));
-        } else {
-            // Parameter not set - use default OR position memory for position parameter
-            // Position memory: If retriggering same media without specified position,
-            // use stored position (continue from where it left off, even after gate ends)
-            if (param.name == "position") {
-                // Check if we have a stored position for this media index
-                // This works even if the media has stopped (gate ended)
-                auto posIt = lastPositionByMediaIndex.find(triggerData.mediaIndex);
-                if (posIt != lastPositionByMediaIndex.end()) {
-                    // Use stored position (position memory)
-                    finalValue = posIt->second;
-                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Using stored position for media " 
-                                             << triggerData.mediaIndex << ": " << finalValue;
-                } else {
-                    // No stored position - use default (start from beginning)
-                    finalValue = param.defaultValue;
-                    // Only log at verbose level to reduce log spam (rests trigger this frequently)
-                    ofLogVerbose("MediaPool") << "[POSITION_MEMORY] No stored position for media " 
-                                              << triggerData.mediaIndex << ", using default: " << finalValue
-                                              << " (map size: " << lastPositionByMediaIndex.size() << ")";
-                }
-            } else {
-                // Other parameters (speed, volume, etc.) - use default
-                finalValue = param.defaultValue;
+        // Check if position parameter is not explicitly set
+        if (event.parameters.find("position") == event.parameters.end()) {
+            // Check if we have a stored position for this media index
+            auto posIt = lastPositionByMediaIndex.find(mediaIndex);
+            if (posIt != lastPositionByMediaIndex.end()) {
+                // Use stored position (position memory)
+                event.parameters["position"] = posIt->second;
+                ofLogNotice("MediaPool") << "[POSITION_MEMORY] Using stored position for media " 
+                                         << mediaIndex << ": " << posIt->second;
             }
         }
-        
-        // MODULAR: Map to TriggerEventData fields using a mapping system
-        // Note: TriggerEventData has fixed fields (position, speed, volume) - this is MediaPool-specific
-        // Use a lambda-based mapping for cleaner code (more maintainable than if/else chain)
-        static auto mapParamToField = [](const std::string& paramName, float value, TriggerEventData& data) {
-            if (paramName == "position") {
-                data.position = value;
-            } else if (paramName == "speed") {
-                data.speed = value;
-            } else if (paramName == "volume") {
-                data.volume = value;
-            }
-            // Unknown parameters are silently ignored (could log warning in debug mode)
-        };
-        
-        mapParamToField(param.name, finalValue, triggerData);
     }
-    
-    // Duration from event
-    triggerData.stepLength = event.duration;
-    
-    // Audio/video always enabled for sequencer triggers
-    triggerData.audioEnabled = true;
-    triggerData.videoEnabled = true;
     
     // Lock-free queue push (std::queue is thread-safe for single producer, single consumer)
     // We use a mutex only for queue access, but this is minimal overhead
     {
         std::lock_guard<std::mutex> queueLock(stateMutex);
-        eventQueue.push(triggerData);
+        eventQueue.push(event);
     }
 }
 

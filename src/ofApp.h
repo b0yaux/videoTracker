@@ -81,7 +81,7 @@ private:
     
     // GUI state
     bool showGUI = true;
-    bool isPlaying = false;
+    // Note: isPlaying removed - use clock.isPlaying() directly (Clock is single source of truth for transport)
     int numSteps = 16;
     
     // Note: Audio state (devices, volume, level) is now managed by ViewManager

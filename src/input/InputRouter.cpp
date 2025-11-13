@@ -14,12 +14,14 @@ InputRouter::InputRouter() {
 void InputRouter::setup(
     Clock* clock_,
     TrackerSequencer* tracker_,
+    TrackerSequencerGUI* trackerGUI_,
     ViewManager* viewManager_,
     MediaPool* mediaPool_,
     MediaPoolGUI* mediaPoolGUI_
 ) {
     clock = clock_;
     tracker = tracker_;
+    trackerGUI = trackerGUI_;
     viewManager = viewManager_;
     mediaPool = mediaPool_;
     mediaPoolGUI = mediaPoolGUI_;
@@ -27,9 +29,8 @@ void InputRouter::setup(
     ofLogNotice("InputRouter") << "Setup complete";
 }
 
-void InputRouter::setPlayState(bool* isPlaying_) {
-    isPlaying = isPlaying_;
-}
+// Note: setPlayState() removed - play state now comes directly from Clock reference
+// Clock is the single source of truth for transport state
 
 void InputRouter::setCurrentStep(int* currentStep_) {
     currentStep = currentStep_;
@@ -71,8 +72,8 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     if (key == ' ') {
         // Alt+Spacebar: Trigger current edit step
         if (keyEvent.hasModifier(OF_KEY_ALT)) {
-            if (tracker) {
-                int editStep = tracker->getEditStep();
+            if (tracker && trackerGUI) {
+                int editStep = trackerGUI->getEditStep();
                 if (editStep >= 0) {
                     tracker->triggerStep(editStep);
                     logKeyPress(key, "Alt+Spacebar: Trigger step");
@@ -141,18 +142,17 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     // This handles both docked windows and regular panel navigation
     bool trackerCellFocused = false;
     bool onHeaderRow = false;
-    bool isParentWidgetFocused = false;
     
     // ALWAYS check tracker state if tracker exists, regardless of panel index
     // This is because the user might be interacting with tracker even if ViewManager
     // thinks a different panel is active (ImGui window focus vs ViewManager panel state)
-    if (tracker) {
-        int editStep = tracker->getEditStep();
-        int editColumn = tracker->getEditColumn();
+    if (tracker && trackerGUI) {
+        int editStep = trackerGUI->getEditStep();
+        int editColumn = trackerGUI->getEditColumn();
         // Check if a valid cell is focused (indicates user is interacting with tracker)
         trackerCellFocused = (editStep >= 0 && editStep < tracker->getStepCount() && editColumn >= 0);
         // Check if on header row (editStep == -1 means no cell focused, likely on header)
-        onHeaderRow = (editStep == -1 && !tracker->getIsEditingCell());
+        onHeaderRow = (editStep == -1 && !trackerGUI->getIsEditingCell());
     }
     
     bool isInTrackerPanel = (tracker && viewManager && currentPanelIndex == 2);
@@ -172,23 +172,34 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         // Check for modifier keys properly
         bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
         bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-        bool cmdPressed = keyEvent.hasModifier(OF_KEY_COMMAND);
         
         // CRITICAL: In edit mode, block arrow keys from ImGui navigation
         // This prevents ImGui from moving focus when arrow keys adjust values
-        bool inEditMode = tracker->getIsEditingCell();
+        bool inEditMode = trackerGUI ? trackerGUI->getIsEditingCell() : false;
         
         // CRITICAL: Route Enter and numeric keys even when ImGui wants keyboard
         // This ensures these keys work when cells are focused
         // CRITICAL: In edit mode, ALWAYS route arrow keys to tracker BEFORE ImGui can process them
         // This prevents ImGui from using arrow keys for navigation and changing focus
-        if (inEditMode && (key == OF_KEY_UP || key == OF_KEY_DOWN || 
+        if (inEditMode && trackerGUI && (key == OF_KEY_UP || key == OF_KEY_DOWN || 
                            key == OF_KEY_LEFT || key == OF_KEY_RIGHT)) {
             // Arrow keys in edit mode: always route to tracker (adjust values)
             // Don't let ImGui use them for navigation - this locks focus to the editing cell
             // Sync state first to ensure tracker knows current cell
             syncEditStateFromImGuiFocus();
-            if (tracker->handleKeyPress(key, ctrlPressed, shiftPressed)) {
+            // Create GUI state struct from trackerGUI
+            TrackerSequencer::GUIState guiState;
+            guiState.editStep = trackerGUI->getEditStep();
+            guiState.editColumn = trackerGUI->getEditColumn();
+            guiState.isEditingCell = trackerGUI->getIsEditingCell();
+            guiState.editBufferCache = trackerGUI->getEditBufferCache();
+            guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
+            if (tracker->handleKeyPress(key, ctrlPressed, shiftPressed, guiState)) {
+                // Update GUI state back from the modified guiState
+                trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
+                trackerGUI->setInEditMode(guiState.isEditingCell);
+                trackerGUI->getEditBufferCache() = guiState.editBufferCache;
+                trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
                 ofLogNotice("InputRouter") << "  Arrow key in edit mode: HANDLED by tracker (blocked from ImGui)";
                 logKeyPress(key, "Tracker: Arrow key in edit mode (blocked from ImGui)");
                 return true; // Consume the key to prevent ImGui from processing
@@ -215,10 +226,27 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
             }
             
             ofLogNotice("InputRouter") << "  Enter key detected in tracker panel";
+            if (!trackerGUI) {
+                return false;
+            }
+            
+            // Create GUI state struct from trackerGUI
+            TrackerSequencer::GUIState guiState;
+            guiState.editStep = trackerGUI->getEditStep();
+            guiState.editColumn = trackerGUI->getEditColumn();
+            guiState.isEditingCell = trackerGUI->getIsEditingCell();
+            guiState.editBufferCache = trackerGUI->getEditBufferCache();
+            guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
+            
             if (shiftPressed) {
                 // Shift+Enter: Exit grid navigation (clear cell selection)
                 ofLogNotice("InputRouter") << "  Shift+Enter: Exiting grid";
-                if (tracker->handleKeyPress(key, false, true)) {
+                if (tracker->handleKeyPress(key, false, true, guiState)) {
+                    // Update GUI state back from the modified guiState
+                    trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
+                    trackerGUI->setInEditMode(guiState.isEditingCell);
+                    trackerGUI->getEditBufferCache() = guiState.editBufferCache;
+                    trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
                     logKeyPress(key, "Tracker: Shift+Enter (exit grid)");
                     return true;
                 }
@@ -229,17 +257,26 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
                 ofLogNotice("InputRouter") << "  Regular Enter: Syncing edit state from ImGui focus";
                 syncEditStateFromImGuiFocus();
                 
+                // Update GUI state after sync
+                guiState.editStep = trackerGUI->getEditStep();
+                guiState.editColumn = trackerGUI->getEditColumn();
+                guiState.isEditingCell = trackerGUI->getIsEditingCell();
+                guiState.editBufferCache = trackerGUI->getEditBufferCache();
+                guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
+                
                 // DEBUG: Log frame count and state before handling
                 int currentFrame = ImGui::GetFrameCount();
-                int editStep = tracker->getEditStep();
-                int editColumn = tracker->getEditColumn();
-                bool isEditing = tracker->getIsEditingCell();
                 ofLogNotice("InputRouter") << "  Enter key at frame=" << currentFrame
-                    << ", editStep=" << editStep << ", editColumn=" << editColumn
-                    << ", isEditingCell=" << (isEditing ? "YES" : "NO");
+                    << ", editStep=" << guiState.editStep << ", editColumn=" << guiState.editColumn
+                    << ", isEditingCell=" << (guiState.isEditingCell ? "YES" : "NO");
                 
-                bool handled = tracker->handleKeyPress(key, false, false);
+                bool handled = tracker->handleKeyPress(key, false, false, guiState);
                 if (handled) {
+                    // Update GUI state back from the modified guiState
+                    trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
+                    trackerGUI->setInEditMode(guiState.isEditingCell);
+                    trackerGUI->getEditBufferCache() = guiState.editBufferCache;
+                    trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
                     if (currentStep) {
                         *currentStep = tracker->getCurrentStep();
                     }
@@ -249,8 +286,8 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
                 } else {
                     // Enter was pressed but tracker didn't handle it
                     // This might mean editStep/editColumn aren't set yet
-                    ofLogWarning("InputRouter") << "  Enter key NOT handled by tracker. editStep=" << editStep 
-                        << ", editColumn=" << editColumn << ", isEditingCell=" << (isEditing ? "YES" : "NO");
+                    ofLogWarning("InputRouter") << "  Enter key NOT handled by tracker. editStep=" << guiState.editStep 
+                        << ", editColumn=" << guiState.editColumn << ", isEditingCell=" << (guiState.isEditingCell ? "YES" : "NO");
                     
                     // Still consume it to prevent ImGui from activating buttons
                     // The tracker should handle it next frame once GUI sync happens
@@ -262,14 +299,26 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         // Route numeric keys and edit mode keys to tracker
         // This allows typing numbers to auto-enter edit mode, and handles edit mode input
         ofLogNotice("InputRouter") << "  Checking numeric keys: inEditMode=" << (inEditMode ? "YES" : "NO");
-        if (inEditMode) {
+        if (inEditMode && trackerGUI) {
             // In edit mode: Arrow keys already handled above, now handle numeric input
             // Numeric keys (including numpad - openFrameworks converts numpad to regular '0'-'9')
             // Also handle decimal point, minus, backspace, delete for numeric input
             if ((key >= '0' && key <= '9') ||
                 key == '.' || key == '-' || key == OF_KEY_BACKSPACE || key == OF_KEY_DEL) {
                 ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' in edit mode - routing to tracker";
-                if (tracker->handleKeyPress(key, ctrlPressed, shiftPressed)) {
+                // Create GUI state struct from trackerGUI
+                TrackerSequencer::GUIState guiState;
+                guiState.editStep = trackerGUI->getEditStep();
+                guiState.editColumn = trackerGUI->getEditColumn();
+                guiState.isEditingCell = trackerGUI->getIsEditingCell();
+                guiState.editBufferCache = trackerGUI->getEditBufferCache();
+                guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
+                if (tracker->handleKeyPress(key, ctrlPressed, shiftPressed, guiState)) {
+                    // Update GUI state back from the modified guiState
+                    trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
+                    trackerGUI->setInEditMode(guiState.isEditingCell);
+                    trackerGUI->getEditBufferCache() = guiState.editBufferCache;
+                    trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
                     ofLogNotice("InputRouter") << "  Numeric key HANDLED by tracker (in edit mode)";
                     logKeyPress(key, "Tracker: Numeric key in edit mode");
                     return true;
@@ -277,7 +326,7 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
                     ofLogWarning("InputRouter") << "  Numeric key NOT handled by tracker (in edit mode)";
                 }
             }
-        } else {
+        } else if (trackerGUI) {
             // Not in edit mode: Route numeric keys to tracker for direct typing
             // This allows typing numbers to auto-enter edit mode
             // BUT: Don't route if an ImGui input field is active (e.g., repeat count inputs)
@@ -303,16 +352,27 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
                 ofLogNotice("InputRouter") << "  Syncing edit state from ImGui focus";
                 syncEditStateFromImGuiFocus();
                 
+                // Create GUI state struct from trackerGUI
+                TrackerSequencer::GUIState guiState;
+                guiState.editStep = trackerGUI->getEditStep();
+                guiState.editColumn = trackerGUI->getEditColumn();
+                guiState.isEditingCell = trackerGUI->getIsEditingCell();
+                guiState.editBufferCache = trackerGUI->getEditBufferCache();
+                guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
+                
                 // DEBUG: Log frame count and state before handling
                 int currentFrame = ImGui::GetFrameCount();
-                int editStep = tracker->getEditStep();
-                int editColumn = tracker->getEditColumn();
                 ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' at frame=" 
-                    << currentFrame << ", editStep=" << editStep << ", editColumn=" << editColumn;
+                    << currentFrame << ", editStep=" << guiState.editStep << ", editColumn=" << guiState.editColumn;
                 
-                bool handled = tracker->handleKeyPress(key, ctrlPressed, shiftPressed);
+                bool handled = tracker->handleKeyPress(key, ctrlPressed, shiftPressed, guiState);
                 
                 if (handled) {
+                    // Update GUI state back from the modified guiState
+                    trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
+                    trackerGUI->setInEditMode(guiState.isEditingCell);
+                    trackerGUI->getEditBufferCache() = guiState.editBufferCache;
+                    trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
                     ofLogNotice("InputRouter") << "  Numeric key HANDLED by tracker (entered edit mode)";
                     logKeyPress(key, "Tracker: Numeric key (auto-enter edit mode)");
                     return true;
@@ -320,7 +380,7 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
                     // Numeric key not handled - no cell is focused
                     // Don't consume the key - let ImGui or other handlers process it
                     ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' NOT handled by tracker (no cell focused). "
-                        << "editStep=" << editStep << ", editColumn=" << editColumn;
+                        << "editStep=" << guiState.editStep << ", editColumn=" << guiState.editColumn;
                     return false; // Let other handlers process the key
                 }
             }
@@ -385,14 +445,13 @@ bool InputRouter::handleGlobalShortcuts(int key) {
     switch (key) {
         case ' ':  // SPACE - Play/Stop (always works, even when ImGui has focus)
             if (clock) {
-                bool currentlyPlaying = (isPlaying && *isPlaying);
+                // Use Clock as single source of truth for transport state
+                bool currentlyPlaying = clock->isPlaying();
                 if (currentlyPlaying) {
                     clock->stop();
-                    if (isPlaying) *isPlaying = false;
                     logKeyPress(key, "Global: Stop");
                 } else {
                     clock->start();
-                    if (isPlaying) *isPlaying = true;
                     logKeyPress(key, "Global: Start");
                 }
                 return true;  // Always return true to prevent ImGui from processing spacebar
@@ -468,14 +527,27 @@ bool InputRouter::handlePanelNavigation(ofKeyEventArgs& keyEvent) {
 }
 
 bool InputRouter::handleTrackerInput(ofKeyEventArgs& keyEvent) {
-    if (!tracker) return false;
+    if (!tracker || !trackerGUI) return false;
     
     int key = keyEvent.key;
     bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
     bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
     
+    // Create GUI state struct from trackerGUI
+    TrackerSequencer::GUIState guiState;
+    guiState.editStep = trackerGUI->getEditStep();
+    guiState.editColumn = trackerGUI->getEditColumn();
+    guiState.isEditingCell = trackerGUI->getIsEditingCell();
+    guiState.editBufferCache = trackerGUI->getEditBufferCache();
+    guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
+    
     // Delegate to TrackerSequencer with proper modifier flags
-    if (tracker->handleKeyPress(key, ctrlPressed, shiftPressed)) {
+    if (tracker->handleKeyPress(key, ctrlPressed, shiftPressed, guiState)) {
+        // Update GUI state back from the modified guiState
+        trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
+        trackerGUI->setInEditMode(guiState.isEditingCell);
+        trackerGUI->getEditBufferCache() = guiState.editBufferCache;
+        trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
         if (currentStep) {
             *currentStep = tracker->getCurrentStep();
         }
@@ -495,14 +567,14 @@ bool InputRouter::isImGuiCapturingKeyboard() const {
 }
 
 bool InputRouter::isSequencerInEditMode() const {
-    return tracker ? tracker->getIsEditingCell() : false;
+    return trackerGUI ? trackerGUI->getIsEditingCell() : false;
 }
 
 void InputRouter::syncEditStateFromImGuiFocus() {
     // Sync edit state from ImGui focus before processing keys
     // This ensures editStep/editColumn are set even if GUI draw sync hasn't happened yet
-    if (tracker) {
-        TrackerSequencerGUI::syncEditStateFromImGuiFocus(*tracker);
+    if (trackerGUI) {
+        trackerGUI->syncEditStateFromImGuiFocus();
     }
 }
 

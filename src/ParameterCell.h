@@ -40,6 +40,7 @@ public:
     
     // Edit buffer management
     void setEditBuffer(const std::string& buffer);
+    void setEditBuffer(const std::string& buffer, bool initialized); // Overload to set both buffer and initialized flag
     const std::string& getEditBuffer() const { return editBuffer; }
     bool isEditBufferInitialized() const { return editBufferInitialized; }
     
@@ -110,6 +111,16 @@ public:
     bool shouldRefocus = false;
     
 private:
+    // Constants
+    static constexpr size_t MAX_EDIT_BUFFER_LENGTH = 50;
+    static constexpr float DRAG_SENSITIVITY_PIXELS = 200.0f;
+    static constexpr float EPSILON_DIVISION = 1e-9f;
+    static constexpr int INDEX_MAX_DEFAULT = 127;
+    static constexpr int LENGTH_MIN = 1;
+    static constexpr int LENGTH_MAX = 16;
+    static constexpr const char* FIXED_TYPE_INDEX = "index";
+    static constexpr const char* FIXED_TYPE_LENGTH = "length";
+    
     // Internal state
     bool isEditing = false;
     bool editBufferInitialized = false;
@@ -132,10 +143,21 @@ private:
     float getDefaultParseValue(const std::string& str) const;
     void applyDragValue(float newValue);
     
+    // String utility helpers
+    static bool isOnlyDashes(const std::string& str);
+    static std::string trimWhitespace(const std::string& str);
+    
+    // ImGui state management helpers
+    void disableImGuiKeyboardNav();
+    void enableImGuiKeyboardNav();
+    
+    // Value removal helper
+    void removeParameter();
+    
     // Color helpers
-    ImU32 getFillBarColor();
-    ImU32 getRedOutlineColor();
-    ImU32 getOrangeOutlineColor();
+    ImU32 getFillBarColor() const;
+    ImU32 getRedOutlineColor() const;
+    ImU32 getOrangeOutlineColor() const;
 };
 
 

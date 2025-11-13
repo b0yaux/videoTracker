@@ -185,13 +185,14 @@ void Clock::audioOut(ofSoundBuffer& buffer) {
             sampleAccumulator -= samplesPerStep;
             stepCounter++;
             
-            StepEventData stepData;
-            stepData.stepNumber = stepCounter;
-            stepData.beatNumber = beatCounter;
-            stepData.timestamp = ofGetElapsedTimef();
-            stepData.bpm = current;
+            TimeEvent stepEvent;
+            stepEvent.type = TimeEventType::STEP;
+            stepEvent.stepNumber = stepCounter;
+            stepEvent.beatNumber = beatCounter;
+            stepEvent.timestamp = ofGetElapsedTimef();
+            stepEvent.bpm = current;
             
-            ofNotifyEvent(stepEvent, stepData);
+            ofNotifyEvent(timeEvent, stepEvent);
         }
         
         // Check for beat event (for visualizer) - independent timing
@@ -199,12 +200,14 @@ void Clock::audioOut(ofSoundBuffer& buffer) {
             beatAccumulator -= samplesPerBeat;
             beatCounter++;
             
-            BeatEventData beatData;
-            beatData.beatNumber = beatCounter;
-            beatData.timestamp = ofGetElapsedTimef();
-            beatData.bpm = current;
+            TimeEvent beatEvent;
+            beatEvent.type = TimeEventType::BEAT;
+            beatEvent.stepNumber = -1;  // Not applicable for beat events
+            beatEvent.beatNumber = beatCounter;
+            beatEvent.timestamp = ofGetElapsedTimef();
+            beatEvent.bpm = current;
             
-            ofNotifyEvent(beatEvent, beatData);
+            ofNotifyEvent(timeEvent, beatEvent);
             beatPulse = 1.0f;
         }
     }

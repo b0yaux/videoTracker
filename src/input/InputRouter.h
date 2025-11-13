@@ -3,6 +3,7 @@
 
 class Clock;
 class TrackerSequencer;
+class TrackerSequencerGUI;
 class ViewManager;
 class MediaPool;
 class MediaPoolGUI;
@@ -16,13 +17,15 @@ public:
     void setup(
         Clock* clock,
         TrackerSequencer* tracker,
+        TrackerSequencerGUI* trackerGUI,
         ViewManager* viewManager,
         MediaPool* mediaPool,
         MediaPoolGUI* mediaPoolGUI
     );
 
     // Callbacks for state that needs to be updated
-    void setPlayState(bool* isPlaying);
+    // Note: Play state now comes directly from Clock (single source of truth)
+    // Clock reference is provided in setup() - no need for separate setPlayState()
     void setCurrentStep(int* currentStep);
     void setLastTriggeredStep(int* lastTriggeredStep);
     void setShowGUI(bool* showGUI);
@@ -39,12 +42,13 @@ private:
     // System references
     Clock* clock = nullptr;
     TrackerSequencer* tracker = nullptr;
+    TrackerSequencerGUI* trackerGUI = nullptr;
     ViewManager* viewManager = nullptr;
     MediaPool* mediaPool = nullptr;
     MediaPoolGUI* mediaPoolGUI = nullptr;
 
     // State references (optional - can be nullptr)
-    bool* isPlaying = nullptr;
+    // Note: Play state comes from Clock reference (single source of truth)
     int* currentStep = nullptr;
     int* lastTriggeredStep = nullptr;
     bool* showGUI = nullptr;

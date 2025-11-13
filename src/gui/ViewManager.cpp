@@ -190,7 +190,7 @@ void ViewManager::drawTrackerPanel(Panel previousPanel) {
                 navigateToPanel(Panel::TRACKER);
                 // CRITICAL: Clear cell focus when clicking empty space to prevent auto-focus loop
                 // This prevents ImGui from auto-focusing the first cell when clicking empty space
-                tracker->clearCellFocus();
+                trackerGUI->clearCellFocus();
             }
             
             trackerGUI->draw(*tracker);

@@ -13,9 +13,37 @@ public:
     void draw(TrackerSequencer& sequencer);
     
     // Sync edit state from ImGui focus - called from InputRouter when keys are pressed
-    static bool syncEditStateFromImGuiFocus(TrackerSequencer& sequencer);
+    // Note: This is now an instance method since GUI state is managed by TrackerSequencerGUI
+    bool syncEditStateFromImGuiFocus();
+    
+    // GUI state accessors (moved from TrackerSequencer)
+    int getEditStep() const { return editStep; }
+    int getEditColumn() const { return editColumn; }
+    bool getIsEditingCell() const { return isEditingCell; }
+    const std::string& getEditBufferCache() const { return editBufferCache; }
+    std::string& getEditBufferCache() { return editBufferCache; }
+    bool getEditBufferInitializedCache() const { return editBufferInitializedCache; }
+    
+    // GUI state setters
+    void setEditCell(int step, int column) { 
+        editStep = step; 
+        editColumn = column; 
+    }
+    void setInEditMode(bool editing) { isEditingCell = editing; }
+    void setEditBufferInitializedCache(bool init) { editBufferInitializedCache = init; }
+    void clearCellFocus();
+    
+    // Check if keyboard input should be routed to sequencer
+    bool isKeyboardFocused() const { return (editStep >= 0 && editColumn >= 0); }
     
 private:
+    // GUI state (moved from TrackerSequencer)
+    int editStep = -1;      // Currently selected row for editing (-1 = none)
+    int editColumn = -1;    // Currently selected column for editing (-1 = none, 0 = step number, 1+ = column index)
+    bool isEditingCell = false; // True when in edit mode (typing numeric value)
+    std::string editBufferCache; // Cache for edit buffer to persist across frames
+    bool editBufferInitializedCache = false; // Cache for edit buffer initialized state
+    
     // Performance optimization: dirty flag to avoid expensive string formatting every frame
     bool patternDirty;
     int lastNumSteps;

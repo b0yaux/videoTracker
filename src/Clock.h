@@ -20,18 +20,18 @@ struct ClockConfig {
     float pulseThreshold = 0.05f;
 };
 
-// Event data structures
-struct BeatEventData {
-    int beatNumber;
-    double timestamp;
-    float bpm;
+// Unified time event structure (replaces BeatEventData and StepEventData)
+enum class TimeEventType {
+    BEAT,   // Beat event (once per beat)
+    STEP    // Step event (multiple per beat)
 };
 
-struct StepEventData {
-    int stepNumber;
-    int beatNumber;
-    double timestamp;
-    float bpm;
+struct TimeEvent {
+    TimeEventType type;      // BEAT or STEP
+    int beatNumber;          // Beat number (valid for both types)
+    int stepNumber;          // Step number (valid only for STEP type, -1 for BEAT)
+    double timestamp;        // Timestamp when event occurred
+    float bpm;              // Current BPM at time of event
 };
 
 class Clock : public ofxSoundOutput {
@@ -45,11 +45,15 @@ public:
     float getBPM() const;
     
     // Transport control
+    // NOTE: Clock is the SINGLE SOURCE OF TRUTH for global transport state.
+    // All other components (TrackerSequencer, MediaPool, ofApp) should query
+    // clock.isPlaying() rather than maintaining their own transport state.
+    // This follows the BespokeSynth/SunVox pattern: master transport with derived local states.
     void start();
     void stop();
     void pause();
     void reset();
-    bool isPlaying() const;
+    bool isPlaying() const;  // Master transport state - single source of truth
     
     // Steps per beat control
     void setStepsPerBeat(int spb);
@@ -64,9 +68,8 @@ public:
     void addTransportListener(TransportCallback listener);
     void removeTransportListener();
     
-    // Beat and step event systems for sample-accurate timing
-    ofEvent<BeatEventData> beatEvent;  // For visualizer (once per beat)
-    ofEvent<StepEventData> stepEvent;  // For TrackerSequencer (multiple per beat)
+    // Unified time event system for sample-accurate timing
+    ofEvent<TimeEvent> timeEvent;  // Fires for both beats and steps (use type field to distinguish)
     
     // Configuration
     void setConfig(const ClockConfig& cfg);
@@ -83,6 +86,9 @@ public:
     
 private:
     // State
+    // Master transport state - single source of truth for global playback
+    // All transport control goes through Clock (start/stop/pause/reset)
+    // Other components subscribe via addTransportListener() to be notified of changes
     bool playing;
     std::atomic<float> currentBpm;
     std::atomic<float> targetBpm;

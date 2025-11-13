@@ -127,6 +127,9 @@ void MediaPoolGUI::drawMediaList() {
     // Get current index for auto-scrolling
     size_t currentIndex = mediaPool->getCurrentIndex();
     
+    // Track if index changed to determine if we should sync scroll
+    bool shouldSyncScroll = (currentIndex != previousMediaIndex);
+    
     // Show indexed media list with actual file names
     if (mediaPool->getNumPlayers() > 0) {
         auto playerNames = mediaPool->getPlayerNames();
@@ -210,7 +213,8 @@ void MediaPoolGUI::drawMediaList() {
                 }
                 
                 // Auto-scroll to current playing media at top of list
-                if (i == currentIndex) {
+                // Only sync scroll when media index changes (allows user scrolling otherwise)
+                if (i == currentIndex && shouldSyncScroll) {
                     ImGui::SetScrollHereY(0.0f); // 0.0 = top of visible area
                 }
                 
@@ -298,6 +302,9 @@ void MediaPoolGUI::drawMediaList() {
         }
     ImGui::Separator();
     }
+    
+    // Update previous index after processing list (for scroll sync on next frame)
+    previousMediaIndex = currentIndex;
     
     // CRITICAL: Update parent widget focus state AFTER the list ends
     // Following ImGui pattern: We can't check IsItemFocused() for a widget created earlier,

@@ -7,9 +7,33 @@
 #include <map>    // For paramRanges map
 
 TrackerSequencerGUI::TrackerSequencerGUI() 
-    : patternDirty(true), lastNumSteps(0), lastPlaybackStep(-1), anyCellFocusedThisFrame(false), parentWidgetId(0) {
+    : editStep(-1), editColumn(-1), isEditingCell(false), editBufferInitializedCache(false),
+      patternDirty(true), lastNumSteps(0), lastPlaybackStep(-1), anyCellFocusedThisFrame(false), parentWidgetId(0) {
     pendingRowOutline.shouldDraw = false;
     pendingRowOutline.step = -1;
+}
+
+void TrackerSequencerGUI::clearCellFocus() {
+    // Guard: Don't clear if already cleared (prevents spam and unnecessary work)
+    if (editStep == -1) {
+        return;
+    }
+    ofLogNotice("TrackerSequencerGUI") << "[FOCUS_DEBUG] clearCellFocus() - clearing editStep to -1 (was: " << editStep 
+                                     << ", column: " << editColumn 
+                                     << ", isEditingCell: " << isEditingCell << ")";
+    
+    // If we were in edit mode, restore ImGui keyboard navigation
+    if (isEditingCell) {
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        ofLogNotice("TrackerSequencerGUI") << "[FOCUS_DEBUG] Restored ImGui keyboard navigation (was in edit mode)";
+    }
+    
+    editStep = -1;
+    editColumn = -1;
+    isEditingCell = false;
+    editBufferCache.clear();
+    editBufferInitializedCache = false;
 }
 
 void TrackerSequencerGUI::draw(TrackerSequencer& sequencer) {
@@ -299,9 +323,10 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     static int lastEditColumn = -1;
     static bool lastIsEditingCell = false;
     
-    int currentEditStep = sequencer.getEditingStepIndex();
-    int currentEditColumn = sequencer.getEditingColumnIndex();
-    bool currentIsEditingCell = sequencer.isInEditMode();
+    // Use GUI's own state instead of sequencer's (GUI state moved to TrackerSequencerGUI)
+    int currentEditStep = editStep;
+    int currentEditColumn = editColumn;
+    bool currentIsEditingCell = isEditingCell;
     
     if (currentEditStep != lastEditStep || 
         currentEditColumn != lastEditColumn ||
@@ -334,9 +359,10 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     int playbackStep = sequencer.getPlaybackStepIndex();
     
     // Cache edit state to avoid repeated member access
-    int cachedEditStep = sequencer.getEditingStepIndex();
-    int cachedEditColumn = sequencer.getEditingColumnIndex();
-    bool cachedIsEditingCell = sequencer.isInEditMode();
+    // Use GUI's own state instead of sequencer's (GUI state moved to TrackerSequencerGUI)
+    int cachedEditStep = editStep;
+    int cachedEditColumn = editColumn;
+    bool cachedIsEditingCell = isEditingCell;
     
     // Cache indexRangeCallback result (expensive callback - called once instead of 16+ times)
     int maxIndex = sequencer.indexRangeCallback ? sequencer.indexRangeCallback() : 127;
@@ -463,10 +489,11 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
         // This prevents focus loss when ImGui temporarily loses focus after exiting edit mode
         // NOTE: This check happens AFTER all cells are drawn, so it won't interfere with
         // the ViewManager's empty space click handling which clears focus BEFORE drawing
-        if (sequencer.getEditStep() >= 0 && !anyCellFocusedThisFrame && !sequencer.getIsEditingCell() && !sequencer.shouldRefocusCurrentCell) {
+        // Note: shouldRefocusCurrentCell flag removed - GUI manages its own focus state
+        if (editStep >= 0 && !anyCellFocusedThisFrame && !isEditingCell) {
             ofLogNotice("TrackerSequencerGUI") << "[FOCUS_DEBUG] Clearing cell focus - no cell was focused this frame (step: " 
-                                                << sequencer.getEditStep() << ", column: " << sequencer.getEditingColumnIndex() << ")";
-            sequencer.clearCellFocus();
+                                                << editStep << ", column: " << editColumn << ")";
+            clearCellFocus();
         }
         
         // Draw row outline if needed (after all cells are drawn)
@@ -506,11 +533,11 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
         // before calling trackerGUI->draw(). This prevents the focus loop issue where
         // ImGui auto-focuses a cell and then we try to clear it, causing a loop.
         // We keep this check as a fallback for clicks outside the window.
-        if (sequencer.getEditStep() >= 0 && ImGui::IsMouseClicked(0)) {
+        if (editStep >= 0 && ImGui::IsMouseClicked(0)) {
             // Only clear if click is outside the window entirely
             // (Empty space clicks within the window are handled by ViewManager)
             if (!ImGui::IsWindowHovered()) {
-                sequencer.clearCellFocus();
+                clearCellFocus();
             }
         }
     }
@@ -615,26 +642,12 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
     // Cells should only be focused via explicit clicks or keyboard navigation
     ImGui::PushItemFlag(ImGuiItemFlags_NoNavDefaultFocus, true);
     
-    // Check if we should refocus this cell (after keyboard navigation)
-    bool shouldRefocus = (step == sequencer.getEditStep() && sequencer.getEditingColumnIndex() == 0 && sequencer.shouldRefocusCurrentCell);
-    
-    // Request focus if needed (before creating button)
-    if (shouldRefocus) {
-        ImGui::SetKeyboardFocusHere(0);
-    }
-    
+    // Note: shouldRefocusCurrentCell flag removed - GUI manages its own focus state
     // Draw button
     bool buttonClicked = ImGui::Button(stepBuf, ImVec2(-1, 0));
     
     // Pop the flag after creating the button
     ImGui::PopItemFlag();
-    
-    // Refocus after drawing (if needed) - ensures focus is set
-    if (shouldRefocus) {
-        ImGui::SetKeyboardFocusHere(-1);
-        ImGuiIO& io = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    }
     
     // Pop button styling if we pushed it
     if (isStepActive) {
@@ -654,36 +667,29 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
         sequencer.triggerStep(step);
         // Note: editStep/editColumn will be synced below when ImGui::IsItemFocused() is true
         // If focus doesn't happen immediately, we still need to set it here for immediate keyboard input
-        sequencer.setEditingStepIndex(step);
-        sequencer.setEditingColumnIndex(0);
+        setEditCell(step, 0);
     }
     
-    // ONE-WAY SYNC: ImGui focus → Sequencer state
-    // Only sync when item was actually clicked, keyboard-navigated, or refocusing
+    // ONE-WAY SYNC: ImGui focus → GUI state
+    // Only sync when item was actually clicked or keyboard-navigated
     bool actuallyFocused = ImGui::IsItemFocused();
     if (actuallyFocused) {
         bool itemWasClicked = ImGui::IsItemClicked(0);
         bool keyboardNavActive = (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
         
-        // Only sync if this is an intentional focus (click, keyboard nav, or refocus)
-        if (itemWasClicked || keyboardNavActive || shouldRefocus) {
+        // Only sync if this is an intentional focus (click or keyboard nav)
+        if (itemWasClicked || keyboardNavActive) {
             anyCellFocusedThisFrame = true;
-            bool cellChanged = (sequencer.getEditingStepIndex() != step || sequencer.getEditingColumnIndex() != 0);
+            bool cellChanged = (editStep != step || editColumn != 0);
             
             // When in edit mode, prevent focus from changing to a different cell
-            if (sequencer.isInEditMode() && cellChanged) {
+            if (isEditingCell && cellChanged) {
                 return; // Exit early - keep focus locked to editing cell
             }
             
-            // Sync state
-            int previousStep = sequencer.getEditingStepIndex();
-            sequencer.setEditingStepIndex(step);
-            sequencer.setEditingColumnIndex(0);
-            
-            // Clear refocus flag after successful sync
-            if (shouldRefocus) {
-                sequencer.shouldRefocusCurrentCell = false;
-            }
+            // Sync state to GUI
+            int previousStep = editStep;
+            setEditCell(step, 0);
             
             // When paused, sync playback position and trigger step (walk through)
             bool stepChanged = (step != sequencer.getPlaybackStep());
@@ -693,8 +699,10 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
             }
             
             // Exit edit mode if navigating to a different cell
-            if (cellChanged && sequencer.isInEditMode()) {
-                sequencer.setInEditMode(false);
+            if (cellChanged && isEditingCell) {
+                setInEditMode(false);
+                editBufferCache.clear();
+                editBufferInitializedCache = false;
                 // Note: ParameterCell manages its own edit buffer state
             }
         }
@@ -703,9 +711,9 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
     // Draw outline for selected cells only (not hover)
     // When step number cell is selected, draw outline around entire row
     // Don't draw outline if we're on header row (editStep == -1)
-    bool isSelected = (sequencer.getEditingStepIndex() == step && sequencer.getEditingColumnIndex() == 0 && sequencer.getEditingStepIndex() >= 0);
+    bool isSelected = (editStep == step && editColumn == 0 && editStep >= 0);
     bool isFocused = ImGui::IsItemFocused();
-    bool shouldShowOutline = isSelected || (isFocused && !sequencer.isInEditMode() && sequencer.getEditingStepIndex() >= 0);
+    bool shouldShowOutline = isSelected || (isFocused && !isEditingCell && editStep >= 0);
     
     if (shouldShowOutline) {
         if (isSelected) {
@@ -723,7 +731,7 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
             static ImU32 rowRedOutlineColor = ImGui::GetColorU32(ImVec4(1.0f, 0.0f, 0.0f, 1.0f));
             
             // Orange outline when in edit mode, red outline when just selected (use cached colors)
-            pendingRowOutline.color = (isSelected && sequencer.isInEditMode())
+            pendingRowOutline.color = (isSelected && isEditingCell)
                 ? rowOrangeOutlineColor  // Orange outline in edit mode
                 : rowRedOutlineColor; // Red outline when not editing
         } else if (isFocused) {
@@ -763,7 +771,7 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
     paramCell.setEditing(cachedIsEditingCell && isSelected);
     // Restore edit buffer cache if editing (for persistence across frames)
     if (cachedIsEditingCell && isSelected) {
-        paramCell.setEditBuffer(sequencer.getEditBufferCache());
+        paramCell.setEditBuffer(editBufferCache);
     }
     
     // Restore drag state if this cell is being dragged (for persistence across frames)
@@ -775,17 +783,18 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
     
     // Determine focus state
     bool isFocused = (cachedEditStep == step && cachedEditColumn == editColumnValue);
-    bool shouldFocusFirst = (step == 0 && editColumnValue == 1 && sequencer.shouldFocusFirstCell);
-    bool shouldRefocusCurrentCell = (step == cachedEditStep && editColumnValue == cachedEditColumn && sequencer.shouldRefocusCurrentCell);
+    // Note: shouldFocusFirstCell and shouldRefocusCurrentCell flags removed - GUI manages its own focus state
+    bool shouldFocusFirst = false;  // Can be re-implemented if needed
+    bool shouldRefocusCurrentCell = false;  // Can be re-implemented if needed
     
     // Draw using ParameterCell
     ParameterCellInteraction interaction = paramCell.draw(uniqueId, isFocused, shouldFocusFirst, shouldRefocusCurrentCell);
     
-    // Sync state back from ParameterCell to TrackerSequencer
+    // Sync state back from ParameterCell to GUI state
     if (interaction.focusChanged) {
         // Update edit step/column if focus changed
-        int previousStep = sequencer.getEditingStepIndex();
-        sequencer.setEditCell(step, editColumnValue);
+        int previousStep = editStep;
+        setEditCell(step, editColumnValue);
         anyCellFocusedThisFrame = true;
         
         // When paused, sync playback position and trigger step (walk through)
@@ -798,8 +807,8 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
     
     if (interaction.clicked) {
         // Cell was clicked - focus it but don't enter edit mode yet
-        sequencer.setEditCell(step, editColumnValue);
-        sequencer.setInEditMode(false);
+        setEditCell(step, editColumnValue);
+        setInEditMode(false);
         // Note: ParameterCell manages its own edit buffer state
     }
     
@@ -831,25 +840,15 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
     
     // Sync edit mode state and edit buffer cache if editing
     if (paramCell.isEditingMode()) {
-        sequencer.setInEditMode(true);
+        setInEditMode(true);
         // Cache edit buffer for persistence across frames (ParameterCell owns the logic)
-        sequencer.getEditBufferCache() = paramCell.getEditBuffer();
-        sequencer.setEditBufferInitializedCache(paramCell.isEditBufferInitialized());
+        editBufferCache = paramCell.getEditBuffer();
+        setEditBufferInitializedCache(paramCell.isEditBufferInitialized());
     } else if (cachedIsEditingCell && isSelected && !paramCell.isEditingMode()) {
         // Exited edit mode
-        sequencer.setInEditMode(false);
-        sequencer.getEditBufferCache().clear();
-        sequencer.setEditBufferInitializedCache(false);
-    }
-    
-    // Handle shouldFocusFirstCell flag
-    if (shouldFocusFirst) {
-        sequencer.shouldFocusFirstCell = false;
-    }
-    
-    // Handle shouldRefocusCurrentCell flag
-    if (shouldRefocusCurrentCell) {
-        sequencer.shouldRefocusCurrentCell = false;
+        setInEditMode(false);
+        editBufferCache.clear();
+        editBufferInitializedCache = false;
     }
     
     // Early exit if requested (prevents further processing for this cell)
@@ -860,10 +859,12 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
 
 
 // Sync edit state from ImGui focus - called from InputRouter when keys are pressed
-bool TrackerSequencerGUI::syncEditStateFromImGuiFocus(TrackerSequencer& sequencer) {
+bool TrackerSequencerGUI::syncEditStateFromImGuiFocus() {
     // Check if editStep/editColumn are already valid (GUI sync already happened)
-    if (sequencer.getEditingStepIndex() >= 0 && sequencer.getEditingStepIndex() < sequencer.getCurrentPattern().getStepCount() && 
-        sequencer.getEditingColumnIndex() >= 0) {
+    // This method is called from InputRouter before processing keys to ensure state is synced
+    // The actual syncing from ImGui focus happens in the draw methods
+    // This method just checks if state is already set
+    if (editStep >= 0 && editColumn >= 0) {
         return true; // Already synced
     }
     
