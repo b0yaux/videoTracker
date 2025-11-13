@@ -232,20 +232,17 @@ void ofApp::setup() {
 //--------------------------------------------------------------
 void ofApp::update() {
     // PERFORMANCE: Only update the active player, not all 117 players
-    // This is critical for performance - updating all players every frame is extremely expensive
     auto currentPlayer = mediaPool.getActivePlayer();
     if (currentPlayer) {
-        // Only update the active player (audio and video processing)
-        // PERFORMANCE CRITICAL: Only update when actually playing to avoid expensive operations
-        if (currentPlayer->isPlaying()) {
-            currentPlayer->update();
-            
-            // Process visual pipeline - simplified for direct texture drawing
-            // Only update video player if video is enabled and playing
-            if (currentPlayer->videoEnabled.get() && currentPlayer->isVideoLoaded()) {
-                auto& videoPlayer = currentPlayer->getVideoPlayer();
-                videoPlayer.update();  // Just update, no FBO processing needed
-            }
+        // CRITICAL FIX: Always call update() to check for gate ending
+        // The gate ending check in MediaPlayer::update() must run every frame
+        // to detect when scheduledStopActive expires, even if player appears stopped
+        currentPlayer->update();
+        
+        // Process visual pipeline - only when actually playing (performance optimization)
+        if (currentPlayer->isPlaying() && currentPlayer->videoEnabled.get() && currentPlayer->isVideoLoaded()) {
+            auto& videoPlayer = currentPlayer->getVideoPlayer();
+            videoPlayer.update();  // Just update, no FBO processing needed
         }
     }
     
@@ -456,8 +453,8 @@ void ofApp::setupGUI() {
 
     style.Colors[ImGuiCol_MenuBarBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.8f);     
 
-    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.75f);          // Window title background
-    // style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.15f, 0.15f, 0.15f, 0.9f); // Active title background
+    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.65f);          // Window title background
+    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.15f, 0.15f, 0.8f, 0.75f); // Active title background
     // style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.05f, 0.05f, 0.05f, 0.7f); // Collapsed title background
     
     style.Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);      // Scrollbar background
@@ -470,8 +467,8 @@ void ofApp::setupGUI() {
     //style.Colors[ImGuiCol_ResizeGripActive] = ImVec4(0.4f, 0.4f, 0.4f, 1.0f); // Resize grip active
     
     style.Colors[ImGuiCol_Tab] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);              // Tab background
-    // style.Colors[ImGuiCol_TabHovered] = ImVec4(0.2f, 0.2f, 0.2f, 0.9f);      // Tab hover
-    // style.Colors[ImGuiCol_TabActive] = ImVec4(0.2f, 0.2f, 0.2f, 1.0f);        // Tab active
+    style.Colors[ImGuiCol_TabHovered] = ImVec4(0.2f, 0.2f, 0.45f, 0.75f);      // Tab hover
+    style.Colors[ImGuiCol_TabActive] = ImVec4(0.05f, 0.05f, 0.2f, 0.8f);        // Tab active
     style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.05f, 0.05f, 0.05f, 0.7f);  // Tab unfocused
     style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.15f, 0.15f, 0.15f, 0.8f); // Tab unfocused active
     
@@ -517,6 +514,79 @@ void ofApp::drawGUI() {
         // Ensure ImGui keyboard navigation is enabled (for arrow key navigation)
         ImGuiIO& io = ImGui::GetIO();
         
+        // CRITICAL: Track window focus state using ImGui's AppFocusLost flag
+        // This is set by the GLFW backend when the window loses/regains focus
+        // This is more reliable than checking window focus states manually
+        static bool lastAppFocusLost = false;
+        bool appFocusLost = io.AppFocusLost;
+        
+        // Detect focus regain (transition from lost to regained)
+        if (lastAppFocusLost && !appFocusLost) {
+            // Window regained focus - clear stale focus states and reset navigation
+            ofLogNotice("ofApp") << "[FOCUS_DEBUG] Window regained focus - resetting ImGui state";
+            
+            // Clear any active ImGui items that might be stuck
+            // This prevents input fields or other widgets from staying in an active state
+            if (ImGui::IsAnyItemActive()) {
+                ImGui::ClearActiveID();
+                ofLogNotice("ofApp") << "[FOCUS_DEBUG] Cleared active ImGui item";
+            }
+            
+            // Reset ImGui navigation state to prevent stale navigation
+            // Access internal context to reset navigation ID (prevents stuck navigation)
+            ImGuiContext* g = ImGui::GetCurrentContext();
+            if (g) {
+                // Reset navigation ID to clear any stale navigation state
+                // This ensures keyboard navigation works properly after regaining focus
+                if (g->NavId != 0) {
+                    g->NavId = 0;
+                    g->NavIdIsAlive = false;
+                    ofLogNotice("ofApp") << "[FOCUS_DEBUG] Reset ImGui navigation ID";
+                }
+                
+                // Clear any focused item that might be stale
+                if (g->ActiveId != 0) {
+                    g->ActiveId = 0;
+                    g->ActiveIdWindow = nullptr;
+                    ofLogNotice("ofApp") << "[FOCUS_DEBUG] Cleared stale ActiveId";
+                }
+            }
+            
+            // Clear TrackerSequencer cell focus if it's stale
+            if (trackerSequencer.getEditingStepIndex() >= 0) {
+                ofLogNotice("ofApp") << "[FOCUS_DEBUG] Clearing TrackerSequencer cell focus (step: " 
+                                     << trackerSequencer.getEditingStepIndex() 
+                                     << ", column: " << trackerSequencer.getEditingColumnIndex() << ")";
+                trackerSequencer.clearCellFocus();
+            }
+            
+            // Clear MediaPoolGUI cell focus if it's stale
+            if (mediaPoolGUI.isKeyboardFocused()) {
+                ofLogNotice("ofApp") << "[FOCUS_DEBUG] Clearing MediaPoolGUI cell focus";
+                mediaPoolGUI.clearCellFocus();
+            }
+            
+            // Force reset ImGui navigation state - ensure keyboard navigation is enabled
+            io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+            
+            // Reset key and mouse states to prevent stuck keys from before focus was lost
+            // This ensures keys/buttons pressed before losing focus don't remain "down" after regaining focus
+            // ClearInputKeys() clears keyboard/gamepad state + text input buffer (equivalent to releasing all keys)
+            io.ClearInputKeys();
+            // ClearInputMouse() clears mouse button states
+            io.ClearInputMouse();
+            
+            // Note: Don't manually set WantCaptureKeyboard/WantCaptureMouse - these are computed by ImGui
+            // based on active widgets. They will be recalculated automatically in the next frame.
+            
+            ofLogNotice("ofApp") << "[FOCUS_DEBUG] Reset ImGui keyboard navigation and input states";
+        } else if (!lastAppFocusLost && appFocusLost) {
+            // Window lost focus
+            ofLogNotice("ofApp") << "[FOCUS_DEBUG] Window lost focus";
+        }
+        
+        lastAppFocusLost = appFocusLost;
+        
         // Disable ImGui's Tab key handling - we handle Tab ourselves for panel navigation
         // This prevents ImGui from capturing Tab before our keyPressed handler
         io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
@@ -531,8 +601,10 @@ void ofApp::drawGUI() {
             // State changed - update ConfigFlags only now
             if (shouldEnableNav) {
                 io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+                ofLogNotice("ofApp") << "[NAV_DEBUG] Enabled keyboard navigation";
             } else {
                 io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+                ofLogNotice("ofApp") << "[NAV_DEBUG] Disabled keyboard navigation (cell editing)";
             }
             lastNavState = shouldEnableNav;
         }

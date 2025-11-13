@@ -4,6 +4,7 @@
 #include "ofEvents.h"
 #include "Module.h"
 #include "Pattern.h"
+#include "ParameterCell.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -45,6 +46,11 @@ public:
     // NOTE: TrackerSequencer does NOT inherit from Module (SunVox-style)
     // This prepares for future BespokeSynth-style migration where TrackerSequencer becomes a Module
     std::vector<ParameterDescriptor> getAvailableParameters() const;
+    
+    // Module interface compatibility methods (for future Module inheritance)
+    std::vector<ParameterDescriptor> getParameters(); // Alias for getAvailableParameters
+    void onTrigger(TriggerEvent& event); // Sequencers don't receive triggers, but method exists for interface
+    void setParameter(const std::string& paramName, float value, bool notify = true); // Interface compliance
     
     // Transport listener for Clock play/stop events
     void onClockTransportChanged(bool isPlaying);
@@ -117,7 +123,9 @@ public:
     
     // UI interaction
     bool handleKeyPress(int key, bool ctrlPressed = false, bool shiftPressed = false);
+    bool handleKeyPress(ofKeyEventArgs& keyEvent); // Overload for ofKeyEventArgs
     void handleMouseClick(int x, int y, int button);
+    bool isKeyboardFocused() const; // Check if keyboard input should be routed here
     
     // Getters
     int getStepCount() const;  // Returns current pattern's step count
@@ -140,12 +148,13 @@ public:
     int getCurrentPlayingStep() const { return currentPlayingStep; }
     void clearCellFocus();
     
-    // Edit buffer accessors for GUI
+    // Edit mode accessors for GUI
     void setInEditMode(bool editing) { isEditingCell = editing; }
-    std::string& getEditInputBuffer() { return editBuffer; }
-    const std::string& getEditInputBuffer() const { return editBuffer; }
-    void setEditBufferInitialized(bool init) { editBufferInitialized = init; }
-    bool getEditBufferInitialized() const { return editBufferInitialized; }
+    // Edit buffer cache accessors (for persistence across frames - ParameterCell owns the logic)
+    std::string& getEditBufferCache() { return editBufferCache; }
+    const std::string& getEditBufferCache() const { return editBufferCache; }
+    void setEditBufferInitializedCache(bool init) { editBufferInitializedCache = init; }
+    bool getEditBufferInitializedCache() const { return editBufferInitializedCache; }
     
     // Pattern cell accessor for GUI
     PatternCell& getPatternCell(int step) { return getCurrentPattern()[step]; }
@@ -154,8 +163,8 @@ public:
     // Drag state accessors for GUI
     float getDragStartY() const { return dragStartY; }
     float getDragStartX() const { return dragStartX; }
-    int getLastDragValue() const { return lastDragValue; }
-    void setLastDragValue(int value) { lastDragValue = value; }
+    float getLastDragValue() const { return lastDragValue; }
+    void setLastDragValue(float value) { lastDragValue = value; }
     
     void requestFocusMoveToParentWidget() { requestFocusMoveToParent = true; }  // Request GUI to move focus to parent widget
     bool shouldMoveFocusToParent() const { return requestFocusMoveToParent; }  // GUI compatibility alias
@@ -215,15 +224,7 @@ private:
     bool handlePatternGridClick(int x, int y);
     bool handlePatternRowClick(int step, int column); // Unused - kept for API compatibility
     
-    // Edit mode helpers
-    void adjustParameterValue(int delta);
-    void applyEditValue(int displayValue);
-    void applyEditValueFloat(float value, const std::string& parameterName);
-    void initializeEditBuffer(); // Initialize edit buffer with current cell value
-    
     // Parameter range conversion helpers (use actual parameter ranges, not 0-127)
-    static float parameterToDisplayValue(const std::string& paramName, float value);
-    static float displayValueToParameter(const std::string& paramName, float displayValue);
     static std::pair<float, float> getParameterRange(const std::string& paramName);
     static float getParameterDefault(const std::string& paramName); // Note: Uses getAvailableParameters() which is non-static
     static ParameterType getParameterType(const std::string& paramName); // Get parameter type dynamically
@@ -252,14 +253,14 @@ private:
     int playbackStep;  // Currently playing step (for visual indicator)
     int editStep;      // Currently selected row for editing
     int editColumn;    // Currently selected column for editing (-1 = none, 0 = step number, 1+ = column index)
-    bool isEditingCell; // True when in edit mode (typing numeric value)
-    std::string editBuffer; // Buffer for numeric input during edit mode
-    bool editBufferInitialized; // True if buffer was initialized from cell value (not user typing)
+    bool isEditingCell; // True when in edit mode (typing numeric value) - derived from ParameterCell state
+    std::string editBufferCache; // Cache for edit buffer to persist across frames (ParameterCell owns the logic, this is just persistence)
+    bool editBufferInitializedCache; // Cache for edit buffer initialized state
     
     // Drag state for parameter cell editing (moved from static variables to avoid loop issues)
     int draggingStep;      // Step being dragged (-1 if not dragging)
     int draggingColumn;    // Column being dragged (-1 if not dragging)
-    int lastDragValue;     // Last drag value for throttling
+    float lastDragValue;   // Last drag value (float for precision with float parameters)
     float dragStartY;      // Y position when drag started
     float dragStartX;      // X position when drag started (for horizontal dragging)
     int lastTriggeredStep;
@@ -318,9 +319,15 @@ private:
     // Helper to apply pending edit
     void applyPendingEdit();
     
-    // Helper to parse edit buffer and apply edit (used for both immediate and queued edits)
-    bool parseAndApplyEditBuffer(int step, int column, bool queueForPlayback);
-    
     // Helper to determine if edit should be queued (during playback on current step)
     bool shouldQueueEdit() const;
+    
+    // ParameterCell adapter methods - bridge PatternCell to ParameterCell
+    // Creates and configures a ParameterCell for a specific step/column
+    ParameterCell createParameterCellForColumn(int step, int column);
+    
+    // Configures callbacks for a ParameterCell to connect to PatternCell operations
+    void configureParameterCellCallbacks(ParameterCell& cell, int step, int column);
 };
+
+

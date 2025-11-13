@@ -25,6 +25,8 @@ public:
     ofParameter<float> startPosition; // 0.0-1.0 (start position for playback - synced with tracker)
     ofParameter<float> speed;         // playback rate
     ofParameter<bool> loop;
+    ofParameter<float> loopStart;     // 0.0-1.0 (loop start position)
+    ofParameter<float> loopEnd;       // 0.0-1.0 (loop end position)
     
     // Audio-specific parameters (forwarded from audioPlayer)
     ofParameter<float> volume;
@@ -73,7 +75,12 @@ public:
     
     // Parameter group accessor
     ofParameterGroup& getParameters() { return parameters; }
+    const ofParameterGroup& getParameters() const { return parameters; }
     
+    // Helper methods for parameter access by name (for use in callbacks/mapping)
+    // Returns nullptr if parameter name not found
+    const ofParameter<float>* getFloatParameter(const std::string& name) const;
+    ofParameter<float>* getFloatParameter(const std::string& name);
     
     // Setup method to initialize parameters and connections
     void setup();

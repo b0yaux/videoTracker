@@ -1,6 +1,6 @@
+
 #include "MediaPool.h"
 #include "MediaPlayer.h"
-#include "Clock.h"
 #include "TrackerSequencer.h"
 #include "ofFileUtils.h"
 #include "ofSystemUtils.h"
@@ -494,6 +494,26 @@ bool MediaPool::playMediaManual(size_t index, float position) {
 }
 
 //--------------------------------------------------------------
+void MediaPool::stopManualPreview() {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    
+    // Only stop if we're in manual preview mode
+    if (currentMode.load(std::memory_order_relaxed) != PlaybackMode::MANUAL_PREVIEW) {
+        return;
+    }
+    
+    // Stop the active player
+    if (activePlayer) {
+        activePlayer->stop();
+    }
+    
+    // Transition to IDLE state
+    currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+    
+    ofLogNotice("ofxMediaPool") << "Manual preview stopped (state: IDLE)";
+}
+
+//--------------------------------------------------------------
 void MediaPool::onStepTrigger(int step, int mediaIndex, float position, 
                               float speed, float volume, float stepLength, 
                               bool audioEnabled, bool videoEnabled) {
@@ -763,6 +783,23 @@ void MediaPool::update() {
             onManualPreviewEnd();
         }
     }
+    
+    // Check for gate end in sequencer active mode (user-triggered steps with length-based triggers)
+    // When playWithGate() is called, MediaPlayer stops automatically when the gate duration expires
+    // We need to detect this and transition back to IDLE mode so the button state updates correctly
+    if (mode == PlaybackMode::SEQUENCER_ACTIVE && activePlayer && currentIndex < players.size()) {
+        // Check if the player was playing and then stopped (gate ended)
+        // This handles length-based triggers where the step ends after a duration
+        bool isCurrentlyPlaying = activePlayer->isPlaying();
+        bool wasPlaying = lastPlayingStateByMediaIndex[currentIndex];
+        
+        if (wasPlaying && !isCurrentlyPlaying) {
+            // Player was playing and then stopped - gate ended
+            // Transition to IDLE mode so the button state updates correctly (goes back to grey)
+            currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+            ofLogNotice("MediaPool") << "Gate ended for sequencer-triggered step - transitioning to IDLE mode";
+        }
+    }
 }
 
 //--------------------------------------------------------------
@@ -847,9 +884,6 @@ void MediaPool::processEventQueue() {
             setActivePlayer(event.mediaIndex);
         }
         
-        // Transition to SEQUENCER_ACTIVE state (atomic write)
-        currentMode.store(PlaybackMode::SEQUENCER_ACTIVE, std::memory_order_relaxed);
-        
         // Apply media-specific parameters from the step event
         // PERFORMANCE: Only set parameters if values actually changed to avoid triggering expensive callbacks
         if (event.audioEnabled) {
@@ -905,6 +939,18 @@ void MediaPool::processEventQueue() {
         // Position memory should only store the actual playback position during playback (in update()),
         // or when capturing before stop. Storing event.position here would overwrite the real playback position.
         player->playWithGate(stepDurationSeconds);
+        
+        // CRITICAL FIX: Only transition to SEQUENCER_ACTIVE if playback actually started
+        // This ensures the button state is correct - if playWithGate() fails or doesn't start playback,
+        // we stay in IDLE mode so the button doesn't incorrectly show as green
+        if (player->isPlaying()) {
+            // Transition to SEQUENCER_ACTIVE state (atomic write)
+            currentMode.store(PlaybackMode::SEQUENCER_ACTIVE, std::memory_order_relaxed);
+        } else {
+            // Playback didn't start - stay in IDLE mode
+            // This can happen if the player is in a bad state or media isn't loaded
+            ofLogWarning("MediaPool") << "playWithGate() called but player is not playing - staying in IDLE mode";
+        }
         
         // Log positions after playWithGate to track any changes
         float afterPlayPosition = player->position.get();
@@ -1045,6 +1091,9 @@ std::vector<ParameterDescriptor> MediaPool::getParameters() {
     params.push_back(ParameterDescriptor("position", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Position"));
     params.push_back(ParameterDescriptor("speed", ParameterType::FLOAT, -10.0f, 10.0f, 1.0f, "Speed"));
     params.push_back(ParameterDescriptor("volume", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Volume"));
+    params.push_back(ParameterDescriptor("pitch", ParameterType::FLOAT, 0.5f, 2.0f, 1.0f, "Pitch"));
+    params.push_back(ParameterDescriptor("loopStart", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Loop Start"));
+    params.push_back(ParameterDescriptor("loopEnd", ParameterType::FLOAT, 0.0f, 1.0f, 1.0f, "Loop End"));
     
     return params;
 }
@@ -1084,6 +1133,18 @@ void MediaPool::setParameter(const std::string& paramName, float value, bool not
         } else if (name == "speed") {
             oldValue = activePlayer->speed.get();
             activePlayer->speed.set(val);
+            return std::abs(oldValue - val) > 0.0001f;
+        } else if (name == "pitch") {
+            oldValue = activePlayer->pitch.get();
+            activePlayer->pitch.set(val);
+            return std::abs(oldValue - val) > 0.0001f;
+        } else if (name == "loopStart") {
+            oldValue = activePlayer->loopStart.get();
+            activePlayer->loopStart.set(val);
+            return std::abs(oldValue - val) > 0.0001f;
+        } else if (name == "loopEnd") {
+            oldValue = activePlayer->loopEnd.get();
+            activePlayer->loopEnd.set(val);
             return std::abs(oldValue - val) > 0.0001f;
         } else if (name == "position") {
             // Position has special handling: set both startPosition and position
@@ -1226,3 +1287,5 @@ void MediaPool::onTrigger(TriggerEvent& event) {
         eventQueue.push(triggerData);
     }
 }
+
+

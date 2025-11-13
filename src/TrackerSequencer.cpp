@@ -5,6 +5,7 @@
 #include "ofJson.h"
 #include "ofxImGui.h"  // Add this line for ImGui support
 #include <cmath>  // For std::round
+#include <limits>  // For std::numeric_limits
 
 // TrackerSequencer implementation
 //--------------------------------------------------------------
@@ -13,7 +14,7 @@ TrackerSequencer::TrackerSequencer()
       playing(false), currentMediaStartStep(-1), 
       currentMediaStepLength(0.0f), 
       sampleAccumulator(0.0), lastBpm(120.0f),
-      draggingStep(-1), draggingColumn(-1), lastDragValue(-1), dragStartY(0.0f), dragStartX(0.0f),
+      draggingStep(-1), draggingColumn(-1), lastDragValue(0.0f), dragStartY(0.0f), dragStartX(0.0f),
       stepStartTime(0.0f), stepEndTime(0.0f),
       showGUI(true),
       currentPlayingStep(-1), shouldFocusFirstCell(false), shouldRefocusCurrentCell(false), requestFocusMoveToParent(false), parentWidgetFocused(false),
@@ -34,8 +35,8 @@ void TrackerSequencer::setup(Clock* clockRef, int steps) {
     editStep = -1;    // No cell selected initially (user must click to select)
     editColumn = -1;  // No column selected initially
     isEditingCell = false; // Not in edit mode initially
-    editBuffer.clear(); // Clear edit buffer
-    editBufferInitialized = false; // Buffer not initialized yet
+    editBufferCache.clear(); // Clear edit buffer cache
+    editBufferInitializedCache = false; // Buffer cache not initialized
     shouldFocusFirstCell = false; // No focus request initially
     shouldRefocusCurrentCell = false; // No refocus request initially
     
@@ -850,18 +851,85 @@ void TrackerSequencer::clearCellFocus() {
     if (editStep == -1) {
         return;
     }
-    ofLogNotice("TrackerSequencer") << "[DEBUG] [SET editStep] clearCellFocus() - clearing editStep to -1 (was: " << editStep << ")";
+    ofLogNotice("TrackerSequencer") << "[FOCUS_DEBUG] clearCellFocus() - clearing editStep to -1 (was: " << editStep 
+                                     << ", column: " << editColumn 
+                                     << ", isEditingCell: " << isEditingCell << ")";
+    
+    // If we were in edit mode, restore ImGui keyboard navigation
+    if (isEditingCell) {
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        ofLogNotice("TrackerSequencer") << "[FOCUS_DEBUG] Restored ImGui keyboard navigation (was in edit mode)";
+    }
+    
     editStep = -1;
     editColumn = -1;
     isEditingCell = false;
-    editBuffer.clear();
-    editBufferInitialized = false;
+    editBufferCache.clear();
+    editBufferInitializedCache = false;
     shouldFocusFirstCell = false;
     shouldRefocusCurrentCell = false;
 }
 
 bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
-    // Handle keyboard shortcuts for pattern editing
+    // If a cell is selected (editStep/editColumn are valid), delegate to ParameterCell
+    // This handles both editing cells and selected cells (for auto-entering edit mode)
+    if (isValidStep(editStep) && editColumn > 0) {
+        // Create ParameterCell for current cell and delegate keyboard handling
+        ParameterCell cell = createParameterCellForColumn(editStep, editColumn);
+        
+        // Sync state from TrackerSequencer to ParameterCell
+        cell.isSelected = true;
+        cell.setEditing(isEditingCell);
+        // Restore edit buffer cache if editing (for persistence across frames)
+        if (isEditingCell) {
+            cell.setEditBuffer(editBufferCache);
+        }
+        
+        // Delegate keyboard handling to ParameterCell
+        bool handled = cell.handleKeyPress(key, ctrlPressed, shiftPressed);
+        
+        if (handled) {
+            // Check state changes BEFORE syncing
+            bool wasEditing = isEditingCell;
+            bool nowEditing = cell.isEditingMode();
+            
+            // Sync edit mode state back from ParameterCell to TrackerSequencer
+            isEditingCell = nowEditing;
+            // Cache edit buffer for persistence across frames (ParameterCell owns the logic)
+            if (nowEditing) {
+                editBufferCache = cell.getEditBuffer();
+                editBufferInitializedCache = cell.isEditBufferInitialized();
+            } else {
+                editBufferCache.clear();
+                editBufferInitializedCache = false;
+            }
+            
+            // If ParameterCell entered edit mode, sync that
+            if (nowEditing && !wasEditing) {
+                // Disable ImGui keyboard navigation when entering edit mode
+                ImGuiIO& io = ImGui::GetIO();
+                io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+            }
+            
+            // If ParameterCell exited edit mode, sync that too
+            if (!nowEditing && wasEditing) {
+                // ParameterCell exited edit mode (e.g., Enter confirmed, Escape cancelled)
+                if (key == OF_KEY_RETURN && !ctrlPressed && !shiftPressed) {
+                    // Enter confirmed - request refocus
+                    shouldRefocusCurrentCell = true;
+                }
+                
+                // Re-enable ImGui keyboard navigation when exiting edit mode
+                ImGuiIO& io = ImGui::GetIO();
+                io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+            }
+            return true;
+        }
+        // If ParameterCell didn't handle it, fall through to grid navigation logic
+    }
+    
+    // Handle keyboard shortcuts for pattern editing (grid navigation)
     switch (key) {
         // Enter key behavior:
         // - Enter on step number column (editColumn == 0): Trigger step
@@ -870,33 +938,37 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             if (ctrlPressed || shiftPressed) {
                 // Ctrl+Enter or Shift+Enter: Exit grid navigation
                 ofLogNotice("TrackerSequencer") << "[DEBUG] [SET editStep] Ctrl/Shift+Enter - clearing editStep to -1";
+                // If we were in edit mode, restore ImGui keyboard navigation
+                if (isEditingCell) {
+                    ImGuiIO& io = ImGui::GetIO();
+                    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+                }
                 editStep = -1;
                 editColumn = -1;
                 isEditingCell = false;
-                editBuffer.clear();
-                editBufferInitialized = false;
+                editBufferCache.clear();
+                editBufferInitializedCache = false;
                 shouldFocusFirstCell = false;
                 return true;
             }
             
             if (isEditingCell) {
-                // In edit mode: Confirm and exit edit mode
-                // Always try to parse (empty buffer removes dynamic parameters, invalid input also removes)
+                // Should have been handled by ParameterCell above, but handle fallback
                 if (isValidStep(editStep) && editColumn > 0) {
-                    parseAndApplyEditBuffer(editStep, editColumn, shouldQueueEdit());
-                }
-                // Preserve editStep/editColumn so cell remains selected after exiting edit mode
-                // Set flag to request GUI to refocus the cell (ImGui may lose focus temporarily)
-                if (isValidStep(editStep) && editColumn > 0) {
+                    ParameterCell cell = createParameterCellForColumn(editStep, editColumn);
+                    cell.isSelected = true;
+                    cell.setEditing(true);
+                    cell.applyValue(); // Confirm edit
                     shouldRefocusCurrentCell = true;
                 }
                 isEditingCell = false;
-                editBuffer.clear();
-                editBufferInitialized = false;
+                editBufferCache.clear();
+                editBufferInitializedCache = false;
                 
-                // Don't re-enable keyboard navigation immediately - let GUI refocus first
-                // Keyboard navigation will be re-enabled in the next frame after refocus
-                // This prevents ImGui from moving focus before we can refocus the cell
+                // Re-enable ImGui keyboard navigation when exiting edit mode
+                ImGuiIO& io = ImGui::GetIO();
+                io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+                
                 return true;
             } else if (isValidStep(editStep) && editColumn >= 0) {
                 if (editColumn == 0) {
@@ -907,11 +979,15 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 // Data column: Enter edit mode
                 if (editColumn > 0 && editColumn <= (int)columnConfig.size()) {
                     isEditingCell = true;
-                    initializeEditBuffer();
-                    editBufferInitialized = true;
+                    // Initialize via ParameterCell (ParameterCell manages its own edit buffer)
+                    ParameterCell cell = createParameterCellForColumn(editStep, editColumn);
+                    cell.isSelected = true;
+                    cell.enterEditMode();
+                    // Cache edit buffer after entering edit mode
+                    editBufferCache = cell.getEditBuffer();
+                    editBufferInitializedCache = cell.isEditBufferInitialized();
                     
                     // CRITICAL: Disable ImGui keyboard navigation when entering edit mode
-                    // This prevents arrow keys from navigating away while editing
                     ImGuiIO& io = ImGui::GetIO();
                     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
                     
@@ -932,19 +1008,19 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                     editColumn = 1;
                     shouldFocusFirstCell = true;
                     isEditingCell = false;
-                    editBuffer.clear();
-                    editBufferInitialized = false;
+                    editBufferCache.clear();
+                    editBufferInitializedCache = false;
                     return true;
                 }
             }
             return false;
             
-        // Escape: Exit edit mode
+        // Escape: Exit edit mode (should be handled by ParameterCell, but handle fallback)
         case OF_KEY_ESC:
             if (isEditingCell) {
                 isEditingCell = false;
-                editBuffer.clear();
-                editBufferInitialized = false;
+                editBufferCache.clear();
+                editBufferInitializedCache = false;
                 
                 // CRITICAL: Re-enable ImGui keyboard navigation when exiting edit mode
                 ImGuiIO& io = ImGui::GetIO();
@@ -954,23 +1030,10 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             }
             return false;
             
-        // Backspace: Delete last character in edit buffer
+        // Backspace and Delete: Should be handled by ParameterCell above
         case OF_KEY_BACKSPACE:
-            if (isEditingCell && !editBuffer.empty()) {
-                editBuffer.pop_back();
-                // If user edits the buffer (even with backspace), mark as user-edited
-                editBufferInitialized = false;
-                return true;
-            }
-            return false;
-            
-        // Delete key: Clear edit buffer
         case OF_KEY_DEL:
-            if (isEditingCell) {
-                editBuffer.clear();
-                editBufferInitialized = false; // Clearing buffer means user is editing
-                return true;
-            }
+            // These should have been handled by ParameterCell if in edit mode
             return false;
             
         // Tab: Always let ImGui handle for panel navigation
@@ -980,7 +1043,7 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             
         // Arrow keys: 
         // - Cmd+Arrow Up/Down: Move playback step (walk through steps)
-        // - In edit mode: Adjust values ONLY (no navigation)
+        // - In edit mode: Adjust values ONLY (no navigation) - handled by ParameterCell
         // - Not in edit mode: Let ImGui handle navigation between cells
         case OF_KEY_UP:
             if (ctrlPressed && !isEditingCell) {
@@ -994,26 +1057,35 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 return false;
             }
             if (isEditingCell) {
-                // In edit mode: Adjust value
-                // When adjusting during playback, update edit buffer but don't apply immediately
-                // Edit will be applied when Enter is pressed (queued for next trigger)
-                adjustParameterValue(1);
-                // Force GUI refresh by ensuring edit buffer is updated
-                // The GUI will display the updated edit buffer value
-                return true;
+                // In edit mode: Should be handled by ParameterCell above
+                // Fallback: adjust value directly
+                if (isValidStep(editStep) && editColumn > 0) {
+                    ParameterCell cell = createParameterCellForColumn(editStep, editColumn);
+                    cell.isSelected = true;
+                    cell.setEditing(true);
+                    cell.adjustValue(1);
+                    return true;
+                }
+                return false;
             }
-            // Not in edit mode: Check if at top boundary - exit grid focus
-            if (isValidStep(editStep) && editStep == 0) {
-                // At top of grid - exit grid focus to allow navigation to other widgets
-                clearCellFocus();
-                return false; // Let ImGui handle navigation to other widgets
+            // Not in edit mode: Navigate to cell above
+            if (isValidStep(editStep) && editColumn >= 0) {
+                if (editStep > 0) {
+                    // Move to cell above (same column)
+                    editStep--;
+                    shouldRefocusCurrentCell = true;
+                    return true;
+                } else {
+                    // At top of grid - exit grid focus to allow navigation to other widgets
+                    clearCellFocus();
+                    return false; // Let ImGui handle navigation to other widgets
+                }
             }
             // Not in edit mode: Check if on header row (editStep == -1 means no cell focused, likely on header)
             if (editStep == -1 && !isEditingCell) {
                 // On header row - clear cell focus and let ImGui handle navigation naturally
-                // This allows ImGui to move focus outside the table container
                 clearCellFocus();
-                return false; // Let ImGui handle the UP key to exit table navigation
+                return false; // Let ImGui handle the UP key to navigate to other widgets
             }
             // Not in edit mode: Let ImGui handle navigation
             return false;
@@ -1030,20 +1102,30 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 return false;
             }
             if (isEditingCell) {
-                // In edit mode: Adjust value
-                // When adjusting during playback, update edit buffer but don't apply immediately
-                // Edit will be applied when Enter is pressed (queued for next trigger)
-                adjustParameterValue(-1);
-                // Force GUI refresh by ensuring edit buffer is updated
-                // The GUI will display the updated edit buffer value
-                return true;
+                // In edit mode: Should be handled by ParameterCell above
+                // Fallback: adjust value directly
+                if (isValidStep(editStep) && editColumn > 0) {
+                    ParameterCell cell = createParameterCellForColumn(editStep, editColumn);
+                    cell.isSelected = true;
+                    cell.setEditing(true);
+                    cell.adjustValue(-1);
+                    return true;
+                }
+                return false;
             }
-            // Not in edit mode: Check if at bottom boundary - exit grid focus
-            int stepCount = getCurrentPattern().getStepCount();
-            if (isValidStep(editStep) && editStep == stepCount - 1) {
-                // At bottom of grid - exit grid focus to allow navigation to other widgets
-                clearCellFocus();
-                return false; // Let ImGui handle navigation to other widgets
+            // Not in edit mode: Navigate to cell below
+            if (isValidStep(editStep) && editColumn >= 0) {
+                int stepCount = getCurrentPattern().getStepCount();
+                if (editStep < stepCount - 1) {
+                    // Move to cell below (same column)
+                    editStep++;
+                    shouldRefocusCurrentCell = true;
+                    return true;
+                } else {
+                    // At bottom of grid - exit grid focus to allow navigation to other widgets
+                    clearCellFocus();
+                    return false; // Let ImGui handle navigation to other widgets
+                }
             }
             // Not in edit mode: Let ImGui handle navigation
             return false;
@@ -1051,18 +1133,67 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             
         case OF_KEY_LEFT:
             if (isEditingCell) {
-                // In edit mode: Adjust value
-                adjustParameterValue(-1);
-                return true;
+                // In edit mode: Should be handled by ParameterCell above
+                // Fallback: adjust value directly
+                if (isValidStep(editStep) && editColumn > 0) {
+                    ParameterCell cell = createParameterCellForColumn(editStep, editColumn);
+                    cell.isSelected = true;
+                    cell.setEditing(true);
+                    cell.adjustValue(-1);
+                    return true;
+                }
+                return false;
+            }
+            // Not in edit mode: Navigate to cell to the left
+            if (isValidStep(editStep) && editColumn >= 0) {
+                if (editColumn > 1) {
+                    // Move to cell to the left (decrement column)
+                    editColumn--;
+                    shouldRefocusCurrentCell = true;
+                    return true;
+                } else if (editColumn == 1) {
+                    // At first data column - move to step number column (column 0)
+                    editColumn = 0;
+                    shouldRefocusCurrentCell = true;
+                    return true;
+                } else {
+                    // At step number column (column 0) - exit grid focus
+                    return false;
+                }
             }
             // Not in edit mode: Let ImGui handle navigation
             return false;
             
         case OF_KEY_RIGHT:
             if (isEditingCell) {
-                // In edit mode: Adjust value
-                adjustParameterValue(1);
-                return true;
+                // In edit mode: Should be handled by ParameterCell above
+                // Fallback: adjust value directly
+                if (isValidStep(editStep) && editColumn > 0) {
+                    ParameterCell cell = createParameterCellForColumn(editStep, editColumn);
+                    cell.isSelected = true;
+                    cell.setEditing(true);
+                    cell.adjustValue(1);
+                    return true;
+                }
+                return false;
+            }
+            // Not in edit mode: Navigate to cell to the right
+            if (isValidStep(editStep) && editColumn >= 0) {
+                int maxColumn = (int)columnConfig.size();
+                if (editColumn == 0) {
+                    // At step number column - move to first data column (column 1)
+                    editColumn = 1;
+                    shouldRefocusCurrentCell = true;
+                    return true;
+                } else if (editColumn < maxColumn) {
+                    // Move to cell to the right (increment column)
+                    editColumn++;
+                    shouldRefocusCurrentCell = true;
+                    return true;
+                } else {
+                    // At rightmost column - exit grid focus
+                    return false;
+                }
             }
             // Not in edit mode: Let ImGui handle navigation
             return false;
@@ -1086,96 +1217,34 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             break;
             
         // Numeric input (0-9) - Blender-style: direct typing enters edit mode and starts editing
+        // This should be handled by ParameterCell if in edit mode, but handle auto-enter and media selection
         case '0': case '1': case '2': case '3': case '4': case '5': 
         case '6': case '7': case '8': case '9': {
-            // Auto-enter edit mode if we have a valid cell focused (Blender-style)
-            // CRITICAL: Only auto-enter edit mode if a cell is actually focused
-            // Don't default to first cell - user must explicitly focus a cell first
+            // If not in edit mode, check if we should auto-enter edit mode or handle media selection
             if (!isEditingCell) {
                 // Check if we have a valid cell focused
                 if (isValidStep(editStep) && editColumn > 0 && editColumn <= (int)columnConfig.size()) {
-                    // We have a valid cell: enter edit mode immediately
+                    // We have a valid cell: enter edit mode and delegate to ParameterCell
                     isEditingCell = true;
-                    editBuffer.clear();
-                    editBufferInitialized = false;
+                    ParameterCell cell = createParameterCellForColumn(editStep, editColumn);
+                    cell.isSelected = true;
+                    cell.enterEditMode();
+                    // Cache edit buffer after entering edit mode
+                    editBufferCache = cell.getEditBuffer();
+                    editBufferInitializedCache = cell.isEditBufferInitialized();
                     
                     // Disable ImGui keyboard navigation when entering edit mode
                     ImGuiIO& io = ImGui::GetIO();
                     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-                } else {
-                    // No valid cell focused - don't auto-enter edit mode
-                    // User must explicitly focus a cell (click or navigate with arrow keys/Enter) first
-                    ofLogNotice("TrackerSequencer") << "[DEBUG] Digit key ignored - no cell focused (editStep=" << editStep << ", editColumn=" << editColumn << ")";
-                    return false;
-                }
-            } else {
-                // Already in edit mode: if buffer was initialized from cell value, replace on first digit
-                if (editBufferInitialized && !editBuffer.empty()) {
-                    // Check if buffer is still the original initialized value (simple integer)
-                    bool isSimpleInteger = true;
-                    for (size_t i = 0; i < editBuffer.length(); i++) {
-                        char c = editBuffer[i];
-                        if (i == 0 && c == '-') continue;
-                        if (c < '0' || c > '9') {
-                            isSimpleInteger = false;
-                            break;
-                        }
-                    }
-                    if (isSimpleInteger) {
-                        editBuffer.clear();
-                        editBufferInitialized = false;
-                    } else {
-                        editBufferInitialized = false;
-                    }
-                } else {
-                    editBufferInitialized = false;
-                }
-            }
-            
-            // In edit mode: append to edit buffer and apply immediately (Blender-style reactive editing)
-            if (isEditingCell) {
-                editBuffer += (char)key;
-                // Allow up to 15 characters for longer numbers (e.g., "127", "1.56", "-0.5")
-                if (editBuffer.length() > 15) {
-                    editBuffer = editBuffer.substr(editBuffer.length() - 15);
-                }
-                
-                // Apply value immediately as user types (Blender-style)
-                if (!editBuffer.empty()) {
-                    try {
-                        float floatValue = std::stof(editBuffer);
-                        
-                        // Apply appropriate range based on column type
-                        if (editColumn > 0 && editColumn <= (int)columnConfig.size()) {
-                            int colIdx = editColumn - 1;
-                            if (colIdx >= 0 && colIdx < (int)columnConfig.size()) {
-                                const auto& col = columnConfig[colIdx];
-                                // MODULAR: Handle fixed columns (index/length) - use isFixed flag
-                                if (col.isFixed && col.parameterName == "length") {
-                                    // Length must be integer between 1-16
-                                    int newValue = std::max(1, std::min(16, (int)std::round(floatValue)));
-                                    applyEditValue(newValue);
-                                } else if (col.isFixed && col.parameterName == "index") {
-                                    // Index: 0 = rest, 1+ = media index (1-based display)
-                                    int maxIndex = indexRangeCallback ? indexRangeCallback() : 127;
-                                    int newValue = std::max(0, std::min(maxIndex, (int)std::round(floatValue)));
-                                    applyEditValue(newValue);
-                                } else {
-                                    // For parameter columns, accept float values directly
-                                    applyEditValueFloat(floatValue, col.parameterName);
-                                }
-                            }
-                        }
-                    } catch (...) {
-                        // Invalid number, ignore (e.g., incomplete decimal like ".")
-                    }
-                }
-                return true;
-            } else {
-                // Not in edit mode and not on a data column: media selection (1-9, 0) for index column
-                // This only works when editColumn == 0 (step number column) or when on index column
-                if (!isValidStep(editStep)) return false;
-                if (editColumn == 1) { // Index column
+                    
+                    // Now handle the digit key via ParameterCell
+                    cell.handleKeyPress(key, ctrlPressed, shiftPressed);
+                    // Cache edit buffer after handling key
+                    editBufferCache = cell.getEditBuffer();
+                    editBufferInitializedCache = cell.isEditBufferInitialized();
+                    return true;
+                } else if (isValidStep(editStep) && editColumn == 1) {
+                    // Not in edit mode and on index column: media selection (1-9, 0) for quick selection
                     if (key == '0') {
                         // Clear media index (rest)
                         getCurrentPattern()[editStep].index = -1;
@@ -1187,109 +1256,45 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                             return true;
                         }
                     }
+                } else {
+                    // No valid cell focused - don't auto-enter edit mode
+                    ofLogNotice("TrackerSequencer") << "[DEBUG] Digit key ignored - no cell focused (editStep=" << editStep << ", editColumn=" << editColumn << ")";
+                    return false;
                 }
             }
+            // If already in edit mode, should have been handled by ParameterCell delegation above
             break;
         }
         
         // Decimal point and minus sign for numeric input
+        // This should be handled by ParameterCell if in edit mode, but handle auto-enter
         case '.':
         case '-': {
-            // Auto-enter edit mode if we have a valid cell focused
-            // CRITICAL: Only auto-enter edit mode if a cell is actually focused
-            // Don't default to first cell - user must explicitly focus a cell first
+            // If not in edit mode, auto-enter edit mode if we have a valid cell focused
             if (!isEditingCell) {
                 // Check if we have a valid cell focused
                 if (isValidStep(editStep) && editColumn > 0 && editColumn <= (int)columnConfig.size()) {
-                    // We have a valid cell: enter edit mode immediately
+                    // We have a valid cell: enter edit mode and delegate to ParameterCell
                     isEditingCell = true;
-                    editBuffer.clear();
+                    ParameterCell cell = createParameterCellForColumn(editStep, editColumn);
+                    cell.isSelected = true;
+                    cell.enterEditMode();
                     
                     // Disable ImGui keyboard navigation when entering edit mode
                     ImGuiIO& io = ImGui::GetIO();
                     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+                    
+                    // Now handle the decimal/minus key via ParameterCell
+                    cell.handleKeyPress(key, ctrlPressed, shiftPressed);
+                    return true;
                 } else {
                     // No valid cell focused - don't auto-enter edit mode
-                    // User must explicitly focus a cell (click or navigate with arrow keys/Enter) first
                     ofLogNotice("TrackerSequencer") << "[DEBUG] Decimal/minus key ignored - no cell focused (editStep=" << editStep << ", editColumn=" << editColumn << ")";
                     return false;
                 }
             }
-            
-            if (isEditingCell) {
-                // CRITICAL: If buffer was initialized from cell value, clear it on first character typed
-                // This allows user to type '--' or any value even if cell had a previous value
-                if (editBufferInitialized && !editBuffer.empty()) {
-                    editBuffer.clear();
-                    editBufferInitialized = false;
-                }
-                
-                // Allow decimal point and minus sign in edit buffer
-                // For minus: allow multiple dashes (user might type '--' to clear)
-                // Only allow minus at the start (if buffer has content, don't add minus)
-                if (key == '-' && !editBuffer.empty() && editBuffer[0] != '-') {
-                    // Minus sign only allowed at the beginning
-                    return true;
-                }
-                // Only allow one decimal point
-                if (key == '.' && editBuffer.find('.') != std::string::npos) {
-                    return true;
-                }
-                editBuffer += (char)key;
-                // Limit to 15 characters
-                if (editBuffer.length() > 15) {
-                    editBuffer = editBuffer.substr(editBuffer.length() - 15);
-                }
-                
-                // Apply value immediately (Blender-style)
-                // Skip if buffer is empty, single '.', or contains only dashes (any number)
-                bool shouldSkipRealtimeParse = false;
-                if (editBuffer.empty() || editBuffer == ".") {
-                    shouldSkipRealtimeParse = true;
-                } else {
-                    // Check if buffer contains only dashes
-                    bool onlyDashes = true;
-                    for (char c : editBuffer) {
-                        if (c != '-') {
-                            onlyDashes = false;
-                            break;
-                        }
-                    }
-                    if (onlyDashes) {
-                        shouldSkipRealtimeParse = true;
-                    }
-                }
-                
-                if (!shouldSkipRealtimeParse) {
-                    try {
-                        float floatValue = std::stof(editBuffer);
-                        
-                        // Apply appropriate range based on column type
-                        if (editColumn > 0 && editColumn <= (int)columnConfig.size()) {
-                            int colIdx = editColumn - 1;
-                            if (colIdx >= 0 && colIdx < (int)columnConfig.size()) {
-                                const auto& col = columnConfig[colIdx];
-                                // MODULAR: Handle fixed columns (index/length) - use isFixed flag
-                                if (col.isFixed && col.parameterName == "length") {
-                                    int newValue = std::max(1, std::min(16, (int)std::round(floatValue)));
-                                    applyEditValue(newValue);
-                                } else if (col.isFixed && col.parameterName == "index") {
-                                    int maxIndex = indexRangeCallback ? indexRangeCallback() : 127;
-                                    int newValue = std::max(0, std::min(maxIndex, (int)std::round(floatValue)));
-                                    applyEditValue(newValue);
-                                } else {
-                                    applyEditValueFloat(floatValue, col.parameterName);
-                                }
-                            }
-                        }
-                    } catch (...) {
-                        // Invalid number (incomplete or non-numeric) - don't set anything
-                        // Parameter will be removed when Enter is pressed if still invalid
-                    }
-                }
-                return true;
-            }
-            return false;
+            // If already in edit mode, should have been handled by ParameterCell delegation above
+            break;
         }
         
         // Note: Numpad keys are already handled above - openFrameworks converts
@@ -1303,9 +1308,7 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
 // Private methods
 //--------------------------------------------------------------
 
-// GUI drawing methods removed - now in TrackerSequencerGUI class
-
-// GUI drawing methods (drawPatternRow, drawStepNumber, drawMediaIndex, drawPosition, drawSpeed, drawVolume, drawStepLength, drawParameterCell) 
+// GUI drawing methods (drawPatternRow, drawStepNumber, drawParameterCell) 
 // have been moved to TrackerSequencerGUI class
 
 // drawAudioEnabled and drawVideoEnabled removed - A/V toggles no longer used
@@ -1428,303 +1431,8 @@ int TrackerSequencer::getColumnCount() const {
 
 // Edit mode helpers
 //--------------------------------------------------------------
-void TrackerSequencer::adjustParameterValue(int delta) {
-    if (editColumn <= 0 || editColumn > (int)columnConfig.size() || !isValidStep(editStep)) {
-        return;
-    }
-    
-    int colIdx = editColumn - 1;
-    if (colIdx < 0 || colIdx >= (int)columnConfig.size()) {
-        return;
-    }
-    
-    const auto& col = columnConfig[colIdx];
-    auto& cell = getCurrentPattern()[editStep];
-    
-    // MODULAR: Handle fixed columns (index/length) - use isFixed flag
-    if (col.isFixed && col.parameterName == "length") {
-        int stepCount = cell.length;
-        stepCount = std::max(1, std::min(16, stepCount));
-        stepCount = std::max(1, std::min(16, stepCount + delta));
-        
-        // Update edit buffer for display
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%d", stepCount);
-        editBuffer = buf;
-        
-        // During playback, if editing the current playback step, only update the edit buffer
-        // Don't apply immediately - wait for Enter to queue the edit
-        if (playing && editStep == playbackStep) {
-            // Just update the edit buffer - value will be applied when Enter is pressed
-            return;
-        } else {
-            // Not playing or editing a different step: apply immediately
-            cell.length = stepCount;
-            setCell(editStep, cell);
-            return;
-        }
-    }
-    
-    // MODULAR: Handle fixed columns (index/length) - use isFixed flag
-    if (col.isFixed && col.parameterName == "index") {
-        int currentIndex = cell.index;
-        int maxIndex = indexRangeCallback ? indexRangeCallback() : 127;
-        // -1 = rest, 0+ = media index
-        if (currentIndex < 0) {
-            // Start from 0 if at rest
-            currentIndex = 0;
-        } else {
-            currentIndex = std::max(-1, std::min(maxIndex - 1, currentIndex + delta));
-        }
-        
-        // Update edit buffer for display
-        char buf[8];
-        if (currentIndex < 0) {
-            snprintf(buf, sizeof(buf), "--");
-        } else {
-            snprintf(buf, sizeof(buf), "%02d", currentIndex + 1); // Display 1-based
-        }
-        editBuffer = buf;
-        
-        // During playback, if editing the current playback step, only update the edit buffer
-        // Don't apply immediately - wait for Enter to queue the edit
-        if (playing && editStep == playbackStep) {
-            // Just update the edit buffer - value will be applied when Enter is pressed
-            return;
-        } else {
-            // Not playing or editing a different step: apply immediately
-            cell.index = currentIndex;
-            setCell(editStep, cell);
-            return;
-        }
-    }
-    
-    // Use actual default from ParameterDescriptor (position: 0.0, speed: 1.0, volume: 1.0)
-    float defaultValue = getParameterDefault(col.parameterName);
-    float value = cell.getParameterValue(col.parameterName, defaultValue);
-    
-    // For float parameters, apply delta directly to the actual value
-    // Calculate a reasonable step size based on the parameter range
-    auto range = getParameterRange(col.parameterName);
-    float minVal = range.first;
-    float maxVal = range.second;
-    float rangeSize = maxVal - minVal;
-    
-    // Use 1% of range as step size, with minimum step of 0.01
-    float stepSize = std::max(0.01f, rangeSize * 0.01f);
-    float newValue = value + (delta * stepSize);
-    
-    // Clamp to parameter range
-    newValue = std::max(minVal, std::min(maxVal, newValue));
-    
-    // Update edit buffer with actual float value
-    // MODULAR: Use formatParameterValue() for type-based formatting
-    editBuffer = formatParameterValue(col.parameterName, newValue);
-    
-    // During playback on current step: only update buffer (Enter will queue it)
-    // Otherwise: apply immediately for real-time feedback
-    if (playing && editStep == playbackStep) {
-        // Edit buffer updated, will be applied when Enter is pressed
-    } else {
-        applyEditValueFloat(newValue, col.parameterName);
-    }
-}
-
-void TrackerSequencer::applyEditValue(int displayValue) {
-    if (editColumn <= 0 || editColumn > (int)columnConfig.size() || !isValidStep(editStep)) {
-        return;
-    }
-    
-    int colIdx = editColumn - 1;
-    if (colIdx < 0 || colIdx >= (int)columnConfig.size()) {
-        return;
-    }
-    
-    const auto& col = columnConfig[colIdx];
-    auto& cell = getCurrentPattern()[editStep];
-    
-    // MODULAR: Handle fixed columns (index/length) - use isFixed flag
-    if (col.isFixed && col.parameterName == "length") {
-        int stepCount = std::max(1, std::min(16, displayValue));
-        cell.length = stepCount;
-        setCell(editStep, cell);
-        return;
-    }
-    
-    // MODULAR: Handle fixed columns (index/length) - use isFixed flag
-    if (col.isFixed && col.parameterName == "index") {
-        // Display value is 1-based (01-99), convert to 0-based for storage
-        // 0 = rest/empty, 1+ = media index (0-based)
-        int maxIndex = indexRangeCallback ? indexRangeCallback() : 127;
-        if (displayValue == 0) {
-            cell.index = -1; // Rest
-        } else {
-            cell.index = std::max(0, std::min(maxIndex - 1, displayValue - 1)); // Convert 1-based to 0-based
-        }
-        setCell(editStep, cell);
-        return;
-    }
-    
-    // Convert from tracker display value (0-127) to actual parameter value using helper function
-    float actualValue = displayValueToParameter(col.parameterName, (float)displayValue);
-    
-    cell.setParameterValue(col.parameterName, actualValue);
-    setCell(editStep, cell);
-}
-
-void TrackerSequencer::applyEditValueFloat(float value, const std::string& parameterName) {
-    if (!isValidStep(editStep)) {
-        return;
-    }
-    
-    // Get the parameter range to validate the value
-    auto range = getParameterRange(parameterName);
-    float minVal = range.first;
-    float maxVal = range.second;
-    
-    // Clamp value to parameter range
-    float clampedValue = std::max(minVal, std::min(maxVal, value));
-    
-    // Apply directly to the parameter (no display value conversion)
-    auto& cell = getCurrentPattern()[editStep];
-    cell.setParameterValue(parameterName, clampedValue);
-    setCell(editStep, cell);
-}
-
-bool TrackerSequencer::parseAndApplyEditBuffer(int step, int column, bool queueForPlayback) {
-    if (!isValidStep(step) || column <= 0 || column > (int)columnConfig.size()) {
-        return false;
-    }
-    
-    int colIdx = column - 1;
-    if (colIdx < 0 || colIdx >= (int)columnConfig.size()) {
-        return false;
-    }
-    
-    const auto& col = columnConfig[colIdx];
-    
-    // For fixed columns, empty buffer is invalid
-    if (col.isFixed && editBuffer.empty()) {
-        return false;
-    }
-    
-    // Handle empty buffer or invalid input for dynamic parameters (removes parameter, allows position memory)
-    // Check for clear/empty patterns first (before trying to parse)
-    if (!col.isFixed) {
-        // Trim whitespace for comparison
-        std::string trimmed = editBuffer;
-        while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.back() == ' ')) {
-            if (trimmed.front() == ' ') trimmed.erase(0, 1);
-            if (!trimmed.empty() && trimmed.back() == ' ') trimmed.pop_back();
-        }
-        
-        // Check for clear patterns: empty, or strings containing only dashes (any number of '-')
-        if (trimmed.empty()) {
-            // Empty buffer - remove parameter
-            if (queueForPlayback) {
-                pendingEdit.step = step;
-                pendingEdit.column = column;
-                pendingEdit.parameterName = col.parameterName;
-                pendingEdit.shouldRemove = true;
-            } else {
-                auto& cell = getCurrentPattern()[step];
-                cell.removeParameter(col.parameterName);
-                setCell(step, cell);
-            }
-            return true;
-        }
-        
-        // Check if string contains only dashes (any number: '-', '--', '---', etc.)
-        bool onlyDashes = true;
-        for (char c : trimmed) {
-            if (c != '-') {
-                onlyDashes = false;
-                break;
-            }
-        }
-        if (onlyDashes) {
-            // Only dashes - remove parameter
-            if (queueForPlayback) {
-                pendingEdit.step = step;
-                pendingEdit.column = column;
-                pendingEdit.parameterName = col.parameterName;
-                pendingEdit.shouldRemove = true;
-            } else {
-                auto& cell = getCurrentPattern()[step];
-                cell.removeParameter(col.parameterName);
-                setCell(step, cell);
-            }
-            return true;
-        }
-    }
-    
-    // Try to parse as number
-    try {
-        // MODULAR: Handle fixed columns (index/length) - use isFixed flag
-        if (col.isFixed && col.parameterName == "length") {
-            int lengthValue = std::max(1, std::min(16, (int)std::round(std::stof(editBuffer))));
-            if (queueForPlayback) {
-                pendingEdit.step = step;
-                pendingEdit.column = column;
-                pendingEdit.parameterName = col.parameterName;
-                pendingEdit.isLength = true;
-                pendingEdit.lengthValue = lengthValue;
-            } else {
-                auto& cell = getCurrentPattern()[step];
-                cell.length = lengthValue;
-                setCell(step, cell);
-            }
-            return true;
-        } else if (col.isFixed && col.parameterName == "index") {
-            int maxIndex = indexRangeCallback ? indexRangeCallback() : 127;
-            int indexValue = std::max(0, std::min(maxIndex, (int)std::round(std::stof(editBuffer))));
-            // For index: 0 means empty/rest (index = -1), 1+ means media index (0-based)
-            int finalIndex = (indexValue == 0) ? -1 : (indexValue - 1);
-            if (queueForPlayback) {
-                pendingEdit.step = step;
-                pendingEdit.column = column;
-                pendingEdit.parameterName = col.parameterName;
-                pendingEdit.isIndex = true;
-                pendingEdit.indexValue = finalIndex;
-            } else {
-                auto& cell = getCurrentPattern()[step];
-                cell.index = finalIndex;
-                setCell(step, cell);
-            }
-            return true;
-        } else {
-            // Dynamic parameter - parse as float
-            float floatValue = std::stof(editBuffer);
-            if (queueForPlayback) {
-                pendingEdit.step = step;
-                pendingEdit.column = column;
-                pendingEdit.parameterName = col.parameterName;
-                pendingEdit.value = floatValue;
-            } else {
-                applyEditValueFloat(floatValue, col.parameterName);
-            }
-            return true;
-        }
-    } catch (...) {
-        // Parse failed - for dynamic parameters, remove it (allows position memory/defaults)
-        // For fixed columns, invalid input is an error
-        if (!col.isFixed) {
-            if (queueForPlayback) {
-                pendingEdit.step = step;
-                pendingEdit.column = column;
-                pendingEdit.parameterName = col.parameterName;
-                pendingEdit.shouldRemove = true;
-            } else {
-                auto& cell = getCurrentPattern()[step];
-                cell.removeParameter(col.parameterName);
-                setCell(step, cell);
-            }
-            return true;
-        }
-        // Invalid value for fixed column
-        return false;
-    }
-}
+// Legacy edit methods removed - use ParameterCell methods instead
+// The pending edit queue is handled via ParameterCell callbacks
 
 bool TrackerSequencer::shouldQueueEdit() const {
     return playing && isValidStep(editStep) && editStep == playbackStep && editColumn > 0;
@@ -1754,56 +1462,45 @@ void TrackerSequencer::applyPendingEdit() {
     }
 }
 
-void TrackerSequencer::initializeEditBuffer() {
-    // Initialize edit buffer with current value for arrow key editing
-    if (!isValidStep(editStep) || editColumn <= 0 || editColumn > (int)columnConfig.size()) {
-        editBuffer.clear();
-        return;
-    }
-    
-    const auto& cell = getCurrentPattern()[editStep];
-    int colIdx = editColumn - 1;
-    if (colIdx < 0 || colIdx >= (int)columnConfig.size()) {
-        editBuffer.clear();
-        return;
-    }
-    
-    const auto& col = columnConfig[colIdx];
-    
-    // MODULAR: Handle fixed columns (index/length) - use isFixed flag
-    if (col.isFixed && col.parameterName == "index") {
-        int currentIndex = cell.index;
-        if (currentIndex >= 0 && indexRangeCallback) {
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%02d", currentIndex + 1);
-            editBuffer = buf;
-        } else {
-            editBuffer = "00";
-        }
-    } else if (col.isFixed && col.parameterName == "length") {
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%d", cell.length);
-        editBuffer = buf;
-    } else {
-        // Parameter column - initialize with actual float value (not converted to 0-127)
-        // If parameter is not set, initialize with empty buffer (user can type to set it)
-        if (!cell.hasParameter(col.parameterName)) {
-            // Parameter not set - start with empty buffer (user can type value or '--' to keep it empty)
-            editBuffer.clear();
-        } else {
-            // Parameter is set - initialize with actual value
-            float defaultValue = getParameterDefault(col.parameterName);
-            float value = cell.getParameterValue(col.parameterName, defaultValue);
-            
-            // Display actual float value with appropriate precision
-            // MODULAR: Use formatParameterValue() for type-based formatting
-            editBuffer = formatParameterValue(col.parameterName, value);
-        }
-    }
-}
+// initializeEditBuffer() removed - use ParameterCell::enterEditMode() instead
+// ParameterCell manages its own edit buffer initialization
 
 // Expose TrackerSequencer parameters for discovery
 //--------------------------------------------------------------
+// Module interface implementation
+//--------------------------------------------------------------
+std::vector<ParameterDescriptor> TrackerSequencer::getParameters() {
+    return getAvailableParameters();
+}
+
+void TrackerSequencer::onTrigger(TriggerEvent& event) {
+    // Sequencers don't receive triggers - they generate them
+    // This method must exist to satisfy Module interface, but does nothing
+}
+
+void TrackerSequencer::setParameter(const std::string& paramName, float value, bool notify) {
+    // Sequencers don't have settable parameters in the traditional sense
+    // Parameters are set per-step via pattern cells
+    // This method exists for Module interface compliance but does nothing
+    if (notify && parameterChangeCallback) {
+        parameterChangeCallback(paramName, value);
+    }
+}
+
+bool TrackerSequencer::handleKeyPress(ofKeyEventArgs& keyEvent) {
+    // Convert ofKeyEventArgs to existing handleKeyPress signature
+    int key = keyEvent.key;
+    bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
+    bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
+    return handleKeyPress(key, ctrlPressed, shiftPressed);
+}
+
+bool TrackerSequencer::isKeyboardFocused() const {
+    // Check if a cell is focused (indicates keyboard input should be routed here)
+    // A cell is focused if editStep >= 0 and editColumn >= 0
+    return (editStep >= 0 && editColumn >= 0);
+}
+
 std::vector<ParameterDescriptor> TrackerSequencer::getAvailableParameters() const {
     std::vector<ParameterDescriptor> params;
     
@@ -1925,33 +1622,6 @@ std::pair<float, float> TrackerSequencer::getParameterRange(const std::string& p
     }
     // Default range for unknown parameters
     return std::make_pair(0.0f, 1.0f);
-}
-
-float TrackerSequencer::parameterToDisplayValue(const std::string& paramName, float value) {
-    auto range = getParameterRange(paramName);
-    float minVal = range.first;
-    float maxVal = range.second;
-    float rangeSize = maxVal - minVal;
-    
-    if (rangeSize <= 0.0f) return 0.0f;
-    
-    // Normalize to 0-127 range for display (tracker-style)
-    float normalized = (value - minVal) / rangeSize;
-    return normalized * 127.0f;
-}
-
-float TrackerSequencer::displayValueToParameter(const std::string& paramName, float displayValue) {
-    auto range = getParameterRange(paramName);
-    float minVal = range.first;
-    float maxVal = range.second;
-    float rangeSize = maxVal - minVal;
-    
-    // Clamp display value to 0-127
-    displayValue = std::max(0.0f, std::min(127.0f, displayValue));
-    
-    // Convert from 0-127 to actual parameter range
-    float normalized = displayValue / 127.0f;
-    return minVal + (normalized * rangeSize);
 }
 
 // Static helper to get default value
@@ -2257,5 +1927,188 @@ void TrackerSequencer::setPatternChainEntryDisabled(int chainIndex, bool disable
     patternChainDisabled[chainIndex] = disabled;
     ofLogVerbose("TrackerSequencer") << "Set chain entry " << chainIndex << " disabled: " << (disabled ? "true" : "false");
 }
+
+// ParameterCell adapter methods - bridge PatternCell to ParameterCell
+//--------------------------------------------------------------
+ParameterCell TrackerSequencer::createParameterCellForColumn(int step, int column) {
+    if (!isValidStep(step) || column <= 0 || column > (int)columnConfig.size()) {
+        return ParameterCell(); // Return empty cell for invalid input
+    }
+    
+    int colIdx = column - 1;
+    if (colIdx < 0 || colIdx >= (int)columnConfig.size()) {
+        return ParameterCell();
+    }
+    
+    const auto& col = columnConfig[colIdx];
+    ParameterCell cell;
+    
+    // Configure basic properties
+    cell.parameterName = col.parameterName;
+    cell.isFixed = col.isFixed;
+    if (col.isFixed) {
+        cell.fixedType = col.parameterName; // "index" or "length"
+        // Fixed columns are always integers
+        cell.isInteger = true;
+        cell.stepIncrement = 1.0f;
+    }
+    
+    // Set value range based on column type
+    if (col.isFixed && col.parameterName == "index") {
+        // Index column: 0 = rest, 1+ = media index (1-based display)
+        int maxIndex = indexRangeCallback ? indexRangeCallback() : 127;
+        cell.setValueRange(0.0f, (float)maxIndex, 0.0f);
+        cell.getMaxIndex = [this]() { return indexRangeCallback ? indexRangeCallback() : 127; };
+    } else if (col.isFixed && col.parameterName == "length") {
+        // Length column: 1-16 range
+        cell.setValueRange(1.0f, 16.0f, 1.0f);
+    } else {
+        // Dynamic parameter column - use parameter ranges
+        auto range = getParameterRange(col.parameterName);
+        float defaultValue = getParameterDefault(col.parameterName);
+        cell.setValueRange(range.first, range.second, defaultValue);
+        
+        // Determine if parameter is integer or float
+        ParameterType paramType = getParameterType(col.parameterName);
+        cell.isInteger = (paramType == ParameterType::INT);
+        
+        // Calculate optimal step increment based on range and type
+        cell.calculateStepIncrement();
+    }
+    
+    // Configure callbacks
+    configureParameterCellCallbacks(cell, step, column);
+    
+    return cell;
+}
+
+void TrackerSequencer::configureParameterCellCallbacks(ParameterCell& cell, int step, int column) {
+    if (!isValidStep(step) || column <= 0 || column > (int)columnConfig.size()) {
+        return;
+    }
+    
+    int colIdx = column - 1;
+    if (colIdx < 0 || colIdx >= (int)columnConfig.size()) {
+        return;
+    }
+    
+    const auto& col = columnConfig[colIdx];
+    std::string paramName = col.parameterName; // Capture by value for lambda
+    bool isFixedCol = col.isFixed; // Capture by value
+    std::string fixedTypeCol = col.isFixed ? col.parameterName : ""; // Capture by value
+    
+    // getCurrentValue callback - returns current value from PatternCell
+    // Returns NaN to indicate empty/not set (will display as "--")
+    // For fixed columns, still uses -1.0f for compatibility
+    cell.getCurrentValue = [this, step, paramName, isFixedCol, fixedTypeCol]() -> float {
+        if (!isValidStep(step)) {
+            // Return NaN for invalid step (will display as "--")
+            return std::numeric_limits<float>::quiet_NaN();
+        }
+        
+        auto& patternCell = getCurrentPattern()[step];
+        
+        if (isFixedCol && fixedTypeCol == "index") {
+            // Index: return 1-based display value (0 = rest, 1+ = media index)
+            int idx = patternCell.index;
+            return (idx < 0) ? 0.0f : (float)(idx + 1);
+        } else if (isFixedCol && fixedTypeCol == "length") {
+            // Length: return -1.0f if index is -1 (rest), otherwise return length
+            // For fixed columns, we still use -1.0f for compatibility
+            if (patternCell.index < 0) {
+                return -1.0f; // Show "--" when index is rest
+            }
+            return (float)patternCell.length;
+        } else {
+            // Dynamic parameter: return NaN if parameter doesn't exist (will display as "--")
+            // This allows parameters with negative ranges (like speed -10 to 10) to distinguish
+            // between "not set" (NaN/--) and explicit values like 1.0 or -1.0
+            if (!patternCell.hasParameter(paramName)) {
+                return std::numeric_limits<float>::quiet_NaN();
+            }
+            return patternCell.getParameterValue(paramName, 0.0f);
+        }
+    };
+    
+    // onValueApplied callback - applies value to PatternCell
+    cell.onValueApplied = [this, step, colIdx, paramName, isFixedCol, fixedTypeCol](const std::string&, float value) {
+        if (!isValidStep(step)) return;
+        
+        // Check if we should queue this edit (playback editing)
+        bool shouldQueue = shouldQueueEdit() && step == editStep && (colIdx + 1) == editColumn;
+        
+        if (shouldQueue) {
+            // Queue edit for next trigger
+            pendingEdit.step = step;
+            pendingEdit.column = colIdx + 1;
+            pendingEdit.parameterName = paramName;
+            
+            if (isFixedCol && fixedTypeCol == "index") {
+                // Index: value is 1-based display, convert to 0-based storage
+                // 0 = rest (-1), 1+ = media index (0-based)
+                int indexValue = (int)std::round(value);
+                pendingEdit.isIndex = true;
+                pendingEdit.indexValue = (indexValue == 0) ? -1 : (indexValue - 1);
+            } else if (isFixedCol && fixedTypeCol == "length") {
+                // Length: clamp to 1-16
+                int lengthValue = std::max(1, std::min(16, (int)std::round(value)));
+                pendingEdit.isLength = true;
+                pendingEdit.lengthValue = lengthValue;
+            } else {
+                // Dynamic parameter
+                pendingEdit.value = value;
+            }
+            pendingEdit.shouldRemove = false;
+        } else {
+            // Apply immediately
+            auto& patternCell = getCurrentPattern()[step];
+            if (isFixedCol && fixedTypeCol == "index") {
+                // Index: value is 1-based display, convert to 0-based storage
+                int indexValue = (int)std::round(value);
+                patternCell.index = (indexValue == 0) ? -1 : (indexValue - 1);
+            } else if (isFixedCol && fixedTypeCol == "length") {
+                // Length: clamp to 1-16
+                patternCell.length = std::max(1, std::min(16, (int)std::round(value)));
+            } else {
+                // Dynamic parameter
+                patternCell.setParameterValue(paramName, value);
+            }
+            setCell(step, patternCell);
+        }
+    };
+    
+    // onValueRemoved callback - removes parameter from PatternCell
+    cell.onValueRemoved = [this, step, colIdx, paramName, isFixedCol](const std::string&) {
+        if (!isValidStep(step)) return;
+        
+        // Check if we should queue this edit (playback editing)
+        bool shouldQueue = shouldQueueEdit() && step == editStep && (colIdx + 1) == editColumn;
+        
+        if (shouldQueue) {
+            // Queue removal for next trigger
+            pendingEdit.step = step;
+            pendingEdit.column = colIdx + 1;
+            pendingEdit.parameterName = paramName;
+            pendingEdit.shouldRemove = true;
+        } else {
+            // Remove immediately (only for dynamic parameters)
+            if (!isFixedCol) {
+                auto& patternCell = getCurrentPattern()[step];
+                patternCell.removeParameter(paramName);
+                setCell(step, patternCell);
+            }
+        }
+    };
+    
+    // formatValue callback - uses TrackerSequencer's formatting (static method)
+    cell.formatValue = [paramName](float value) -> std::string {
+        return formatParameterValue(paramName, value);
+    };
+    
+    // parseValue callback - uses default parsing (can be enhanced if needed)
+    // ParameterCell already has default parsing, so we can leave this unset
+    // or provide custom parsing if needed
+}
+
 
 

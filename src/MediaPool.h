@@ -48,6 +48,13 @@ struct TriggerEventData {
     float stepLength;
     bool audioEnabled;
     bool videoEnabled;
+    
+    // Parameter control flags: track which parameters were explicitly set by sequencer
+    // When false, MediaPool should NOT apply the parameter (leave MediaPlayer's value unchanged)
+    // This allows user-editable parameters when sequencer doesn't send values
+    bool positionSet;  // true if sequencer explicitly set position (not '--')
+    bool speedSet;     // true if sequencer explicitly set speed (not '--')
+    bool volumeSet;    // true if sequencer explicitly set volume (not '--')
 };
 
 class MediaPool : public Module {
@@ -124,6 +131,7 @@ public:
     
     // Manual media playback (for GUI preview)
     bool playMediaManual(size_t index, float position = 0.0f);
+    void stopManualPreview();  // Stop manual preview and transition to IDLE
     
     // Query methods for state checking
     PlaybackMode getCurrentMode() const;

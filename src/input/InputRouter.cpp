@@ -93,7 +93,45 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         }
     }
     
-    // Priority 4: Tracker input - only when in tracker panel
+    // Priority 4: MediaPool parameter editing - check BEFORE tracker to avoid conflicts
+    // CRITICAL: Sync focus state from ImGui before checking if parameter is focused
+    // This ensures editingColumnIndex and editingParameter are set even if GUI draw sync hasn't happened yet
+    int currentPanelIndex = viewManager ? viewManager->getCurrentPanelIndex() : -1;
+    
+    if (mediaPoolGUI) {
+        MediaPoolGUI::syncEditStateFromImGuiFocus(*mediaPoolGUI);
+    }
+    
+    bool mediaPoolParameterFocused = (mediaPoolGUI && mediaPoolGUI->isKeyboardFocused());
+    
+    // DEBUG: Log MediaPool focus state
+    ofLogVerbose("InputRouter") << "  MediaPool check: currentPanelIndex=" << currentPanelIndex
+                                 << ", mediaPoolParameterFocused=" << (mediaPoolParameterFocused ? "YES" : "NO")
+                                 << ", mediaPoolGUI=" << (mediaPoolGUI ? "YES" : "NO");
+    
+    // CRITICAL: Handle MediaPool parameter editing FIRST, regardless of panel index
+    // This allows editing parameters even when ViewManager thinks a different panel is active
+    // (e.g., MediaPool parameters in a docked window while tracker panel is "active")
+    if (mediaPoolGUI && mediaPoolParameterFocused) {
+        bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
+        bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
+        
+        ofLogNotice("InputRouter") << "  MediaPool parameter focused - routing key to MediaPoolGUI (panel=" << currentPanelIndex << ", key=" << key << ")";
+        
+        // Delegate to MediaPoolGUI for parameter editing
+        bool handled = mediaPoolGUI->handleKeyPress(key, ctrlPressed, shiftPressed);
+        if (handled) {
+            ofLogNotice("InputRouter") << "  Key handled by MediaPoolGUI";
+            return true;
+        } else {
+            ofLogNotice("InputRouter") << "  Key NOT handled by MediaPoolGUI - letting ImGui handle";
+            // If MediaPoolGUI didn't handle it, let ImGui process it (for navigation)
+            // This allows arrow keys to work for navigation even when cells are focused
+            return false;
+        }
+    }
+    
+    // Priority 5: Tracker input - only when in tracker panel
     // CRITICAL: Route tracker input BEFORE ImGui can consume it, even if ImGui wants keyboard
     // This ensures Enter and numeric keys work when cells are focused
     // 
@@ -101,7 +139,6 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     // 1. Panel index == 2 (official tracker panel)
     // 2. OR a tracker cell is focused (editStep/editColumn are valid)
     // This handles both docked windows and regular panel navigation
-    int currentPanelIndex = viewManager ? viewManager->getCurrentPanelIndex() : -1;
     bool trackerCellFocused = false;
     bool onHeaderRow = false;
     bool isParentWidgetFocused = false;
@@ -114,11 +151,8 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         int editColumn = tracker->getEditColumn();
         // Check if a valid cell is focused (indicates user is interacting with tracker)
         trackerCellFocused = (editStep >= 0 && editStep < tracker->getStepCount() && editColumn >= 0);
-        // Check if on header row (editStep == -1 AND parent widget is NOT focused)
-        // This distinguishes "on header row" (inside table) from "on parent widget" (outside table)
-        onHeaderRow = (editStep == -1 && !tracker->getIsEditingCell() && !tracker->getIsParentWidgetFocused());
-        // Check if parent widget is focused (container level)
-        isParentWidgetFocused = tracker->getIsParentWidgetFocused();
+        // Check if on header row (editStep == -1 means no cell focused, likely on header)
+        onHeaderRow = (editStep == -1 && !tracker->getIsEditingCell());
     }
     
     bool isInTrackerPanel = (tracker && viewManager && currentPanelIndex == 2);
@@ -127,61 +161,14 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         << ", viewManager=" << (viewManager ? "YES" : "NO")
         << ", currentPanelIndex=" << currentPanelIndex
         << ", trackerCellFocused=" << (trackerCellFocused ? "YES" : "NO")
-        << ", onHeaderRow=" << (onHeaderRow ? "YES" : "NO")
-        << ", isParentWidgetFocused=" << (isParentWidgetFocused ? "YES" : "NO");
-    
-    // Check if we're at container level (parent widget focused) for any panel
-    // This allows navigation from container level to panel level
-    bool mediaPoolParentWidgetFocused = false;
-    if (mediaPoolGUI) {
-        mediaPoolParentWidgetFocused = mediaPoolGUI->getIsParentWidgetFocused();
-    }
-    bool atContainerLevel = isParentWidgetFocused || mediaPoolParentWidgetFocused;
-    
-    // DEBUG: Log container level state
-    if (atContainerLevel) {
-        ofLogNotice("InputRouter") << "  >>> AT CONTAINER LEVEL (parent widget focused) <<<";
-    }
-    
-    // When at container level, handle UP/DOWN or Ctrl+Enter to navigate between panels
-    // This allows going up one more level from container to panel/module level
-    // CRITICAL: When at container level, we're NOT in the tracker grid, so skip tracker input handling
-    // CRITICAL: Arrow keys MUST be passed to ImGui immediately when at container level
-    if (atContainerLevel) {
-        bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
-        bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-        
-        // First, handle panel navigation with modifiers (Ctrl+Enter, Ctrl+Shift+Enter)
-        if (viewManager) {
-            if (key == OF_KEY_RETURN && ctrlPressed && !shiftPressed) {
-                ofLogNotice("InputRouter") << "  At container level: Ctrl+Enter - navigating to previous panel";
-                viewManager->previousPanel();
-                return true; // Consume the key
-            } else if (key == OF_KEY_RETURN && ctrlPressed && shiftPressed) {
-                ofLogNotice("InputRouter") << "  At container level: Ctrl+Shift+Enter - navigating to next panel";
-                viewManager->nextPanel();
-                return true; // Consume the key
-            }
-        }
-        
-        // Then handle arrow keys - let ImGui process them for navigation
-        // This MUST happen after modifier checks but before any other processing
-        if (key == OF_KEY_UP || key == OF_KEY_DOWN || key == OF_KEY_LEFT || key == OF_KEY_RIGHT) {
-            ofLogNotice("InputRouter") << "  At container level: Arrow key " << key << " - letting ImGui handle navigation immediately";
-            // CRITICAL: Return false immediately to let ImGui process arrow keys
-            // Don't let any other code interfere with arrow key navigation
-            return false; // Let ImGui process arrow keys normally
-        }
-    }
+        << ", onHeaderRow=" << (onHeaderRow ? "YES" : "NO");
     
     // Use either panel index check OR tracker cell focused check OR header row check
-    // BUT: If parent widget is focused, we're at container level, not in the grid
     // This handles both docked windows and regular panel navigation, including header row navigation
     bool inTrackerPanel = isInTrackerPanel || trackerCellFocused || onHeaderRow;
     
-    // CRITICAL: Skip tracker input handling if we're at container level
-    // This ensures arrow keys work normally for ImGui navigation when parent widget is focused
-    if (tracker && inTrackerPanel && !atContainerLevel) {
+    // Handle tracker input - cells are directly navigable like other widgets
+    if (tracker && inTrackerPanel) {
         // Check for modifier keys properly
         bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
         bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
@@ -208,16 +195,15 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
             }
         }
         
-        // When on header row, request focus move to parent widget
-        // We need to explicitly move focus since ImGui won't do it automatically
-        if (onHeaderRow && key == OF_KEY_UP && !inEditMode) {
-            ofLogNotice("InputRouter") << "  UP key on header row: requesting focus move to parent widget";
-            // Set flag for GUI to move focus to parent widget in next frame
-            tracker->requestFocusMoveToParentWidget();
-            // Clear cell focus so ImGui sees correct state
-            tracker->clearCellFocus();
-            // Consume the key - we handle the focus move ourselves
-            return true; // Consume the key
+        // CRITICAL: When NOT in edit mode, let ImGui handle arrow keys for navigation
+        // Don't route arrow keys to tracker - this allows ImGui's native navigation to work
+        // The tracker's arrow key handling (in handleKeyPress) should only be used in edit mode
+        if (!inEditMode && (key == OF_KEY_UP || key == OF_KEY_DOWN || 
+                            key == OF_KEY_LEFT || key == OF_KEY_RIGHT)) {
+            // Not in edit mode: Let ImGui handle arrow keys for native navigation
+            // This allows smooth navigation between parameter cells and step cells
+            ofLogNotice("InputRouter") << "  Arrow key NOT in edit mode: letting ImGui handle navigation";
+            return false; // Let ImGui process arrow keys for navigation
         }
         
         // Enter key: Check for Ctrl+Enter (go up a level) vs Shift+Enter (exit grid)
@@ -229,17 +215,7 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
             }
             
             ofLogNotice("InputRouter") << "  Enter key detected in tracker panel";
-            if (ctrlPressed) {
-                // Ctrl+Enter: Go up a level in navigation (exit grid to parent widget)
-                // Works from both cells and header row
-                ofLogNotice("InputRouter") << "  Ctrl+Enter: Requesting focus move to parent widget";
-                // Set flag for GUI to move focus to parent widget in next frame
-                tracker->requestFocusMoveToParentWidget();
-                // Clear cell focus so ImGui sees correct state
-                tracker->clearCellFocus();
-                // Consume the key - we handle the focus move ourselves
-                return true; // Consume the key
-            } else if (shiftPressed) {
+            if (shiftPressed) {
                 // Shift+Enter: Exit grid navigation (clear cell selection)
                 ofLogNotice("InputRouter") << "  Shift+Enter: Exiting grid";
                 if (tracker->handleKeyPress(key, false, true)) {
@@ -364,10 +340,9 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
             << ", trackerCellFocused=" << (trackerCellFocused ? "YES" : "NO") << ")";
     }
     
-    // Handle MediaPool navigation (similar to tracker panel)
-    // Check if we're in MediaPool panel (reuse currentPanelIndex from above)
+    // Handle MediaPool panel-specific navigation (only when in MediaPool panel)
+    // Note: Parameter editing is handled earlier (Priority 4) before tracker checks
     bool inMediaPoolPanel = (mediaPool && viewManager && currentPanelIndex == 3);
-    
     if (inMediaPoolPanel && mediaPoolGUI) {
         bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
         bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);

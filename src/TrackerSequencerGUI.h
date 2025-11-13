@@ -54,20 +54,5 @@ private:
                           int maxIndex, const std::map<std::string, std::pair<float, float>>& paramRanges,
                           const std::map<std::string, float>& paramDefaults,
                           int cachedEditStep, int cachedEditColumn, bool cachedIsEditingCell);
-    
-    // Unified drag handling for all column types
-    void handleDragEditing(TrackerSequencer& sequencer, int step, int editColumnValue,
-                          const TrackerSequencer::ColumnConfig& colConfig, 
-                          PatternCell& cell,
-                          const std::map<std::string, std::pair<float, float>>& paramRanges,
-                          const std::map<std::string, float>& paramDefaults);
-    
-    // Legacy methods - kept for backward compatibility but not used
-    void drawMediaIndex(TrackerSequencer& sequencer, int step);
-    void drawPosition(TrackerSequencer& sequencer, int step);
-    void drawSpeed(TrackerSequencer& sequencer, int step);
-    void drawVolume(TrackerSequencer& sequencer, int step);
-    void drawStepLength(TrackerSequencer& sequencer, int step);
-    void drawValueBar(float fillPercent);
 };
 

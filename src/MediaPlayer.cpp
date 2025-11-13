@@ -23,6 +23,8 @@ void MediaPlayer::setup() {
     startPosition.set("Start Position", 0.0f, 0.0f, 1.0f);  // Start position for playback (synced with tracker)
     speed.set("Speed", 1.0f, -10.0f, 10.0f);  // Support negative speeds for backward playback
     loop.set("Loop", true);
+    loopStart.set("Loop Start", 0.0f, 0.0f, 1.0f);  // Loop start position
+    loopEnd.set("Loop End", 1.0f, 0.0f, 1.0f);      // Loop end position
     
     // Setup enable/disable toggles
     audioEnabled.set("Audio Enabled", true);
@@ -42,6 +44,8 @@ void MediaPlayer::setup() {
     parameters.add(startPosition);
     parameters.add(speed);
     parameters.add(loop);
+    parameters.add(loopStart);
+    parameters.add(loopEnd);
     parameters.add(audioEnabled);
     parameters.add(videoEnabled);
     parameters.add(volume);
@@ -62,6 +66,22 @@ void MediaPlayer::setup() {
     // No need to forward to underlying players since they don't have media parameters
     
     isSetup = true;
+}
+
+const ofParameter<float>* MediaPlayer::getFloatParameter(const std::string& name) const {
+    if (name == "position") return &position;
+    if (name == "startPosition") return &startPosition;
+    if (name == "speed") return &speed;
+    if (name == "volume") return &volume;
+    if (name == "pitch") return &pitch;
+    if (name == "loopStart") return &loopStart;
+    if (name == "loopEnd") return &loopEnd;
+    return nullptr;
+}
+
+ofParameter<float>* MediaPlayer::getFloatParameter(const std::string& name) {
+    // Use const_cast to avoid code duplication - safe since we're just removing const
+    return const_cast<ofParameter<float>*>(static_cast<const MediaPlayer*>(this)->getFloatParameter(name));
 }
 
 bool MediaPlayer::load(const std::string& audioPath, const std::string& videoPath) {
