@@ -82,5 +82,10 @@ private:
     // Helper method to handle ParameterCell keyboard input (reduces duplication)
     // Returns true if key was handled, false otherwise
     bool handleParameterCellKeyPress(const ParameterDescriptor& paramDesc, int key, bool ctrlPressed, bool shiftPressed);
+    
+    // Helper method to truncate text to fit within available width
+    // showEnd: if true, truncates from start (shows end with ellipsis prefix), 
+    //          if false, truncates from end (shows start with ellipsis suffix)
+    std::string truncateTextToWidth(const std::string& text, float maxWidth, bool showEnd = false, const std::string& ellipsis = "...");
 };
 

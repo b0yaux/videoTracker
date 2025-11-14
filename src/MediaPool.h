@@ -99,13 +99,16 @@ public:
     
     // Manual media playback (for GUI preview)
     bool playMediaManual(size_t index, float position = 0.0f);
-    void stopManualPreview();  // Stop manual preview and transition to IDLE
+    // stopManualPreview() removed - update() automatically transitions MANUAL_PREVIEW → IDLE when player stops
     
     // Query methods for state checking
     PlaybackMode getCurrentMode() const;
     bool isSequencerActive() const;
     bool isManualPreview() const;
     bool isIdle() const;
+    
+    // Helper to transition to IDLE mode immediately (for button handlers)
+    void setModeIdle();
     
     // Preview mode control
     void setPreviewMode(PreviewMode mode);
@@ -178,6 +181,10 @@ private:
     
     // Track last playing state to detect when player stops (for position capture)
     std::map<int, bool> lastPlayingStateByMediaIndex;
+    
+    // Gate timer tracking for sequencer-triggered playback
+    bool gateTimerActive;
+    float gateEndTime;
     
     // Parameter change callback (inherited from Module base class)
     // Note: MediaPool inherits parameterChangeCallback from Module

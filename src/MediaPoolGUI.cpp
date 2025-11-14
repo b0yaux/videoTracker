@@ -18,6 +18,42 @@ void MediaPoolGUI::setMediaPool(MediaPool& pool) {
     mediaPool = &pool;
 }
 
+std::string MediaPoolGUI::truncateTextToWidth(const std::string& text, float maxWidth, bool showEnd, const std::string& ellipsis) {
+    if (maxWidth <= 0.0f) return text;
+    
+    ImVec2 textSize = ImGui::CalcTextSize(text.c_str());
+    if (textSize.x <= maxWidth) return text;
+    
+    float ellipsisWidth = ImGui::CalcTextSize(ellipsis.c_str()).x;
+    float maxTextWidth = maxWidth - ellipsisWidth;
+    
+    if (showEnd) {
+        // Truncate from start: show end of text with ellipsis prefix
+        std::string result = text;
+        while (result.length() > 0) {
+            ImVec2 testSize = ImGui::CalcTextSize(result.c_str());
+            if (testSize.x <= maxTextWidth) break;
+            result = result.substr(1); // Remove first character
+        }
+        return ellipsis + result;
+    } else {
+        // Truncate from end: show start of text with ellipsis suffix
+        // Quick estimate to reduce iterations for very long strings
+        float avgCharWidth = textSize.x / text.length();
+        int estimatedChars = (int)(maxTextWidth / avgCharWidth);
+        std::string result = text.substr(0, std::max(0, estimatedChars - 1));
+        
+        // Refine by checking actual width (usually only 1-2 iterations needed)
+        while (result.length() > 0) {
+            ImVec2 testSize = ImGui::CalcTextSize(result.c_str());
+            if (testSize.x <= maxTextWidth) break;
+            result.pop_back();
+        }
+        
+        return result + ellipsis;
+    }
+}
+
 void MediaPoolGUI::draw() {
 
 
@@ -66,9 +102,14 @@ void MediaPoolGUI::drawDirectoryControls() {
     }
     ImGui::SameLine();
     std::string displayPath = mediaPool->getDataDirectory();
-    if (displayPath.length() > 50) {
-        displayPath = "..." + displayPath.substr(displayPath.length() - 47);
+    
+    // Calculate available width after button (account for spacing)
+    float availableWidth = ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x;
+    if (availableWidth > 0.0f) {
+        // For directory paths, show the end (directory name) rather than the beginning
+        displayPath = truncateTextToWidth(displayPath, availableWidth, true);
     }
+    
     ImGui::Text("%s", displayPath.c_str());
     ImGui::Separator();
 }
@@ -190,6 +231,19 @@ void MediaPoolGUI::drawMediaList() {
                 } else {
                     // Fallback to player name if no file name
                     title = playerNames[i];
+                }
+                
+                // Truncate title if too long for available width
+                float availableWidth = ImGui::GetContentRegionAvail().x;
+                if (availableWidth > 0.0f) {
+                    // Calculate width of prefix: "[01] [AV] "
+                    std::string prefix = indexStr + " " + mediaType + " ";
+                    float prefixWidth = ImGui::CalcTextSize(prefix.c_str()).x;
+                    float maxTitleWidth = availableWidth - prefixWidth - 20.0f; // Reserve padding
+                    
+                    if (maxTitleWidth > 0.0f) {
+                        title = truncateTextToWidth(title, maxTitleWidth);
+                    }
                 }
                 
                 // Clean display name: [01] [AV] Title
@@ -375,23 +429,11 @@ void MediaPoolGUI::drawWaveform() {
                             }
                             // Use setParameter to trigger synchronization notifications
                             mediaPool->setParameter("position", relativeX, true);
-                            ofLogNotice("MediaPoolGUI") << "Seeking to position " << relativeX;
                             
-                            // Debug: Check position before play
-                            ofLogNotice("MediaPoolGUI") << "Position before play: " << player->position.get();
-                            
-                            // Check if MediaPool is in IDLE mode and start manual preview if needed
-                            if (mediaPool->isIdle()) {
-                                ofLogNotice("MediaPoolGUI") << "MediaPool is IDLE, starting manual preview from position " << relativeX;
+                            // If player is not playing, start it; otherwise it will continue from new position
+                            if (!player->isPlaying()) {
                                 mediaPool->playMediaManual(mediaPool->getCurrentIndex(), relativeX);
-                            } else {
-                                // MediaPool is already active, just play from the new position
-                                player->play();
-                                ofLogNotice("MediaPoolGUI") << "Resumed playback from position " << relativeX;
                             }
-                            
-                            // Debug: Check position after play
-                            ofLogNotice("MediaPoolGUI") << "Position after play: " << player->position.get();
                         }
                     }
                 } else if (ImGui::IsMouseDragging(0)) {
@@ -870,220 +912,102 @@ void MediaPoolGUI::drawMediaIndexButton(int columnIndex, size_t numParamColumns)
     size_t numPlayers = mediaPool->getNumPlayers();
     auto activePlayer = mediaPool->getActivePlayer();
     
-    // Check if current index's player is the active player and is playing
-    // This ensures the button only shows green when THIS media is playing
-    // IMPORTANT: When sequencer triggers media, it updates currentIndex via setActivePlayer(),
-    // so currentIndex should always match the active player's index
-    // CRITICAL FIX: Check both isPlaying() AND mode to determine button state
-    // When manually pausing, mode transitions to IDLE immediately, but isPlaying() might lag
-    // When empty step triggers, both mode and isPlaying() are updated correctly
-    bool isCurrentMediaPlaying = false;
-    if (activePlayer != nullptr && currentIndex < numPlayers) {
-        // Verify that the active player matches the current index
-        auto currentPlayer = mediaPool->getMediaPlayer(currentIndex);
-        if (currentPlayer == activePlayer) {
-            // Check if player is actually playing
-            bool playerIsPlaying = activePlayer->isPlaying();
-            
-            // CRITICAL FIX: Also check mode - if mode is IDLE, button should be grey
-            // This ensures button turns grey immediately when manually pausing
-            // (mode transitions to IDLE immediately, even if isPlaying() hasn't updated yet)
-            bool isIdleMode = mediaPool->isIdle();
-            bool isManualPreviewMode = mediaPool->isManualPreview();
-            
-            // Button is green only if:
-            // 1. Player is actually playing, AND
-            // 2. Mode is not IDLE (either MANUAL_PREVIEW or SEQUENCER_ACTIVE)
-            // This ensures button turns grey immediately when mode becomes IDLE (manual pause)
-            isCurrentMediaPlaying = playerIsPlaying && !isIdleMode;
-            
-            // DEBUG: Log state changes for sequencer-triggered media
-            // Use a per-index static map to track state changes for each media item
-            static std::map<size_t, bool> lastPlayingStateByIndex;
-            bool lastState = lastPlayingStateByIndex[currentIndex];
-            if (isCurrentMediaPlaying != lastState) {
-                PlaybackMode currentMode = isIdleMode ? PlaybackMode::IDLE : 
-                                          (isManualPreviewMode ? PlaybackMode::MANUAL_PREVIEW : PlaybackMode::SEQUENCER_ACTIVE);
-                ofLogNotice("MediaPoolGUI") << "[BUTTON_STATE] Index " << currentIndex 
-                                             << " playing state changed: " << lastState 
-                                             << " -> " << isCurrentMediaPlaying 
-                                             << " (playerIsPlaying: " << playerIsPlaying
-                                             << ", mode: " << (currentMode == PlaybackMode::IDLE ? "IDLE" : 
-                                                               (currentMode == PlaybackMode::MANUAL_PREVIEW ? "MANUAL_PREVIEW" : "SEQUENCER_ACTIVE")) << ")";
-                lastPlayingStateByIndex[currentIndex] = isCurrentMediaPlaying;
-            }
-        }
-    }
-    
     // Format button text: show current index (1-based) or "--" if no media
     std::string indexText;
     if (numPlayers > 0) {
-        int displayIndex = (int)(currentIndex + 1); // 1-based display
+        int displayIndex = (int)(currentIndex + 1);
         char buf[8];
-        snprintf(buf, sizeof(buf), "%02d", displayIndex); // Zero-padded to 2 digits
+        snprintf(buf, sizeof(buf), "%02d", displayIndex);
         indexText = buf;
     } else {
         indexText = "--";
     }
     
-    // Determine focus state (similar to TrackerSequencer step button)
-    bool isFocused = (editingColumnIndex == columnIndex);
+    // Determine focus state
     bool shouldRefocus = (editingColumnIndex == columnIndex && shouldRefocusCurrentCell);
     
-    // Request focus if needed (before creating button)
     if (shouldRefocus) {
         ImGui::SetKeyboardFocusHere(0);
     }
     
-    // Apply button styling for active playback (similar to TrackerSequencer step button)
-    if (isCurrentMediaPlaying) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetColorU32(ImVec4(0.2f, 0.7f, 0.2f, 0.8f))); // Green active state
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetColorU32(ImVec4(0.25f, 0.75f, 0.25f, 0.9f))); // Brighter green on hover
+    // SIMPLIFIED: Button state is based on mode - supports both manual and sequencer playback
+    // Button is green if media is playing (either MANUAL_PREVIEW or SEQUENCER_ACTIVE)
+    // Button is grey if IDLE (stopped)
+    bool isCurrentMediaPlaying = false;
+    if (activePlayer != nullptr && currentIndex < numPlayers) {
+        auto currentPlayer = mediaPool->getMediaPlayer(currentIndex);
+        if (currentPlayer == activePlayer) {
+            // Button is green if mode is MANUAL_PREVIEW OR SEQUENCER_ACTIVE
+            // This syncs with both manual clicks and external sequencer triggers
+            isCurrentMediaPlaying = (mediaPool->isManualPreview() || mediaPool->isSequencerActive()) 
+                        && currentPlayer->isPlaying();
+        }
     }
     
-    // Prevent ImGui from auto-focusing when clicking empty space
+    // Apply button styling for active playback
+    if (isCurrentMediaPlaying) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetColorU32(ImVec4(0.2f, 0.7f, 0.2f, 0.8f)));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetColorU32(ImVec4(0.25f, 0.75f, 0.25f, 0.9f)));
+    }
+    
     ImGui::PushItemFlag(ImGuiItemFlags_NoNavDefaultFocus, true);
-    
-    // Draw button
     bool buttonClicked = ImGui::Button(indexText.c_str(), ImVec2(-1, 0));
-    
-    // Pop the flag after creating the button
     ImGui::PopItemFlag();
     
-    // Refocus after drawing (if needed)
     if (shouldRefocus) {
         ImGui::SetKeyboardFocusHere(-1);
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     }
     
-    // Pop button styling if we pushed it
     if (isCurrentMediaPlaying) {
         ImGui::PopStyleColor(2);
     }
     
-    // Prevent spacebar from triggering button clicks (spacebar should only pause/play globally)
+    // SIMPLIFIED: Handle button click - simple toggle logic
     bool spacebarPressed = ImGui::IsKeyPressed(ImGuiKey_Space, false);
     
-    // Handle button click: toggle play/pause for current media
-    // Works with both manual preview and external triggers (sequencer)
-    // CRITICAL FIX: Use MediaPool mode as primary check, not isPlaying()
-    // isPlaying() can lag after stop(), causing double-click issue
-    // Mode is updated immediately and is more reliable for toggle logic
-    // CRITICAL: Only use buttonClicked (not IsItemClicked) for proper toggle behavior
-    // buttonClicked is only true on the frame when button is released (single click)
-    // IsItemClicked can be true for multiple frames, causing continuous triggering
     if (buttonClicked && !spacebarPressed && numPlayers > 0) {
-        // Check MediaPool mode first (more reliable than isPlaying() which can lag)
-        bool isManualPreviewMode = mediaPool->isManualPreview();
-        bool isSequencerActiveMode = mediaPool->isSequencerActive();
-        
-        // RE-CHECK playing state as secondary check (for sequencer-triggered playback)
-        bool currentlyPlaying = false;
-        if (activePlayer != nullptr && currentIndex < numPlayers) {
-            auto currentPlayer = mediaPool->getMediaPlayer(currentIndex);
-            if (currentPlayer == activePlayer) {
-                currentlyPlaying = activePlayer->isPlaying();
+        auto currentPlayer = mediaPool->getMediaPlayer(currentIndex);
+        if (currentPlayer) {
+            // Only toggle manual preview - don't interfere with sequencer playback
+            // If sequencer is active, button click does nothing (sequencer controls playback)
+            if (mediaPool->isManualPreview()) {
+                // Currently in MANUAL_PREVIEW mode - stop it
+                currentPlayer->stop();
+                mediaPool->setModeIdle();  // Transition to IDLE immediately
+            } else if (mediaPool->isIdle()) {
+                // Not playing (IDLE) - start manual preview
+                // Note: If SEQUENCER_ACTIVE, we don't do anything (sequencer is in control)
+                float startPosition = currentPlayer->position.get();
+                mediaPool->playMediaManual(currentIndex, startPosition);
             }
-        }
-        
-        ofLogNotice("MediaPoolGUI") << "[BUTTON_DEBUG] Button clicked - isCurrentMediaPlaying: " << isCurrentMediaPlaying 
-                                     << ", currentlyPlaying (rechecked): " << currentlyPlaying
-                                     << ", isManualPreviewMode: " << isManualPreviewMode
-                                     << ", isSequencerActiveMode: " << isSequencerActiveMode
-                                     << ", currentIndex: " << currentIndex 
-                                     << ", activePlayer: " << (activePlayer ? "exists" : "null");
-        
-        // Toggle logic: Use mode as primary check (more reliable than isPlaying())
-        // If in MANUAL_PREVIEW mode, stop. Otherwise, play.
-        if (isManualPreviewMode && currentlyPlaying) {
-            // Manual preview mode and playing - stop it
-            if (activePlayer && currentIndex < numPlayers) {
-                auto currentPlayer = mediaPool->getMediaPlayer(currentIndex);
-                if (currentPlayer == activePlayer) {
-                    mediaPool->stopManualPreview();
-                }
-            }
-        } else if (isSequencerActiveMode && currentlyPlaying) {
-            // Sequencer active and playing - just stop player (sequencer controls mode)
-            if (activePlayer && currentIndex < numPlayers) {
-                auto currentPlayer = mediaPool->getMediaPlayer(currentIndex);
-                if (currentPlayer == activePlayer) {
-                    currentPlayer->stop();
-                }
-            }
-        } else {
-            // Not in manual preview mode or not playing - start playback
-            // This works regardless of current mode (IDLE, SEQUENCER_ACTIVE, etc.)
-            // playMediaManual() will transition to MANUAL_PREVIEW mode and stop any other playback
-            auto currentPlayer = mediaPool->getMediaPlayer(currentIndex);
-            if (currentPlayer) {
-                // Get current position if media was previously playing, otherwise start from beginning
-                float startPosition = 0.0f;
-                if (currentPlayer == activePlayer) {
-                    // Use current position if this is the active player
-                    startPosition = currentPlayer->position.get();
-                }
-                // Always call playMediaManual - it handles stopping other players and mode transitions
-                // This works regardless of current mode (IDLE, SEQUENCER_ACTIVE, etc.)
-                ofLogNotice("MediaPoolGUI") << "[BUTTON_DEBUG] Calling playMediaManual for index " << currentIndex 
-                                             << " at position " << startPosition;
-                bool success = mediaPool->playMediaManual(currentIndex, startPosition);
-                if (!success) {
-                    ofLogWarning("MediaPoolGUI") << "[BUTTON_DEBUG] Failed to start manual playback for index " << currentIndex;
-                } else {
-                    // CRITICAL FIX: Re-check playing state immediately after playMediaManual
-                    // This ensures button state updates correctly even if there's a timing issue
-                    // Also fixes the double-click issue where playMediaManual succeeds but player isn't playing yet
-                    auto playerAfterPlay = mediaPool->getMediaPlayer(currentIndex);
-                    bool isPlayingAfterCall = (playerAfterPlay && playerAfterPlay->isPlaying());
-                    ofLogNotice("MediaPoolGUI") << "[BUTTON_DEBUG] Button clicked: Started manual playback for index " << currentIndex 
-                                                 << " - isPlaying() after call: " << isPlayingAfterCall
-                                                 << " - player: " << (playerAfterPlay ? "exists" : "null");
-                    
-                    // If playMediaManual succeeded but player isn't playing, log a warning
-                    // This helps debug the double-click issue
-                    if (!isPlayingAfterCall) {
-                        ofLogWarning("MediaPoolGUI") << "[BUTTON_DEBUG] WARNING: playMediaManual returned success but player is not playing! "
-                                                      << "This may cause the double-click issue. "
-                                                      << "activePlayer: " << (mediaPool->getActivePlayer() ? "exists" : "null")
-                                                      << ", currentIndex: " << currentIndex
-                                                      << ", startPosition: " << startPosition;
-                    }
-                }
-            } else {
-                ofLogWarning("MediaPoolGUI") << "No player found for index " << currentIndex;
-            }
+            // If isSequencerActive(), do nothing - sequencer controls playback
         }
     }
     
-    // ONE-WAY SYNC: ImGui focus → MediaPoolGUI state (similar to TrackerSequencer)
+    // ONE-WAY SYNC: ImGui focus → MediaPoolGUI state
     bool actuallyFocused = ImGui::IsItemFocused();
     if (actuallyFocused) {
         bool itemWasClicked = ImGui::IsItemClicked(0);
         bool keyboardNavActive = (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
         
-        // Only sync if this is an intentional focus (click, keyboard nav, or refocus)
         if (itemWasClicked || keyboardNavActive || shouldRefocus) {
             anyCellFocusedThisFrame = true;
             bool columnChanged = (editingColumnIndex != columnIndex);
             
-            // When in edit mode, prevent focus from changing to a different column
             if (isEditingParameter && columnChanged) {
-                return; // Exit early - keep focus locked to editing column
+                return;
             }
             
-            // Sync state
             editingColumnIndex = columnIndex;
-            editingParameter.clear(); // Media index button doesn't have a parameter name
+            editingParameter.clear();
             isParentWidgetFocused = false;
             
-            // Clear refocus flag after successful sync
             if (shouldRefocus) {
                 shouldRefocusCurrentCell = false;
             }
             
-            // Exit edit mode if navigating to a different column
             if (columnChanged && isEditingParameter) {
                 isEditingParameter = false;
                 editBufferCache.clear();
