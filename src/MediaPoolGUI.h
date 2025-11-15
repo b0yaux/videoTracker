@@ -38,6 +38,18 @@ private:
     
     // Waveform visualization
     float waveformHeight;
+    static constexpr int MAX_WAVEFORM_POINTS = 2000;  // Maximum number of points for smooth waveform rendering
+    
+    // Waveform marker dragging state
+    enum class WaveformMarker {
+        NONE,
+        PLAYHEAD,
+        POSITION,
+        REGION_START,
+        REGION_END
+    };
+    WaveformMarker draggingMarker = WaveformMarker::NONE;
+    float waveformDragStartX = 0.0f;
     
     // Navigation state (parent widget pattern, similar to TrackerSequencerGUI)
     ImGuiID parentWidgetId = 0;
@@ -73,8 +85,10 @@ private:
     void drawSearchBar();
     void drawMediaList();
     void drawWaveform();
+    void drawWaveformControls(const ImVec2& canvasPos, const ImVec2& canvasMax, float canvasWidth, float canvasHeight);  // Draw markers and controls on top of waveform
     void drawParameters();  // New: Draw parameter editing section as one-row table
     void drawMediaIndexButton(int columnIndex, size_t numParamColumns);  // Draw media index button (play/pause trigger)
+    void drawPlayStyleButton(int columnIndex, size_t numParamColumns);  // Draw PlayStyle button (cycles ONCE/LOOP/NEXT)
     
     // Helper method to create and configure ParameterCell for a parameter (similar to TrackerSequencer)
     ParameterCell createParameterCellForParameter(const ParameterDescriptor& paramDesc);
@@ -87,5 +101,8 @@ private:
     // showEnd: if true, truncates from start (shows end with ellipsis prefix), 
     //          if false, truncates from end (shows start with ellipsis suffix)
     std::string truncateTextToWidth(const std::string& text, float maxWidth, bool showEnd = false, const std::string& ellipsis = "...");
+    
+    // Helper method to draw position memory mode selector button in header
+    void drawPositionMemoryModeButton(const ImVec2& cellStartPos, float columnWidth, float cellMinY);
 };
 

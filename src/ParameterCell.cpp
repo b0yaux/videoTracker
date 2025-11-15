@@ -624,22 +624,29 @@ void ParameterCell::initializeEditBuffer() {
     float currentVal = getCurrentValue();
     
     if (isFixed && fixedType == FIXED_TYPE_INDEX) {
-        // Index column: 1-based display (01-99), 0 = rest
-        // currentVal is already in 1-based display format (0 = rest, 1+ = media index)
-        int indexVal = (int)std::round(currentVal);
-        if (indexVal <= 0) {
-            editBuffer = "00"; // Rest
+        // Index column: 1-based display (01-99), NaN = rest
+        if (std::isnan(currentVal)) {
+            editBuffer = "--"; // Show "--" for NaN (empty/rest)
         } else {
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%02d", indexVal);
-            editBuffer = buf;
+            int indexVal = (int)std::round(currentVal);
+            if (indexVal <= 0) {
+                editBuffer = "--"; // Also handle edge case
+            } else {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "%02d", indexVal);
+                editBuffer = buf;
+            }
         }
     } else if (isFixed && fixedType == FIXED_TYPE_LENGTH) {
-        // Length column: 1-16 range
-        int lengthVal = (int)std::round(currentVal);
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%d", lengthVal);
-        editBuffer = buf;
+        // Length column: 1-16 range, NaN = not set
+        if (std::isnan(currentVal)) {
+            editBuffer = "--"; // Show "--" for NaN (empty/not set)
+        } else {
+            int lengthVal = (int)std::round(currentVal);
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%d", lengthVal);
+            editBuffer = buf;
+        }
     } else {
         // Dynamic parameter or MediaPool parameter
         if (formatValue) {
@@ -665,10 +672,7 @@ std::string ParameterCell::formatDisplayText(float value) const {
     
     if (isFixed && fixedType == FIXED_TYPE_INDEX) {
         // Index: 1-based display (01-99)
-        // For fixed columns, we still use -1.0f to indicate rest (compatibility)
-        if (value < 0.0f) {
-            return "--";
-        }
+        // NaN is already handled above, so we can process valid values
         int idx = (int)std::round(value);
         if (idx <= 0) {
             return "--";
@@ -680,10 +684,7 @@ std::string ParameterCell::formatDisplayText(float value) const {
     
     if (isFixed && fixedType == FIXED_TYPE_LENGTH) {
         // Length: 1-16 range, formatted as "02"
-        // For fixed columns, we still use -1.0f to indicate rest (compatibility)
-        if (value < 0.0f) {
-            return "--";
-        }
+        // NaN is already handled above, so we can process valid values
         int len = std::max(LENGTH_MIN, std::min(LENGTH_MAX, (int)std::round(value)));
         char buf[8];
         snprintf(buf, sizeof(buf), "%02d", len);
@@ -698,12 +699,8 @@ std::string ParameterCell::formatDisplayText(float value) const {
 
 float ParameterCell::calculateFillPercent(float value) const {
     // Check for NaN (not a number) - indicates empty/not set (no fill)
+    // Unified system: all empty values (Index, Length, dynamic parameters) use NaN
     if (std::isnan(value)) {
-        return 0.0f;
-    }
-    
-    // For fixed columns, we still use -1.0f to indicate rest (compatibility)
-    if (isFixed && value < 0.0f) {
         return 0.0f;
     }
     
@@ -910,7 +907,7 @@ ParameterCellInteraction ParameterCell::draw(int uniqueId,
     float cellWidth = ImGui::GetColumnWidth();
     ImVec2 cellMax = ImVec2(cellMin.x + cellWidth, cellMin.y + cellHeight);
     
-    // Draw value bar background first (as true background layer)
+    // Draw value bar background (no cell background - using row background instead)
     if (fillPercent > 0.01f) {
         ImDrawList* drawList = ImGui::GetWindowDrawList();
         if (drawList) {
@@ -971,8 +968,10 @@ ParameterCellInteraction ParameterCell::draw(int uniqueId,
         if (!result.dragStarted) {
             result.dragStarted = true;
         }
-    } else if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
-        // Start drag when cell is active and mouse is dragging
+    } else if (ImGui::IsItemActive() && ImGui::IsMouseDown(0)) {
+        // Start drag when cell is active and mouse button is held down
+        // Use IsMouseDown(0) instead of IsMouseDragging(0) to start drag immediately on click
+        // This allows dragging to work even with slow or minimal mouse movement
         // IsItemActive() returns true when mouse was clicked on this item and is still held
         // This works even if mouse has moved outside the cell (Blender-style)
         // NOTE: Don't require isSelected - IsItemActive() is sufficient to indicate the cell was clicked

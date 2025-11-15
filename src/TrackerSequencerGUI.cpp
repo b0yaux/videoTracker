@@ -95,7 +95,7 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
         } else if (isCurrentPattern && isPlaying) {
             bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.0f, 0.9f, 0.0f, 0.6f));  // Bright green when playing
         } else if (isCurrentPattern) {
-            bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.9f, 0.5f, 0.1f, 0.6f));  // Blue for current pattern
+            bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.1f, 0.1f, 0.9f, 0.8f));  // Blue for current pattern
         } else if (isCurrentChainEntry) {
             bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.4f, 0.4f, 0.4f, 1.0f));  // Gray for current chain entry
         } else {
@@ -556,8 +556,14 @@ void TrackerSequencerGUI::drawPatternRow(TrackerSequencer& sequencer, int step, 
     ImGui::TableNextRow();
     
     // Static cached colors for performance (calculated once at initialization)
-    static ImU32 activeStepColor = ImGui::GetColorU32(ImVec4(0.0f, 0.85f, 0.0f, 0.4f));
-    static ImU32 inactiveStepColor = ImGui::GetColorU32(ImVec4(0.4f, 0.8f, 0.4f, 0.3f));
+    static ImU32 activeStepColor = ImGui::GetColorU32(ImVec4(0.0f, 0.85f, 0.0f, 0.5f));
+    static ImU32 inactiveStepColor = ImGui::GetColorU32(ImVec4(0.2f, 0.7f, 0.2f, 0.2f));
+    static ImU32 rowBgColor = ImGui::GetColorU32(ImVec4(0.01f, 0.01f, 0.01f, 0.5f)); // Filled row background (darker)
+    static ImU32 emptyRowBgColor = ImGui::GetColorU32(ImVec4(0.05f, 0.05f, 0.05f, 0.1f)); // Empty row background (very subtle)
+    
+    // Check if row is fully empty (all cells are NaN/empty)
+    // A row is empty if the PatternCell's index is < 0 (which means all values are empty/NaN)
+    bool isRowEmpty = sequencer.getCurrentPattern()[step].isEmpty();
     
     // Determine if this step is currently active (playing)
     // Use cached values passed as parameters instead of calling getters
@@ -567,15 +573,25 @@ void TrackerSequencerGUI::drawPatternRow(TrackerSequencer& sequencer, int step, 
     // For length=1 steps, currentPlayingStep is cleared when they finish, so they won't show as active
     bool isStepActive = isCurrentPlayingStep;
     
-    // Highlight playback step: green when active, slightly green grey when inactive
+    // Set row background: transparent for empty rows, grey for filled rows
+    // Playback highlight is applied on top if this is the playback step
+    // Note: We must explicitly set transparent for empty rows because ImGuiTableFlags_RowBg
+    // automatically applies default row backgrounds even when we don't set one
     if (isPlaybackStep) {
         if (isStepActive) {
-            // Active step: bright green (using cached color)
+            // Active playback step: bright green
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, activeStepColor);
         } else {
-            // Inactive step: slightly green grey (using cached color)
+            // Inactive playback step: slightly green grey
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, inactiveStepColor);
         }
+    } else if (!isRowEmpty) {
+        // Non-empty row (not playback): standard grey background
+        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, rowBgColor);
+    } else {
+        // Empty rows (not playback): very subtle grey background with tiny alpha
+        // This overrides the default row background that ImGuiTableFlags_RowBg would apply
+        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, emptyRowBgColor);
     }
     
     // Draw step number column (pass cached values)
@@ -612,6 +628,10 @@ static void syncPlaybackToEditIfPaused(TrackerSequencer& sequencer, int newStep,
 void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, bool isPlaybackStep,
                                          bool isPlaying, int currentPlayingStep) {
     ImGui::TableNextColumn();
+    
+    // Set step number cell background to black (like column headers)
+    static ImU32 stepNumberBgColor = ImGui::GetColorU32(ImVec4(0.05f, 0.05f, 0.05f, 0.8f));
+    ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, stepNumberBgColor);
     
     // Get cell rect for red outline (before drawing button)
     ImVec2 cellMin = ImGui::GetCursorScreenPos();

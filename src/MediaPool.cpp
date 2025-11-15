@@ -9,8 +9,9 @@
 
 MediaPool::MediaPool(const std::string& dataDir) 
     : currentIndex(0), dataDirectory(dataDir), isSetup(false), currentMode(PlaybackMode::IDLE), 
-      currentPreviewMode(PreviewMode::STOP_AT_END), clock(nullptr), activePlayer(nullptr), 
-      lastTransportState(false), playerConnected(false), gateTimerActive(false), gateEndTime(0.0f) {
+      currentPlayStyle(PlayStyle::ONCE), clock(nullptr), activePlayer(nullptr), 
+      lastTransportState(false), playerConnected(false), gateTimerActive(false), gateEndTime(0.0f),
+      positionMemory(PositionMemoryMode::PER_INDEX), lastTriggeredStep(-1) {
     // setup() will be called later with clock reference
 }
 
@@ -267,6 +268,7 @@ void MediaPool::clear() {
     audioFiles.clear();
     videoFiles.clear();
     currentIndex = 0;
+    positionMemory.clear();  // Clear position memory when clearing media pool
 }
 
 void MediaPool::refresh() {
@@ -291,32 +293,6 @@ bool MediaPool::isVideoFile(const std::string& filename) {
     return (ext == "mov" || ext == "mp4" || ext == "avi");
 }
 
-std::string MediaPool::findMatchingVideo(const std::string& audioFile) {
-    std::string audioBase = getBaseName(audioFile);
-    
-    // Use hash map for O(1) lookup instead of O(n) linear search
-    for (const auto& videoFile : videoFiles) {
-        std::string videoBase = getBaseName(videoFile);
-        if (audioBase == videoBase) {
-            return videoFile;
-        }
-    }
-    
-    return "";
-}
-
-std::string MediaPool::findMatchingAudio(const std::string& videoFile) {
-    std::string videoBase = getBaseName(videoFile);
-    
-    for (const auto& audioFile : audioFiles) {
-        std::string audioBase = getBaseName(audioFile);
-        if (audioBase == videoBase) {
-            return audioFile;
-        }
-    }
-    
-    return "";
-}
 
 std::string MediaPool::getMediaDirectory() const {
     return dataDirectory;
@@ -465,11 +441,28 @@ bool MediaPool::playMediaManual(size_t index, float position) {
     
     // Stop and reset the player for fresh playback
     player->stop();  // Stop any current playback
-    // PERFORMANCE CRITICAL: Only set startPosition before play() - don't set position
-    // because that triggers onPositionChanged() which calls expensive setPosition() (~200ms).
+    
+    // Convert absolute position to relative within region
+    float regionStartVal = player->regionStart.get();
+    float regionEndVal = player->regionEnd.get();
+    float regionSize = regionEndVal - regionStartVal;
+    
+    float relativePos = 0.0f;
+    if (regionSize > 0.001f) {
+        // Clamp to region bounds, then map to relative
+        float clampedAbsolute = std::max(regionStartVal, std::min(regionEndVal, position));
+        relativePos = (clampedAbsolute - regionStartVal) / regionSize;
+        relativePos = std::max(0.0f, std::min(1.0f, relativePos));
+    } else {
+        // If region is invalid, use position directly (clamped)
+        relativePos = std::max(0.0f, std::min(1.0f, position));
+    }
+    
+    // PERFORMANCE CRITICAL: Only set startPosition before play() - don't set playheadPosition
+    // because that triggers onPlayheadPositionChanged() which calls expensive setPosition() (~200ms).
     // The play() method will handle setting the actual video position efficiently.
-    player->startPosition.set(position);
-    // NOTE: Don't set player->position here - it triggers expensive setPosition() via listener
+    player->startPosition.set(relativePos);
+    // NOTE: Don't set player->playheadPosition here - it triggers expensive setPosition() via listener
     // The play() method will set the position correctly based on startPosition
     
     // Re-enable audio/video if they were loaded (stop() disables them)
@@ -480,8 +473,8 @@ bool MediaPool::playMediaManual(size_t index, float position) {
         player->videoEnabled.set(true);
     }
     
-    // Set loop based on preview mode
-    bool shouldLoop = (currentPreviewMode == PreviewMode::LOOP);
+    // Set loop based on play style
+    bool shouldLoop = (currentPlayStyle == PlayStyle::LOOP);
     player->loop.set(shouldLoop);
     
     // Now play
@@ -623,23 +616,26 @@ void MediaPool::setModeIdle() {
 }
 
 //--------------------------------------------------------------
-// Preview mode control
-void MediaPool::setPreviewMode(PreviewMode mode) {
+// Play style control (applies to both manual preview and sequencer playback)
+void MediaPool::setPlayStyle(PlayStyle style) {
     std::lock_guard<std::mutex> lock(stateMutex);
-    currentPreviewMode = mode;
-    ofLogNotice("ofxMediaPool") << "Preview mode set to: " << (int)mode;
+    currentPlayStyle = style;
+    ofLogNotice("ofxMediaPool") << "Play style set to: " << (int)style;
     
-    // Apply the new mode to the currently active player if it's playing
-    if (activePlayer && currentMode.load(std::memory_order_relaxed) == PlaybackMode::MANUAL_PREVIEW) {
-        bool shouldLoop = (mode == PreviewMode::LOOP);
-        activePlayer->loop.set(shouldLoop);
-        ofLogNotice("ofxMediaPool") << "Applied preview mode to active player - loop: " << shouldLoop;
+    // Apply the new style to the currently active player if it's playing
+    if (activePlayer) {
+        PlaybackMode mode = currentMode.load(std::memory_order_relaxed);
+        if (mode == PlaybackMode::MANUAL_PREVIEW || mode == PlaybackMode::SEQUENCER_ACTIVE) {
+            bool shouldLoop = (style == PlayStyle::LOOP);
+            activePlayer->loop.set(shouldLoop);
+            ofLogNotice("ofxMediaPool") << "Applied play style to active player - loop: " << shouldLoop;
+        }
     }
 }
 
-PreviewMode MediaPool::getPreviewMode() const {
+PlayStyle MediaPool::getPlayStyle() const {
     std::lock_guard<std::mutex> lock(stateMutex);
-    return currentPreviewMode;
+    return currentPlayStyle;
 }
 
 //--------------------------------------------------------------
@@ -660,39 +656,94 @@ void MediaPool::update() {
         }
     }
     
-    // Update position memory and detect playback state changes
+    // Process event queue FIRST to update lastTriggeredStep before position capture
+    processEventQueue();
+    
+    // Unified position memory capture and region end detection
     if (activePlayer && currentIndex < players.size()) {
         bool isCurrentlyPlaying = activePlayer->isPlaying();
-        bool wasPlaying = lastPlayingStateByMediaIndex[currentIndex];
         
         if (isCurrentlyPlaying) {
-            // Store position when advancing
-            float currentPosition = activePlayer->position.get();
-            auto it = lastPositionByMediaIndex.find(currentIndex);
+            // Get current playhead position (absolute: 0.0-1.0 of entire media)
+            float currentPosition = activePlayer->playheadPosition.get();
+            float regionStartVal = activePlayer->regionStart.get();
+            float regionEndVal = activePlayer->regionEnd.get();
             
-            if (it == lastPositionByMediaIndex.end()) {
-                if (currentPosition > 0.01f) {
-                    lastPositionByMediaIndex[currentIndex] = currentPosition;
+            // Ensure region bounds are valid
+            if (regionStartVal > regionEndVal) {
+                std::swap(regionStartVal, regionEndVal);
+            }
+            
+            // Check if playhead has reached or exceeded region end
+            const float REGION_END_THRESHOLD = 0.001f;
+            bool reachedRegionEnd = (currentPosition >= regionEndVal - REGION_END_THRESHOLD);
+            
+            // Handle region end based on play style (only if not looping)
+            if (reachedRegionEnd && !activePlayer->loop.get()) {
+                switch (currentPlayStyle) {
+                    case PlayStyle::ONCE:
+                        activePlayer->stop();
+                        break;
+                    case PlayStyle::LOOP:
+                        if (activePlayer->isAudioLoaded()) {
+                            activePlayer->getAudioPlayer().setPosition(regionStartVal);
+                        }
+                        if (activePlayer->isVideoLoaded()) {
+                            activePlayer->getVideoPlayer().getVideoFile().setPosition(regionStartVal);
+                            activePlayer->getVideoPlayer().getVideoFile().update();
+                        }
+                        activePlayer->playheadPosition.set(regionStartVal);
+                        break;
+                    case PlayStyle::NEXT:
+                        activePlayer->stop();
+                        break;
                 }
-            } else {
-                float storedPosition = it->second;
-                if (currentPosition > storedPosition + 0.001f) {
-                    lastPositionByMediaIndex[currentIndex] = currentPosition;
+            } else if (reachedRegionEnd && activePlayer->loop.get()) {
+                if (currentPosition > regionEndVal + REGION_END_THRESHOLD) {
+                    if (activePlayer->isAudioLoaded()) {
+                        activePlayer->getAudioPlayer().setPosition(regionStartVal);
+                    }
+                    if (activePlayer->isVideoLoaded()) {
+                        activePlayer->getVideoPlayer().getVideoFile().setPosition(regionStartVal);
+                        activePlayer->getVideoPlayer().getVideoFile().update();
+                    }
+                    activePlayer->playheadPosition.set(regionStartVal);
                 }
             }
-        } else if (wasPlaying && !isCurrentlyPlaying) {
+            
+            // Capture position while playing - use lastTriggeredStep (now updated by processEventQueue)
+            // For per-index mode, step is ignored in makeKey(), so this is fine
+            // For per-step mode, we need the correct step which is now in lastTriggeredStep
+            // CRITICAL: Only capture position if transport is playing (not stopped)
+            // This prevents position from being saved after transport stops, which would
+            // repopulate position memory after it was cleared on transport stop
+            bool transportIsPlaying = false;
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                transportIsPlaying = lastTransportState;
+            }
+            if (transportIsPlaying && (!reachedRegionEnd || currentPlayStyle != PlayStyle::LOOP)) {
+                int step = (mode == PlaybackMode::SEQUENCER_ACTIVE) ? lastTriggeredStep : -1;
+                if (step >= 0 || mode != PlaybackMode::SEQUENCER_ACTIVE) {
+                    positionMemory.capture(step, currentIndex, currentPosition);
+                }
+            }
+        } else {
             // Player stopped - capture final position
-            float stoppedPosition = activePlayer->position.get();
-            
-            if (stoppedPosition < 0.01f) {
-                auto it = lastPositionByMediaIndex.find(currentIndex);
-                if (it != lastPositionByMediaIndex.end() && it->second > 0.01f) {
-                    stoppedPosition = it->second;
-                }
+            // CRITICAL: Only capture position if transport is still playing
+            // When transport stops, position memory is cleared, and we don't want to
+            // repopulate it with the preserved position from stop()
+            bool transportIsPlaying = false;
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                transportIsPlaying = lastTransportState;
             }
-            
-            if (stoppedPosition > 0.01f) {
-                lastPositionByMediaIndex[currentIndex] = stoppedPosition;
+            if (transportIsPlaying) {
+                float stoppedPosition = activePlayer->playheadPosition.get();
+                int step = (mode == PlaybackMode::SEQUENCER_ACTIVE) ? lastTriggeredStep : -1;
+                if (step >= 0 || mode != PlaybackMode::SEQUENCER_ACTIVE) {
+                    positionMemory.capture(step, currentIndex, stoppedPosition);
+                }
             }
             
             // Transition to IDLE when playback stops
@@ -706,28 +757,21 @@ void MediaPool::update() {
                 ofLogNotice("MediaPool") << "[MANUAL_STOP] Manual preview stopped - transitioning to IDLE mode";
             }
         }
-        
-        lastPlayingStateByMediaIndex[currentIndex] = isCurrentlyPlaying;
     }
     
-    // Process event queue
-    processEventQueue();
-    
-    // Check for end-of-media in manual preview mode
+    // Check for end-of-playback (applies to both manual preview and sequencer)
     mode = currentMode.load(std::memory_order_relaxed);
-    if (mode == PlaybackMode::MANUAL_PREVIEW && activePlayer) {
+    if ((mode == PlaybackMode::MANUAL_PREVIEW || mode == PlaybackMode::SEQUENCER_ACTIVE) && activePlayer) {
         if (!activePlayer->isPlaying() && !activePlayer->loop.get()) {
-            onManualPreviewEnd();
+            onPlaybackEnd();
         }
     }
 }
 
 //--------------------------------------------------------------
 void MediaPool::processEventQueue() {
-    // Process all queued events from audio thread (called from update in GUI thread)
     std::queue<TriggerEvent> localQueue;
     
-    // Swap queue under lock (fast operation)
     {
         std::lock_guard<std::mutex> queueLock(stateMutex);
         localQueue.swap(eventQueue);
@@ -741,8 +785,19 @@ void MediaPool::processEventQueue() {
     }
     
     // Process events without lock (we're in GUI thread now)
+    bool isFirstEvent = true;
     while (!localQueue.empty()) {
         const TriggerEvent& event = localQueue.front();
+        
+        // Clear transportJustStarted flag after processing first event
+        if (isFirstEvent) {
+            std::lock_guard<std::mutex> flagLock(stateMutex);
+            if (transportJustStarted) {
+                transportJustStarted = false;
+                ofLogVerbose("MediaPool") << "[TRANSPORT_START] First event processed, position restoration enabled";
+            }
+            isFirstEvent = false;
+        }
         
         // Extract mediaIndex from "note" parameter
         int mediaIndex = -1;
@@ -754,12 +809,8 @@ void MediaPool::processEventQueue() {
         // Handle empty cells (rests) - stop immediately
         if (mediaIndex < 0) {
             if (activePlayer) {
-                if (activePlayer->isPlaying() && currentIndex < players.size()) {
-                    float currentPosition = activePlayer->position.get();
-                    if (currentPosition > 0.01f) {
-                        lastPositionByMediaIndex[currentIndex] = currentPosition;
-                    }
-                }
+                // CRITICAL: Capture position BEFORE stopping, using current step context
+                // Don't capture here - let update() handle it with correct step tracking
                 activePlayer->stop();
             }
             gateTimerActive = false;
@@ -780,22 +831,22 @@ void MediaPool::processEventQueue() {
             continue;
         }
         
+        // CRITICAL: Update lastTriggeredStep BEFORE any position captures
+        // This ensures update() uses the correct step when capturing positions
+        if (event.step >= 0) {
+            lastTriggeredStep = event.step;
+        }
+        
         // Set active player if changed
         bool playerChanged = (currentIndex != mediaIndex || activePlayer != player);
         if (playerChanged) {
-            if (activePlayer && activePlayer->isPlaying() && currentIndex < players.size()) {
-                float currentPosition = activePlayer->position.get();
-                if (currentPosition > 0.01f) {
-                    lastPositionByMediaIndex[currentIndex] = currentPosition;
-                }
-            }
+            // CRITICAL: Don't capture position here - let update() handle it
+            // Position capture should happen in update() with correct step tracking
             setActivePlayer(mediaIndex);
         }
         
         // Extract parameters from TriggerEvent map with defaults and proper clamping
-        // Helper lambda to get parameter value with validation
         auto getParamValue = [&](const std::string& paramName, float defaultValue) -> float {
-            // Find parameter descriptor for range validation
             auto descIt = std::find_if(paramDescriptors.begin(), paramDescriptors.end(),
                 [&](const ParameterDescriptor& desc) { return desc.name == paramName; });
             
@@ -806,10 +857,8 @@ void MediaPool::processEventQueue() {
                 maxVal = descIt->maxValue;
             }
             
-            // Get value from event or use default
             auto eventIt = event.parameters.find(paramName);
             if (eventIt != event.parameters.end()) {
-                // Clamp to parameter range
                 return std::max(minVal, std::min(maxVal, eventIt->second));
             }
             return defaultValue;
@@ -819,6 +868,18 @@ void MediaPool::processEventQueue() {
         float speed = getParamValue("speed", defaults.count("speed") > 0 ? defaults["speed"] : 1.0f);
         float volume = getParamValue("volume", defaults.count("volume") > 0 ? defaults["volume"] : 1.0f);
         
+        // Clamp position to region bounds
+        float regionStartVal = player->regionStart.get();
+        float regionEndVal = player->regionEnd.get();
+        float regionSize = regionEndVal - regionStartVal;
+        
+        float clampedPosition = position;
+        if (regionSize > 0.001f) {
+            clampedPosition = std::max(0.0f, std::min(1.0f, position));
+        } else {
+            clampedPosition = std::max(0.0f, std::min(1.0f, position));
+        }
+        
         // Audio/video always enabled for sequencer triggers
         if (!player->audioEnabled.get()) {
             player->audioEnabled.set(true);
@@ -827,20 +888,26 @@ void MediaPool::processEventQueue() {
             player->videoEnabled.set(true);
         }
         
-        // Set volume (audio parameter)
-        if (std::abs(player->volume.get() - volume) > 0.001f) {
+        // Set volume
+        if (std::abs(player->volume.get() - volume) > PARAMETER_EPSILON) {
             player->volume.set(volume);
         }
         
         // Set playback parameters
-        if (std::abs(player->startPosition.get() - position) > 0.001f) {
-            player->startPosition.set(position);
+        if (std::abs(player->startPosition.get() - clampedPosition) > PARAMETER_EPSILON) {
+            player->startPosition.set(clampedPosition);
         }
-        if (std::abs(player->speed.get() - speed) > 0.001f) {
+        if (std::abs(player->speed.get() - speed) > PARAMETER_EPSILON) {
             player->speed.set(speed);
         }
         
-        // Use duration directly from TriggerEvent (already calculated in seconds by TrackerSequencer)
+        // Set loop based on play style
+        bool shouldLoop = (currentPlayStyle == PlayStyle::LOOP);
+        if (std::abs(player->loop.get() ? 1.0f : 0.0f - (shouldLoop ? 1.0f : 0.0f)) > PARAMETER_EPSILON) {
+            player->loop.set(shouldLoop);
+        }
+        
+        // Use duration directly from TriggerEvent
         float stepDurationSeconds = event.duration;
         
         // Trigger media playback with gating
@@ -863,24 +930,25 @@ void MediaPool::processEventQueue() {
 }
 
 //--------------------------------------------------------------
-// Handle end-of-media in manual preview mode
-void MediaPool::onManualPreviewEnd() {
+// Handle end-of-playback (applies to both manual preview and sequencer)
+void MediaPool::onPlaybackEnd() {
     // No lock needed - caller (update()) already holds stateMutex
     
-    if (currentMode.load(std::memory_order_relaxed) != PlaybackMode::MANUAL_PREVIEW) return;
+    PlaybackMode mode = currentMode.load(std::memory_order_relaxed);
+    if (mode != PlaybackMode::MANUAL_PREVIEW && mode != PlaybackMode::SEQUENCER_ACTIVE) return;
     
-    switch (currentPreviewMode) {
-        case PreviewMode::STOP_AT_END:
+    switch (currentPlayStyle) {
+        case PlayStyle::ONCE:
             // Stop the current player
             if (activePlayer) {
                 activePlayer->stop();
             }
             currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
             break;
-        case PreviewMode::LOOP:
+        case PlayStyle::LOOP:
             // Already handled by loop=true
             break;
-        case PreviewMode::PLAY_NEXT:
+        case PlayStyle::NEXT:
             if (players.size() > 1) {
                 size_t nextIndex = (currentIndex + 1) % players.size();
                 ofLogNotice("ofxMediaPool") << "Playing next media: " << nextIndex;
@@ -893,7 +961,7 @@ void MediaPool::onManualPreviewEnd() {
                     
                     // Reset and prepare for playback
                     nextPlayer->stop();
-                    nextPlayer->position.set(0.0f);
+                    nextPlayer->playheadPosition.set(0.0f);
                     
                     // Re-enable audio/video if they were loaded
                     if (nextPlayer->isAudioLoaded()) {
@@ -909,7 +977,7 @@ void MediaPool::onManualPreviewEnd() {
                     // Start playback
                     nextPlayer->play();
                     
-                    ofLogNotice("ofxMediaPool") << "Started next media " << nextIndex << " (state: MANUAL_PREVIEW)";
+                    ofLogNotice("ofxMediaPool") << "Started next media " << nextIndex << " (state: " << (mode == PlaybackMode::MANUAL_PREVIEW ? "MANUAL_PREVIEW" : "SEQUENCER_ACTIVE") << ")";
                 } else {
                     currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
                 }
@@ -944,8 +1012,18 @@ void MediaPool::onTransportChanged(bool isPlaying) {
     if (isPlaying != lastTransportState) {
         lastTransportState = isPlaying;
         
-        if (!isPlaying) {
-            // Transport stopped - reset gate timer and transition to IDLE
+        if (isPlaying) {
+            // Transport started - flag should already be set from previous stop
+            // Just log that we're starting a fresh session
+            ofLogNotice("MediaPool") << "[TRANSPORT_START] Starting fresh playback session (mode: " 
+                                     << (int)positionMemory.getMode() << ", flag: " << transportJustStarted << ")";
+        } else {
+            // Transport stopped - prepare for next start by clearing memory and setting flag
+            // This ensures memory is cleared BEFORE the next transport start triggers events
+            // CRITICAL: Clear memory on STOP, not START, to avoid race condition
+            positionMemory.clear();
+            transportJustStarted = true;  // Set flag now, so it's ready for next start
+            
             if (currentMode.load(std::memory_order_relaxed) == PlaybackMode::SEQUENCER_ACTIVE) {
                 gateTimerActive = false;
                 currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
@@ -954,6 +1032,9 @@ void MediaPool::onTransportChanged(bool isPlaying) {
                     activePlayer->stop();
                 }
             }
+            
+            ofLogNotice("MediaPool") << "[TRANSPORT_STOP] Position memory cleared for next playback session (mode: " 
+                                     << (int)positionMemory.getMode() << ")";
         }
         
         if (transportListener) {
@@ -984,8 +1065,8 @@ std::vector<ParameterDescriptor> MediaPool::getParameters() {
     params.push_back(ParameterDescriptor("speed", ParameterType::FLOAT, -10.0f, 10.0f, 1.0f, "Speed"));
     params.push_back(ParameterDescriptor("volume", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Volume"));
     params.push_back(ParameterDescriptor("pitch", ParameterType::FLOAT, 0.5f, 2.0f, 1.0f, "Pitch"));
-    params.push_back(ParameterDescriptor("loopStart", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Loop Start"));
-    params.push_back(ParameterDescriptor("loopEnd", ParameterType::FLOAT, 0.0f, 1.0f, 1.0f, "Loop End"));
+    params.push_back(ParameterDescriptor("regionStart", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Region Start"));
+    params.push_back(ParameterDescriptor("regionEnd", ParameterType::FLOAT, 0.0f, 1.0f, 1.0f, "Region End"));
     
     return params;
 }
@@ -1021,37 +1102,49 @@ void MediaPool::setParameter(const std::string& paramName, float value, bool not
         if (name == "volume") {
             oldValue = activePlayer->volume.get();
             activePlayer->volume.set(val);
-            return std::abs(oldValue - val) > 0.0001f;
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
         } else if (name == "speed") {
             oldValue = activePlayer->speed.get();
             activePlayer->speed.set(val);
-            return std::abs(oldValue - val) > 0.0001f;
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
         } else if (name == "pitch") {
             oldValue = activePlayer->pitch.get();
             activePlayer->pitch.set(val);
-            return std::abs(oldValue - val) > 0.0001f;
-        } else if (name == "loopStart") {
-            oldValue = activePlayer->loopStart.get();
-            activePlayer->loopStart.set(val);
-            return std::abs(oldValue - val) > 0.0001f;
-        } else if (name == "loopEnd") {
-            oldValue = activePlayer->loopEnd.get();
-            activePlayer->loopEnd.set(val);
-            return std::abs(oldValue - val) > 0.0001f;
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
+        } else if (name == "regionStart" || name == "loopStart") {
+            // Support both new name (regionStart) and old name (loopStart) for backward compatibility
+            oldValue = activePlayer->regionStart.get();
+            activePlayer->regionStart.set(val);
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
+        } else if (name == "regionEnd" || name == "loopEnd") {
+            // Support both new name (regionEnd) and old name (loopEnd) for backward compatibility
+            oldValue = activePlayer->regionEnd.get();
+            activePlayer->regionEnd.set(val);
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
         } else if (name == "position") {
-            // Position has special handling: set both startPosition and position
-            // When setting position via ParameterSync, we're setting the startPosition (for sync with tracker)
-            // PERFORMANCE CRITICAL: Update position parameter for UI display, but rely on onPositionChanged() checks
-            // to prevent expensive setPosition() calls when position is already correct
+            // Position from TrackerSequencer is relative (0.0-1.0 within region)
+            // Store it directly as relative startPosition
             oldValue = activePlayer->startPosition.get();
-            if (std::abs(oldValue - val) > 0.0001f) {
-                activePlayer->startPosition.set(val);
-                // Update position parameter for UI display (shows the target start position when paused)
-                // The onPositionChanged() listener will check if actual video position needs to change
-                // and only call expensive setPosition() if there's a significant difference (>0.01f threshold)
-                float currentPos = activePlayer->position.get();
-                if (std::abs(currentPos - val) > 0.001f) {
-                    activePlayer->position.set(val);
+            if (std::abs(oldValue - val) > PARAMETER_EPSILON) {
+                // Clamp to valid relative range
+                float relativePos = std::max(0.0f, std::min(1.0f, val));
+                activePlayer->startPosition.set(relativePos);
+                
+                // Update playheadPosition for UI display (map to absolute)
+                float regionStartVal = activePlayer->regionStart.get();
+                float regionEndVal = activePlayer->regionEnd.get();
+                float regionSize = regionEndVal - regionStartVal;
+                float absolutePos = 0.0f;
+                
+                if (regionSize > 0.001f) {
+                    absolutePos = regionStartVal + relativePos * regionSize;
+                } else {
+                    absolutePos = std::max(0.0f, std::min(1.0f, relativePos));
+                }
+                
+                float currentPos = activePlayer->playheadPosition.get();
+                if (std::abs(currentPos - absolutePos) > POSITION_EPSILON) {
+                    activePlayer->playheadPosition.set(absolutePos);
                 }
                 return true;
             }
@@ -1093,23 +1186,56 @@ void MediaPool::onTrigger(TriggerEvent& event) {
         
         // Check if position parameter is not explicitly set
         if (event.parameters.find("position") == event.parameters.end()) {
-            // Check if we have a stored position for this media index
-            auto posIt = lastPositionByMediaIndex.find(mediaIndex);
-            if (posIt != lastPositionByMediaIndex.end()) {
-                // Use stored position (position memory)
-                event.parameters["position"] = posIt->second;
-                ofLogNotice("MediaPool") << "[POSITION_MEMORY] Using stored position for media " 
-                                         << mediaIndex << ": " << posIt->second;
+            // CRITICAL FIX: Check transportJustStarted flag FIRST
+            // This prevents position restoration for the first event after transport start,
+            // even if memory was repopulated after clearing (race condition in per-index mode)
+            // In per-index mode, position capture after clearing can repopulate memory before
+            // the first trigger, causing stale position to be restored. The flag ensures
+            // the first event always starts fresh, matching per-step mode behavior.
+            bool shouldRestore = true;
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                // Don't restore if transport just started (fresh session) OR if memory is empty
+                if (transportJustStarted || positionMemory.size() == 0) {
+                    shouldRestore = false;
+                    if (transportJustStarted) {
+                        ofLogVerbose("MediaPool") << "[TRANSPORT_START] Skipping position restore - fresh session (flag set)";
+                    } else {
+                        ofLogVerbose("MediaPool") << "[TRANSPORT_START] Memory is empty, skipping position restore (fresh session)";
+                    }
+                }
+            }
+            
+            if (shouldRestore) {
+                // Restore position from memory (mode-aware: per-step, per-index, or global)
+                float storedPosition = positionMemory.restore(event.step, mediaIndex, 0.0f);
+                if (storedPosition > POSITION_THRESHOLD) {
+                    event.parameters["position"] = storedPosition;
+                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Using stored position for step " 
+                                             << event.step << ", media " << mediaIndex << ": " << storedPosition;
+                }
             }
         }
     }
     
-    // Lock-free queue push (std::queue is thread-safe for single producer, single consumer)
-    // We use a mutex only for queue access, but this is minimal overhead
+    // Lock-free queue push
     {
         std::lock_guard<std::mutex> queueLock(stateMutex);
         eventQueue.push(event);
     }
+}
+
+//--------------------------------------------------------------
+// Position memory mode control
+void MediaPool::setPositionMemoryMode(PositionMemoryMode mode) {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    positionMemory.setMode(mode);
+    ofLogNotice("MediaPool") << "Position memory mode set to: " << (int)mode;
+}
+
+PositionMemoryMode MediaPool::getPositionMemoryMode() const {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    return positionMemory.getMode();
 }
 
 

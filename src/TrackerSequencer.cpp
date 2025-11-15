@@ -766,6 +766,7 @@ void TrackerSequencer::triggerStep(int step) {
     // Modules will map these to their own parameters
     TriggerEvent triggerEvt;
     triggerEvt.duration = duration;
+    triggerEvt.step = step;  // Include step number for position memory modes
     
     // Map PatternCell parameters to TrackerSequencer parameters
     // "note" is the sequencer's parameter name (maps to cell.index for MediaPool)
@@ -1921,7 +1922,7 @@ void TrackerSequencer::configureParameterCellCallbacks(ParameterCell& cell, int 
     
     // getCurrentValue callback - returns current value from PatternCell
     // Returns NaN to indicate empty/not set (will display as "--")
-    // For fixed columns, still uses -1.0f for compatibility
+    // Unified system: all empty values (Index, Length, dynamic parameters) use NaN
     cell.getCurrentValue = [this, step, paramName, isFixedCol, fixedTypeCol]() -> float {
         if (!isValidStep(step)) {
             // Return NaN for invalid step (will display as "--")
@@ -1931,14 +1932,13 @@ void TrackerSequencer::configureParameterCellCallbacks(ParameterCell& cell, int 
         auto& patternCell = getCurrentPattern()[step];
         
         if (isFixedCol && fixedTypeCol == "index") {
-            // Index: return 1-based display value (0 = rest, 1+ = media index)
+            // Index: return NaN when empty (index <= 0), otherwise return 1-based display value
             int idx = patternCell.index;
-            return (idx < 0) ? 0.0f : (float)(idx + 1);
+            return (idx < 0) ? std::numeric_limits<float>::quiet_NaN() : (float)(idx + 1);
         } else if (isFixedCol && fixedTypeCol == "length") {
-            // Length: return -1.0f if index is -1 (rest), otherwise return length
-            // For fixed columns, we still use -1.0f for compatibility
+            // Length: return NaN when index < 0 (rest), otherwise return length
             if (patternCell.index < 0) {
-                return -1.0f; // Show "--" when index is rest
+                return std::numeric_limits<float>::quiet_NaN(); // Use NaN instead of -1.0f
             }
             return (float)patternCell.length;
         } else {

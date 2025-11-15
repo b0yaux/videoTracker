@@ -1177,7 +1177,9 @@ private:
 #include <unordered_set>
 
 MediaPool::MediaPool(const std::string& dataDir) 
-    : currentIndex(0), dataDirectory(dataDir), isSetup(false), currentMode(PlaybackMode::IDLE), currentPreviewMode(PreviewMode::STOP_AT_END), clock(nullptr), activePlayer(nullptr), lastTransportState(false), playerConnected(false) {
+    : currentIndex(0), dataDirectory(dataDir), isSetup(false), currentMode(PlaybackMode::IDLE), 
+      currentPreviewMode(PreviewMode::STOP_AT_END), clock(nullptr), activePlayer(nullptr), 
+      lastTransportState(false), playerConnected(false), gateTimerActive(false), gateEndTime(0.0f) {
     // setup() will be called later with clock reference
 }
 
@@ -1458,32 +1460,6 @@ bool MediaPool::isVideoFile(const std::string& filename) {
     return (ext == "mov" || ext == "mp4" || ext == "avi");
 }
 
-std::string MediaPool::findMatchingVideo(const std::string& audioFile) {
-    std::string audioBase = getBaseName(audioFile);
-    
-    // Use hash map for O(1) lookup instead of O(n) linear search
-    for (const auto& videoFile : videoFiles) {
-        std::string videoBase = getBaseName(videoFile);
-        if (audioBase == videoBase) {
-            return videoFile;
-        }
-    }
-    
-    return "";
-}
-
-std::string MediaPool::findMatchingAudio(const std::string& videoFile) {
-    std::string videoBase = getBaseName(videoFile);
-    
-    for (const auto& audioFile : audioFiles) {
-        std::string audioBase = getBaseName(audioFile);
-        if (audioBase == videoBase) {
-            return audioFile;
-        }
-    }
-    
-    return "";
-}
 
 std::string MediaPool::getMediaDirectory() const {
     return dataDirectory;
@@ -1684,7 +1660,8 @@ void MediaPool::stopAllMedia() {
         disconnectActivePlayer();
     }
     
-    // Transition to IDLE state
+    // Reset gate timer and transition to IDLE
+    gateTimerActive = false;
     currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
 }
 
@@ -1810,147 +1787,80 @@ PreviewMode MediaPool::getPreviewMode() const {
 
 //--------------------------------------------------------------
 void MediaPool::update() {
-
-    // Update position memory: Store current playback position for active player
+    PlaybackMode mode = currentMode.load(std::memory_order_relaxed);
+    float currentTime = ofGetElapsedTimef();
+    
+    // Check gate timer expiration for sequencer-triggered playback
+    if (mode == PlaybackMode::SEQUENCER_ACTIVE && gateTimerActive) {
+        if (currentTime >= gateEndTime) {
+            // Gate expired - stop playback and transition to IDLE
+            if (activePlayer) {
+                activePlayer->stop();
+            }
+            currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+            gateTimerActive = false;
+            ofLogNotice("MediaPool") << "[GATE_END] Gate timer expired - transitioning to IDLE mode";
+        }
+    }
+    
+    // Update position memory and detect playback state changes
     if (activePlayer && currentIndex < players.size()) {
         bool isCurrentlyPlaying = activePlayer->isPlaying();
         bool wasPlaying = lastPlayingStateByMediaIndex[currentIndex];
         
         if (isCurrentlyPlaying) {
-            // Player is playing - store position only when it's actually advancing
+            // Store position when advancing
             float currentPosition = activePlayer->position.get();
             auto it = lastPositionByMediaIndex.find(currentIndex);
             
-            // SIMPLIFIED LOGIC: Only store position when it's advancing forward
-            // This prevents storing startPosition (near-zero) when playback just started
-            float currentStartPosition = activePlayer->startPosition.get();
             if (it == lastPositionByMediaIndex.end()) {
-                // First time storing - only store if position is meaningful (> 1% into media)
-                // This prevents storing near-zero startPosition values
-                if (currentPosition > 0.01f) {
+                if (currentPosition > POSITION_THRESHOLD) {
                     lastPositionByMediaIndex[currentIndex] = currentPosition;
-                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Stored initial position for media " << currentIndex 
-                                             << ": " << currentPosition 
-                                             << " | startPosition: " << currentStartPosition;
                 }
             } else {
-                // Already have stored position - only update if advancing forward
-                // This prevents overwriting good positions with earlier/near-zero values
                 float storedPosition = it->second;
-                if (currentPosition > storedPosition + 0.001f) {
-                    // Position advanced - update stored value
+                if (currentPosition > storedPosition + POSITION_EPSILON) {
                     lastPositionByMediaIndex[currentIndex] = currentPosition;
-                    if (std::abs(currentPosition - storedPosition) > 0.01f) {
-                        ofLogNotice("MediaPool") << "[POSITION_MEMORY] Stored advancing position for media " << currentIndex 
-                                                 << ": " << currentPosition << " (was: " << storedPosition << ")"
-                                                 << " | startPosition: " << currentStartPosition;
-                    }
                 }
-                // If position didn't advance or went backward, keep existing stored value
             }
         } else if (wasPlaying && !isCurrentlyPlaying) {
-            // Player just stopped - capture final position for position memory
-            // Note: stop() preserves the actual playback position (fixed in MediaPlayer::stop())
+            // Player stopped - capture final position
             float stoppedPosition = activePlayer->position.get();
-            float stoppedStartPosition = activePlayer->startPosition.get();
             
-            ofLogNotice("MediaPool") << "[POSITION_MEMORY] Player stopped for media " << currentIndex
-                                      << " | position: " << stoppedPosition 
-                                      << " | startPosition: " << stoppedStartPosition;
-            
-            // CRITICAL FIX: If position was reset to 0 (or near-zero) after stop(),
-            // it means the underlying players reset their position before stop() could preserve it.
-            // In this case, check if we already have a stored position that's more recent.
-            // If the current position is invalid (< 0.01f) but we have a stored position,
-            // use the stored position instead (it was captured before the reset).
-            if (stoppedPosition < 0.01f) {
-                // Position was reset - check if we have a stored position
+            if (stoppedPosition < POSITION_THRESHOLD) {
                 auto it = lastPositionByMediaIndex.find(currentIndex);
-                if (it != lastPositionByMediaIndex.end() && it->second > 0.01f) {
-                    // Use the stored position (it was captured before the reset)
+                if (it != lastPositionByMediaIndex.end() && it->second > POSITION_THRESHOLD) {
                     stoppedPosition = it->second;
-                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Position was reset to " 
-                                             << activePlayer->position.get() 
-                                             << ", using stored position: " << stoppedPosition;
                 }
             }
             
-            // Only store if position is meaningful (> 1% into media)
-            // This prevents storing near-zero positions when playback stops immediately
-            if (stoppedPosition > 0.01f) {
-                float oldStored = (lastPositionByMediaIndex.find(currentIndex) != lastPositionByMediaIndex.end()) 
-                                  ? lastPositionByMediaIndex[currentIndex] : 0.0f;
+            if (stoppedPosition > POSITION_THRESHOLD) {
                 lastPositionByMediaIndex[currentIndex] = stoppedPosition;
-                
-                if (std::abs(stoppedPosition - oldStored) > 0.001f) {
-                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Captured position on stop for media " 
-                                             << currentIndex << ": " << stoppedPosition 
-                                             << " (was: " << oldStored << ")";
-                }
-            } else {
-                ofLogNotice("MediaPool") << "[POSITION_MEMORY] Position too small to store on stop: " 
-                                         << stoppedPosition << " (threshold: 0.01)";
             }
             
-            // CRITICAL FIX: Check for stop transition IMMEDIATELY when player stops
-            // This must happen BEFORE updating lastPlayingStateByMediaIndex so we can use the correct wasPlaying value
-            // AND BEFORE processing new events, so we don't restart playback immediately after stop
-            // Automatically transition to IDLE when player stops (for both SEQUENCER_ACTIVE and MANUAL_PREVIEW)
-            PlaybackMode mode = currentMode.load(std::memory_order_relaxed);
+            // Transition to IDLE when playback stops
+            mode = currentMode.load(std::memory_order_relaxed);
             if (mode == PlaybackMode::SEQUENCER_ACTIVE) {
-                // Player was playing and then stopped while in SEQUENCER_ACTIVE mode - gate ended
-                // Transition to IDLE mode so the button state updates correctly (goes back to grey)
                 currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
-                ofLogNotice("MediaPool") << "[GATE_END] Gate ended for sequencer-triggered step (media " << currentIndex 
-                                         << ") - transitioning to IDLE mode | wasPlaying: " << wasPlaying 
-                                         << " -> isPlaying: " << isCurrentlyPlaying;
+                gateTimerActive = false;
+                ofLogNotice("MediaPool") << "[GATE_END] Player stopped - transitioning to IDLE mode";
             } else if (mode == PlaybackMode::MANUAL_PREVIEW) {
-                // Player was playing and then stopped while in MANUAL_PREVIEW mode
-                // Transition to IDLE mode automatically (no need for separate stopManualPreview())
                 currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
                 ofLogNotice("MediaPool") << "[MANUAL_STOP] Manual preview stopped - transitioning to IDLE mode";
             }
         }
         
-        // Update playing state tracking (AFTER gate end check so we can use the correct wasPlaying value)
         lastPlayingStateByMediaIndex[currentIndex] = isCurrentlyPlaying;
     }
     
-    // Process lock-free event queue from audio thread (moved to GUI thread)
-    // NOTE: This is called AFTER gate end detection, so if a gate just ended and transitioned to IDLE,
-    // any new triggers will restart playback and transition back to SEQUENCER_ACTIVE.
-    // This is correct behavior - the button will turn green again if there's a new step.
-    // But if there's NO new trigger, the button will correctly stay grey (IDLE mode).
+    // Process event queue
     processEventQueue();
     
     // Check for end-of-media in manual preview mode
-    // Use the underlying players' built-in end detection instead of hacky position checking
-    PlaybackMode mode = currentMode.load(std::memory_order_relaxed);
+    mode = currentMode.load(std::memory_order_relaxed);
     if (mode == PlaybackMode::MANUAL_PREVIEW && activePlayer) {
-        // Check if the player has stopped playing (which happens automatically at end)
         if (!activePlayer->isPlaying() && !activePlayer->loop.get()) {
-            // Media has reached the end and stopped
             onManualPreviewEnd();
-        }
-    }
-    
-    // CRITICAL FIX: Double-check gate end AFTER processing events
-    // This handles the case where the player stops AFTER processEventQueue() runs
-    // (e.g., if gate end happens in the same frame as event processing)
-    // We need to check again to ensure mode transitions to IDLE if player stopped
-    // and no new playback was started by processEventQueue()
-    if (activePlayer && currentIndex < players.size()) {
-        bool isCurrentlyPlaying = activePlayer->isPlaying();
-        bool wasPlaying = lastPlayingStateByMediaIndex[currentIndex];
-        mode = currentMode.load(std::memory_order_relaxed);
-        
-        // If player stopped and we're still in SEQUENCER_ACTIVE mode, transition to IDLE
-        // This catches gate ends that happen after processEventQueue() processes events
-        if (mode == PlaybackMode::SEQUENCER_ACTIVE && wasPlaying && !isCurrentlyPlaying) {
-            currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
-            ofLogNotice("MediaPool") << "[GATE_END] Gate ended for sequencer-triggered step (media " << currentIndex 
-                                     << ") - transitioning to IDLE mode (post-event-check) | wasPlaying: " << wasPlaying 
-                                     << " -> isPlaying: " << isCurrentlyPlaying;
         }
     }
 }
@@ -1987,31 +1897,15 @@ void MediaPool::processEventQueue() {
         // Handle empty cells (rests) - stop immediately
         if (mediaIndex < 0) {
             if (activePlayer) {
-                // Capture position before stopping (for position memory)
-                // Only store if meaningful - update() will handle the actual storage
                 if (activePlayer->isPlaying() && currentIndex < players.size()) {
                     float currentPosition = activePlayer->position.get();
-                    float currentStartPosition = activePlayer->startPosition.get();
-                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Rest stop for media " << currentIndex
-                                              << " | position: " << currentPosition 
-                                              << " | startPosition: " << currentStartPosition;
-                    // Only store if meaningful (> 1%) - prevents storing near-zero values
-                    if (currentPosition > 0.01f) {
+                    if (currentPosition > POSITION_THRESHOLD) {
                         lastPositionByMediaIndex[currentIndex] = currentPosition;
-                        ofLogNotice("MediaPool") << "[POSITION_MEMORY] Captured position before rest stop: media " 
-                                                 << currentIndex << " = " << currentPosition;
                     }
                 }
                 activePlayer->stop();
-                // After stop, log both positions again to see if they changed
-                if (currentIndex < players.size()) {
-                    float afterStopPosition = activePlayer->position.get();
-                    float afterStopStartPosition = activePlayer->startPosition.get();
-                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] After rest stop for media " << currentIndex
-                                              << " | position: " << afterStopPosition 
-                                              << " | startPosition: " << afterStopStartPosition;
-                }
             }
+            gateTimerActive = false;
             localQueue.pop();
             continue;
         }
@@ -2029,23 +1923,13 @@ void MediaPool::processEventQueue() {
             continue;
         }
         
-        // Only set active player if it's different (optimization: avoid resetting connection flag)
+        // Set active player if changed
         bool playerChanged = (currentIndex != mediaIndex || activePlayer != player);
         if (playerChanged) {
-            // Capture position of previous player before switching (for position memory)
-            // Only store if meaningful - update() will handle the actual storage during playback
             if (activePlayer && activePlayer->isPlaying() && currentIndex < players.size()) {
                 float currentPosition = activePlayer->position.get();
-                float currentStartPosition = activePlayer->startPosition.get();
-                ofLogNotice("MediaPool") << "[POSITION_MEMORY] Player switch from media " << currentIndex
-                                          << " | position: " << currentPosition 
-                                          << " | startPosition: " << currentStartPosition
-                                          << " (switching to media " << mediaIndex << ")";
-                // Only store if meaningful (> 1%) - prevents storing near-zero values
-                if (currentPosition > 0.01f) {
+                if (currentPosition > POSITION_THRESHOLD) {
                     lastPositionByMediaIndex[currentIndex] = currentPosition;
-                    ofLogNotice("MediaPool") << "[POSITION_MEMORY] Captured position before switch: media " 
-                                             << currentIndex << " = " << currentPosition;
                 }
             }
             setActivePlayer(mediaIndex);
@@ -2087,59 +1971,35 @@ void MediaPool::processEventQueue() {
         }
         
         // Set volume (audio parameter)
-        if (std::abs(player->volume.get() - volume) > 0.001f) {
+        if (std::abs(player->volume.get() - volume) > PARAMETER_EPSILON) {
             player->volume.set(volume);
         }
         
-        // Set playback parameters (only if changed)
-        // PERFORMANCE CRITICAL: Only set startPosition before play() - don't set position
-        // because that triggers onPositionChanged() which calls expensive setPosition() (~200ms).
-        // The play() method will handle setting the actual video position efficiently.
-        // We'll update position parameter after play() for UI display, but without triggering listener.
-        float currentStartPos = player->startPosition.get();
-        float currentPos = player->position.get();
-        ofLogNotice("MediaPool") << "[POSITION_MEMORY] Processing trigger for media " << mediaIndex 
-                                  << " with position: " << position 
-                                  << " (currentIndex: " << currentIndex << ")"
-                                  << " | startPosition: " << currentStartPos 
-                                  << " | position: " << currentPos;
-        if (std::abs(currentStartPos - position) > 0.001f) {
+        // Set playback parameters
+        if (std::abs(player->startPosition.get() - position) > PARAMETER_EPSILON) {
             player->startPosition.set(position);
-            ofLogNotice("MediaPool") << "[POSITION_MEMORY] Set startPosition to: " << position;
         }
-        // NOTE: Don't set player->position here - it triggers expensive setPosition() via listener
-        // The play() method will set the position correctly based on startPosition
-        if (std::abs(player->speed.get() - speed) > 0.001f) {
+        if (std::abs(player->speed.get() - speed) > PARAMETER_EPSILON) {
             player->speed.set(speed);
         }
         
         // Use duration directly from TriggerEvent (already calculated in seconds by TrackerSequencer)
         float stepDurationSeconds = event.duration;
         
-        // Trigger media playback with gating (default behavior for step-based playback)
-        // NOTE: We do NOT store event.position here - that's the START position, not the current playback position.
-        // Position memory should only store the actual playback position during playback (in update()),
-        // or when capturing before stop. Storing event.position here would overwrite the real playback position.
+        // Trigger media playback with gating
         player->playWithGate(stepDurationSeconds);
         
-        // CRITICAL FIX: Only transition to SEQUENCER_ACTIVE if playback actually started
-        // This ensures the button state is correct - if playWithGate() fails or doesn't start playback,
-        // we stay in IDLE mode so the button doesn't incorrectly show as green
+        // Track gate timer for reliable gate-end detection
+        gateTimerActive = true;
+        gateEndTime = ofGetElapsedTimef() + stepDurationSeconds;
+        
+        // Transition to SEQUENCER_ACTIVE if playback started
         if (player->isPlaying()) {
-            // Transition to SEQUENCER_ACTIVE state (atomic write)
             currentMode.store(PlaybackMode::SEQUENCER_ACTIVE, std::memory_order_relaxed);
         } else {
-            // Playback didn't start - stay in IDLE mode
-            // This can happen if the player is in a bad state or media isn't loaded
+            gateTimerActive = false;
             ofLogWarning("MediaPool") << "playWithGate() called but player is not playing - staying in IDLE mode";
         }
-        
-        // Log positions after playWithGate to track any changes
-        float afterPlayPosition = player->position.get();
-        float afterPlayStartPosition = player->startPosition.get();
-        ofLogNotice("MediaPool") << "[POSITION_MEMORY] After playWithGate for media " << mediaIndex
-                                  << " | position: " << afterPlayPosition 
-                                  << " | startPosition: " << afterPlayStartPosition;
         
         localQueue.pop();
     }
@@ -2228,24 +2088,17 @@ void MediaPool::onTransportChanged(bool isPlaying) {
         lastTransportState = isPlaying;
         
         if (!isPlaying) {
-            // Transport stopped - transition to IDLE if in SEQUENCER_ACTIVE mode
+            // Transport stopped - reset gate timer and transition to IDLE
             if (currentMode.load(std::memory_order_relaxed) == PlaybackMode::SEQUENCER_ACTIVE) {
+                gateTimerActive = false;
                 currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
-                ofLogNotice("MediaPool") << "Transport stopped - transitioning to IDLE mode";
                 
-                // Stop any active player that was playing under sequencer control
                 if (activePlayer && activePlayer->isPlaying()) {
                     activePlayer->stop();
-                    // REMOVED: Don't notify position change on transport stop
-                    // The pattern already has the correct position value from when the step was triggered
-                    // Position sync should only happen when user explicitly edits position, not on transport state changes
-                    // This prevents unwanted pattern cell edits when pausing playback
-                    ofLogNotice("MediaPool") << "Stopped active player due to transport stop";
                 }
             }
         }
         
-        // Notify any registered transport listener
         if (transportListener) {
             transportListener(isPlaying);
         }
@@ -2311,36 +2164,36 @@ void MediaPool::setParameter(const std::string& paramName, float value, bool not
         if (name == "volume") {
             oldValue = activePlayer->volume.get();
             activePlayer->volume.set(val);
-            return std::abs(oldValue - val) > 0.0001f;
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
         } else if (name == "speed") {
             oldValue = activePlayer->speed.get();
             activePlayer->speed.set(val);
-            return std::abs(oldValue - val) > 0.0001f;
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
         } else if (name == "pitch") {
             oldValue = activePlayer->pitch.get();
             activePlayer->pitch.set(val);
-            return std::abs(oldValue - val) > 0.0001f;
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
         } else if (name == "loopStart") {
             oldValue = activePlayer->loopStart.get();
             activePlayer->loopStart.set(val);
-            return std::abs(oldValue - val) > 0.0001f;
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
         } else if (name == "loopEnd") {
             oldValue = activePlayer->loopEnd.get();
             activePlayer->loopEnd.set(val);
-            return std::abs(oldValue - val) > 0.0001f;
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
         } else if (name == "position") {
             // Position has special handling: set both startPosition and position
             // When setting position via ParameterSync, we're setting the startPosition (for sync with tracker)
             // PERFORMANCE CRITICAL: Update position parameter for UI display, but rely on onPositionChanged() checks
             // to prevent expensive setPosition() calls when position is already correct
             oldValue = activePlayer->startPosition.get();
-            if (std::abs(oldValue - val) > 0.0001f) {
+            if (std::abs(oldValue - val) > PARAMETER_EPSILON) {
                 activePlayer->startPosition.set(val);
                 // Update position parameter for UI display (shows the target start position when paused)
                 // The onPositionChanged() listener will check if actual video position needs to change
-                // and only call expensive setPosition() if there's a significant difference (>0.01f threshold)
+                // and only call expensive setPosition() if there's a significant difference (POSITION_THRESHOLD)
                 float currentPos = activePlayer->position.get();
-                if (std::abs(currentPos - val) > 0.001f) {
+                if (std::abs(currentPos - val) > POSITION_EPSILON) {
                     activePlayer->position.set(val);
                 }
                 return true;
@@ -2587,6 +2440,10 @@ private:
     // Track last playing state to detect when player stops (for position capture)
     std::map<int, bool> lastPlayingStateByMediaIndex;
     
+    // Gate timer tracking for sequencer-triggered playback
+    bool gateTimerActive;
+    float gateEndTime;
+    
     // Parameter change callback (inherited from Module base class)
     // Note: MediaPool inherits parameterChangeCallback from Module
     
@@ -2595,8 +2452,11 @@ private:
     void scanMediaFiles(const std::string& path, ofDirectory& dir);  // Extract duplicate logic
     bool isAudioFile(const std::string& filename);
     bool isVideoFile(const std::string& filename);
-    std::string findMatchingVideo(const std::string& audioFile);
-    std::string findMatchingAudio(const std::string& videoFile);
+    
+    // Position and parameter comparison thresholds
+    static constexpr float POSITION_EPSILON = 0.001f;      // Small difference threshold for position comparisons
+    static constexpr float POSITION_THRESHOLD = 0.01f;     // Significant position threshold (for video seeking, position memory)
+    static constexpr float PARAMETER_EPSILON = 0.001f;     // Small difference threshold for parameter comparisons
     
 };
 #include "MediaPoolGUI.h"
@@ -3097,7 +2957,7 @@ void MediaPoolGUI::drawWaveform() {
                     
                     // Prepare data for ImDrawList - much more efficient than manual drawing
                     // Resize vectors if needed
-                    int maxPoints = 2000; // Reasonable number of points for smooth waveform
+                    int maxPoints = MAX_WAVEFORM_POINTS;
                     int stepSize = std::max(1, numFrames / maxPoints);
                     actualPoints = std::min(maxPoints, numFrames / stepSize);
                     
@@ -3540,7 +3400,8 @@ void MediaPoolGUI::drawMediaIndexButton(int columnIndex, size_t numParamColumns)
         if (currentPlayer == activePlayer) {
             // Button is green if mode is MANUAL_PREVIEW OR SEQUENCER_ACTIVE
             // This syncs with both manual clicks and external sequencer triggers
-            isCurrentMediaPlaying = mediaPool->isManualPreview() || mediaPool->isSequencerActive();
+            isCurrentMediaPlaying = (mediaPool->isManualPreview() || mediaPool->isSequencerActive()) 
+                        && currentPlayer->isPlaying();
         }
     }
     
@@ -3836,6 +3697,7 @@ private:
     
     // Waveform visualization
     float waveformHeight;
+    static constexpr int MAX_WAVEFORM_POINTS = 2000;  // Maximum number of points for smooth waveform rendering
     
     // Navigation state (parent widget pattern, similar to TrackerSequencerGUI)
     ImGuiID parentWidgetId = 0;
@@ -19905,1103 +19767,3 @@ private:
     void saveLayout();
     void loadLayout();
 };
-#include "MenuBar.h"
-#include "ofLog.h"
-
-MenuBar::MenuBar() {
-}
-
-void MenuBar::setup(
-    std::function<void()> onSavePattern_fn,
-    std::function<void()> onLoadPattern_fn,
-    std::function<void()> onSaveLayout_fn,
-    std::function<void()> onLoadLayout_fn
-) {
-    onSavePattern = onSavePattern_fn;
-    onLoadPattern = onLoadPattern_fn;
-    onSaveLayout = onSaveLayout_fn;
-    onLoadLayout = onLoadLayout_fn;
-
-    ofLogNotice("MenuBar") << "Setup complete";
-}
-
-void MenuBar::draw() {
-    if (ImGui::BeginMainMenuBar()) {
-        drawFileMenu();
-        drawLayoutMenu();
-        drawHelpMenu();
-        ImGui::EndMainMenuBar();
-    }
-
-    // Help popup - draw every frame if open
-    // Note: OpenPopup must be called before BeginPopupModal in the same frame
-    // So we check if the flag was set and open it, then show the modal
-    if (showControlsHelp && ImGui::BeginPopupModal("Controls Help", &showControlsHelp, 
-                                    ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Controls");
-        ImGui::Text("SPACE: Play/Stop");
-        ImGui::Text("R: Reset");
-        ImGui::Text("G: Toggle GUI");
-        ImGui::Text("N: Next media");
-        ImGui::Text("M: Previous media");
-        ImGui::Text("S: Save pattern");
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Pattern Editing");
-        ImGui::Text("Click cells to edit");
-        ImGui::Text("Drag to set values");
-        ImGui::Text("Right-click for options");
-        ImGui::Separator();
-        if (ImGui::Button("Close")) {
-            showControlsHelp = false;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
-}
-
-void MenuBar::drawFileMenu() {
-    if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Save Pattern")) {
-            if (onSavePattern) onSavePattern();
-        }
-        if (ImGui::MenuItem("Load Pattern")) {
-            if (onLoadPattern) onLoadPattern();
-        }
-        ImGui::EndMenu();
-    }
-}
-
-void MenuBar::drawLayoutMenu() {
-    if (ImGui::BeginMenu("Layout")) {
-        if (ImGui::MenuItem("Save Layout as Default")) {
-            if (onSaveLayout) onSaveLayout();
-        }
-        if (ImGui::MenuItem("Load Default Layout")) {
-            if (onLoadLayout) onLoadLayout();
-        }
-        ImGui::EndMenu();
-    }
-}
-
-void MenuBar::drawHelpMenu() {
-    if (ImGui::BeginMenu("Help")) {
-        if (ImGui::MenuItem("Controls")) {
-            showControlsHelp = true;
-            // OpenPopup must be called in the same frame as BeginPopupModal
-            // We'll open it immediately here, then BeginPopupModal will be called in draw()
-            ImGui::OpenPopup("Controls Help");
-        }
-        ImGui::EndMenu();
-    }
-}
-
-#pragma once
-#include "ofMain.h"
-#include "ofxImGui.h"
-#include <functional>
-#include <string>
-
-class MenuBar {
-public:
-    MenuBar();
-    ~MenuBar() = default;
-
-    // Setup with callback functions
-    void setup(
-        std::function<void()> onSavePattern,
-        std::function<void()> onLoadPattern,
-        std::function<void()> onSaveLayout,
-        std::function<void()> onLoadLayout
-    );
-
-    // Called every frame in ofApp::draw()
-    // Returns true if menu bar is active (prevents input below)
-    void draw();
-
-    // Accessor for help popup state (optional, for external management)
-    bool isHelpPopupOpen() const { return showControlsHelp; }
-    void closeHelpPopup() { showControlsHelp = false; }
-
-private:
-    // Callback functions
-    std::function<void()> onSavePattern;
-    std::function<void()> onLoadPattern;
-    std::function<void()> onSaveLayout;
-    std::function<void()> onLoadLayout;
-
-    // UI state
-    bool showControlsHelp = false;
-
-    // Private helper methods for each menu section
-    void drawFileMenu();
-    void drawLayoutMenu();
-    void drawHelpMenu();
-};
-
-#include "ViewManager.h"
-#include "Clock.h"
-#include "ClockGUI.h"
-#include "MediaPool.h"
-#include "MediaPoolGUI.h"
-#include "TrackerSequencer.h"
-#include "TrackerSequencerGUI.h"
-#include "ofxSoundObjects.h"
-#include "ofxImGui.h"
-#include "ofSoundStream.h"
-#include "ofLog.h"
-
-ViewManager::ViewManager() {
-}
-
-void ViewManager::setup(
-    Clock* clock_,
-    ClockGUI* clockGUI_,
-    ofxSoundOutput* audioOutput_,
-    TrackerSequencer* tracker_,
-    TrackerSequencerGUI* trackerGUI_,
-    MediaPool* mediaPool_,
-    MediaPoolGUI* mediaPoolGUI_,
-    ofSoundStream* soundStream_
-) {
-    clock = clock_;
-    clockGUI = clockGUI_;
-    audioOutput = audioOutput_;
-    tracker = tracker_;
-    trackerGUI = trackerGUI_;
-    mediaPool = mediaPool_;
-    mediaPoolGUI = mediaPoolGUI_;
-    soundStream = soundStream_;
-    
-    // Initialize audio devices
-    if (soundStream) {
-        audioDevices = soundStream->getDeviceList();
-        
-        // Find default output device
-        for (size_t i = 0; i < audioDevices.size(); i++) {
-            if (audioDevices[i].isDefaultOutput) {
-                selectedAudioDevice = i;
-                break;
-            }
-        }
-        
-        // Store listener for future device changes (will be set by ofApp after setup)
-        // Initial setup will be done by ofApp after setting listener
-    }
-
-    ofLogNotice("ViewManager") << "Setup complete with " 
-                               << PANEL_NAMES.size() << " panels";
-}
-
-// setAudioDeviceState() removed - audio state is now owned by ViewManager
-
-void ViewManager::navigateToPanel(Panel panel) {
-    if (panel < Panel::COUNT) {
-        currentPanel = panel;
-        ofLogNotice("ViewManager") << "Navigated to: " 
-                                   << PANEL_NAMES[static_cast<int>(panel)];
-    }
-}
-
-void ViewManager::nextPanel() {
-    int next = (static_cast<int>(currentPanel) + 1) % static_cast<int>(Panel::COUNT);
-    navigateToPanel(static_cast<Panel>(next));
-}
-
-void ViewManager::previousPanel() {
-    int prev = (static_cast<int>(currentPanel) - 1 + static_cast<int>(Panel::COUNT)) 
-             % static_cast<int>(Panel::COUNT);
-    navigateToPanel(static_cast<Panel>(prev));
-}
-
-void ViewManager::handleMouseClick(int x, int y) {
-    // This could be enhanced to detect which panel was clicked
-    // For now, ImGui handles this automatically
-}
-
-const char* ViewManager::getCurrentPanelName() const {
-    int idx = static_cast<int>(currentPanel);
-    if (idx >= 0 && idx < PANEL_NAMES.size()) {
-        return PANEL_NAMES[idx];
-    }
-    return "Unknown";
-}
-
-void ViewManager::draw() {
-    // Draw panels - each panel will set focus if needed (before Begin())
-    // We need to track panel changes, but update lastPanel AFTER drawing
-    // so each panel can check if it should set focus
-    Panel previousPanel = lastPanel;
-    
-    drawClockPanel(previousPanel);
-    drawAudioOutputPanel(previousPanel);
-    drawTrackerPanel(previousPanel);
-    drawMediaPoolPanel(previousPanel);
-    
-    // Update lastPanel after drawing (so next frame can detect changes)
-    lastPanel = currentPanel;
-}
-
-void ViewManager::setFocusIfChanged() {
-    // This method is no longer needed - focus setting is handled in draw()
-    // Keeping it for compatibility but it does nothing
-}
-
-void ViewManager::drawClockPanel(Panel previousPanel) {
-    if (clockGUI && clock) {
-        // Set focus only when panel changed and this is the current panel
-        // Must be called BEFORE Begin() for it to work
-        if (currentPanel == Panel::CLOCK && currentPanel != previousPanel) {
-            ImGui::SetNextWindowFocus();
-        }
-        
-        if (ImGui::Begin("Clock ")) {
-            // Detect mouse click on panel background (not on widgets) to switch focus
-            // Only switch if clicking on the window background, not on interactive widgets
-            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                navigateToPanel(Panel::CLOCK);
-            }
-            
-            // Clock controls
-            clockGUI->draw(*clock);
-            ImGui::End();
-        }
-    }
-}
-
-void ViewManager::drawAudioOutputPanel(Panel previousPanel) {
-    // Set focus only when panel changed and this is the current panel
-    // Must be called BEFORE Begin() for it to work
-    if (currentPanel == Panel::AUDIO_OUTPUT && currentPanel != previousPanel) {
-        ImGui::SetNextWindowFocus();
-    }
-    
-    if (ImGui::Begin("Audio Output")) {
-        // Detect mouse click on panel background (not on widgets) to switch focus
-        // Only switch if clicking on the window background, not on interactive widgets
-        if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-            navigateToPanel(Panel::AUDIO_OUTPUT);
-        }
-        
-        // Audio device selection
-        if (!audioDevices.empty()) {
-            if (ImGui::Combo("Device", &selectedAudioDevice, [](void* data, int idx, const char** out_text) {
-                auto* devices = static_cast<std::vector<ofSoundDevice>*>(data);
-                if (idx >= 0 && idx < devices->size()) {
-                    *out_text = (*devices)[idx].name.c_str();
-                    return true;
-                }
-                return false;
-            }, &audioDevices, audioDevices.size())) {
-                audioDeviceChanged = true;
-            }
-            
-            if (audioDeviceChanged && soundStream) {
-                // Re-setup audio stream with new device, preserving listener
-                setupAudioStream();
-                audioDeviceChanged = false;
-            }
-        }
-        
-        // Volume control
-        ImGui::SliderFloat("Volume", &globalVolume, 0.0f, 1.0f, "%.2f");
-        
-        // Audio level visualization
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.0f, 1.0f, 0.0f, 1.0f));
-        ImGui::ProgressBar(currentAudioLevel, ImVec2(-1, 0), "");
-            ImGui::PopStyleColor();
-        ImGui::Text("Level: %.3f", currentAudioLevel);
-        ImGui::End();
-    }
-}
-
-void ViewManager::drawTrackerPanel(Panel previousPanel) {
-    if (trackerGUI && tracker) {
-        // Set focus only when panel changed and this is the current panel
-        // Must be called BEFORE Begin() for it to work
-        if (currentPanel == Panel::TRACKER && currentPanel != previousPanel) {
-            ImGui::SetNextWindowFocus();
-        }
-        
-        if (ImGui::Begin("Tracker Sequencer")) {
-            // Detect mouse click on panel background (not on widgets) to switch focus
-            // Only switch if clicking on the window background, not on interactive widgets
-            // This allows clicking on tracker cells to work regardless of which panel is "current"
-            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                navigateToPanel(Panel::TRACKER);
-                // CRITICAL: Clear cell focus when clicking empty space to prevent auto-focus loop
-                // This prevents ImGui from auto-focusing the first cell when clicking empty space
-                tracker->clearCellFocus();
-            }
-            
-            trackerGUI->draw(*tracker);
-            ImGui::End();
-        }
-    }
-}
-
-void ViewManager::drawMediaPoolPanel(Panel previousPanel) {
-    if (mediaPoolGUI && mediaPool) {
-        // Set focus only when panel changed and this is the current panel
-        // Must be called BEFORE Begin() for it to work
-        if (currentPanel == Panel::MEDIA_POOL && currentPanel != previousPanel) {
-            ImGui::SetNextWindowFocus();
-        }
-        
-        if (ImGui::Begin("Media Pool")) {
-            // Detect mouse click on panel background (not on widgets) to switch focus
-            // Only switch if clicking on the window background, not on interactive widgets
-            // This allows clicking on media pool items to work regardless of which panel is "current"
-            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                navigateToPanel(Panel::MEDIA_POOL);
-            }
-            
-            mediaPoolGUI->draw();  // Delegate to separate GUI
-            ImGui::End();
-        }
-    }
-}
-
-void ViewManager::setupAudioStream(ofBaseApp* listener) {
-    if (!soundStream || audioDevices.empty()) {
-        ofLogError("ViewManager") << "Cannot setup audio stream: no soundStream or devices";
-        return;
-    }
-    
-    // Use provided listener or stored listener
-    ofBaseApp* listenerToUse = listener ? listener : audioListener;
-    
-    // Close existing stream if open
-    soundStream->close();
-    
-    // Setup audio stream with selected device
-    ofSoundStreamSettings settings;
-    if (listenerToUse) {
-        settings.setOutListener(listenerToUse);
-    }
-    settings.sampleRate = 44100;
-    settings.numOutputChannels = 2;
-    settings.numInputChannels = 0;
-    settings.bufferSize = 512;
-    
-    if (selectedAudioDevice >= 0 && selectedAudioDevice < (int)audioDevices.size()) {
-        settings.setOutDevice(audioDevices[selectedAudioDevice]);
-    }
-    
-    soundStream->setup(settings);
-    ofLogNotice("ViewManager") << "Audio stream setup with device: " 
-                               << (selectedAudioDevice < (int)audioDevices.size() 
-                                   ? audioDevices[selectedAudioDevice].name 
-                                   : "default");
-}
-
-#pragma once
-#include "ofMain.h"
-#include <array>
-#include <string>
-
-class Clock;
-class ClockGUI;
-class MediaPool;
-class MediaPoolGUI;
-class TrackerSequencer;
-class TrackerSequencerGUI;
-class ofxSoundOutput;
-class ofSoundStream;
-
-// Panel identifiers
-enum class Panel {
-    CLOCK = 0,
-    AUDIO_OUTPUT = 1,
-    TRACKER = 2,
-    MEDIA_POOL = 3,
-    COUNT = 4
-};
-
-class ViewManager {
-public:
-    ViewManager();
-    ~ViewManager() = default;
-
-    // Setup - pass all GUI objects and domains
-    void setup(
-        Clock* clock,
-        ClockGUI* clockGUI,
-        ofxSoundOutput* audioOutput,
-        TrackerSequencer* tracker,
-        TrackerSequencerGUI* trackerGUI,
-        MediaPool* mediaPool,
-        MediaPoolGUI* mediaPoolGUI,
-        ofSoundStream* soundStream  // For audio device management
-    );
-
-    // Panel navigation
-    void navigateToPanel(Panel panel);
-    void nextPanel();
-    void previousPanel();
-    Panel getCurrentPanel() const { return currentPanel; }
-
-    // Mouse click detection and panel switching
-    void handleMouseClick(int x, int y);
-
-    // Main draw function - delegates to appropriate panels
-    void draw();
-
-    // Getters for current state
-    int getCurrentPanelIndex() const { return static_cast<int>(currentPanel); }
-    const char* getCurrentPanelName() const;
-
-    // Audio state access (for ofApp to update currentAudioLevel and set listener)
-    void setCurrentAudioLevel(float level) { currentAudioLevel = level; }
-    float getGlobalVolume() const { return globalVolume; }
-    void setAudioListener(ofBaseApp* listener) { audioListener = listener; }
-    
-    // Audio device management (public for ofApp to call after setting listener)
-    void setupAudioStream(ofBaseApp* audioListener = nullptr);
-
-private:
-    // Panel references
-    Clock* clock = nullptr;
-    ClockGUI* clockGUI = nullptr;
-    ofxSoundOutput* audioOutput = nullptr;
-    TrackerSequencer* tracker = nullptr;
-    TrackerSequencerGUI* trackerGUI = nullptr;
-    MediaPool* mediaPool = nullptr;
-    MediaPoolGUI* mediaPoolGUI = nullptr;
-    ofSoundStream* soundStream = nullptr;  // For audio device management
-
-    // Audio Output panel state (owned by ViewManager)
-    std::vector<ofSoundDevice> audioDevices;
-    int selectedAudioDevice = 0;
-    bool audioDeviceChanged = false;
-    float globalVolume = 1.0f;
-    float currentAudioLevel = 0.0f;
-    ofBaseApp* audioListener = nullptr;  // Store listener for device changes
-
-    // State
-    Panel currentPanel = Panel::CLOCK;
-    Panel lastPanel = Panel::COUNT;  // Invalid, triggers focus on first draw
-
-    // Panel names for debugging/logging
-    static constexpr std::array<const char*, 4> PANEL_NAMES = {{
-        "Clock ",
-        "Audio Output",
-        "Tracker Sequencer",
-        "Media Pool"
-    }};
-
-    // Private draw methods for each panel
-    void drawClockPanel(Panel previousPanel);
-    void drawAudioOutputPanel(Panel previousPanel);
-    void drawTrackerPanel(Panel previousPanel);
-    void drawMediaPoolPanel(Panel previousPanel);
-
-    // Helper to set focus when panel changes (not every frame)
-    void setFocusIfChanged();
-};
-
-#include "InputRouter.h"
-#include "Clock.h"
-#include "TrackerSequencer.h"
-#include "TrackerSequencerGUI.h"
-#include "gui/ViewManager.h"
-#include "MediaPool.h"
-#include "MediaPoolGUI.h"
-#include "ofxImGui.h"
-#include "ofLog.h"
-
-InputRouter::InputRouter() {
-}
-
-void InputRouter::setup(
-    Clock* clock_,
-    TrackerSequencer* tracker_,
-    ViewManager* viewManager_,
-    MediaPool* mediaPool_,
-    MediaPoolGUI* mediaPoolGUI_
-) {
-    clock = clock_;
-    tracker = tracker_;
-    viewManager = viewManager_;
-    mediaPool = mediaPool_;
-    mediaPoolGUI = mediaPoolGUI_;
-
-    ofLogNotice("InputRouter") << "Setup complete";
-}
-
-void InputRouter::setPlayState(bool* isPlaying_) {
-    isPlaying = isPlaying_;
-}
-
-void InputRouter::setCurrentStep(int* currentStep_) {
-    currentStep = currentStep_;
-}
-
-void InputRouter::setLastTriggeredStep(int* lastTriggeredStep_) {
-    lastTriggeredStep = lastTriggeredStep_;
-}
-
-void InputRouter::setShowGUI(bool* showGUI_) {
-    showGUI = showGUI_;
-}
-
-bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
-    int key = keyEvent.key;
-    
-    // LOG: Entry point for all key presses
-    ofLogNotice("InputRouter") << "=== KEY PRESS: key=" << key 
-        << " ('" << (char)key << "')";
-    
-    // Priority 1: Panel navigation (Ctrl+Tab / Ctrl+Shift+Tab) - check BEFORE ImGui processes
-    // IMPORTANT: Use OF_KEY_CONTROL (not COMMAND) for Ctrl key
-    // On Mac: OF_KEY_CONTROL = Control key, OF_KEY_COMMAND = Command key (⌘)
-    if (key == OF_KEY_TAB) {
-        bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
-        if (ctrlPressed) {
-            if (handlePanelNavigation(keyEvent)) {
-                return true;
-            }
-        }
-        // Regular Tab (without Ctrl) - let ImGui handle it for native navigation
-        // Don't return false here, let it fall through to ImGui processing
-    }
-    
-    updateImGuiCaptureState();
-    
-    // Priority 2: Spacebar - ALWAYS works (global transport control)
-    // Handle spacebar BEFORE other checks to ensure it always works
-    if (key == ' ') {
-        // Alt+Spacebar: Trigger current edit step
-        if (keyEvent.hasModifier(OF_KEY_ALT)) {
-            if (tracker) {
-                int editStep = tracker->getEditStep();
-                if (editStep >= 0) {
-                    tracker->triggerStep(editStep);
-                    logKeyPress(key, "Alt+Spacebar: Trigger step");
-                    return true;
-                }
-            }
-        }
-        // Regular Spacebar: Play/Stop (always works, even when ImGui has focus)
-        if (handleGlobalShortcuts(key)) {
-            return true;
-        }
-    }
-    
-    // Priority 3: Other global shortcuts - only when ImGui isn't busy
-    if (!ImGui::IsAnyItemActive() && !ImGui::GetIO().WantCaptureMouse) {
-        if (handleGlobalShortcuts(key)) {
-            return true;
-        }
-    }
-    
-    // Priority 4: Tracker input - only when in tracker panel
-    // CRITICAL: Route tracker input BEFORE ImGui can consume it, even if ImGui wants keyboard
-    // This ensures Enter and numeric keys work when cells are focused
-    // 
-    // IMPORTANT: We check multiple conditions to determine if we're in the tracker panel:
-    // 1. Panel index == 2 (official tracker panel)
-    // 2. OR a tracker cell is focused (editStep/editColumn are valid)
-    // This handles both docked windows and regular panel navigation
-    int currentPanelIndex = viewManager ? viewManager->getCurrentPanelIndex() : -1;
-    bool trackerCellFocused = false;
-    bool onHeaderRow = false;
-    bool isParentWidgetFocused = false;
-    
-    // ALWAYS check tracker state if tracker exists, regardless of panel index
-    // This is because the user might be interacting with tracker even if ViewManager
-    // thinks a different panel is active (ImGui window focus vs ViewManager panel state)
-    if (tracker) {
-        int editStep = tracker->getEditStep();
-        int editColumn = tracker->getEditColumn();
-        // Check if a valid cell is focused (indicates user is interacting with tracker)
-        trackerCellFocused = (editStep >= 0 && editStep < tracker->getStepCount() && editColumn >= 0);
-        // Check if on header row (editStep == -1 AND parent widget is NOT focused)
-        // This distinguishes "on header row" (inside table) from "on parent widget" (outside table)
-        onHeaderRow = (editStep == -1 && !tracker->getIsEditingCell() && !tracker->getIsParentWidgetFocused());
-        // Check if parent widget is focused (container level)
-        isParentWidgetFocused = tracker->getIsParentWidgetFocused();
-    }
-    
-    bool isInTrackerPanel = (tracker && viewManager && currentPanelIndex == 2);
-    
-    ofLogNotice("InputRouter") << "  Panel check: tracker=" << (tracker ? "YES" : "NO")
-        << ", viewManager=" << (viewManager ? "YES" : "NO")
-        << ", currentPanelIndex=" << currentPanelIndex
-        << ", trackerCellFocused=" << (trackerCellFocused ? "YES" : "NO")
-        << ", onHeaderRow=" << (onHeaderRow ? "YES" : "NO")
-        << ", isParentWidgetFocused=" << (isParentWidgetFocused ? "YES" : "NO");
-    
-    // Check if we're at container level (parent widget focused) for any panel
-    // This allows navigation from container level to panel level
-    bool mediaPoolParentWidgetFocused = false;
-    if (mediaPoolGUI) {
-        mediaPoolParentWidgetFocused = mediaPoolGUI->getIsParentWidgetFocused();
-    }
-    bool atContainerLevel = isParentWidgetFocused || mediaPoolParentWidgetFocused;
-    
-    // DEBUG: Log container level state
-    if (atContainerLevel) {
-        ofLogNotice("InputRouter") << "  >>> AT CONTAINER LEVEL (parent widget focused) <<<";
-    }
-    
-    // When at container level, handle UP/DOWN or Ctrl+Enter to navigate between panels
-    // This allows going up one more level from container to panel/module level
-    // CRITICAL: When at container level, we're NOT in the tracker grid, so skip tracker input handling
-    // CRITICAL: Arrow keys MUST be passed to ImGui immediately when at container level
-    if (atContainerLevel) {
-        bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
-        bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-        
-        // First, handle panel navigation with modifiers (Ctrl+Enter, Ctrl+Shift+Enter)
-        if (viewManager) {
-            if (key == OF_KEY_RETURN && ctrlPressed && !shiftPressed) {
-                ofLogNotice("InputRouter") << "  At container level: Ctrl+Enter - navigating to previous panel";
-                viewManager->previousPanel();
-                return true; // Consume the key
-            } else if (key == OF_KEY_RETURN && ctrlPressed && shiftPressed) {
-                ofLogNotice("InputRouter") << "  At container level: Ctrl+Shift+Enter - navigating to next panel";
-                viewManager->nextPanel();
-                return true; // Consume the key
-            }
-        }
-        
-        // Then handle arrow keys - let ImGui process them for navigation
-        // This MUST happen after modifier checks but before any other processing
-        if (key == OF_KEY_UP || key == OF_KEY_DOWN || key == OF_KEY_LEFT || key == OF_KEY_RIGHT) {
-            ofLogNotice("InputRouter") << "  At container level: Arrow key " << key << " - letting ImGui handle navigation immediately";
-            // CRITICAL: Return false immediately to let ImGui process arrow keys
-            // Don't let any other code interfere with arrow key navigation
-            return false; // Let ImGui process arrow keys normally
-        }
-    }
-    
-    // Use either panel index check OR tracker cell focused check OR header row check
-    // BUT: If parent widget is focused, we're at container level, not in the grid
-    // This handles both docked windows and regular panel navigation, including header row navigation
-    bool inTrackerPanel = isInTrackerPanel || trackerCellFocused || onHeaderRow;
-    
-    // CRITICAL: Skip tracker input handling if we're at container level
-    // This ensures arrow keys work normally for ImGui navigation when parent widget is focused
-    if (tracker && inTrackerPanel && !atContainerLevel) {
-        // Check for modifier keys properly
-        bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
-        bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-        bool cmdPressed = keyEvent.hasModifier(OF_KEY_COMMAND);
-        
-        // CRITICAL: In edit mode, block arrow keys from ImGui navigation
-        // This prevents ImGui from moving focus when arrow keys adjust values
-        bool inEditMode = tracker->getIsEditingCell();
-        
-        // CRITICAL: Route Enter and numeric keys even when ImGui wants keyboard
-        // This ensures these keys work when cells are focused
-        // CRITICAL: In edit mode, ALWAYS route arrow keys to tracker BEFORE ImGui can process them
-        // This prevents ImGui from using arrow keys for navigation and changing focus
-        if (inEditMode && (key == OF_KEY_UP || key == OF_KEY_DOWN || 
-                           key == OF_KEY_LEFT || key == OF_KEY_RIGHT)) {
-            // Arrow keys in edit mode: always route to tracker (adjust values)
-            // Don't let ImGui use them for navigation - this locks focus to the editing cell
-            // Sync state first to ensure tracker knows current cell
-            syncEditStateFromImGuiFocus();
-            if (tracker->handleKeyPress(key, ctrlPressed, shiftPressed)) {
-                ofLogNotice("InputRouter") << "  Arrow key in edit mode: HANDLED by tracker (blocked from ImGui)";
-                logKeyPress(key, "Tracker: Arrow key in edit mode (blocked from ImGui)");
-                return true; // Consume the key to prevent ImGui from processing
-            }
-        }
-        
-        // When on header row, request focus move to parent widget
-        // We need to explicitly move focus since ImGui won't do it automatically
-        if (onHeaderRow && key == OF_KEY_UP && !inEditMode) {
-            ofLogNotice("InputRouter") << "  UP key on header row: requesting focus move to parent widget";
-            // Set flag for GUI to move focus to parent widget in next frame
-            tracker->requestFocusMoveToParentWidget();
-            // Clear cell focus so ImGui sees correct state
-            tracker->clearCellFocus();
-            // Consume the key - we handle the focus move ourselves
-            return true; // Consume the key
-        }
-        
-        // Enter key: Check for Ctrl+Enter (go up a level) vs Shift+Enter (exit grid)
-        if (key == OF_KEY_RETURN) {
-            // When on header row, don't route Enter to tracker - let ImGui handle it
-            if (onHeaderRow && !ctrlPressed && !shiftPressed) {
-                ofLogNotice("InputRouter") << "  Enter key on header row: letting ImGui handle (not routing to tracker)";
-                return false; // Let ImGui process the key
-            }
-            
-            ofLogNotice("InputRouter") << "  Enter key detected in tracker panel";
-            if (ctrlPressed) {
-                // Ctrl+Enter: Go up a level in navigation (exit grid to parent widget)
-                // Works from both cells and header row
-                ofLogNotice("InputRouter") << "  Ctrl+Enter: Requesting focus move to parent widget";
-                // Set flag for GUI to move focus to parent widget in next frame
-                tracker->requestFocusMoveToParentWidget();
-                // Clear cell focus so ImGui sees correct state
-                tracker->clearCellFocus();
-                // Consume the key - we handle the focus move ourselves
-                return true; // Consume the key
-            } else if (shiftPressed) {
-                // Shift+Enter: Exit grid navigation (clear cell selection)
-                ofLogNotice("InputRouter") << "  Shift+Enter: Exiting grid";
-                if (tracker->handleKeyPress(key, false, true)) {
-                    logKeyPress(key, "Tracker: Shift+Enter (exit grid)");
-                    return true;
-                }
-            } else {
-                // Regular Enter: Always try to handle it if we're in tracker panel
-                // CRITICAL: Sync editStep/editColumn from ImGui focus BEFORE calling handleKeyPress
-                // This ensures the tracker knows which cell is focused even if GUI sync hasn't happened yet
-                ofLogNotice("InputRouter") << "  Regular Enter: Syncing edit state from ImGui focus";
-                syncEditStateFromImGuiFocus();
-                
-                // DEBUG: Log frame count and state before handling
-                int currentFrame = ImGui::GetFrameCount();
-                int editStep = tracker->getEditStep();
-                int editColumn = tracker->getEditColumn();
-                bool isEditing = tracker->getIsEditingCell();
-                ofLogNotice("InputRouter") << "  Enter key at frame=" << currentFrame
-                    << ", editStep=" << editStep << ", editColumn=" << editColumn
-                    << ", isEditingCell=" << (isEditing ? "YES" : "NO");
-                
-                bool handled = tracker->handleKeyPress(key, false, false);
-                if (handled) {
-                    if (currentStep) {
-                        *currentStep = tracker->getCurrentStep();
-                    }
-                    ofLogNotice("InputRouter") << "  Enter key HANDLED by tracker";
-                    logKeyPress(key, "Tracker: Enter (handled)");
-                    return true;
-                } else {
-                    // Enter was pressed but tracker didn't handle it
-                    // This might mean editStep/editColumn aren't set yet
-                    ofLogWarning("InputRouter") << "  Enter key NOT handled by tracker. editStep=" << editStep 
-                        << ", editColumn=" << editColumn << ", isEditingCell=" << (isEditing ? "YES" : "NO");
-                    
-                    // Still consume it to prevent ImGui from activating buttons
-                    // The tracker should handle it next frame once GUI sync happens
-                    return true; // Consume to prevent ImGui from processing
-                }
-            }
-        }
-        
-        // Route numeric keys and edit mode keys to tracker
-        // This allows typing numbers to auto-enter edit mode, and handles edit mode input
-        ofLogNotice("InputRouter") << "  Checking numeric keys: inEditMode=" << (inEditMode ? "YES" : "NO");
-        if (inEditMode) {
-            // In edit mode: Arrow keys already handled above, now handle numeric input
-            // Numeric keys (including numpad - openFrameworks converts numpad to regular '0'-'9')
-            // Also handle decimal point, minus, backspace, delete for numeric input
-            if ((key >= '0' && key <= '9') ||
-                key == '.' || key == '-' || key == OF_KEY_BACKSPACE || key == OF_KEY_DEL) {
-                ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' in edit mode - routing to tracker";
-                if (tracker->handleKeyPress(key, ctrlPressed, shiftPressed)) {
-                    ofLogNotice("InputRouter") << "  Numeric key HANDLED by tracker (in edit mode)";
-                    logKeyPress(key, "Tracker: Numeric key in edit mode");
-                    return true;
-                } else {
-                    ofLogWarning("InputRouter") << "  Numeric key NOT handled by tracker (in edit mode)";
-                }
-            }
-        } else {
-            // Not in edit mode: Route numeric keys to tracker for direct typing
-            // This allows typing numbers to auto-enter edit mode
-            // BUT: Don't route if an ImGui input field is active (e.g., repeat count inputs)
-            if ((key >= '0' && key <= '9') || key == '.' || key == '-') {
-                // Check if any ImGui widget is active (including InputText fields like repeat count)
-                // If so, let ImGui handle the key instead of routing to tracker
-                // This prevents interference when editing pattern chain repeat counts
-                if (ImGui::IsAnyItemActive()) {
-                    ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - ImGui item active (e.g., repeat count InputText), letting ImGui handle it";
-                    return false; // Let ImGui handle it
-                }
-                
-                // Also check WantTextInput as a fallback (for cases where item might not be "active" yet)
-                ImGuiIO& io = ImGui::GetIO();
-                if (io.WantTextInput) {
-                    ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - ImGui text input active, letting ImGui handle it";
-                    return false; // Let ImGui handle it
-                }
-                
-                ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' detected (not in edit mode)";
-                // CRITICAL: Sync editStep/editColumn from ImGui focus BEFORE calling handleKeyPress
-                // This ensures the tracker knows which cell is focused even if GUI sync hasn't happened yet
-                ofLogNotice("InputRouter") << "  Syncing edit state from ImGui focus";
-                syncEditStateFromImGuiFocus();
-                
-                // DEBUG: Log frame count and state before handling
-                int currentFrame = ImGui::GetFrameCount();
-                int editStep = tracker->getEditStep();
-                int editColumn = tracker->getEditColumn();
-                ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' at frame=" 
-                    << currentFrame << ", editStep=" << editStep << ", editColumn=" << editColumn;
-                
-                bool handled = tracker->handleKeyPress(key, ctrlPressed, shiftPressed);
-                
-                if (handled) {
-                    ofLogNotice("InputRouter") << "  Numeric key HANDLED by tracker (entered edit mode)";
-                    logKeyPress(key, "Tracker: Numeric key (auto-enter edit mode)");
-                    return true;
-                } else {
-                    // Numeric key not handled - no cell is focused
-                    // Don't consume the key - let ImGui or other handlers process it
-                    ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' NOT handled by tracker (no cell focused). "
-                        << "editStep=" << editStep << ", editColumn=" << editColumn;
-                    return false; // Let other handlers process the key
-                }
-            }
-        }
-        
-        ofLogNotice("InputRouter") << "  Key not matched for tracker input, checking other handlers...";
-        
-        // Handle other tracker input with proper modifiers
-        if (handleTrackerInput(keyEvent)) {
-            ofLogNotice("InputRouter") << "  Key handled by handleTrackerInput";
-            return true;
-        }
-        
-        ofLogNotice("InputRouter") << "  Key not handled in tracker panel section";
-    } else {
-        ofLogNotice("InputRouter") << "  NOT in tracker panel (currentPanelIndex=" << currentPanelIndex 
-            << ", trackerCellFocused=" << (trackerCellFocused ? "YES" : "NO") << ")";
-    }
-    
-    // Handle MediaPool navigation (similar to tracker panel)
-    // Check if we're in MediaPool panel (reuse currentPanelIndex from above)
-    bool inMediaPoolPanel = (mediaPool && viewManager && currentPanelIndex == 3);
-    
-    if (inMediaPoolPanel && mediaPoolGUI) {
-        bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
-        bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-        
-        // Ctrl+Enter: Go up a level (focus parent container)
-        // Works when inside the media list (a Selectable is focused)
-        if (key == OF_KEY_RETURN && ctrlPressed && !shiftPressed) {
-            // Check if we're inside the media list (a Selectable is focused)
-            // We can detect this by checking if parent widget is NOT focused
-            // (if parent widget is focused, we're already at parent level)
-            if (!mediaPoolGUI->getIsParentWidgetFocused()) {
-                ofLogNotice("InputRouter") << "  Ctrl+Enter in MediaPool: requesting focus move to parent container";
-                mediaPoolGUI->requestFocusMoveToParent();
-                return true; // Consume the key
-            }
-        }
-        
-        // UP key on first list item: Move focus to parent widget
-        // This allows exiting the list using default ImGui navigation
-        // We detect this by checking if we're NOT on parent widget and UP is pressed
-        // ImGui will handle the actual navigation, but we need to detect when we're at the first item
-        // and explicitly move to parent widget
-        if (key == OF_KEY_UP && !mediaPoolGUI->getIsParentWidgetFocused()) {
-            // Check if we're at the first navigable item in the list
-            // We can't directly check this, but we can let ImGui handle it first,
-            // then check if focus moved to parent widget
-            // For now, we'll let ImGui handle UP key navigation naturally
-            // The parent widget pattern will work when ImGui tries to navigate up from first item
-            ofLogNotice("InputRouter") << "  UP key in MediaPool list - letting ImGui handle navigation";
-            // Don't consume - let ImGui handle it
-        }
-    }
-    
-    return false;
-}
-
-bool InputRouter::handleGlobalShortcuts(int key) {
-    // Global shortcuts work even when ImGui has focus
-
-    switch (key) {
-        case ' ':  // SPACE - Play/Stop (always works, even when ImGui has focus)
-            if (clock) {
-                bool currentlyPlaying = (isPlaying && *isPlaying);
-                if (currentlyPlaying) {
-                    clock->stop();
-                    if (isPlaying) *isPlaying = false;
-                    logKeyPress(key, "Global: Stop");
-                } else {
-                    clock->start();
-                    if (isPlaying) *isPlaying = true;
-                    logKeyPress(key, "Global: Start");
-                }
-                return true;  // Always return true to prevent ImGui from processing spacebar
-            }
-            break;
-
-        case 'r':
-        case 'R':  // R - Reset
-            if (clock) {
-                clock->reset();
-                if (tracker) tracker->reset();
-                if (currentStep) *currentStep = 0;
-                if (lastTriggeredStep) *lastTriggeredStep = 0;
-                logKeyPress(key, "Global: Reset");
-                return true;
-            }
-            break;
-
-        case 'g':
-        case 'G':  // G - Toggle GUI
-            if (showGUI) {
-                *showGUI = !*showGUI;
-                logKeyPress(key, "Global: Toggle GUI");
-                return true;
-            }
-            break;
-
-        case 'n':
-        case 'N':  // N - Next media
-            if (mediaPool) {
-                mediaPool->nextPlayer();
-                logKeyPress(key, "Global: Next media");
-                return true;
-            }
-            break;
-
-        case 'm':
-        case 'M':  // M - Previous media
-            if (mediaPool) {
-                mediaPool->previousPlayer();
-                logKeyPress(key, "Global: Previous media");
-                return true;
-            }
-            break;
-
-        case 'S':  // S - Save pattern (capital S to distinguish from speed)
-            if (tracker) {
-                tracker->saveState("pattern.json");
-                logKeyPress(key, "Global: Save pattern");
-                return true;
-            }
-            break;
-    }
-
-    return false;
-}
-
-bool InputRouter::handlePanelNavigation(ofKeyEventArgs& keyEvent) {
-    if (!viewManager) return false;
-    
-    int key = keyEvent.key;
-    if (key == OF_KEY_TAB) {
-        bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-        if (shiftPressed) {
-            viewManager->previousPanel();
-        } else {
-            viewManager->nextPanel();
-        }
-        logKeyPress(key, "Navigation: Ctrl+Tab");
-        return true;
-    }
-    return false;
-}
-
-bool InputRouter::handleTrackerInput(ofKeyEventArgs& keyEvent) {
-    if (!tracker) return false;
-    
-    int key = keyEvent.key;
-    bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
-    bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-    
-    // Delegate to TrackerSequencer with proper modifier flags
-    if (tracker->handleKeyPress(key, ctrlPressed, shiftPressed)) {
-        if (currentStep) {
-            *currentStep = tracker->getCurrentStep();
-        }
-        logKeyPress(key, "Tracker input");
-        return true;
-    }
-    return false;
-}
-
-void InputRouter::updateImGuiCaptureState() {
-    ImGuiIO& io = ImGui::GetIO();
-    imGuiCapturingKeyboard = io.WantCaptureKeyboard;
-}
-
-bool InputRouter::isImGuiCapturingKeyboard() const {
-    return imGuiCapturingKeyboard;
-}
-
-bool InputRouter::isSequencerInEditMode() const {
-    return tracker ? tracker->getIsEditingCell() : false;
-}
-
-void InputRouter::syncEditStateFromImGuiFocus() {
-    // Sync edit state from ImGui focus before processing keys
-    // This ensures editStep/editColumn are set even if GUI draw sync hasn't happened yet
-    if (tracker) {
-        TrackerSequencerGUI::syncEditStateFromImGuiFocus(*tracker);
-    }
-}
-
-void InputRouter::logKeyPress(int key, const char* context) {
-    ofLogVerbose("InputRouter") << context << " - Key: " << key;
-}
-
-#pragma once
-#include "ofMain.h"
-
-class Clock;
-class TrackerSequencer;
-class ViewManager;
-class MediaPool;
-class MediaPoolGUI;
-
-class InputRouter {
-public:
-    InputRouter();
-    ~InputRouter() = default;
-
-    // Setup with references to controllable systems
-    void setup(
-        Clock* clock,
-        TrackerSequencer* tracker,
-        ViewManager* viewManager,
-        MediaPool* mediaPool,
-        MediaPoolGUI* mediaPoolGUI
-    );
-
-    // Callbacks for state that needs to be updated
-    void setPlayState(bool* isPlaying);
-    void setCurrentStep(int* currentStep);
-    void setLastTriggeredStep(int* lastTriggeredStep);
-    void setShowGUI(bool* showGUI);
-
-    // Main keyboard handler - called from ofApp::keyPressed()
-    // Returns true if the input was consumed (don't pass to others)
-    bool handleKeyPress(ofKeyEventArgs& keyEvent);
-
-    // System state flags
-    bool isImGuiCapturingKeyboard() const;
-    bool isSequencerInEditMode() const;
-
-private:
-    // System references
-    Clock* clock = nullptr;
-    TrackerSequencer* tracker = nullptr;
-    ViewManager* viewManager = nullptr;
-    MediaPool* mediaPool = nullptr;
-    MediaPoolGUI* mediaPoolGUI = nullptr;
-
-    // State references (optional - can be nullptr)
-    bool* isPlaying = nullptr;
-    int* currentStep = nullptr;
-    int* lastTriggeredStep = nullptr;
-    bool* showGUI = nullptr;
-
-    // Keyboard capture state
-    bool imGuiCapturingKeyboard = false;
-
-    // Handler methods for different input categories
-    bool handleGlobalShortcuts(int key);
-    bool handlePanelNavigation(ofKeyEventArgs& keyEvent);
-    bool handleTrackerInput(ofKeyEventArgs& keyEvent);
-
-    // Helper to check ImGui capture state
-    void updateImGuiCaptureState();
-    
-    // Helper to sync edit state from ImGui focus (if a cell is focused)
-    void syncEditStateFromImGuiFocus();
-
-    // Logging helper
-    void logKeyPress(int key, const char* context);
-};
-

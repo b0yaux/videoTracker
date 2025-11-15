@@ -44,6 +44,9 @@ struct TriggerEvent {
     
     // Optional: duration in seconds (for step-based triggers)
     float duration = 0.0f;
+    
+    // Step number from sequencer (-1 for non-sequencer triggers like manual preview)
+    int step = -1;
 };
 
 // Unified base class for instruments and effects (SunVox-style)

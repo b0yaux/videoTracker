@@ -448,15 +448,15 @@ void ofApp::setupGUI() {
  
     style.Colors[ImGuiCol_DockingEmptyBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
 
-    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.7f);        // Dark neutral grey panels
-    style.Colors[ImGuiCol_ChildBg] = ImVec4(0.15f, 0.15f, 0.15f, 0.6f);  
-    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.95f);
-    style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.5f); // Modal dimming
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.15f, 0.15f, 0.15f, 0.4f);           // Window background
+    style.Colors[ImGuiCol_ChildBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.6f);         // Child background
+    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.95f);           // Popup background
+    style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.5f);   // Modal dimming
 
-    style.Colors[ImGuiCol_MenuBarBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.8f);     
+    style.Colors[ImGuiCol_MenuBarBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.8f);         // Menu bar background
 
-    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.65f);          // Window title background
-    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.15f, 0.15f, 0.8f, 0.75f); // Active title background
+    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.65f);       // Window title background
+    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.2f, 0.0f, 0.4f, 0.65f);    // Active title background
     // style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.05f, 0.05f, 0.05f, 0.7f); // Collapsed title background
     
     style.Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);      // Scrollbar background
@@ -469,21 +469,22 @@ void ofApp::setupGUI() {
     //style.Colors[ImGuiCol_ResizeGripActive] = ImVec4(0.4f, 0.4f, 0.4f, 1.0f); // Resize grip active
     
     style.Colors[ImGuiCol_Tab] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);              // Tab background
-    style.Colors[ImGuiCol_TabHovered] = ImVec4(0.2f, 0.2f, 0.45f, 0.75f);      // Tab hover
-    style.Colors[ImGuiCol_TabActive] = ImVec4(0.05f, 0.05f, 0.2f, 0.8f);        // Tab active
+    style.Colors[ImGuiCol_TabHovered] = ImVec4(0.2f, 0.2f, 0.2f, 0.6f);      // Tab hover
+    style.Colors[ImGuiCol_TabActive] = ImVec4(0.01f, 0.01f, 0.01f, 0.8f);        // Tab active
     style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.05f, 0.05f, 0.05f, 0.7f);  // Tab unfocused
     style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.15f, 0.15f, 0.15f, 0.8f); // Tab unfocused active
     
-    style.Colors[ImGuiCol_Separator] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);         // Dark separator
-    style.Colors[ImGuiCol_SeparatorHovered] = ImVec4(0.3f, 0.3f, 0.3f, 0.9f);   // Dark hover
-    style.Colors[ImGuiCol_SeparatorActive] = ImVec4(0.4f, 0.4f, 0.4f, 1.0f);    // Dark active
+    style.Colors[ImGuiCol_Separator] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);          // Separator color
+    style.Colors[ImGuiCol_SeparatorHovered] = ImVec4(0.3f, 0.3f, 0.3f, 0.9f);   // Separator hover
+    style.Colors[ImGuiCol_SeparatorActive] = ImVec4(0.4f, 0.4f, 0.4f, 1.0f);    // Separator active
     
     // Table / Grid colors
-    style.Colors[ImGuiCol_TableHeaderBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.8f);   // Dark table headers
+    style.Colors[ImGuiCol_TableHeaderBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.8f);   // Table headers
     style.Colors[ImGuiCol_TableBorderStrong] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f); // Dark borders
     style.Colors[ImGuiCol_TableBorderLight] = ImVec4(0.4f, 0.4f, 0.4f, 0.6f);  // Lighter borders
-    style.Colors[ImGuiCol_TableRowBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);       // Transparent row backgrounds
-    style.Colors[ImGuiCol_TableRowBgAlt] = ImVec4(0.05f, 0.05f, 0.05f, 0.5f); // Subtle alternating rows
+    // Row backgrounds: standard grey (individual rows can override for empty/playback states)
+    style.Colors[ImGuiCol_TableRowBg] = ImVec4(0.05f, 0.05f, 0.05f, 0.5f);       // Row backgrounds
+    style.Colors[ImGuiCol_TableRowBgAlt] = ImVec4(0.05f, 0.05f, 0.05f, 0.5f); // Alternative transparent rows
 
     style.Colors[ImGuiCol_Header] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);          // Dark headers
     // style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);   // Dark hover

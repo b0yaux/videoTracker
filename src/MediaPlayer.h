@@ -21,12 +21,12 @@ public:
     ofParameter<bool> videoEnabled;
     
     // Synchronized parameters (control both A/V)
-    ofParameter<float> position;      // 0.0-1.0 (current playhead position when playing, start position when paused)
-    ofParameter<float> startPosition; // 0.0-1.0 (start position for playback - synced with tracker)
+    ofParameter<float> playheadPosition; // 0.0-1.0 (current playhead position during playback)
+    ofParameter<float> startPosition;    // 0.0-1.0 (start position for playback - synced with tracker)
     ofParameter<float> speed;         // playback rate
     ofParameter<bool> loop;
-    ofParameter<float> loopStart;     // 0.0-1.0 (loop start position)
-    ofParameter<float> loopEnd;       // 0.0-1.0 (loop end position)
+    ofParameter<float> regionStart;   // 0.0-1.0 (playback region start - defines minimum playable position)
+    ofParameter<float> regionEnd;     // 0.0-1.0 (playback region end - defines maximum playable position)
     
     // Audio-specific parameters (forwarded from audioPlayer)
     ofParameter<float> volume;
@@ -89,7 +89,7 @@ private:
     // Parameter listeners
     void onAudioEnabledChanged(bool& enabled);
     void onVideoEnabledChanged(bool& enabled);
-    void onPositionChanged(float& pos);
+    void onPlayheadPositionChanged(float& pos);
     void onSpeedChanged(float& speed);
     void onLoopChanged(bool& loop);
     void onVolumeChanged(float& vol);

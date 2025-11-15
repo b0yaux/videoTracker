@@ -246,30 +246,41 @@ void Pattern::fromJson(const ofJson& json) {
         auto cellJson = json[i];
         PatternCell cell;
         
-        // Load fixed fields
-        if (cellJson.contains("index")) {
+        // Load fixed fields - handle null values gracefully
+        if (cellJson.contains("index") && !cellJson["index"].is_null()) {
             cell.index = cellJson["index"];
-        } else if (cellJson.contains("mediaIndex")) {
+        } else if (cellJson.contains("mediaIndex") && !cellJson["mediaIndex"].is_null()) {
             cell.index = cellJson["mediaIndex"]; // Legacy support
         }
+        // else: use default value (-1) from PatternCell constructor
         
-        if (cellJson.contains("length")) {
+        if (cellJson.contains("length") && !cellJson["length"].is_null()) {
             cell.length = cellJson["length"];
-        } else if (cellJson.contains("stepLength")) {
+        } else if (cellJson.contains("stepLength") && !cellJson["stepLength"].is_null()) {
             cell.length = cellJson["stepLength"]; // Legacy support
         }
+        // else: use default value (1) from PatternCell constructor
         
         // Load parameter values (new format)
         if (cellJson.contains("parameters") && cellJson["parameters"].is_object()) {
             auto paramJson = cellJson["parameters"];
             for (auto it = paramJson.begin(); it != paramJson.end(); ++it) {
-                cell.setParameterValue(it.key(), it.value());
+                // Skip null parameter values
+                if (!it.value().is_null() && it.value().is_number()) {
+                    cell.setParameterValue(it.key(), it.value());
+                }
             }
         } else {
             // Legacy: migrate old format to new parameter map
-            if (cellJson.contains("position")) cell.setParameterValue("position", cellJson["position"]);
-            if (cellJson.contains("speed")) cell.setParameterValue("speed", cellJson["speed"]);
-            if (cellJson.contains("volume")) cell.setParameterValue("volume", cellJson["volume"]);
+            if (cellJson.contains("position") && !cellJson["position"].is_null()) {
+                cell.setParameterValue("position", cellJson["position"]);
+            }
+            if (cellJson.contains("speed") && !cellJson["speed"].is_null()) {
+                cell.setParameterValue("speed", cellJson["speed"]);
+            }
+            if (cellJson.contains("volume") && !cellJson["volume"].is_null()) {
+                cell.setParameterValue("volume", cellJson["volume"]);
+            }
         }
         // Legacy: audioEnabled/videoEnabled fields are ignored (backward compatibility)
         
