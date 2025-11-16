@@ -14,9 +14,9 @@ ParameterSync::~ParameterSync() {
 }
 
 void ParameterSync::connect(
-    void* source,
+    Module* source,
     const std::string& sourceParam,
-    void* target,
+    Module* target,
     const std::string& targetParam,
     std::function<bool()> condition
 ) {
@@ -38,7 +38,7 @@ void ParameterSync::connect(
     ofLogNotice("ParameterSync") << "Connected: " << sourceParam << " -> " << targetParam;
 }
 
-void ParameterSync::disconnect(void* source, const std::string& sourceParam) {
+void ParameterSync::disconnect(Module* source, const std::string& sourceParam) {
     auto it = bindings.begin();
     while (it != bindings.end()) {
         if (it->source == source && it->sourceParam == sourceParam) {
@@ -55,7 +55,7 @@ void ParameterSync::update() {
     // For now, we rely on parameter change notifications
 }
 
-void ParameterSync::notifyParameterChange(void* module, const std::string& paramName, float value) {
+void ParameterSync::notifyParameterChange(Module* module, const std::string& paramName, float value) {
     // Find all bindings where this module is the source
     auto bindingIndices = findBindingsForSource(module, paramName);
     
@@ -98,59 +98,69 @@ void ParameterSync::notifyParameterChange(void* module, const std::string& param
     }
 }
 
-float ParameterSync::getParameterValue(void* module, const std::string& paramName) const {
+float ParameterSync::getParameterValue(Module* module, const std::string& paramName) const {
     if (!module) {
         return 0.0f;
     }
     
-    // Try TrackerSequencer first (check by parameter name)
-    if (paramName == "currentStepPosition") {
-        TrackerSequencer* ts = static_cast<TrackerSequencer*>(module);
-        return ts->getCurrentStepPosition();
+    // Try to use Module interface first (for modules that properly implement it)
+    // Check if parameter exists in module's parameter list
+    auto params = module->getParameters();
+    for (const auto& param : params) {
+        if (param.name == paramName) {
+            // Use Module's setParameter/getParameter if available
+            // For now, we still need special cases for TrackerSequencer and MediaPool
+            // until they fully implement the Module interface
+            break;
+        }
     }
     
-    // Try MediaPool (check by parameter name)
+    // Special case: TrackerSequencer (check by parameter name)
+    // TODO: Remove this once TrackerSequencer fully implements Module interface
+    if (paramName == "currentStepPosition") {
+        TrackerSequencer* ts = dynamic_cast<TrackerSequencer*>(module);
+        if (ts) {
+            return ts->getCurrentStepPosition();
+        }
+    }
+    
+    // Special case: MediaPool (check by parameter name)
     // For position sync, we want to get startPosition (not playhead position)
     if (paramName == "position") {
-        MediaPool* mp = static_cast<MediaPool*>(module);
-        auto* player = mp->getActivePlayer();
-        if (player) {
-            // Return startPosition for sync (this is what we sync with tracker)
-            return player->startPosition.get();
+        MediaPool* mp = dynamic_cast<MediaPool*>(module);
+        if (mp) {
+            auto* player = mp->getActivePlayer();
+            if (player) {
+                // Return startPosition for sync (this is what we sync with tracker)
+                return player->startPosition.get();
+            }
         }
     }
     
     return 0.0f;
 }
 
-void ParameterSync::setParameterValue(void* module, const std::string& paramName, float value) {
+void ParameterSync::setParameterValue(Module* module, const std::string& paramName, float value) {
     if (!module) {
         return;
     }
     
-    // Try TrackerSequencer first (check by parameter name)
+    // Special case: TrackerSequencer (check by parameter name)
+    // TODO: Remove this once TrackerSequencer fully implements Module interface
     if (paramName == "currentStepPosition") {
-        TrackerSequencer* ts = static_cast<TrackerSequencer*>(module);
-        ts->setCurrentStepPosition(value);
-        return;
+        TrackerSequencer* ts = dynamic_cast<TrackerSequencer*>(module);
+        if (ts) {
+            ts->setCurrentStepPosition(value);
+            return;
+        }
     }
     
-    // Try MediaPool (check by parameter name)
-    if (paramName == "position") {
-        MediaPool* mp = static_cast<MediaPool*>(module);
-        // Use setParameter with notify=false to prevent feedback loop
-        mp->setParameter(paramName, value, false);
-        return;
-    }
-    
-    // For other modules, use standard setParameter
-    Module* mod = static_cast<Module*>(module);
-    if (mod) {
-        mod->setParameter(paramName, value, false);
-    }
+    // For MediaPool and other modules, use standard Module interface
+    // MediaPool already implements Module::setParameter()
+    module->setParameter(paramName, value, false);
 }
 
-std::vector<size_t> ParameterSync::findBindingsForSource(void* source, const std::string& paramName) const {
+std::vector<size_t> ParameterSync::findBindingsForSource(Module* source, const std::string& paramName) const {
     std::vector<size_t> indices;
     for (size_t i = 0; i < bindings.size(); ++i) {
         if (bindings[i].source == source && bindings[i].sourceParam == paramName) {
@@ -160,7 +170,7 @@ std::vector<size_t> ParameterSync::findBindingsForSource(void* source, const std
     return indices;
 }
 
-std::vector<size_t> ParameterSync::findBindingsForTarget(void* target, const std::string& paramName) const {
+std::vector<size_t> ParameterSync::findBindingsForTarget(Module* target, const std::string& paramName) const {
     std::vector<size_t> indices;
     for (size_t i = 0; i < bindings.size(); ++i) {
         if (bindings[i].target == target && bindings[i].targetParam == paramName) {

@@ -5,6 +5,7 @@
 #include "Module.h"
 #include "Pattern.h"
 #include "ParameterCell.h"
+#include "ofJson.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -14,7 +15,7 @@
 class Clock;
 struct TimeEvent;
 
-class TrackerSequencer {
+class TrackerSequencer : public Module {
     friend class TrackerSequencerGUI;  // Allow GUI to access private members for rendering
     
 public:
@@ -38,17 +39,17 @@ public:
     // Event listener system
     void addStepEventListener(std::function<void(int, float, const PatternCell&)> listener);
     
+    // Module interface implementation
+    std::string getName() const override;
+    ModuleType getType() const override;
+    std::vector<ParameterDescriptor> getParameters() override;
+    void onTrigger(TriggerEvent& event) override; // Sequencers don't receive triggers, but method exists for interface
+    void setParameter(const std::string& paramName, float value, bool notify = true) override;
+    
     // Expose TrackerSequencer parameters (for discovery by modules)
     // TrackerSequencer exposes its own parameters (note, position, speed, volume)
     // Modules map these to their own parameters (e.g., note → mediaIndex)
-    // NOTE: TrackerSequencer does NOT inherit from Module (SunVox-style)
-    // This prepares for future BespokeSynth-style migration where TrackerSequencer becomes a Module
     std::vector<ParameterDescriptor> getAvailableParameters() const;
-    
-    // Module interface compatibility methods (for future Module inheritance)
-    std::vector<ParameterDescriptor> getParameters(); // Alias for getAvailableParameters
-    void onTrigger(TriggerEvent& event); // Sequencers don't receive triggers, but method exists for interface
-    void setParameter(const std::string& paramName, float value, bool notify = true); // Interface compliance
     
     // Transport listener for Clock play/stop events
     void onClockTransportChanged(bool isPlaying);
@@ -119,6 +120,11 @@ public:
     bool loadState(const std::string& filename);
     bool saveState(const std::string& filename) const;
     
+    // Module serialization interface
+    ofJson toJson() const override;
+    void fromJson(const ofJson& json) override;
+    // getTypeName() uses default implementation from Module base class
+    
     // UI interaction
     // Note: GUI state (editStep, editColumn, isEditingCell, editBufferCache) is now managed by TrackerSequencerGUI
     // These methods accept GUI state as parameters instead of using member variables
@@ -128,6 +134,7 @@ public:
         bool isEditingCell = false;
         std::string editBufferCache;
         bool editBufferInitializedCache = false;
+        bool shouldRefocusCurrentCell = false;  // For maintaining focus after exiting edit mode via Enter
     };
     bool handleKeyPress(int key, bool ctrlPressed, bool shiftPressed, GUIState& guiState);
     bool handleKeyPress(ofKeyEventArgs& keyEvent, GUIState& guiState); // Overload for ofKeyEventArgs

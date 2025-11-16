@@ -5,6 +5,7 @@
 #include "gui/ViewManager.h"
 #include "MediaPool.h"
 #include "MediaPoolGUI.h"
+#include "gui/Console.h"
 #include "ofxImGui.h"
 #include "ofLog.h"
 
@@ -17,7 +18,8 @@ void InputRouter::setup(
     TrackerSequencerGUI* trackerGUI_,
     ViewManager* viewManager_,
     MediaPool* mediaPool_,
-    MediaPoolGUI* mediaPoolGUI_
+    MediaPoolGUI* mediaPoolGUI_,
+    Console* console_
 ) {
     clock = clock_;
     tracker = tracker_;
@@ -25,8 +27,17 @@ void InputRouter::setup(
     viewManager = viewManager_;
     mediaPool = mediaPool_;
     mediaPoolGUI = mediaPoolGUI_;
+    console = console_;
 
     ofLogNotice("InputRouter") << "Setup complete";
+}
+
+void InputRouter::setSessionCallbacks(
+    std::function<void()> onSaveSession_,
+    std::function<void()> onLoadSession_
+) {
+    onSaveSession = onSaveSession_;
+    onLoadSession = onLoadSession_;
 }
 
 // Note: setPlayState() removed - play state now comes directly from Clock reference
@@ -46,23 +57,87 @@ void InputRouter::setShowGUI(bool* showGUI_) {
 
 bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     int key = keyEvent.key;
+    int keycode = keyEvent.keycode;
+    int scancode = keyEvent.scancode;
     
-    // LOG: Entry point for all key presses
-    ofLogNotice("InputRouter") << "=== KEY PRESS: key=" << key 
-        << " ('" << (char)key << "')";
+    // Extract modifiers once at the top
+    bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
+    bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
+    bool cmdPressed = keyEvent.hasModifier(OF_KEY_COMMAND);
+    
+    // Debug: Log Cmd+':' attempts (before check to see what we're receiving)
+    if (cmdPressed && (key == ':' || key == 58 || keycode == 59)) {
+        ofLogNotice("InputRouter") << "[COLON_DEBUG] Cmd+':' detected: key=" << key 
+                                    << ", keycode=" << keycode 
+                                    << ", scancode=" << scancode 
+                                    << ", shift=" << shiftPressed
+                                    << ", isColonKey=" << (key == ':' || key == 58 || (keycode == 59 && shiftPressed));
+    }
+    
+    // Priority 0: Cmd+':' - Toggle Console (global shortcut, works everywhere)
+    // On macOS, ':' is Shift+';' (semicolon), so we need to check for semicolon keycode (59) with Shift
+    // Also check direct ':' character (ASCII 58) and keycode 59 (semicolon)
+    bool isColonKey = (key == ':' || key == 58 || (keycode == 59 && shiftPressed));
+    if (isColonKey && cmdPressed && viewManager) {
+        bool visible = viewManager->isConsoleVisible();
+        viewManager->setConsoleVisible(!visible);
+        
+        // Sync Console's internal state and navigate to console panel when showing
+        if (!visible && console) {
+            console->open();
+            // Navigate to console panel - Panel enum is defined in ViewManager.h (global namespace)
+            // We can access it directly since it's in the global namespace
+            viewManager->navigateToPanel(Panel::CONSOLE);
+        } else if (visible && console) {
+            console->close();
+        }
+        
+        logKeyPress(key, "Global: Cmd+':' Toggle Console");
+        return true; // Consume the key
+    }
+    
+    // Priority 0.5: Console arrow keys for history navigation (before other handlers consume them)
+    // Only handle if console is visible and input text is focused
+    if (console && viewManager && viewManager->isConsoleVisible() && console->isConsoleOpen() &&
+        (key == OF_KEY_UP || key == OF_KEY_DOWN)) {
+        if (console->handleArrowKeys(key)) {
+            logKeyPress(key, "Console: Arrow key history navigation");
+            return true; // Console consumed the arrow key
+        }
+    }
     
     // Priority 1: Panel navigation (Ctrl+Tab / Ctrl+Shift+Tab) - check BEFORE ImGui processes
-    // IMPORTANT: Use OF_KEY_CONTROL (not COMMAND) for Ctrl key
-    // On Mac: OF_KEY_CONTROL = Control key, OF_KEY_COMMAND = Command key (⌘)
-    if (key == OF_KEY_TAB) {
-        bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
-        if (ctrlPressed) {
-            if (handlePanelNavigation(keyEvent)) {
-                return true;
-            }
+    // On macOS, Ctrl+Tab may be transformed by the system. Detect Tab by checking:
+    // 1. Standard Tab detection (key/keycode)
+    // 2. macOS-specific: When Control is pressed, check scancode (48 = Tab on macOS)
+    const int GLFW_KEY_TAB = 258;
+    const int MACOS_SCANCODE_TAB = 48;  // Tab scancode on macOS (from logs)
+    
+    bool isTabKey = (key == OF_KEY_TAB) || (keycode == GLFW_KEY_TAB);
+    
+    // macOS workaround: When Control is pressed, also check scancode for Tab
+    // This handles cases where macOS transforms Ctrl+Tab events
+    if (!isTabKey && ctrlPressed && scancode == MACOS_SCANCODE_TAB) {
+        isTabKey = true;
+    }
+    
+    // Debug: Log Tab key detection attempts
+    if (ctrlPressed && (key == OF_KEY_TAB || keycode == GLFW_KEY_TAB || scancode == MACOS_SCANCODE_TAB)) {
+        ofLogNotice("InputRouter") << "[TAB_DEBUG] Ctrl+Tab detected: key=" << key 
+                                    << ", keycode=" << keycode 
+                                    << ", scancode=" << scancode 
+                                    << ", isTabKey=" << isTabKey;
+    }
+    
+    if (isTabKey && ctrlPressed) {
+        // Ctrl+Tab or Ctrl+Shift+Tab - handle panel navigation
+        ofLogNotice("InputRouter") << "[TAB_DEBUG] Handling Ctrl+Tab navigation";
+        if (handlePanelNavigation(keyEvent)) {
+            ofLogNotice("InputRouter") << "[TAB_DEBUG] Panel navigation handled successfully";
+            return true; // Consume the key to prevent ImGui from processing
+        } else {
+            ofLogWarning("InputRouter") << "[TAB_DEBUG] Panel navigation handler returned false";
         }
-        // Regular Tab (without Ctrl) - let ImGui handle it for native navigation
-        // Don't return false here, let it fall through to ImGui processing
     }
     
     updateImGuiCaptureState();
@@ -71,14 +146,12 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     // Handle spacebar BEFORE other checks to ensure it always works
     if (key == ' ') {
         // Alt+Spacebar: Trigger current edit step
-        if (keyEvent.hasModifier(OF_KEY_ALT)) {
-            if (tracker && trackerGUI) {
-                int editStep = trackerGUI->getEditStep();
-                if (editStep >= 0) {
-                    tracker->triggerStep(editStep);
-                    logKeyPress(key, "Alt+Spacebar: Trigger step");
-                    return true;
-                }
+        if (tracker && trackerGUI) {
+            int editStep = trackerGUI->getEditStep();
+            if (editStep >= 0) {
+                tracker->triggerStep(editStep);
+                logKeyPress(key, "Alt+Spacebar: Trigger step");
+                return true;
             }
         }
         // Regular Spacebar: Play/Stop (always works, even when ImGui has focus)
@@ -105,31 +178,16 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     
     bool mediaPoolParameterFocused = (mediaPoolGUI && mediaPoolGUI->isKeyboardFocused());
     
-    // DEBUG: Log MediaPool focus state
-    ofLogVerbose("InputRouter") << "  MediaPool check: currentPanelIndex=" << currentPanelIndex
-                                 << ", mediaPoolParameterFocused=" << (mediaPoolParameterFocused ? "YES" : "NO")
-                                 << ", mediaPoolGUI=" << (mediaPoolGUI ? "YES" : "NO");
-    
-    // CRITICAL: Handle MediaPool parameter editing FIRST, regardless of panel index
+    // Handle MediaPool parameter editing FIRST, regardless of panel index
     // This allows editing parameters even when ViewManager thinks a different panel is active
-    // (e.g., MediaPool parameters in a docked window while tracker panel is "active")
     if (mediaPoolGUI && mediaPoolParameterFocused) {
-        bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
-        bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-        
-        ofLogNotice("InputRouter") << "  MediaPool parameter focused - routing key to MediaPoolGUI (panel=" << currentPanelIndex << ", key=" << key << ")";
-        
         // Delegate to MediaPoolGUI for parameter editing
         bool handled = mediaPoolGUI->handleKeyPress(key, ctrlPressed, shiftPressed);
         if (handled) {
-            ofLogNotice("InputRouter") << "  Key handled by MediaPoolGUI";
             return true;
-        } else {
-            ofLogNotice("InputRouter") << "  Key NOT handled by MediaPoolGUI - letting ImGui handle";
-            // If MediaPoolGUI didn't handle it, let ImGui process it (for navigation)
-            // This allows arrow keys to work for navigation even when cells are focused
-            return false;
         }
+        // If MediaPoolGUI didn't handle it, let ImGui process it (for navigation)
+        return false;
     }
     
     // Priority 5: Tracker input - only when in tracker panel
@@ -156,76 +214,51 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     }
     
     bool isInTrackerPanel = (tracker && viewManager && currentPanelIndex == 2);
-    
-    ofLogNotice("InputRouter") << "  Panel check: tracker=" << (tracker ? "YES" : "NO")
-        << ", viewManager=" << (viewManager ? "YES" : "NO")
-        << ", currentPanelIndex=" << currentPanelIndex
-        << ", trackerCellFocused=" << (trackerCellFocused ? "YES" : "NO")
-        << ", onHeaderRow=" << (onHeaderRow ? "YES" : "NO");
-    
-    // Use either panel index check OR tracker cell focused check OR header row check
-    // This handles both docked windows and regular panel navigation, including header row navigation
     bool inTrackerPanel = isInTrackerPanel || trackerCellFocused || onHeaderRow;
     
     // Handle tracker input - cells are directly navigable like other widgets
     if (tracker && inTrackerPanel) {
-        // Check for modifier keys properly
-        bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
-        bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
         
-        // CRITICAL: In edit mode, block arrow keys from ImGui navigation
-        // This prevents ImGui from moving focus when arrow keys adjust values
+        // PHASE 1: Arrow keys in edit mode are handled directly in ParameterCell::draw()
+        // InputRouter should skip them to prevent double-processing
         bool inEditMode = trackerGUI ? trackerGUI->getIsEditingCell() : false;
         
-        // CRITICAL: Route Enter and numeric keys even when ImGui wants keyboard
-        // This ensures these keys work when cells are focused
-        // CRITICAL: In edit mode, ALWAYS route arrow keys to tracker BEFORE ImGui can process them
-        // This prevents ImGui from using arrow keys for navigation and changing focus
-        if (inEditMode && trackerGUI && (key == OF_KEY_UP || key == OF_KEY_DOWN || 
+        if (inEditMode && (key == OF_KEY_UP || key == OF_KEY_DOWN || 
                            key == OF_KEY_LEFT || key == OF_KEY_RIGHT)) {
-            // Arrow keys in edit mode: always route to tracker (adjust values)
-            // Don't let ImGui use them for navigation - this locks focus to the editing cell
-            // Sync state first to ensure tracker knows current cell
-            syncEditStateFromImGuiFocus();
-            // Create GUI state struct from trackerGUI
-            TrackerSequencer::GUIState guiState;
-            guiState.editStep = trackerGUI->getEditStep();
-            guiState.editColumn = trackerGUI->getEditColumn();
-            guiState.isEditingCell = trackerGUI->getIsEditingCell();
-            guiState.editBufferCache = trackerGUI->getEditBufferCache();
-            guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
-            if (tracker->handleKeyPress(key, ctrlPressed, shiftPressed, guiState)) {
-                // Update GUI state back from the modified guiState
-                trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
-                trackerGUI->setInEditMode(guiState.isEditingCell);
-                trackerGUI->getEditBufferCache() = guiState.editBufferCache;
-                trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
-                ofLogNotice("InputRouter") << "  Arrow key in edit mode: HANDLED by tracker (blocked from ImGui)";
-                logKeyPress(key, "Tracker: Arrow key in edit mode (blocked from ImGui)");
-                return true; // Consume the key to prevent ImGui from processing
-            }
+            // Arrow keys in edit mode: Let Phase 1 handle them
+            ofLogNotice("InputRouter") << "  Arrow key in edit mode - letting Phase 1 handle it in ParameterCell::draw()";
+            return false; // Let ImGui process it so Phase 1 can handle it
         }
         
-        // CRITICAL: When NOT in edit mode, let ImGui handle arrow keys for navigation
-        // Don't route arrow keys to tracker - this allows ImGui's native navigation to work
-        // The tracker's arrow key handling (in handleKeyPress) should only be used in edit mode
+        // When NOT in edit mode, let ImGui handle arrow keys for navigation
         if (!inEditMode && (key == OF_KEY_UP || key == OF_KEY_DOWN || 
                             key == OF_KEY_LEFT || key == OF_KEY_RIGHT)) {
             // Not in edit mode: Let ImGui handle arrow keys for native navigation
-            // This allows smooth navigation between parameter cells and step cells
             ofLogNotice("InputRouter") << "  Arrow key NOT in edit mode: letting ImGui handle navigation";
             return false; // Let ImGui process arrow keys for navigation
         }
         
-        // Enter key: Check for Ctrl+Enter (go up a level) vs Shift+Enter (exit grid)
+        // Enter key: PHASE 1 handles regular Enter in edit mode
+        // InputRouter only handles special cases (Shift+Enter, Ctrl+Enter)
         if (key == OF_KEY_RETURN) {
             // When on header row, don't route Enter to tracker - let ImGui handle it
             if (onHeaderRow && !ctrlPressed && !shiftPressed) {
-                ofLogNotice("InputRouter") << "  Enter key on header row: letting ImGui handle (not routing to tracker)";
                 return false; // Let ImGui process the key
             }
             
-            ofLogNotice("InputRouter") << "  Enter key detected in tracker panel";
+            // PHASE 1: If in edit mode, let Phase 1 handle Enter (validates and exits edit mode)
+            if (inEditMode && !ctrlPressed && !shiftPressed) {
+                ofLogNotice("InputRouter") << "  Enter key - in edit mode, letting Phase 1 handle it in ParameterCell::draw()";
+                return false; // Let ImGui process it so Phase 1 can handle it
+            }
+            
+            // PHASE 1: If a tracker cell is focused (but not in edit mode), let Phase 1 handle Enter
+            if (trackerCellFocused && !ctrlPressed && !shiftPressed) {
+                ofLogNotice("InputRouter") << "  Enter key - tracker cell focused, letting Phase 1 handle it in ParameterCell::draw()";
+                return false; // Let ImGui process it so Phase 1 can handle it
+            }
+            
+            // Special cases: Shift+Enter and Ctrl+Enter are still handled by InputRouter
             if (!trackerGUI) {
                 return false;
             }
@@ -237,153 +270,54 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
             guiState.isEditingCell = trackerGUI->getIsEditingCell();
             guiState.editBufferCache = trackerGUI->getEditBufferCache();
             guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
+            guiState.shouldRefocusCurrentCell = trackerGUI->getShouldRefocusCurrentCell();
             
             if (shiftPressed) {
                 // Shift+Enter: Exit grid navigation (clear cell selection)
-                ofLogNotice("InputRouter") << "  Shift+Enter: Exiting grid";
+                syncEditStateFromImGuiFocus();
+                guiState.editStep = trackerGUI->getEditStep();
+                guiState.editColumn = trackerGUI->getEditColumn();
                 if (tracker->handleKeyPress(key, false, true, guiState)) {
-                    // Update GUI state back from the modified guiState
                     trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
                     trackerGUI->setInEditMode(guiState.isEditingCell);
                     trackerGUI->getEditBufferCache() = guiState.editBufferCache;
                     trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
+                    trackerGUI->setShouldRefocusCurrentCell(guiState.shouldRefocusCurrentCell);
                     logKeyPress(key, "Tracker: Shift+Enter (exit grid)");
                     return true;
                 }
-            } else {
-                // Regular Enter: Always try to handle it if we're in tracker panel
-                // CRITICAL: Sync editStep/editColumn from ImGui focus BEFORE calling handleKeyPress
-                // This ensures the tracker knows which cell is focused even if GUI sync hasn't happened yet
-                ofLogNotice("InputRouter") << "  Regular Enter: Syncing edit state from ImGui focus";
-                syncEditStateFromImGuiFocus();
-                
-                // Update GUI state after sync
-                guiState.editStep = trackerGUI->getEditStep();
-                guiState.editColumn = trackerGUI->getEditColumn();
-                guiState.isEditingCell = trackerGUI->getIsEditingCell();
-                guiState.editBufferCache = trackerGUI->getEditBufferCache();
-                guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
-                
-                // DEBUG: Log frame count and state before handling
-                int currentFrame = ImGui::GetFrameCount();
-                ofLogNotice("InputRouter") << "  Enter key at frame=" << currentFrame
-                    << ", editStep=" << guiState.editStep << ", editColumn=" << guiState.editColumn
-                    << ", isEditingCell=" << (guiState.isEditingCell ? "YES" : "NO");
-                
-                bool handled = tracker->handleKeyPress(key, false, false, guiState);
-                if (handled) {
-                    // Update GUI state back from the modified guiState
-                    trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
-                    trackerGUI->setInEditMode(guiState.isEditingCell);
-                    trackerGUI->getEditBufferCache() = guiState.editBufferCache;
-                    trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
-                    if (currentStep) {
-                        *currentStep = tracker->getCurrentStep();
-                    }
-                    ofLogNotice("InputRouter") << "  Enter key HANDLED by tracker";
-                    logKeyPress(key, "Tracker: Enter (handled)");
-                    return true;
-                } else {
-                    // Enter was pressed but tracker didn't handle it
-                    // This might mean editStep/editColumn aren't set yet
-                    ofLogWarning("InputRouter") << "  Enter key NOT handled by tracker. editStep=" << guiState.editStep 
-                        << ", editColumn=" << guiState.editColumn << ", isEditingCell=" << (guiState.isEditingCell ? "YES" : "NO");
-                    
-                    // Still consume it to prevent ImGui from activating buttons
-                    // The tracker should handle it next frame once GUI sync happens
-                    return true; // Consume to prevent ImGui from processing
-                }
+            } else if (ctrlPressed) {
+                // Ctrl+Enter: Special action (if any)
+                // For now, let it fall through to other handlers
+                return false;
             }
+            // Regular Enter when not in edit mode and no cell focused - let other handlers process it
+            return false;
         }
         
-        // Route numeric keys and edit mode keys to tracker
-        // This allows typing numbers to auto-enter edit mode, and handles edit mode input
-        ofLogNotice("InputRouter") << "  Checking numeric keys: inEditMode=" << (inEditMode ? "YES" : "NO");
-        if (inEditMode && trackerGUI) {
-            // In edit mode: Arrow keys already handled above, now handle numeric input
-            // Numeric keys (including numpad - openFrameworks converts numpad to regular '0'-'9')
-            // Also handle decimal point, minus, backspace, delete for numeric input
-            if ((key >= '0' && key <= '9') ||
-                key == '.' || key == '-' || key == OF_KEY_BACKSPACE || key == OF_KEY_DEL) {
-                ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' in edit mode - routing to tracker";
-                // Create GUI state struct from trackerGUI
-                TrackerSequencer::GUIState guiState;
-                guiState.editStep = trackerGUI->getEditStep();
-                guiState.editColumn = trackerGUI->getEditColumn();
-                guiState.isEditingCell = trackerGUI->getIsEditingCell();
-                guiState.editBufferCache = trackerGUI->getEditBufferCache();
-                guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
-                if (tracker->handleKeyPress(key, ctrlPressed, shiftPressed, guiState)) {
-                    // Update GUI state back from the modified guiState
-                    trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
-                    trackerGUI->setInEditMode(guiState.isEditingCell);
-                    trackerGUI->getEditBufferCache() = guiState.editBufferCache;
-                    trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
-                    ofLogNotice("InputRouter") << "  Numeric key HANDLED by tracker (in edit mode)";
-                    logKeyPress(key, "Tracker: Numeric key in edit mode");
-                    return true;
-                } else {
-                    ofLogWarning("InputRouter") << "  Numeric key NOT handled by tracker (in edit mode)";
-                }
+        // PHASE 1: Numeric keys are handled directly in ParameterCell::draw()
+        // If we're in the tracker panel, InputRouter should NEVER process numeric keys
+        // This prevents double-processing and timing issues with GUI state sync
+        if (inTrackerPanel && ((key >= '0' && key <= '9') || key == '.' || key == '-' || 
+                               key == OF_KEY_BACKSPACE || key == OF_KEY_DEL)) {
+            // Check if any ImGui widget is active (like InputText fields for repeat count)
+            // If so, let ImGui handle it
+            if (ImGui::IsAnyItemActive()) {
+                ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - ImGui item active, letting ImGui handle it";
+                return false;
             }
-        } else if (trackerGUI) {
-            // Not in edit mode: Route numeric keys to tracker for direct typing
-            // This allows typing numbers to auto-enter edit mode
-            // BUT: Don't route if an ImGui input field is active (e.g., repeat count inputs)
-            if ((key >= '0' && key <= '9') || key == '.' || key == '-') {
-                // Check if any ImGui widget is active (including InputText fields like repeat count)
-                // If so, let ImGui handle the key instead of routing to tracker
-                // This prevents interference when editing pattern chain repeat counts
-                if (ImGui::IsAnyItemActive()) {
-                    ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - ImGui item active (e.g., repeat count InputText), letting ImGui handle it";
-                    return false; // Let ImGui handle it
-                }
-                
-                // Also check WantTextInput as a fallback (for cases where item might not be "active" yet)
-                ImGuiIO& io = ImGui::GetIO();
-                if (io.WantTextInput) {
-                    ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - ImGui text input active, letting ImGui handle it";
-                    return false; // Let ImGui handle it
-                }
-                
-                ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' detected (not in edit mode)";
-                // CRITICAL: Sync editStep/editColumn from ImGui focus BEFORE calling handleKeyPress
-                // This ensures the tracker knows which cell is focused even if GUI sync hasn't happened yet
-                ofLogNotice("InputRouter") << "  Syncing edit state from ImGui focus";
-                syncEditStateFromImGuiFocus();
-                
-                // Create GUI state struct from trackerGUI
-                TrackerSequencer::GUIState guiState;
-                guiState.editStep = trackerGUI->getEditStep();
-                guiState.editColumn = trackerGUI->getEditColumn();
-                guiState.isEditingCell = trackerGUI->getIsEditingCell();
-                guiState.editBufferCache = trackerGUI->getEditBufferCache();
-                guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
-                
-                // DEBUG: Log frame count and state before handling
-                int currentFrame = ImGui::GetFrameCount();
-                ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' at frame=" 
-                    << currentFrame << ", editStep=" << guiState.editStep << ", editColumn=" << guiState.editColumn;
-                
-                bool handled = tracker->handleKeyPress(key, ctrlPressed, shiftPressed, guiState);
-                
-                if (handled) {
-                    // Update GUI state back from the modified guiState
-                    trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
-                    trackerGUI->setInEditMode(guiState.isEditingCell);
-                    trackerGUI->getEditBufferCache() = guiState.editBufferCache;
-                    trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
-                    ofLogNotice("InputRouter") << "  Numeric key HANDLED by tracker (entered edit mode)";
-                    logKeyPress(key, "Tracker: Numeric key (auto-enter edit mode)");
-                    return true;
-                } else {
-                    // Numeric key not handled - no cell is focused
-                    // Don't consume the key - let ImGui or other handlers process it
-                    ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' NOT handled by tracker (no cell focused). "
-                        << "editStep=" << guiState.editStep << ", editColumn=" << guiState.editColumn;
-                    return false; // Let other handlers process the key
-                }
+            
+            // Also check WantTextInput as a fallback
+            ImGuiIO& io = ImGui::GetIO();
+            if (io.WantTextInput) {
+                ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - ImGui text input active, letting ImGui handle it";
+                return false;
             }
+            
+            // In tracker panel: Let Phase 1 handle ALL numeric keys
+            // Phase 1 will check if cell is focused and handle accordingly
+            ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - in tracker panel, letting Phase 1 handle it in ParameterCell::draw()";
+            return false; // Let ImGui process it so Phase 1 can handle it
         }
         
         ofLogNotice("InputRouter") << "  Key not matched for tracker input, checking other handlers...";
@@ -401,38 +335,14 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     }
     
     // Handle MediaPool panel-specific navigation (only when in MediaPool panel)
-    // Note: Parameter editing is handled earlier (Priority 4) before tracker checks
     bool inMediaPoolPanel = (mediaPool && viewManager && currentPanelIndex == 3);
     if (inMediaPoolPanel && mediaPoolGUI) {
-        bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
-        bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-        
         // Ctrl+Enter: Go up a level (focus parent container)
-        // Works when inside the media list (a Selectable is focused)
         if (key == OF_KEY_RETURN && ctrlPressed && !shiftPressed) {
-            // Check if we're inside the media list (a Selectable is focused)
-            // We can detect this by checking if parent widget is NOT focused
-            // (if parent widget is focused, we're already at parent level)
             if (!mediaPoolGUI->getIsParentWidgetFocused()) {
-                ofLogNotice("InputRouter") << "  Ctrl+Enter in MediaPool: requesting focus move to parent container";
                 mediaPoolGUI->requestFocusMoveToParent();
                 return true; // Consume the key
             }
-        }
-        
-        // UP key on first list item: Move focus to parent widget
-        // This allows exiting the list using default ImGui navigation
-        // We detect this by checking if we're NOT on parent widget and UP is pressed
-        // ImGui will handle the actual navigation, but we need to detect when we're at the first item
-        // and explicitly move to parent widget
-        if (key == OF_KEY_UP && !mediaPoolGUI->getIsParentWidgetFocused()) {
-            // Check if we're at the first navigable item in the list
-            // We can't directly check this, but we can let ImGui handle it first,
-            // then check if focus moved to parent widget
-            // For now, we'll let ImGui handle UP key navigation naturally
-            // The parent widget pattern will work when ImGui tries to navigate up from first item
-            ofLogNotice("InputRouter") << "  UP key in MediaPool list - letting ImGui handle navigation";
-            // Don't consume - let ImGui handle it
         }
     }
     
@@ -497,10 +407,15 @@ bool InputRouter::handleGlobalShortcuts(int key) {
             }
             break;
 
-        case 'S':  // S - Save pattern (capital S to distinguish from speed)
-            if (tracker) {
+        case 'S':  // S - Save session (capital S to distinguish from speed)
+            if (onSaveSession) {
+                onSaveSession();
+                logKeyPress(key, "Global: Save session");
+                return true;
+            } else if (tracker) {
+                // Fallback to old behavior if callback not set
                 tracker->saveState("pattern.json");
-                logKeyPress(key, "Global: Save pattern");
+                logKeyPress(key, "Global: Save pattern (fallback)");
                 return true;
             }
             break;
@@ -512,18 +427,16 @@ bool InputRouter::handleGlobalShortcuts(int key) {
 bool InputRouter::handlePanelNavigation(ofKeyEventArgs& keyEvent) {
     if (!viewManager) return false;
     
-    int key = keyEvent.key;
-    if (key == OF_KEY_TAB) {
-        bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-        if (shiftPressed) {
-            viewManager->previousPanel();
-        } else {
-            viewManager->nextPanel();
-        }
-        logKeyPress(key, "Navigation: Ctrl+Tab");
-        return true;
+    bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
+    
+    if (shiftPressed) {
+        viewManager->previousPanel();
+        logKeyPress(OF_KEY_TAB, "Navigation: Ctrl+Shift+Tab");
+    } else {
+        viewManager->nextPanel();
+        logKeyPress(OF_KEY_TAB, "Navigation: Ctrl+Tab");
     }
-    return false;
+    return true;
 }
 
 bool InputRouter::handleTrackerInput(ofKeyEventArgs& keyEvent) {

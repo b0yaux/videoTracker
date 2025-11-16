@@ -30,16 +30,16 @@ public:
     
     /**
      * Connect two modules with bidirectional parameter binding
-     * @param source Source module
+     * @param source Source module (must inherit from Module)
      * @param sourceParam Parameter name in source module (e.g., "currentStepPosition")
-     * @param target Target module
+     * @param target Target module (must inherit from Module)
      * @param targetParam Parameter name in target module (e.g., "position")
      * @param condition Optional function that returns true when sync should be active
      */
     void connect(
-        void* source,
+        Module* source,
         const std::string& sourceParam,
-        void* target,
+        Module* target,
         const std::string& targetParam,
         std::function<bool()> condition = nullptr
     );
@@ -49,7 +49,7 @@ public:
      * @param source Source module
      * @param sourceParam Parameter name to disconnect
      */
-    void disconnect(void* source, const std::string& sourceParam);
+    void disconnect(Module* source, const std::string& sourceParam);
     
     /**
      * Update method - call from ofApp::update() to process sync
@@ -59,27 +59,27 @@ public:
     /**
      * Register a parameter change from a module
      * Modules call this when their parameters change
-     * @param module Module that changed
+     * @param module Module that changed (must inherit from Module)
      * @param paramName Parameter name that changed
      * @param value New parameter value
      */
-    void notifyParameterChange(void* module, const std::string& paramName, float value);
+    void notifyParameterChange(Module* module, const std::string& paramName, float value);
     
     /**
      * Get parameter value from a module (for sync system)
      */
-    float getParameterValue(void* module, const std::string& paramName) const;
+    float getParameterValue(Module* module, const std::string& paramName) const;
     
     /**
      * Set parameter value in a module (for sync system)
      */
-    void setParameterValue(void* module, const std::string& paramName, float value);
+    void setParameterValue(Module* module, const std::string& paramName, float value);
 
 private:
     struct Binding {
-        void* source;
+        Module* source;
         std::string sourceParam;
-        void* target;
+        Module* target;
         std::string targetParam;
         std::function<bool()> condition;
         std::atomic<bool> syncing; // Guard to prevent feedback loops
@@ -116,7 +116,7 @@ private:
     std::vector<Binding> bindings;
     
     // Helper to find bindings
-    std::vector<size_t> findBindingsForSource(void* source, const std::string& paramName) const;
-    std::vector<size_t> findBindingsForTarget(void* target, const std::string& paramName) const;
+    std::vector<size_t> findBindingsForSource(Module* source, const std::string& paramName) const;
+    std::vector<size_t> findBindingsForTarget(Module* target, const std::string& paramName) const;
 };
 

@@ -1,5 +1,6 @@
 #pragma once
 #include "ofMain.h"
+#include "GUIConstants.h"
 #include <array>
 #include <string>
 
@@ -9,6 +10,9 @@ class MediaPool;
 class MediaPoolGUI;
 class TrackerSequencer;
 class TrackerSequencerGUI;
+class GUIManager;
+class FileBrowser;
+class Console;
 class ofxSoundOutput;
 class ofSoundStream;
 
@@ -18,7 +22,9 @@ enum class Panel {
     AUDIO_OUTPUT = 1,
     TRACKER = 2,
     MEDIA_POOL = 3,
-    COUNT = 4
+    FILE_BROWSER = 4,
+    CONSOLE = 5,
+    COUNT = 6
 };
 
 class ViewManager {
@@ -31,11 +37,22 @@ public:
         Clock* clock,
         ClockGUI* clockGUI,
         ofxSoundOutput* audioOutput,
+        GUIManager* guiManager,  // New: GUIManager for multiple instances
+        FileBrowser* fileBrowser,  // File browser panel
+        Console* console,  // Console panel
+        ofSoundStream* soundStream  // For audio device management
+    );
+    
+    // Legacy setup method (for backward compatibility during migration)
+    void setup(
+        Clock* clock,
+        ClockGUI* clockGUI,
+        ofxSoundOutput* audioOutput,
         TrackerSequencer* tracker,
         TrackerSequencerGUI* trackerGUI,
         MediaPool* mediaPool,
         MediaPoolGUI* mediaPoolGUI,
-        ofSoundStream* soundStream  // For audio device management
+        ofSoundStream* soundStream
     );
 
     // Panel navigation
@@ -43,6 +60,14 @@ public:
     void nextPanel();
     void previousPanel();
     Panel getCurrentPanel() const { return currentPanel; }
+    
+    // FileBrowser visibility
+    void setFileBrowserVisible(bool visible) { fileBrowserVisible_ = visible; }
+    bool isFileBrowserVisible() const { return fileBrowserVisible_; }
+    
+    // Console visibility
+    void setConsoleVisible(bool visible) { consoleVisible_ = visible; }
+    bool isConsoleVisible() const { return consoleVisible_; }
 
     // Mouse click detection and panel switching
     void handleMouseClick(int x, int y);
@@ -67,10 +92,16 @@ private:
     Clock* clock = nullptr;
     ClockGUI* clockGUI = nullptr;
     ofxSoundOutput* audioOutput = nullptr;
+    GUIManager* guiManager = nullptr;  // New: GUIManager for multiple instances
+    FileBrowser* fileBrowser = nullptr;  // File browser panel
+    Console* console = nullptr;  // Console panel
+    
+    // Legacy: keep for backward compatibility (will be removed)
     TrackerSequencer* tracker = nullptr;
     TrackerSequencerGUI* trackerGUI = nullptr;
     MediaPool* mediaPool = nullptr;
     MediaPoolGUI* mediaPoolGUI = nullptr;
+    
     ofSoundStream* soundStream = nullptr;  // For audio device management
 
     // Audio Output panel state (owned by ViewManager)
@@ -84,22 +115,35 @@ private:
     // State
     Panel currentPanel = Panel::CLOCK;
     Panel lastPanel = Panel::COUNT;  // Invalid, triggers focus on first draw
+    bool fileBrowserVisible_ = false;  // FileBrowser visibility state
+    bool consoleVisible_ = false;  // Console visibility state
 
     // Panel names for debugging/logging
-    static constexpr std::array<const char*, 4> PANEL_NAMES = {{
+    static constexpr std::array<const char*, 6> PANEL_NAMES = {{
         "Clock ",
         "Audio Output",
         "Tracker Sequencer",
-        "Media Pool"
+        "Media Pool",
+        "File Browser",
+        "Console"
     }};
 
     // Private draw methods for each panel
     void drawClockPanel(Panel previousPanel);
     void drawAudioOutputPanel(Panel previousPanel);
-    void drawTrackerPanel(Panel previousPanel);
-    void drawMediaPoolPanel(Panel previousPanel);
+    void drawTrackerPanel(Panel previousPanel);  // Legacy: single instance
+    void drawMediaPoolPanel(Panel previousPanel);  // Legacy: single instance
+    
+    // New: draw multiple instance panels
+    void drawTrackerPanels(Panel previousPanel);  // Draw all visible TrackerSequencer instances
+    void drawMediaPoolPanels(Panel previousPanel);  // Draw all visible MediaPool instances
+    void drawFileBrowserPanel(Panel previousPanel);  // Draw FileBrowser panel
+    void drawConsolePanel(Panel previousPanel);  // Draw Console panel
 
     // Helper to set focus when panel changes (not every frame)
     void setFocusIfChanged();
+    
+    // Helper to draw outline around focused windows
+    void drawFocusedWindowOutline(float thickness = GUIConstants::Outline::FocusThickness);
 };
 

@@ -3,6 +3,9 @@
 #include "MediaPlayer.h"
 #include "ParameterCell.h"
 #include "Module.h"
+#include "core/ModuleRegistry.h"
+#include "gui/GUIConstants.h"
+#include "gui/MediaPreview.h"
 
 MediaPoolGUI::MediaPoolGUI() 
     : mediaPool(nullptr), waveformHeight(100.0f), parentWidgetId(0), 
@@ -15,7 +18,20 @@ MediaPoolGUI::MediaPoolGUI()
 }
 
 void MediaPoolGUI::setMediaPool(MediaPool& pool) {
+    // Legacy method: set direct pointer (for backward compatibility)
     mediaPool = &pool;
+}
+
+MediaPool* MediaPoolGUI::getMediaPool() const {
+    // If instance-aware (has registry and instanceName), use that
+    if (getRegistry() && !getInstanceName().empty()) {
+        auto module = getRegistry()->getModule(getInstanceName());
+        if (!module) return nullptr;
+        return dynamic_cast<MediaPool*>(module.get());
+    }
+    
+    // Fallback to legacy direct pointer (for backward compatibility)
+    return mediaPool;
 }
 
 std::string MediaPoolGUI::truncateTextToWidth(const std::string& text, float maxWidth, bool showEnd, const std::string& ellipsis) {
@@ -55,6 +71,24 @@ std::string MediaPoolGUI::truncateTextToWidth(const std::string& text, float max
 }
 
 void MediaPoolGUI::draw() {
+    // Call base class draw (handles visibility, title bar, enabled state)
+    ModuleGUI::draw();
+}
+
+// Helper function to draw waveform preview in tooltip
+// Now uses shared MediaPreview
+void MediaPoolGUI::drawWaveformPreview(MediaPlayer* player, float width, float height) {
+    MediaPreview::drawWaveformPreview(player, width, height);
+}
+
+void MediaPoolGUI::drawContent() {
+    // Get current MediaPool instance (handles null case)
+    MediaPool* pool = getMediaPool();
+    if (!pool) {
+        ImGui::Text("Instance '%s' not found", getInstanceName().empty() ? "unknown" : getInstanceName().c_str());
+        return;
+    }
+    
     // Draw parameter editing section
     drawParameters();
 
@@ -87,11 +121,16 @@ void MediaPoolGUI::draw() {
 }
 
 void MediaPoolGUI::drawDirectoryControls() {
+    MediaPool* pool = getMediaPool();
+    if (!pool) return;
+    
+    // Browse Directory button - opens native directory browser
     if (ImGui::Button("Browse Directory")) {
-        mediaPool->browseForDirectory();
+        pool->browseForDirectory();
     }
+    
     ImGui::SameLine();
-    std::string displayPath = mediaPool->getDataDirectory();
+    std::string displayPath = pool->getDataDirectory();
     
     // Calculate available width after button (account for spacing)
     float availableWidth = ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x;
@@ -112,7 +151,7 @@ void MediaPoolGUI::drawSearchBar() {
     ImVec2 frameMin = ImGui::GetCursorScreenPos();
     ImVec2 frameMax = ImVec2(frameMin.x + ImGui::CalcItemWidth(), frameMin.y + ImGui::GetFrameHeight());
     bool edited = ImGui::InputText("##search", searchBuffer, sizeof(searchBuffer));
-    ImGui::GetWindowDrawList()->AddRect(frameMin, frameMax, IM_COL32(150, 150, 150, 255), 1.0f, 0, 1.0f); // light grey, thin
+    ImGui::GetWindowDrawList()->AddRect(frameMin, frameMax, GUIConstants::toU32(GUIConstants::Border::SearchBar), 1.0f, 0, 1.0f);
     if (edited) {
         searchFilter = std::string(searchBuffer);
     }
@@ -161,16 +200,19 @@ void MediaPoolGUI::drawMediaList() {
     // Track if any list item is focused (to update parent widget focus state)
     bool anyListItemFocused = false;
     
+    MediaPool* pool = getMediaPool();
+    if (!pool) return;
+    
     // Get current index for auto-scrolling
-    size_t currentIndex = mediaPool->getCurrentIndex();
+    size_t currentIndex = pool->getCurrentIndex();
     
     // Track if index changed to determine if we should sync scroll
     bool shouldSyncScroll = (currentIndex != previousMediaIndex);
     
     // Show indexed media list with actual file names
-    if (mediaPool->getNumPlayers() > 0) {
-        auto playerNames = mediaPool->getPlayerNames();
-        auto playerFileNames = mediaPool->getPlayerFileNames();
+    if (pool->getNumPlayers() > 0) {
+        auto playerNames = pool->getPlayerNames();
+        auto playerFileNames = pool->getPlayerFileNames();
         
         for (size_t i = 0; i < playerNames.size(); i++) {
             // Filter by search term
@@ -194,10 +236,10 @@ void MediaPoolGUI::drawMediaList() {
                 }
             }
             
-            auto player = mediaPool->getMediaPlayer(i);
+            auto player = pool->getMediaPlayer(i);
             if (player) {
                 // Check if this is the currently active player
-                bool isActive = (mediaPool->getActivePlayer() == player);
+                bool isActive = (pool->getActivePlayer() == player);
                 bool isPlaying = (player->isPlaying());
                 
                 // Create clean display format: [01] [AV] Title
@@ -247,16 +289,16 @@ void MediaPoolGUI::drawMediaList() {
                 
                 // Visual styling for active and playing media
                 if (isActive) {
-                    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.1f, 0.1f, 0.9f, 0.8f)); // Blue background for active
+                    ImGui::PushStyleColor(ImGuiCol_Header, GUIConstants::Active::MediaItem);
                 }
                 if (isPlaying) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 1.0f, 0.7f, 1.0f)); // Green for playing
+                    ImGui::PushStyleColor(ImGuiCol_Text, GUIConstants::Text::Playing);
                 }
                 
                 // Make items selectable and clickable
                 if (ImGui::Selectable(displayName.c_str(), isActive)) {
                     // Use playMediaManual to set MANUAL_PREVIEW mode and play from start
-                    bool success = mediaPool->playMediaManual(i, 0.0f);  // Always play from start (position 0.0)
+                    bool success = getMediaPool()->playMediaManual(i, 0.0f);  // Always play from start (position 0.0)
                     if (!success) {
                         ofLogWarning("MediaPoolGUI") << "Failed to play media at index " << i;
                     }
@@ -273,37 +315,11 @@ void MediaPoolGUI::drawMediaList() {
                     anyListItemFocused = true;
                 }
                 
-                // Add hover tooltip with video frame preview
+                // Add hover tooltip with video frame preview and/or audio waveform
                 if (ImGui::IsItemHovered()) {
-                    ImGui::BeginTooltip();
-                    
-                    // Show video frame if available
-                    if (player->isVideoLoaded()) {
-                        ofTexture videoTexture = player->getVideoPlayer().getVideoFile().getTexture();
-                        if (videoTexture.isAllocated()) {
-                            // Display video frame as tooltip
-                            ImGui::Image((void*)(intptr_t)videoTexture.getTextureData().textureID, 
-                                        ImVec2(160, 90), // Preview size
-                                        ImVec2(0, 0), ImVec2(1, 1)); // Normal orientation (no flip)
-                            
-                            // Show basic info below the frame
-                            ImGui::Text("Index: %zu", i);
-                            ImGui::Text("Status: %s", player->isPlaying() ? "Playing" : "Stopped");
-                        } else {
-                            // Fallback to metadata if no video frame available
-                            ImGui::Text("Index: %zu", i);
-                            ImGui::Text("Video: %s", player->isVideoLoaded() ? "Loaded" : "Not loaded");
-                            ImGui::Text("Status: %s", player->isPlaying() ? "Playing" : "Stopped");
-                        }
-                    } else {
-                        // Show audio-only info
-                        ImGui::Text("Index: %zu", i);
-                        ImGui::Text("Audio: %s", player->isAudioLoaded() ? "Loaded" : "Not loaded");
-                        ImGui::Text("Status: %s", player->isPlaying() ? "Playing" : "Stopped");
-                    }
-                    
+                    // Use shared preview utility
+                    MediaPreview::drawMediaTooltip(player, static_cast<int>(i));
                     ImGui::Text("Click to play/pause");
-                    ImGui::EndTooltip();
                 }
                 
                 // Add right-click context menu
@@ -313,13 +329,13 @@ void MediaPoolGUI::drawMediaList() {
                     
                     if (ImGui::MenuItem("Play/Preview", "Click")) {
                         // Stop all other players first
-                        for (size_t j = 0; j < mediaPool->getNumPlayers(); j++) {
-                            auto otherPlayer = mediaPool->getMediaPlayer(j);
+                        for (size_t j = 0; j < getMediaPool()->getNumPlayers(); j++) {
+                            auto otherPlayer = getMediaPool()->getMediaPlayer(j);
                             if (otherPlayer && otherPlayer != player) {
                                 otherPlayer->stop();
                             }
                         }
-                        mediaPool->setActivePlayer(i);
+                        getMediaPool()->setActivePlayer(i);
                         player->play();
                     }
                     
@@ -373,14 +389,32 @@ void MediaPoolGUI::drawMediaList() {
 }
 
 void MediaPoolGUI::drawWaveform() {
-    auto currentPlayer = mediaPool->getActivePlayer();
+    auto currentPlayer = getMediaPool()->getActivePlayer();
     if (!currentPlayer) {
         ImGui::Text("No active player to display waveform.");
         return;
     }
     
+    // Get current media index for per-index zoom state
+    size_t currentIndex = getMediaPool()->getCurrentIndex();
+    auto zoomState = getWaveformZoomState(currentIndex);
+    float waveformZoom = zoomState.first;
+    float waveformOffset = zoomState.second;
+    
     // Create invisible button for interaction area
-    ImVec2 canvasSize = ImVec2(-1, waveformHeight);
+    // CRITICAL: Ensure non-zero size for InvisibleButton (ImGui assertion requirement)
+    // This can fail during initial window setup before layout is complete
+    float safeHeight = std::max(waveformHeight, 1.0f);
+    float availableWidth = ImGui::GetContentRegionAvail().x;
+    
+    // Ensure both dimensions are positive (required by ImGui)
+    // Use fallback values if window isn't ready yet
+    if (availableWidth <= 0.0f) {
+        availableWidth = 100.0f; // Fallback minimum width
+    }
+    // safeHeight is already guaranteed to be >= 1.0f
+    
+    ImVec2 canvasSize = ImVec2(availableWidth, safeHeight);
     ImGui::InvisibleButton("waveform_canvas", canvasSize);
     
     // Get draw list for custom rendering
@@ -390,6 +424,76 @@ void MediaPoolGUI::drawWaveform() {
     float canvasWidth = canvasMax.x - canvasPos.x;
     float canvasHeight = canvasMax.y - canvasPos.y;
     float centerY = canvasPos.y + canvasHeight * 0.5f;
+    
+    // CRITICAL: Check if dragging a ParameterCell - prevents interference with waveform interactions
+    bool isDraggingParameter = !draggingParameter.empty();
+    
+    // Handle zoom and pan interactions
+    if (ImGui::IsItemHovered() && !isDraggingParameter) {
+        // Mouse wheel for zoom (centered on mouse position)
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f) {
+            // Get mouse position relative to canvas
+            ImVec2 mousePos = ImGui::GetMousePos();
+            float mouseX = mousePos.x - canvasPos.x;
+            float mouseTime = mouseX / canvasWidth; // Time position under mouse (0-1)
+            
+            // Calculate visible time range
+            float visibleRange = 1.0f / waveformZoom;
+            float visibleStart = waveformOffset;
+            float mouseTimeAbsolute = visibleStart + mouseTime * visibleRange;
+            
+            // Zoom factor (1.2x per scroll step)
+            float zoomFactor = (wheel > 0.0f) ? 1.2f : 1.0f / 1.2f;
+            float newZoom = waveformZoom * zoomFactor;
+            newZoom = std::max(1.0f, std::min(100.0f, newZoom)); // Clamp zoom
+            
+            // Calculate new offset to keep mouse position fixed
+            float newVisibleRange = 1.0f / newZoom;
+            float newOffset = mouseTimeAbsolute - mouseTime * newVisibleRange;
+            newOffset = std::max(0.0f, std::min(1.0f - newVisibleRange, newOffset));
+            
+            // Store updated zoom state for current index
+            setWaveformZoomState(currentIndex, newZoom, newOffset);
+            waveformZoom = newZoom;
+            waveformOffset = newOffset;
+        }
+        
+        // Handle panning with middle mouse or Shift+drag (only if not dragging a marker or ParameterCell)
+        bool isPanning = false;
+        if (draggingMarker == WaveformMarker::NONE) {
+            isPanning = ImGui::IsMouseDown(2) || (ImGui::IsMouseDragging(0) && ImGui::GetIO().KeyShift);
+        }
+        if (isPanning) {
+            ImVec2 dragDelta = ImGui::GetMouseDragDelta(ImGui::IsMouseDown(2) ? 2 : 0);
+            if (dragDelta.x != 0.0f) {
+                float visibleRange = 1.0f / waveformZoom;
+                
+                // Pan by drag distance (normalized to time range)
+                float panDelta = -dragDelta.x / canvasWidth * visibleRange;
+                float newOffset = waveformOffset + panDelta;
+                newOffset = std::max(0.0f, std::min(1.0f - visibleRange, newOffset));
+                
+                // Store updated offset for current index
+                setWaveformZoomState(currentIndex, waveformZoom, newOffset);
+                waveformOffset = newOffset;
+                
+                ImGui::ResetMouseDragDelta(ImGui::IsMouseDown(2) ? 2 : 0);
+            }
+        }
+        
+        // Double-click to reset zoom
+        if (ImGui::IsMouseDoubleClicked(0)) {
+            setWaveformZoomState(currentIndex, 1.0f, 0.0f);
+            waveformZoom = 1.0f;
+            waveformOffset = 0.0f;
+        }
+    }
+    
+    // Calculate visible time range
+    float visibleRange = 1.0f / waveformZoom;
+    float visibleStart = waveformOffset;
+    float visibleEnd = waveformOffset + visibleRange;
     
     // Check if we have audio data to draw waveform
     bool hasAudioData = false;
@@ -407,9 +511,19 @@ void MediaPoolGUI::drawWaveform() {
         if (numFrames > 0 && numChannels > 0) {
             hasAudioData = true;
             
-            // Prepare data for ImDrawList - much more efficient than manual drawing
-            // Resize vectors if needed
-            int maxPoints = MAX_WAVEFORM_POINTS;
+            // Calculate how many points we need for visible range
+            // When zoomed out (visibleRange = 1.0): use base precision (MAX_WAVEFORM_POINTS)
+            // When zoomed in (visibleRange < 1.0): increase precision proportionally to zoom level
+            // This ensures better detail when zoomed in while maintaining performance when zoomed out
+            // Formula: base points for visible range * (1 + zoom bonus)
+            // The zoom bonus increases precision when zoomed in, allowing more points per visible range
+            float zoomLevel = 1.0f / visibleRange; // Convert visibleRange back to zoom level (1.0 = no zoom, 10.0 = 10x zoom)
+            float zoomPrecisionBonus = (zoomLevel - 1.0f) * ZOOM_PRECISION_MULTIPLIER; // Bonus precision when zoomed in
+            float precisionMultiplier = 1.0f + zoomPrecisionBonus;
+            // Base points for visible range, multiplied by precision to get more detail when zoomed
+            int maxPoints = (int)(MAX_WAVEFORM_POINTS * visibleRange * precisionMultiplier);
+            maxPoints = std::max(MIN_WAVEFORM_POINTS, std::min(MAX_WAVEFORM_POINTS, maxPoints));
+            
             int stepSize = std::max(1, numFrames / maxPoints);
             actualPoints = std::min(maxPoints, numFrames / stepSize);
             
@@ -419,37 +533,48 @@ void MediaPoolGUI::drawWaveform() {
                 channelData[ch].resize(actualPoints);
             }
             
-            // Downsample audio data
+            // Downsample audio data (only for visible range if zoomed in)
             for (int i = 0; i < actualPoints; i++) {
-                int sampleIndex = i * stepSize;
-                if (sampleIndex < numFrames) {
-                    timeData[i] = (float)i / (float)actualPoints; // Normalized time 0-1
-                    
-                    for (int ch = 0; ch < numChannels; ch++) {
-                        channelData[ch][i] = buffer.getSample(sampleIndex, ch);
-                    }
+                // Map point index to time position within visible range
+                float timePos = (float)i / (float)actualPoints;
+                float absoluteTime = visibleStart + timePos * visibleRange;
+                
+                // Clamp to valid range
+                absoluteTime = std::max(0.0f, std::min(1.0f, absoluteTime));
+                
+                // Map to sample index
+                int sampleIndex = (int)(absoluteTime * numFrames);
+                sampleIndex = std::max(0, std::min(numFrames - 1, sampleIndex));
+                
+                timeData[i] = timePos; // Normalized time within visible range (0-1)
+                
+                for (int ch = 0; ch < numChannels; ch++) {
+                    channelData[ch][i] = buffer.getSample(sampleIndex, ch);
                 }
             }
         }
     }
     
     // Draw fallback transparent black rectangle for video-only players
-    ImU32 bgColor = IM_COL32(0, 0, 0, 100); // Semi-transparent black
+    ImU32 bgColor = GUIConstants::toIM_COL32(GUIConstants::Background::Waveform);
     drawList->AddRectFilled(canvasPos, canvasMax, bgColor);
     
     if (hasAudioData) {
         // Draw actual waveform
-        float amplitudeScale = canvasHeight * 0.4f; // Use 80% of height for amplitude
+        float amplitudeScale = canvasHeight * WAVEFORM_AMPLITUDE_SCALE;
+        
+        // Get volume to scale waveform amplitude proportionally
+        float volume = currentPlayer->volume.get();
         
         // Draw each channel with white color
         for (int ch = 0; ch < numChannels; ch++) {
-            ImU32 lineColor = IM_COL32(255, 255, 255, 255); // White
+            ImU32 lineColor = GUIConstants::toU32(GUIConstants::Waveform::Line);
             
             for (int i = 0; i < actualPoints - 1; i++) {
                 float x1 = canvasPos.x + timeData[i] * canvasWidth;
-                float y1 = centerY - channelData[ch][i] * amplitudeScale;
+                float y1 = centerY - channelData[ch][i] * volume * amplitudeScale;
                 float x2 = canvasPos.x + timeData[i + 1] * canvasWidth;
-                float y2 = centerY - channelData[ch][i + 1] * amplitudeScale;
+                float y2 = centerY - channelData[ch][i + 1] * volume * amplitudeScale;
                 
                 drawList->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), lineColor, 1.0f);
             }
@@ -461,10 +586,22 @@ void MediaPoolGUI::drawWaveform() {
 }
 
 void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& canvasMax, float canvasWidth, float canvasHeight) {
-    auto currentPlayer = mediaPool->getActivePlayer();
+    MediaPool* pool = getMediaPool();
+    if (!pool) return;
+    
+    auto currentPlayer = pool->getActivePlayer();
     if (!currentPlayer) return;
     
+    // CRITICAL: Check if dragging a ParameterCell - prevents interference with waveform interactions
+    bool isDraggingParameter = !draggingParameter.empty();
+    
     ImDrawList* drawList = ImGui::GetWindowDrawList();
+    
+    // Get current media index for per-index zoom state
+    size_t currentIndex = getMediaPool()->getCurrentIndex();
+    auto zoomState = getWaveformZoomState(currentIndex);
+    float waveformZoom = zoomState.first;
+    float waveformOffset = zoomState.second;
     
     // Get current parameter values
     float playheadPos = currentPlayer->playheadPosition.get(); // Absolute position
@@ -486,11 +623,24 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
         startPosAbsolute = std::max(0.0f, std::min(1.0f, startPosRelative));
     }
     
-    // Calculate marker positions in screen space
-    float playheadX = canvasPos.x + playheadPos * canvasWidth;
-    float positionX = canvasPos.x + startPosAbsolute * canvasWidth;
-    float regionStartX = canvasPos.x + regionStart * canvasWidth;
-    float regionEndX = canvasPos.x + regionEnd * canvasWidth;
+    // Calculate visible time range (accounting for zoom)
+    float visibleRange = 1.0f / waveformZoom;
+    float visibleStart = waveformOffset;
+    
+    // Helper lambda to map absolute time position to screen X coordinate
+    auto mapToScreenX = [&](float absolutePos) -> float {
+        if (absolutePos < visibleStart || absolutePos > visibleStart + visibleRange) {
+            return -1000.0f; // Off-screen (negative value to indicate off-screen)
+        }
+        float relativePos = (absolutePos - visibleStart) / visibleRange;
+        return canvasPos.x + relativePos * canvasWidth;
+    };
+    
+    // Calculate marker positions in screen space (accounting for zoom)
+    float playheadX = mapToScreenX(playheadPos);
+    float positionX = mapToScreenX(startPosAbsolute);
+    float regionStartX = mapToScreenX(regionStart);
+    float regionEndX = mapToScreenX(regionEnd);
     
     // Marker hit detection threshold (pixels)
     const float MARKER_HIT_THRESHOLD = 8.0f;
@@ -500,40 +650,53 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
     bool isCanvasActive = ImGui::IsItemActive();
     ImVec2 mousePos = ImGui::GetMousePos();
     float mouseX = mousePos.x;
+    
+    // Map screen X to absolute time (accounting for zoom/pan)
     float relativeX = (mouseX - canvasPos.x) / canvasWidth;
+    relativeX = visibleStart + relativeX * visibleRange; // Convert to absolute time
     relativeX = std::max(0.0f, std::min(1.0f, relativeX));
     
     // Detect which marker is closest to mouse (for dragging)
+    // Only check markers that are on-screen
     WaveformMarker hoveredMarker = WaveformMarker::NONE;
     if (isCanvasHovered || isCanvasActive) {
         float minDist = MARKER_HIT_THRESHOLD;
         
-        // Check region start
-        float dist = std::abs(mouseX - regionStartX);
-        if (dist < minDist) {
-            minDist = dist;
-            hoveredMarker = WaveformMarker::REGION_START;
+        // Check region start (only if on-screen)
+        if (regionStartX >= 0.0f) {
+            float dist = std::abs(mouseX - regionStartX);
+            if (dist < minDist) {
+                minDist = dist;
+                hoveredMarker = WaveformMarker::REGION_START;
+            }
         }
         
-        // Check region end
-        dist = std::abs(mouseX - regionEndX);
-        if (dist < minDist) {
-            minDist = dist;
-            hoveredMarker = WaveformMarker::REGION_END;
+        // Check region end (only if on-screen)
+        if (regionEndX >= 0.0f) {
+            float dist = std::abs(mouseX - regionEndX);
+            if (dist < minDist) {
+                minDist = dist;
+                hoveredMarker = WaveformMarker::REGION_END;
+            }
         }
         
-        // Check position marker
-        dist = std::abs(mouseX - positionX);
-        if (dist < minDist) {
-            minDist = dist;
-            hoveredMarker = WaveformMarker::POSITION;
+        // Check position marker (only if on-screen)
+        if (positionX >= 0.0f) {
+            float dist = std::abs(mouseX - positionX);
+            if (dist < minDist) {
+                minDist = dist;
+                hoveredMarker = WaveformMarker::POSITION;
+            }
         }
         
         // Playhead is not draggable, but we can still seek by clicking
     }
     
     // Handle mouse interaction
-    if (isCanvasHovered || isCanvasActive) {
+    // CRITICAL: Don't process waveform mouse interactions when dragging a ParameterCell
+    // This prevents interference between parameter dragging and waveform interactions
+    // (isDraggingParameter is already defined above)
+    if ((isCanvasHovered || isCanvasActive) && !isDraggingParameter) {
         // Update cursor based on hovered marker
         if (hoveredMarker != WaveformMarker::NONE) {
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
@@ -550,7 +713,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                 // Click on empty area: seek playhead to position
                 // CRITICAL: Only update playheadPosition, not startPosition (decoupled)
                 // startPosition should only change when explicitly set (e.g., dragging position marker)
-                auto player = mediaPool->getActivePlayer();
+                auto player = getMediaPool()->getActivePlayer();
                 if (player) {
                     if (player->isPlaying()) {
                         // During playback: seek playhead only (scrubbing)
@@ -563,29 +726,9 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                         }
                         player->playheadPosition.set(relativeX);
                     } else {
-                        // Not playing: update playheadPosition for display, and set startPosition for next playback
-                        // Map absolute position to relative within region for startPosition
-                        float regionStartVal = player->regionStart.get();
-                        float regionEndVal = player->regionEnd.get();
-                        float regionSize = regionEndVal - regionStartVal;
-                        
-                        float relativePos = 0.0f;
-                        if (regionSize > 0.001f) {
-                            // Clamp to region bounds, then map to relative
-                            float clampedAbsolute = std::max(regionStartVal, std::min(regionEndVal, relativeX));
-                            relativePos = (clampedAbsolute - regionStartVal) / regionSize;
-                            relativePos = std::max(0.0f, std::min(1.0f, relativePos));
-                        } else {
-                            relativePos = std::max(0.0f, std::min(1.0f, relativeX));
-                        }
-                        
-                        // Update both: playheadPosition for display, startPosition for next playback
+                        // Not playing: only update playheadPosition for visual feedback (scrubbing)
+                        // Do NOT update startPosition or trigger playback - just move the playhead indicator
                         player->playheadPosition.set(relativeX);
-                        player->startPosition.set(relativePos);
-                        mediaPool->setParameter("position", relativePos, true);
-                        
-                        // Start playback from this position
-                        mediaPool->playMediaManual(mediaPool->getCurrentIndex(), relativeX);
                     }
                 }
             }
@@ -593,7 +736,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
         
         // Continue dragging
         if (draggingMarker != WaveformMarker::NONE && ImGui::IsMouseDragging(0)) {
-            auto player = mediaPool->getActivePlayer();
+            auto player = getMediaPool()->getActivePlayer();
             if (player) {
                 switch (draggingMarker) {
                     case WaveformMarker::REGION_START: {
@@ -601,7 +744,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                         // Clamp to [0, regionEnd]
                         newStart = std::max(0.0f, std::min(regionEnd, newStart));
                         player->regionStart.set(newStart);
-                        mediaPool->setParameter("regionStart", newStart, true);
+                        getMediaPool()->setParameter("regionStart", newStart, true);
                         break;
                     }
                     case WaveformMarker::REGION_END: {
@@ -609,7 +752,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                         // Clamp to [regionStart, 1]
                         newEnd = std::max(regionStart, std::min(1.0f, newEnd));
                         player->regionEnd.set(newEnd);
-                        mediaPool->setParameter("regionEnd", newEnd, true);
+                        getMediaPool()->setParameter("regionEnd", newEnd, true);
                         break;
                     }
                     case WaveformMarker::POSITION: {
@@ -635,7 +778,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                                 (regionStartVal + relativePos * regionSize) : relativePos;
                             player->playheadPosition.set(absolutePos);
                         }
-                        mediaPool->setParameter("position", relativePos, true);
+                        getMediaPool()->setParameter("position", relativePos, true);
                         break;
                     }
                     default:
@@ -652,8 +795,9 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
         // Handle scrubbing during playback (when dragging playhead area)
         // CRITICAL: Scrubbing only affects playheadPosition, not startPosition (decoupled)
         // startPosition should remain unchanged during scrubbing
-        if (draggingMarker == WaveformMarker::NONE && ImGui::IsMouseDragging(0)) {
-            auto player = mediaPool->getActivePlayer();
+        // Also skip if dragging a ParameterCell to prevent interference
+        if (draggingMarker == WaveformMarker::NONE && ImGui::IsMouseDragging(0) && !isDraggingParameter) {
+            auto player = getMediaPool()->getActivePlayer();
             if (player && player->isPlaying()) {
                 // Scrubbing: only update playheadPosition (absolute position)
                 // Don't change startPosition - it should remain as set
@@ -672,14 +816,33 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
         }
     }
     
-    // Draw region background (semi-transparent grey overlay)
-    if (regionStart < regionEnd) {
-        ImU32 regionColor = IM_COL32(150, 150, 150, 30); // Light grey, semi-transparent
-        drawList->AddRectFilled(
-            ImVec2(regionStartX, canvasPos.y),
-            ImVec2(regionEndX, canvasMax.y),
-            regionColor
-        );
+    // Draw grey background on trimmed parts (outside the range)
+    // The range itself keeps the black waveform background
+    // Only draw if markers are on-screen
+    ImU32 trimmedColor = GUIConstants::toIM_COL32(GUIConstants::Background::WaveformTrimmed);
+    if (regionStart > 0.0f && regionStartX >= 0.0f) {
+        // Draw grey background for left trimmed part (before region start)
+        float trimStartX = canvasPos.x;
+        float trimEndX = std::min(regionStartX, canvasMax.x);
+        if (trimEndX > trimStartX) {
+            drawList->AddRectFilled(
+                ImVec2(trimStartX, canvasPos.y),
+                ImVec2(trimEndX, canvasMax.y),
+                trimmedColor
+            );
+        }
+    }
+    if (regionEnd < 1.0f && regionEndX >= 0.0f) {
+        // Draw grey background for right trimmed part (after region end)
+        float trimStartX = std::max(regionEndX, canvasPos.x);
+        float trimEndX = canvasMax.x;
+        if (trimEndX > trimStartX) {
+            drawList->AddRectFilled(
+                ImVec2(trimStartX, canvasPos.y),
+                ImVec2(trimEndX, canvasMax.y),
+                trimmedColor
+            );
+        }
     }
     
     // Marker dimensions
@@ -688,58 +851,130 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
     const float markerHandleHeight = 6.0f;
     const float markerLineTopOffset = markerHandleHeight;
     
-    // Draw region start marker (grey)
-    ImU32 regionStartColor = IM_COL32(180, 180, 180, 255); // Medium grey
-    drawList->AddLine(
-        ImVec2(regionStartX, canvasPos.y + markerLineTopOffset),
-        ImVec2(regionStartX, canvasMax.y),
-        regionStartColor, markerLineWidth
-    );
-    // Draw marker handle (small horizontal bar at top)
-    drawList->AddRectFilled(
-        ImVec2(regionStartX - markerHandleWidth * 0.5f, canvasPos.y),
-        ImVec2(regionStartX + markerHandleWidth * 0.5f, canvasPos.y + markerHandleHeight),
-        regionStartColor
-    );
+    // Draw region start marker (grey) - only if on-screen
+    if (regionStartX >= 0.0f) {
+        ImU32 regionStartColor = GUIConstants::toU32(GUIConstants::Waveform::RegionStart);
+        drawList->AddLine(
+            ImVec2(regionStartX, canvasPos.y + markerLineTopOffset),
+            ImVec2(regionStartX, canvasMax.y),
+            regionStartColor, markerLineWidth
+        );
+        // Draw marker handle (small horizontal bar at top)
+        drawList->AddRectFilled(
+            ImVec2(regionStartX - markerHandleWidth * 0.5f, canvasPos.y),
+            ImVec2(regionStartX + markerHandleWidth * 0.5f, canvasPos.y + markerHandleHeight),
+            regionStartColor
+        );
+    }
     
-    // Draw region end marker (grey)
-    ImU32 regionEndColor = IM_COL32(180, 180, 180, 255); // Medium grey
-    drawList->AddLine(
-        ImVec2(regionEndX, canvasPos.y + markerLineTopOffset),
-        ImVec2(regionEndX, canvasMax.y),
-        regionEndColor, markerLineWidth
-    );
-    // Draw marker handle (small horizontal bar at top)
-    drawList->AddRectFilled(
-        ImVec2(regionEndX - markerHandleWidth * 0.5f, canvasPos.y),
-        ImVec2(regionEndX + markerHandleWidth * 0.5f, canvasPos.y + markerHandleHeight),
-        regionEndColor
-    );
+    // Draw region end marker (grey) - only if on-screen
+    if (regionEndX >= 0.0f) {
+        ImU32 regionEndColor = GUIConstants::toU32(GUIConstants::Waveform::RegionEnd);
+        drawList->AddLine(
+            ImVec2(regionEndX, canvasPos.y + markerLineTopOffset),
+            ImVec2(regionEndX, canvasMax.y),
+            regionEndColor, markerLineWidth
+        );
+        // Draw marker handle (small horizontal bar at top)
+        drawList->AddRectFilled(
+            ImVec2(regionEndX - markerHandleWidth * 0.5f, canvasPos.y),
+            ImVec2(regionEndX + markerHandleWidth * 0.5f, canvasPos.y + markerHandleHeight),
+            regionEndColor
+        );
+    }
     
-    // Draw position marker (darker grey) - shows where playback will start
-    ImU32 positionColor = IM_COL32(120, 120, 120, 255); // Darker grey
-    drawList->AddLine(
-        ImVec2(positionX, canvasPos.y + markerLineTopOffset),
-        ImVec2(positionX, canvasMax.y),
-        positionColor, markerLineWidth
-    );
-    // Draw marker handle (small horizontal bar at top, slightly wider)
-    const float positionHandleWidth = 10.0f;
-    drawList->AddRectFilled(
-        ImVec2(positionX - positionHandleWidth * 0.5f, canvasPos.y),
-        ImVec2(positionX + positionHandleWidth * 0.5f, canvasPos.y + markerHandleHeight),
-        positionColor
-    );
+    // Draw position marker (darker grey) - shows where playback will start - only if on-screen
+    if (positionX >= 0.0f) {
+        ImU32 positionColor = GUIConstants::toU32(GUIConstants::Waveform::Position);
+        drawList->AddLine(
+            ImVec2(positionX, canvasPos.y + markerLineTopOffset),
+            ImVec2(positionX, canvasMax.y),
+            positionColor, markerLineWidth
+        );
+        // Draw marker handle (small horizontal bar at top, slightly wider)
+        const float positionHandleWidth = 10.0f;
+        drawList->AddRectFilled(
+            ImVec2(positionX - positionHandleWidth * 0.5f, canvasPos.y),
+            ImVec2(positionX + positionHandleWidth * 0.5f, canvasPos.y + markerHandleHeight),
+            positionColor
+        );
+    }
     
-    // Draw playhead (green) - shows current playback position (can move freely, even outside region)
+    // Draw playhead (green) - shows current playback position (can move freely, even outside region) - only if on-screen
     bool showPlayhead = (playheadPos > 0.0f || currentPlayer->isPlaying());
-    if (showPlayhead) {
-        ImU32 playheadColor = IM_COL32(0, 255, 0, 255); // Green
+    if (showPlayhead && playheadX >= 0.0f) {
+        ImU32 playheadColor = GUIConstants::toU32(GUIConstants::Waveform::Playhead);
         drawList->AddLine(
             ImVec2(playheadX, canvasPos.y),
             ImVec2(playheadX, canvasMax.y),
             playheadColor, 2.0f
         );
+    }
+    
+    // Draw loop range visualization (when in LOOP play style with loopSize > 0)
+    PlayStyle currentPlayStyle = getMediaPool()->getPlayStyle();
+    if (currentPlayStyle == PlayStyle::LOOP) {
+        float loopSizeSeconds = currentPlayer->loopSize.get();
+        if (loopSizeSeconds > 0.001f) {
+            float duration = currentPlayer->getDuration();
+            if (duration > 0.001f) {
+                // Convert loopSize (seconds) to normalized position (0-1)
+                float loopSizeNormalized = loopSizeSeconds / duration;
+                
+                // Calculate loop start position (absolute) - same logic as in MediaPool::update()
+                float relativeStartPos = currentPlayer->startPosition.get();
+                float regionSize = regionEnd - regionStart;
+                float loopStartAbsolute = 0.0f;
+                
+                if (regionSize > 0.001f) {
+                    loopStartAbsolute = regionStart + relativeStartPos * regionSize;
+                } else {
+                    loopStartAbsolute = std::max(0.0f, std::min(1.0f, relativeStartPos));
+                }
+                
+                // Calculate loop end (clamped to region end and media duration)
+                float calculatedLoopEnd = loopStartAbsolute + loopSizeNormalized;
+                float loopEndAbsolute = std::min(regionEnd, std::min(1.0f, calculatedLoopEnd));
+                
+                // Map to screen coordinates
+                float loopStartX = mapToScreenX(loopStartAbsolute);
+                float loopEndX = mapToScreenX(loopEndAbsolute);
+                
+                // Draw loop range overlay (semi-transparent blue/purple)
+                if (loopStartX >= 0.0f || loopEndX >= 0.0f) {
+                    // Clamp to visible area
+                    float drawStartX = std::max(canvasPos.x, loopStartX >= 0.0f ? loopStartX : canvasPos.x);
+                    float drawEndX = std::min(canvasMax.x, loopEndX >= 0.0f ? loopEndX : canvasMax.x);
+                    
+                    if (drawEndX > drawStartX) {
+                        // Semi-transparent overlay for loop range
+                        ImU32 loopRangeColor = GUIConstants::toIM_COL32(GUIConstants::Waveform::LoopRange);
+                        drawList->AddRectFilled(
+                            ImVec2(drawStartX, canvasPos.y),
+                            ImVec2(drawEndX, canvasMax.y),
+                            loopRangeColor
+                        );
+                        
+                        // Draw border lines for clarity
+                        ImU32 loopBorderColor = GUIConstants::toIM_COL32(GUIConstants::Waveform::LoopRangeBorder);
+                        if (loopStartX >= 0.0f) {
+                            drawList->AddLine(
+                                ImVec2(loopStartX, canvasPos.y),
+                                ImVec2(loopStartX, canvasMax.y),
+                                loopBorderColor, 1.0f
+                            );
+                        }
+                        if (loopEndX >= 0.0f) {
+                            drawList->AddLine(
+                                ImVec2(loopEndX, canvasPos.y),
+                                ImVec2(loopEndX, canvasMax.y),
+                                loopBorderColor, 1.0f
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -750,10 +985,13 @@ ParameterCell MediaPoolGUI::createParameterCellForParameter(const ParameterDescr
     cell.setValueRange(paramDesc.minValue, paramDesc.maxValue, paramDesc.defaultValue);
     cell.calculateStepIncrement();
     
-    auto activePlayer = mediaPool->getActivePlayer();
-    
-    // Set up getCurrentValue callback using MediaPlayer helper method
-    cell.getCurrentValue = [paramDesc, activePlayer]() -> float {
+    // Set up getCurrentValue callback - capture mediaPool to get active player dynamically
+    // This ensures we always get the current active player, not a stale reference
+    cell.getCurrentValue = [this, paramDesc]() -> float {
+        MediaPool* pool = getMediaPool();
+        if (!pool) return paramDesc.defaultValue;
+        
+        auto activePlayer = pool->getActivePlayer();
         if (!activePlayer) return paramDesc.defaultValue;
         
         // Special handling for "position" parameter: show startPosition instead of playheadPosition
@@ -772,19 +1010,104 @@ ParameterCell MediaPoolGUI::createParameterCellForParameter(const ParameterDescr
     
     // Set up onValueApplied callback
     cell.onValueApplied = [this, paramDesc](const std::string&, float value) {
-        if (mediaPool) {
-            mediaPool->setParameter(paramDesc.name, value, true);
+        MediaPool* pool = getMediaPool();
+        if (pool) {
+            pool->setParameter(paramDesc.name, value, true);
         }
     };
     
     // Set up formatValue callback (use openFrameworks ofToString for modern C++ string formatting)
-    cell.formatValue = [paramDesc](float value) -> std::string {
-        if (paramDesc.type == ParameterType::INT) {
-            return ofToString((int)std::round(value));
-        } else {
-            return ofToString(value, 2); // 2 decimal places
+    // Unified precision: 0.001 (3 decimal places) for all float parameters
+    // Special handling for loopSize: logarithmic mapping for better precision at low values (1-100ms granular range)
+    if (paramDesc.name == "loopSize") {
+        // Logarithmic mapping: slider value (0.0-1.0) maps to loopSize (0.001s to 10s)
+        // This provides better precision at low values (1-100ms = 0.001-0.1s)
+        const float MIN_LOOP_SIZE = 0.001f;  // 1ms minimum
+        const float MAX_LOOP_SIZE = 10.0f;   // 10s maximum
+        
+        // Set cell value range to slider range (0.0-1.0) for logarithmic mapping
+        // Calculate default slider value from default seconds value (1.0s)
+        float defaultSeconds = 1.0f;
+        float defaultSliderValue = 0.0f;
+        if (defaultSeconds > MIN_LOOP_SIZE && defaultSeconds < MAX_LOOP_SIZE) {
+            defaultSliderValue = std::log(defaultSeconds / MIN_LOOP_SIZE) / std::log(MAX_LOOP_SIZE / MIN_LOOP_SIZE);
+        } else if (defaultSeconds >= MAX_LOOP_SIZE) {
+            defaultSliderValue = 1.0f;
         }
-    };
+        cell.setValueRange(0.0f, 1.0f, defaultSliderValue);
+        cell.calculateStepIncrement();
+        
+        // Map slider value to logarithmic range
+        cell.getCurrentValue = [this, paramDesc, MIN_LOOP_SIZE, MAX_LOOP_SIZE]() -> float {
+            MediaPool* pool = getMediaPool();
+            if (!pool) return paramDesc.defaultValue;
+            
+            auto activePlayer = pool->getActivePlayer();
+            if (!activePlayer) return paramDesc.defaultValue;
+            
+            // Get actual loopSize value in seconds
+            float actualValue = activePlayer->loopSize.get();
+            
+            // Map from linear seconds to logarithmic slider value (0.0-1.0)
+            // Inverse of: value = MIN * pow(MAX/MIN, sliderValue)
+            if (actualValue <= MIN_LOOP_SIZE) return 0.0f;
+            if (actualValue >= MAX_LOOP_SIZE) return 1.0f;
+            float sliderValue = std::log(actualValue / MIN_LOOP_SIZE) / std::log(MAX_LOOP_SIZE / MIN_LOOP_SIZE);
+            return sliderValue;
+        };
+        
+        // Map slider value back to actual seconds
+        cell.onValueApplied = [this, paramDesc, MIN_LOOP_SIZE, MAX_LOOP_SIZE](const std::string&, float sliderValue) {
+            MediaPool* pool = getMediaPool();
+            if (!pool) return;
+            
+            // Clamp slider value to [0.0, 1.0]
+            sliderValue = std::max(0.0f, std::min(1.0f, sliderValue));
+            
+            // Map from logarithmic slider value to linear seconds
+            // value = MIN * pow(MAX/MIN, sliderValue)
+            float actualValue = MIN_LOOP_SIZE * std::pow(MAX_LOOP_SIZE / MIN_LOOP_SIZE, sliderValue);
+            
+            // Clamp to actual duration if available
+            auto activePlayer = getMediaPool()->getActivePlayer();
+            if (activePlayer) {
+                float duration = activePlayer->getDuration();
+                if (duration > 0.001f) {
+                    actualValue = std::min(actualValue, duration);
+                }
+            }
+            
+            getMediaPool()->setParameter(paramDesc.name, actualValue, true);
+        };
+        
+        // Format display value: show actual seconds with appropriate precision
+        cell.formatValue = [MIN_LOOP_SIZE, MAX_LOOP_SIZE](float sliderValue) -> std::string {
+            // Map slider value to actual seconds for display
+            sliderValue = std::max(0.0f, std::min(1.0f, sliderValue));
+            float actualValue = MIN_LOOP_SIZE * std::pow(MAX_LOOP_SIZE / MIN_LOOP_SIZE, sliderValue);
+            
+            // Use appropriate precision based on value magnitude:
+            // - 5 decimals for values < 0.01s (10ms) - granular synthesis range
+            // - 4 decimals for values < 0.1s (100ms)
+            // - 3 decimals for values >= 0.1s
+            if (actualValue < 0.01f) {
+                return ofToString(actualValue, 5) + "s";
+            } else if (actualValue < 0.1f) {
+                return ofToString(actualValue, 4) + "s";
+            } else {
+                return ofToString(actualValue, 3) + "s";
+            }
+        };
+    } else {
+        // Standard linear mapping for other parameters
+        cell.formatValue = [paramDesc](float value) -> std::string {
+            if (paramDesc.type == ParameterType::INT) {
+                return ofToString((int)std::round(value));
+            } else {
+                return ofToString(value, 3); // 3 decimal places (0.001 precision) for all float parameters
+            }
+        };
+    }
     
     return cell;
 }
@@ -796,6 +1119,9 @@ bool MediaPoolGUI::handleParameterCellKeyPress(const ParameterDescriptor& paramD
     // Sync state from MediaPoolGUI to ParameterCell
     bool isSelected = (editingParameter == paramDesc.name);
     cell.isSelected = isSelected;
+    
+    // Track if we were in edit mode before handling the key
+    bool wasInEditMode = isEditingParameter && isSelected;
     
     // If we're entering edit mode via direct typing, enter edit mode now
     // Otherwise, use the current edit mode state
@@ -814,13 +1140,19 @@ bool MediaPoolGUI::handleParameterCellKeyPress(const ParameterDescriptor& paramD
     
     if (handled) {
         // Sync edit mode state back from ParameterCell to MediaPoolGUI
-        isEditingParameter = cell.isEditingMode();
+        bool nowInEditMode = cell.isEditingMode();
+        isEditingParameter = nowInEditMode;
         if (isEditingParameter) {
             editBufferCache = cell.getEditBuffer();
             editBufferInitializedCache = cell.isEditBufferInitialized();
         } else {
             editBufferCache.clear();
             editBufferInitializedCache = false;
+        }
+        
+        // If we exited edit mode (especially via Enter key), request refocus to maintain cell focus
+        if (wasInEditMode && !nowInEditMode && key == OF_KEY_RETURN) {
+            shouldRefocusCurrentCell = true;
         }
         
         // Disable/enable ImGui keyboard navigation based on edit mode
@@ -836,12 +1168,13 @@ bool MediaPoolGUI::handleParameterCellKeyPress(const ParameterDescriptor& paramD
 }
 
 void MediaPoolGUI::drawParameters() {
-    if (!mediaPool) return;
+    MediaPool* pool = getMediaPool();
+    if (!pool) return;
     
     ImGui::Separator();
     // Get available parameters from MediaPool
-    auto params = mediaPool->getParameters();
-    auto activePlayer = mediaPool->getActivePlayer();
+    auto params = getMediaPool()->getParameters();
+    auto activePlayer = getMediaPool()->getActivePlayer();
     
     if (!activePlayer || params.empty()) {
         ImGui::Text("No parameters available");
@@ -873,7 +1206,9 @@ void MediaPoolGUI::drawParameters() {
     }
     
     // Create an invisible button as the parent widget (similar to TrackerSequencer)
-    ImGui::InvisibleButton("##MediaPoolParamsParent", ImVec2(0, 0));
+    // CRITICAL: InvisibleButton requires non-zero size (ImGui assertion)
+    // Use minimum size of 1x1 pixels to satisfy the requirement
+    ImGui::InvisibleButton("##MediaPoolParamsParent", ImVec2(1, 1));
     
     // Handle clicks on parent widget - clear cell focus when clicked
     if (ImGui::IsItemClicked(0)) {
@@ -944,7 +1279,7 @@ void MediaPoolGUI::drawParameters() {
             ImGui::TableSetColumnIndex((int)i + 2);
             const auto& paramDesc = editableParams[i];
             
-            // Special handling for Position parameter (start position from sequencer): add memory mode selector
+            // Special handling for Position parameter (start position from sequencer): add scan mode selector
             if (paramDesc.name == "position") {
                 // Get cell position and width before drawing header (similar to TrackerSequencerGUI)
                 ImVec2 cellStartPos = ImGui::GetCursorScreenPos();
@@ -954,9 +1289,9 @@ void MediaPoolGUI::drawParameters() {
                 // Draw column name first (standard header)
                 ImGui::TableHeader(paramDesc.displayName.c_str());
                 
-                // Draw memory mode selector button (right-aligned in header)
-                if (mediaPool) {
-                    drawPositionMemoryModeButton(cellStartPos, columnWidth, cellMinY);
+                // Draw scan mode selector button (right-aligned in header)
+                if (pool) {
+                    drawPositionScanModeButton(cellStartPos, columnWidth, cellMinY);
                 }
             } else {
                 // Standard header for other parameters
@@ -966,6 +1301,10 @@ void MediaPoolGUI::drawParameters() {
         
         // Single data row (no steps dimension)
         ImGui::TableNextRow();
+        
+        // Set row background color (darker and more opaque)
+        ImU32 rowBgColor = GUIConstants::toU32(GUIConstants::Background::TableRowFilled);
+        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, rowBgColor);
         
         // Draw media index button (first column, column index 0) - similar to step number button in TrackerSequencer
         ImGui::TableSetColumnIndex(0);
@@ -1048,6 +1387,9 @@ void MediaPoolGUI::drawParameters() {
                     // Maintain focus during drag
                     editingColumnIndex = columnIndex;
                     editingParameter = paramDesc.name;
+                    // CRITICAL: Set anyCellFocusedThisFrame to true during drag to prevent focus from being cleared
+                    // This ensures smooth dragging even when mouse moves outside the cell
+                    anyCellFocusedThisFrame = true;
                 } else {
                     draggingParameter.clear();
                 }
@@ -1090,7 +1432,8 @@ void MediaPoolGUI::drawParameters() {
         }
         
         // After drawing all cells, if column is set but no cell was focused, clear focus
-        if (editingColumnIndex >= 0 && !anyCellFocusedThisFrame && !isEditingParameter && !shouldRefocusCurrentCell) {
+        // CRITICAL: Don't clear focus if we're dragging - this prevents focus loss during smooth dragging
+        if (editingColumnIndex >= 0 && !anyCellFocusedThisFrame && !isEditingParameter && !shouldRefocusCurrentCell && draggingParameter.empty()) {
             clearCellFocus();
         }
         
@@ -1115,7 +1458,7 @@ void MediaPoolGUI::syncEditStateFromImGuiFocus(MediaPoolGUI& gui) {
     if (gui.editingColumnIndex >= 0) {
         // If editingParameter is empty but editingColumnIndex is set, look it up
         if (gui.editingParameter.empty() && gui.mediaPool) {
-            auto params = gui.mediaPool->getParameters();
+            auto params = gui.getMediaPool()->getParameters();
             std::vector<ParameterDescriptor> editableParams;
             for (const auto& param : params) {
                 if (param.name != "note") {
@@ -1135,9 +1478,10 @@ void MediaPoolGUI::syncEditStateFromImGuiFocus(MediaPoolGUI& gui) {
 }
 
 void MediaPoolGUI::drawPlayStyleButton(int columnIndex, size_t numParamColumns) {
-    if (!mediaPool) return;
+    MediaPool* pool = getMediaPool();
+    if (!pool) return;
     
-    PlayStyle currentStyle = mediaPool->getPlayStyle();
+    PlayStyle currentStyle = pool->getPlayStyle();
     
     // Get button label based on current style
     const char* styleLabel = "ONCE";
@@ -1172,7 +1516,7 @@ void MediaPoolGUI::drawPlayStyleButton(int columnIndex, size_t numParamColumns) 
                 nextStyle = PlayStyle::ONCE;
                 break;
         }
-        mediaPool->setPlayStyle(nextStyle);
+        getMediaPool()->setPlayStyle(nextStyle);
     }
     
     // Tooltip on hover
@@ -1182,11 +1526,12 @@ void MediaPoolGUI::drawPlayStyleButton(int columnIndex, size_t numParamColumns) 
 }
 
 void MediaPoolGUI::drawMediaIndexButton(int columnIndex, size_t numParamColumns) {
-    if (!mediaPool) return;
+    MediaPool* pool = getMediaPool();
+    if (!pool) return;
     
-    size_t currentIndex = mediaPool->getCurrentIndex();
-    size_t numPlayers = mediaPool->getNumPlayers();
-    auto activePlayer = mediaPool->getActivePlayer();
+    size_t currentIndex = pool->getCurrentIndex();
+    size_t numPlayers = pool->getNumPlayers();
+    auto activePlayer = pool->getActivePlayer();
     
     // Format button text: show current index (1-based) or "--" if no media
     std::string indexText;
@@ -1211,19 +1556,19 @@ void MediaPoolGUI::drawMediaIndexButton(int columnIndex, size_t numParamColumns)
     // Button is grey if IDLE (stopped)
     bool isCurrentMediaPlaying = false;
     if (activePlayer != nullptr && currentIndex < numPlayers) {
-        auto currentPlayer = mediaPool->getMediaPlayer(currentIndex);
+        auto currentPlayer = getMediaPool()->getMediaPlayer(currentIndex);
         if (currentPlayer == activePlayer) {
             // Button is green if mode is MANUAL_PREVIEW OR SEQUENCER_ACTIVE
             // This syncs with both manual clicks and external sequencer triggers
-            isCurrentMediaPlaying = (mediaPool->isManualPreview() || mediaPool->isSequencerActive()) 
+            isCurrentMediaPlaying = (getMediaPool()->isManualPreview() || getMediaPool()->isSequencerActive()) 
                         && currentPlayer->isPlaying();
         }
     }
     
     // Apply button styling for active playback
     if (isCurrentMediaPlaying) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetColorU32(ImVec4(0.2f, 0.7f, 0.2f, 0.8f)));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetColorU32(ImVec4(0.25f, 0.75f, 0.25f, 0.9f)));
+        ImGui::PushStyleColor(ImGuiCol_Button, GUIConstants::Active::StepButton);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, GUIConstants::Active::StepButtonHover);
     }
     
     ImGui::PushItemFlag(ImGuiItemFlags_NoNavDefaultFocus, true);
@@ -1244,19 +1589,37 @@ void MediaPoolGUI::drawMediaIndexButton(int columnIndex, size_t numParamColumns)
     bool spacebarPressed = ImGui::IsKeyPressed(ImGuiKey_Space, false);
     
     if (buttonClicked && !spacebarPressed && numPlayers > 0) {
-        auto currentPlayer = mediaPool->getMediaPlayer(currentIndex);
+        auto currentPlayer = getMediaPool()->getMediaPlayer(currentIndex);
         if (currentPlayer) {
             // Only toggle manual preview - don't interfere with sequencer playback
             // If sequencer is active, button click does nothing (sequencer controls playback)
-            if (mediaPool->isManualPreview()) {
+            if (getMediaPool()->isManualPreview()) {
                 // Currently in MANUAL_PREVIEW mode - stop it
                 currentPlayer->stop();
-                mediaPool->setModeIdle();  // Transition to IDLE immediately
-            } else if (mediaPool->isIdle()) {
+                getMediaPool()->setModeIdle();  // Transition to IDLE immediately
+            } else if (getMediaPool()->isIdle()) {
                 // Not playing (IDLE) - start manual preview
                 // Note: If SEQUENCER_ACTIVE, we don't do anything (sequencer is in control)
-                float startPosition = currentPlayer->playheadPosition.get();
-                mediaPool->playMediaManual(currentIndex, startPosition);
+                // CRITICAL FIX: Convert relative startPosition to absolute position for playMediaManual
+                // playMediaManual expects absolute position (0.0-1.0), but startPosition is relative within region
+                float relativeStartPos = currentPlayer->startPosition.get();
+                float regionStartVal = currentPlayer->regionStart.get();
+                float regionEndVal = currentPlayer->regionEnd.get();
+                float regionSize = regionEndVal - regionStartVal;
+                
+                float absoluteStartPosition;
+                if (regionSize > 0.001f) {
+                    // Convert relative position to absolute within region
+                    absoluteStartPosition = regionStartVal + relativeStartPos * regionSize;
+                } else {
+                    // If region is invalid, use relative position directly
+                    absoluteStartPosition = relativeStartPos;
+                }
+                
+                // Clamp to valid range
+                absoluteStartPosition = std::max(0.0f, std::min(1.0f, absoluteStartPosition));
+                
+                getMediaPool()->playMediaManual(currentIndex, absoluteStartPosition);
             }
             // If isSequencerActive(), do nothing - sequencer controls playback
         }
@@ -1298,7 +1661,7 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
     // look up the parameter name from the column index
     // This handles cases where focus was synced from ImGui but editingParameter wasn't set yet
     if (editingColumnIndex > 1 && editingParameter.empty() && mediaPool) {
-        auto params = mediaPool->getParameters();
+        auto params = getMediaPool()->getParameters();
         // Filter out "note" parameter (it's not editable in the GUI)
         std::vector<ParameterDescriptor> editableParams;
         for (const auto& param : params) {
@@ -1318,7 +1681,7 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
         // Check if we have a valid parameter column focused (not Index or Play style button)
         if (!isEditingParameter && editingColumnIndex > 1) {
             // Find the parameter descriptor
-            auto params = mediaPool->getParameters();
+            auto params = getMediaPool()->getParameters();
             const ParameterDescriptor* paramDesc = nullptr;
             
             // If editingParameter is set, use it; otherwise look up by column index
@@ -1361,7 +1724,7 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
     // If a parameter is selected and in edit mode, delegate to ParameterCell
     if (!editingParameter.empty() && isEditingParameter) {
         // Find the parameter descriptor
-        auto params = mediaPool->getParameters();
+        auto params = getMediaPool()->getParameters();
         const ParameterDescriptor* paramDesc = nullptr;
         for (const auto& param : params) {
             if (param.name == editingParameter) {
@@ -1383,7 +1746,7 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
         if (key == OF_KEY_UP || key == OF_KEY_DOWN || key == OF_KEY_LEFT || key == OF_KEY_RIGHT) {
             // Ensure we have the parameter descriptor
             if (!editingParameter.empty()) {
-                auto params = mediaPool->getParameters();
+                auto params = getMediaPool()->getParameters();
                 const ParameterDescriptor* paramDesc = nullptr;
                 for (const auto& param : params) {
                     if (param.name == editingParameter) {
@@ -1436,7 +1799,7 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
                 
                 // Ensure editingParameter is set
                 if (editingParameter.empty() && mediaPool) {
-                    auto params = mediaPool->getParameters();
+                    auto params = getMediaPool()->getParameters();
                     std::vector<ParameterDescriptor> editableParams;
                     for (const auto& param : params) {
                         if (param.name != "note") {
@@ -1473,28 +1836,50 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
     return false;
 }
 
-void MediaPoolGUI::drawPositionMemoryModeButton(const ImVec2& cellStartPos, float columnWidth, float cellMinY) {
-    if (!mediaPool) return;
+void MediaPoolGUI::drawPositionScanModeButton(const ImVec2& cellStartPos, float columnWidth, float cellMinY) {
+    MediaPool* pool = getMediaPool();
+    if (!pool) return;
     
-    // Static arrays for mode labels and tooltips (defined once, reused)
-    static const char* const MODE_LABELS[] = { "S", "I", "G" }; // Short labels: Step, Index, Global
+    // Mode cycling button with all 4 modes properly mapped
+    static const char* const MODE_LABELS[] = { "N", "S", "M", "G" }; // None, Step, Media, Global
     static const char* const MODE_TOOLTIPS[] = { 
-        "Per-Step: Each step remembers its own position",
-        "Per-Index: All steps share position per media",
-        "Global: Single position shared across all"
+        "None: No scanning - always start from set position (or 0.0)",
+        "Step: Each step remembers its scan position separately",
+        "Media: Each media remembers its scan position across all steps", 
+        "Global: All media share one scan position"
     };
-    static const char* const MODE_NAMES[] = { "Per-Step", "Per-Index", "Global" };
-    static constexpr int NUM_MODES = 3;
+    static constexpr int NUM_MODES = 4;
     
-    PositionMemoryMode currentMode = mediaPool->getPositionMemoryMode();
-    int currentModeIndex = static_cast<int>(currentMode);
+    // Helper functions to map between enum and GUI index
+    auto modeToGuiIndex = [](ScanMode mode) -> int {
+        switch (mode) {
+            case ScanMode::NONE: return 0;
+            case ScanMode::PER_STEP: return 1;
+            case ScanMode::PER_MEDIA: return 2;
+            case ScanMode::GLOBAL: return 3;
+            default: return 2; // Default to PER_MEDIA
+        }
+    };
+    
+    auto guiIndexToMode = [](int guiIndex) -> ScanMode {
+        switch (guiIndex) {
+            case 0: return ScanMode::NONE;
+            case 1: return ScanMode::PER_STEP;
+            case 2: return ScanMode::PER_MEDIA;
+            case 3: return ScanMode::GLOBAL;
+            default: return ScanMode::PER_MEDIA;
+        }
+    };
+    
+    ScanMode currentMode = getMediaPool()->getScanMode();
+    int currentModeIndex = modeToGuiIndex(currentMode);
     
     // Validate mode index
     if (currentModeIndex < 0 || currentModeIndex >= NUM_MODES) {
-        currentModeIndex = 1; // Default to PER_INDEX if invalid
+        currentModeIndex = 2; // Default to PER_MEDIA if invalid
     }
     
-    ImGui::PushID("PositionMemoryMode");
+    ImGui::PushID("PositionScanMode");
     
     // Calculate button size and position (right-aligned in header)
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
@@ -1507,36 +1892,31 @@ void MediaPoolGUI::drawPositionMemoryModeButton(const ImVec2& cellStartPos, floa
     float buttonStartX = cellMaxX - buttonWidth - padding;
     ImGui::SetCursorScreenPos(ImVec2(buttonStartX, cellMinY));
     
-    // Small button showing current mode
+    // Single click cycles to next mode
     if (ImGui::SmallButton(MODE_LABELS[currentModeIndex])) {
-        ImGui::OpenPopup("PositionMemoryModePopup");
+        int nextModeIndex = (currentModeIndex + 1) % NUM_MODES;
+        getMediaPool()->setScanMode(guiIndexToMode(nextModeIndex));
     }
     
-    // Tooltip on hover
+    // Simple tooltip on hover
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Position Memory Mode: %s\nClick to change mode", MODE_TOOLTIPS[currentModeIndex]);
+        ImGui::SetTooltip("%s", MODE_TOOLTIPS[currentModeIndex]);
     }
     
     ImGui::PopStyleVar();
     
-    // Popup menu for selecting mode
-    if (ImGui::BeginPopup("PositionMemoryModePopup")) {
-        ImGui::Text("Position Memory Mode:");
-        ImGui::Separator();
-        
-        for (int modeIdx = 0; modeIdx < NUM_MODES; modeIdx++) {
-            bool isSelected = (currentModeIndex == modeIdx);
-            if (ImGui::Selectable(MODE_NAMES[modeIdx], isSelected)) {
-                mediaPool->setPositionMemoryMode(static_cast<PositionMemoryMode>(modeIdx));
-                ImGui::CloseCurrentPopup();
-            }
-            if (isSelected) {
-                ImGui::SetItemDefaultFocus();
-            }
-        }
-        
-        ImGui::EndPopup();
-    }
-    
     ImGui::PopID();
+}
+
+std::pair<float, float> MediaPoolGUI::getWaveformZoomState(size_t index) const {
+    auto it = waveformZoomState.find(index);
+    if (it != waveformZoomState.end()) {
+        return it->second;  // Return stored {zoom, offset}
+    }
+    // Default values: no zoom (1.0), no offset (0.0)
+    return std::make_pair(1.0f, 0.0f);
+}
+
+void MediaPoolGUI::setWaveformZoomState(size_t index, float zoom, float offset) {
+    waveformZoomState[index] = std::make_pair(zoom, offset);
 }

@@ -61,9 +61,9 @@ std::string PatternCell::toString() const {
     std::string result = "[" + ofToString(index) + "]";
     result += " len:" + ofToString(length);
     
-    // Add parameter values
+    // Add parameter values (3 decimal places for unified precision)
     for (const auto& pair : parameterValues) {
-        result += " " + pair.first + ":" + ofToString(pair.second, 2);
+        result += " " + pair.first + ":" + ofToString(pair.second, 3);
     }
     
     return result;

@@ -3,16 +3,23 @@
 #include "ofxSoundObjects.h"
 #include "ParameterCell.h"
 #include "Module.h"  // For ParameterDescriptor
+#include "gui/ModuleGUI.h"
 #include <string>
 #include <vector>
 #include <map>
 
 class MediaPool;  // Forward declaration
+class MediaPlayer;  // Forward declaration
+class ModuleRegistry;  // Forward declaration
 
-class MediaPoolGUI {
+class MediaPoolGUI : public ModuleGUI {
 public:
     MediaPoolGUI();
+    
+    // Legacy method (for backward compatibility during migration)
     void setMediaPool(MediaPool& pool);
+    
+    // Override draw to call base class (which calls drawContent)
     void draw();
     
     // Navigation state controls (for InputRouter)
@@ -29,8 +36,16 @@ public:
     // Clear cell focus (for focus restoration when window regains focus)
     void clearCellFocus();
     
+protected:
+    // Implement ModuleGUI::drawContent() - draws panel-specific content
+    void drawContent() override;
+    
 private:
-    MediaPool* mediaPool;
+    // Legacy: keep for backward compatibility (will be removed)
+    MediaPool* mediaPool = nullptr;
+    
+    // Helper to get current MediaPool instance from registry
+    MediaPool* getMediaPool() const;
     
     // Search functionality
     char searchBuffer[256];
@@ -38,7 +53,14 @@ private:
     
     // Waveform visualization
     float waveformHeight;
-    static constexpr int MAX_WAVEFORM_POINTS = 2000;  // Maximum number of points for smooth waveform rendering
+    static constexpr int MAX_WAVEFORM_POINTS = 4000;  // Maximum number of points for smooth waveform rendering (increased for better default precision)
+    static constexpr int MIN_WAVEFORM_POINTS = 200;   // Minimum number of points for waveform rendering (increased for better default precision)
+    static constexpr int MAX_TOOLTIP_WAVEFORM_POINTS = 600;  // Maximum number of points for tooltip waveform preview
+    static constexpr int MIN_WAVEFORM_POINTS_FOR_DRAW = 2;   // Minimum points required to draw waveform (need at least 2 for a line)
+    static constexpr float WAVEFORM_AMPLITUDE_SCALE = 0.4f;  // Amplitude scaling factor (0.4 = 40% of canvas height, using 80% total range)
+    static constexpr float ZOOM_PRECISION_MULTIPLIER = 2.0f; // Multiplier for precision when zoomed in (higher = more points when zoomed)
+    // Per-index zoom and pan state (index -> {zoom, offset})
+    std::map<size_t, std::pair<float, float>> waveformZoomState;  // Stores {zoom, offset} per media index
     
     // Waveform marker dragging state
     enum class WaveformMarker {
@@ -86,6 +108,7 @@ private:
     void drawMediaList();
     void drawWaveform();
     void drawWaveformControls(const ImVec2& canvasPos, const ImVec2& canvasMax, float canvasWidth, float canvasHeight);  // Draw markers and controls on top of waveform
+    void drawWaveformPreview(MediaPlayer* player, float width, float height);  // Draw waveform preview in tooltip
     void drawParameters();  // New: Draw parameter editing section as one-row table
     void drawMediaIndexButton(int columnIndex, size_t numParamColumns);  // Draw media index button (play/pause trigger)
     void drawPlayStyleButton(int columnIndex, size_t numParamColumns);  // Draw PlayStyle button (cycles ONCE/LOOP/NEXT)
@@ -102,7 +125,11 @@ private:
     //          if false, truncates from end (shows start with ellipsis suffix)
     std::string truncateTextToWidth(const std::string& text, float maxWidth, bool showEnd = false, const std::string& ellipsis = "...");
     
-    // Helper method to draw position memory mode selector button in header
-    void drawPositionMemoryModeButton(const ImVec2& cellStartPos, float columnWidth, float cellMinY);
+    // Helper method to draw position scan mode selector button in header
+    void drawPositionScanModeButton(const ImVec2& cellStartPos, float columnWidth, float cellMinY);
+    
+    // Helper methods for per-index zoom state
+    std::pair<float, float> getWaveformZoomState(size_t index) const;  // Returns {zoom, offset} for given index
+    void setWaveformZoomState(size_t index, float zoom, float offset);  // Sets zoom and offset for given index
 };
 

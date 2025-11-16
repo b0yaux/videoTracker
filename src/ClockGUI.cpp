@@ -1,5 +1,6 @@
 #include "ClockGUI.h"
 #include "ofxImGui.h"
+#include "gui/GUIConstants.h"
 
 ClockGUI::ClockGUI() {
 }
@@ -40,7 +41,16 @@ void ClockGUI::draw(Clock& clock) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImDrawList* draw = ImGui::GetWindowDrawList();
     float size = 5.0f + (clock.getBeatPulse() * 5.0f);
-    ImU32 color = clock.isPlaying() ? IM_COL32(clock.getBeatPulse() * 255, clock.getBeatPulse() * 255, clock.getBeatPulse() * 255, 255) : IM_COL32(0, 0, 0, 255);
+    ImU32 color;
+    if (clock.isPlaying()) {
+        ImVec4 pulseColor = GUIConstants::Clock::PulseBase;
+        pulseColor.x *= clock.getBeatPulse();
+        pulseColor.y *= clock.getBeatPulse();
+        pulseColor.z *= clock.getBeatPulse();
+        color = GUIConstants::toIM_COL32(pulseColor);
+    } else {
+        color = GUIConstants::toU32(GUIConstants::Clock::PulseStopped);
+    }
     draw->AddCircleFilled(ImVec2(pos.x+9, pos.y+9), size, color);
     
     ImGui::Dummy(ImVec2(0.0f, 10.0f));

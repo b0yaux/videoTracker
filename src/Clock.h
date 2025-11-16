@@ -8,6 +8,7 @@
 
 #include "ofMain.h"
 #include "ofxSoundObjects.h"
+#include "ofJson.h"
 
 // Configuration structure for Clock
 struct ClockConfig {
@@ -80,6 +81,10 @@ public:
     float getMinBPM() const;
     float getMaxBPM() const;
     float getSampleRate() const;
+    
+    // Serialization
+    ofJson toJson() const;
+    void fromJson(const ofJson& json);
     
     // Audio callback (inherited from ofxSoundOutput)
     void audioOut(ofSoundBuffer& buffer) override;

@@ -3,13 +3,14 @@
 #include "ofxSoundObjects.h"
 #include "ofxVisualObjects.h"
 #include "Module.h"
+#include "readerwriterqueue.h"
 #include <vector>
 #include <memory>
 #include <string>
 #include <mutex>
 #include <atomic>
-#include <queue>
 #include <map>
+#include "ofJson.h"
 
 // Forward declarations to avoid circular dependency
 class MediaPlayer;
@@ -35,11 +36,13 @@ enum class PlayStyle {
     NEXT       // Play next media in pool
 };
 
-// Position memory mode: how position is stored and restored
-enum class PositionMemoryMode {
-    PER_STEP,    // Each step has its own position memory (key: step + mediaIndex)
-    PER_INDEX,   // All steps share position per media index (key: mediaIndex)
-    GLOBAL       // Single position shared across all indexes and steps
+// Position scan mode: how scan position is stored and restored
+// Scan position tracks where playback left off, so next trigger (without explicit position) continues from there
+enum class ScanMode {
+    NONE,        // No scanning - always start from set position (or 0.0)
+    PER_STEP,    // Each step remembers its own scan position (key: step + mediaIndex)
+    PER_MEDIA,   // Each media remembers its scan position across all steps (key: mediaIndex)
+    GLOBAL       // All media share one scan position (key: ignored)
 };
 
 // Note: StepTriggerParams and TriggerEventData removed - using TriggerEvent directly from Module.h
@@ -104,6 +107,11 @@ public:
     void onTrigger(TriggerEvent& event) override;
     void setParameter(const std::string& paramName, float value, bool notify = true) override;
     
+    // Module serialization interface
+    ofJson toJson() const override;
+    void fromJson(const ofJson& json) override;
+    // getTypeName() uses default implementation from Module base class
+    
     // Manual media playback (for GUI preview)
     bool playMediaManual(size_t index, float position = 0.0f);
     // stopManualPreview() removed - update() automatically transitions MANUAL_PREVIEW → IDLE when player stops
@@ -152,115 +160,101 @@ public:
     std::function<void(const std::string&)> onDirectoryChanged;
     void setDirectoryChangeCallback(std::function<void(const std::string&)> callback) { onDirectoryChanged = callback; }
     
-    // Position memory mode control
-    void setPositionMemoryMode(PositionMemoryMode mode);
-    PositionMemoryMode getPositionMemoryMode() const;
+    // Position scan mode control
+    void setScanMode(ScanMode mode);
+    ScanMode getScanMode() const;
     
 private:
-    // Unified position memory system
-    class PositionMemory {
+    // Position scan system: tracks where playback left off for scanning through media
+    // SIMPLIFIED: PER_MEDIA mode now uses MediaPlayer::playheadPosition directly (no storage needed)
+    // Only PER_STEP and GLOBAL modes use this storage
+    class PositionScan {
     private:
-        PositionMemoryMode mode;
+        ScanMode mode;
         
-        // For PER_STEP: key = (step << 16) | mediaIndex
-        // For PER_INDEX: key = mediaIndex
+        // For PER_STEP: key = (step, mediaIndex) pair (simplified from bit-shifting)
         // For GLOBAL: single value, key ignored
-        std::map<int, float> positions;
-        float globalPosition = 0.0f;
+        // NOTE: PER_MEDIA mode no longer uses storage - reads directly from MediaPlayer::playheadPosition
+        std::map<std::pair<int, int>, float> stepPositions;  // (step, mediaIndex) -> position
+        float globalScanPosition = 0.0f;
         
-        static constexpr float POSITION_THRESHOLD = 0.01f;
-        static constexpr float POSITION_EPSILON = 0.001f;
-        static constexpr float POSITION_END_THRESHOLD = 0.99f;  // Positions >= this are treated as "end of media" (reset to start)
-        
-        int makeKey(int step, int mediaIndex) const {
-            switch (mode) {
-                case PositionMemoryMode::PER_STEP:
-                    return (step << 16) | (mediaIndex & 0xFFFF);
-                case PositionMemoryMode::PER_INDEX:
-                    return mediaIndex;
-                case PositionMemoryMode::GLOBAL:
-                    return 0; // Ignored
-                default:
-                    return 0; // Should never happen
-            }
-        }
+        static constexpr float SCAN_THRESHOLD = 0.01f;      // Don't store near-zero positions
+        static constexpr float SCAN_END_THRESHOLD = 0.99f;  // Positions >= this mean "media ended" (reset to start)
         
     public:
-        PositionMemory(PositionMemoryMode m = PositionMemoryMode::PER_INDEX) : mode(m) {}
+        PositionScan(ScanMode m = ScanMode::PER_MEDIA) : mode(m) {}
         
-        void setMode(PositionMemoryMode m) { mode = m; }
-        PositionMemoryMode getMode() const { return mode; }
+        void setMode(ScanMode m) { mode = m; }
+        ScanMode getMode() const { return mode; }
         
-        // Capture position (called from update() when media is playing)
+        // Capture scan position during active playback
+        // NOTE: Only called for PER_STEP and GLOBAL modes
+        // PER_MEDIA mode uses MediaPlayer::playheadPosition directly (no capture needed)
         void capture(int step, int mediaIndex, float position) {
-            // Don't store near-zero positions
-            if (position < POSITION_THRESHOLD) return;
+            if (mode == ScanMode::NONE || mode == ScanMode::PER_MEDIA) return;
+            if (position < SCAN_THRESHOLD) return;  // Don't store near-zero positions
             
-            // CRITICAL FIX: Don't capture positions at end of media (>= 0.99)
-            // When media reaches the end, we should reset position memory (treat as "media ended, start fresh")
-            // This prevents the issue where media gets stuck at 0.999 and immediately stops on retrigger
-            if (position >= POSITION_END_THRESHOLD) {
-                // Media reached the end - clear position memory for this key (will start from beginning next time)
+            // CRITICAL: If media reached the end, reset scan position (start fresh next time)
+            if (position >= SCAN_END_THRESHOLD) {
                 clear(step, mediaIndex);
                 return;
             }
             
-            // Normal position capture (media is still playing, not at end)
-            if (mode == PositionMemoryMode::GLOBAL) {
-                globalPosition = position;
-            } else {
-                int key = makeKey(step, mediaIndex);
-                auto it = positions.find(key);
-                if (it == positions.end() || position > it->second + POSITION_EPSILON) {
-                    positions[key] = position;
+            // Store scan position
+            if (mode == ScanMode::GLOBAL) {
+                globalScanPosition = position;
+            } else if (mode == ScanMode::PER_STEP) {
+                // For PER_STEP mode, step must be valid (>= 0)
+                if (step >= 0) {
+                    stepPositions[{step, mediaIndex}] = position;
                 }
             }
         }
         
-        // Restore position (called from onTrigger() when position parameter missing)
-        float restore(int step, int mediaIndex, float defaultValue = 0.0f) const {
-            if (mode == PositionMemoryMode::GLOBAL) {
-                // Check if global position is at end of media
-                if (globalPosition >= POSITION_END_THRESHOLD) {
-                    return defaultValue; // Media ended, start from beginning
-                }
-                return globalPosition;
-            }
+        // Restore scan position (returns 0.0 if not found or at end)
+        // NOTE: For PER_MEDIA mode, caller should read directly from MediaPlayer::playheadPosition
+        float restore(int step, int mediaIndex) const {
+            if (mode == ScanMode::NONE || mode == ScanMode::PER_MEDIA) return 0.0f;
             
-            int key = makeKey(step, mediaIndex);
-            auto it = positions.find(key);
-            if (it != positions.end()) {
-                // Check if stored position is at end of media
-                if (it->second >= POSITION_END_THRESHOLD) {
-                    return defaultValue; // Media ended, start from beginning
+            if (mode == ScanMode::GLOBAL) {
+                return (globalScanPosition >= SCAN_END_THRESHOLD) ? 0.0f : globalScanPosition;
+            } else if (mode == ScanMode::PER_STEP) {
+                if (step < 0) return 0.0f;
+                auto it = stepPositions.find({step, mediaIndex});
+                if (it != stepPositions.end()) {
+                    // If stored position is at end, return 0.0 (start fresh)
+                    return (it->second >= SCAN_END_THRESHOLD) ? 0.0f : it->second;
                 }
-                return it->second;
             }
-            return defaultValue;
+            return 0.0f;
         }
         
-        // Clear all stored positions
+        // Clear all scan positions (called when transport starts)
         void clear() {
-            positions.clear();
-            globalPosition = 0.0f;
+            stepPositions.clear();
+            globalScanPosition = 0.0f;
         }
         
-        // Clear position for specific step/index (useful for reset)
+        // Clear scan position for specific step/index
         void clear(int step, int mediaIndex) {
-            if (mode == PositionMemoryMode::GLOBAL) {
-                globalPosition = 0.0f;
-            } else {
-                int key = makeKey(step, mediaIndex);
-                positions.erase(key);
+            if (mode == ScanMode::NONE || mode == ScanMode::PER_MEDIA) return;
+            
+            if (mode == ScanMode::GLOBAL) {
+                globalScanPosition = 0.0f;
+            } else if (mode == ScanMode::PER_STEP) {
+                if (step >= 0) {
+                    stepPositions.erase({step, mediaIndex});
+                }
             }
         }
         
-        // Get number of stored positions (for checking if memory is empty)
+        // Get number of stored scan positions
         size_t size() const {
-            if (mode == PositionMemoryMode::GLOBAL) {
-                return (globalPosition > POSITION_THRESHOLD) ? 1 : 0;
+            if (mode == ScanMode::NONE || mode == ScanMode::PER_MEDIA) return 0;
+            if (mode == ScanMode::GLOBAL) {
+                return (globalScanPosition > SCAN_THRESHOLD) ? 1 : 0;
             }
-            return positions.size();
+            return stepPositions.size();
         }
     };
     
@@ -277,8 +271,11 @@ private:
     mutable std::mutex stateMutex;
     
     // Lock-free event queue for audio thread -> GUI thread communication
-    // Uses TriggerEvent directly (from Module.h) - no redundant data structures
-    std::queue<TriggerEvent> eventQueue;
+    // Uses moodycamel::ReaderWriterQueue (SPSC - Single Producer Single Consumer)
+    // Producer: Audio thread (onTrigger)
+    // Consumer: GUI thread (processEventQueue)
+    // Capacity: 1024 events (increased to handle rapid triggering with many media files)
+    moodycamel::ReaderWriterQueue<TriggerEvent> eventQueue{1024};
     
     // Playback state machine (atomic for lock-free reads)
     std::atomic<PlaybackMode> currentMode;
@@ -291,13 +288,21 @@ private:
     // Transport listener system
     TransportCallback transportListener;
     bool lastTransportState;
-    bool transportJustStarted = false;  // Add this flag
     
-    // Unified position memory system (replaces lastPositionByMediaIndex and lastPlayingStateByMediaIndex)
-    PositionMemory positionMemory;
+    // Position scan system (tracks where playback left off for scanning through media)
+    PositionScan positionScan;
     
     // Track last triggered step for position capture (used in update())
     int lastTriggeredStep = -1;
+    
+    // Active step context for accurate position capture timing
+    // Updated in processEventQueue() before position capture happens in update()
+    struct ActiveStepContext {
+        int step = -1;
+        int mediaIndex = -1;
+        float triggerTime = 0.0f;
+    };
+    ActiveStepContext activeStepContext;
     
     // Gate timer tracking for sequencer-triggered playback
     bool gateTimerActive;
@@ -317,3 +322,4 @@ private:
     static constexpr float POSITION_THRESHOLD = 0.01f;     // Significant position threshold (for video seeking, position memory)
     static constexpr float PARAMETER_EPSILON = 0.001f;     // Small difference threshold for parameter comparisons
 };
+

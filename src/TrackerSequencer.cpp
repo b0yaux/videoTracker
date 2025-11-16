@@ -394,7 +394,7 @@ void TrackerSequencer::setCurrentStep(int step) {
     }
 }
 
-bool TrackerSequencer::saveState(const std::string& filename) const {
+ofJson TrackerSequencer::toJson() const {
     ofJson json;
     json["currentStep"] = playbackStep;  // Save playback step for backward compatibility
     // Note: GUI state (editStep, etc.) no longer saved here - managed by TrackerSequencerGUI
@@ -437,6 +437,14 @@ bool TrackerSequencer::saveState(const std::string& filename) const {
     // Legacy: Save single pattern for backward compatibility
     json["pattern"] = getCurrentPattern().toJson();
     
+    return json;
+}
+
+// getTypeName() uses default implementation from Module base class (returns getName())
+
+bool TrackerSequencer::saveState(const std::string& filename) const {
+    ofJson json = toJson();
+    
     ofFile file(filename, ofFile::WriteOnly);
     if (file.is_open()) {
         file << json.dump(4); // Pretty print with 4 spaces
@@ -449,24 +457,7 @@ bool TrackerSequencer::saveState(const std::string& filename) const {
     }
 }
 
-bool TrackerSequencer::loadState(const std::string& filename) {
-    ofFile file(filename, ofFile::ReadOnly);
-    if (!file.is_open()) {
-        ofLogError("TrackerSequencer") << "Failed to load state from " << filename;
-        return false;
-    }
-    
-    std::string jsonString = file.readToBuffer().getText();
-    file.close();
-    
-    ofJson json;
-    try {
-        json = ofJson::parse(jsonString);
-    } catch (const std::exception& e) {
-        ofLogError("TrackerSequencer") << "Failed to parse JSON: " << e.what();
-        return false;
-    }
-    
+void TrackerSequencer::fromJson(const ofJson& json) {
     // Load basic properties
     if (json.contains("currentStep")) {
         playbackStep = json["currentStep"];
@@ -648,6 +639,27 @@ bool TrackerSequencer::loadState(const std::string& filename) {
             currentChainRepeat = 0;
         }
     }
+}
+
+bool TrackerSequencer::loadState(const std::string& filename) {
+    ofFile file(filename, ofFile::ReadOnly);
+    if (!file.is_open()) {
+        ofLogError("TrackerSequencer") << "Failed to load state from " << filename;
+        return false;
+    }
+    
+    std::string jsonString = file.readToBuffer().getText();
+    file.close();
+    
+    ofJson json;
+    try {
+        json = ofJson::parse(jsonString);
+    } catch (const std::exception& e) {
+        ofLogError("TrackerSequencer") << "Failed to parse JSON: " << e.what();
+        return false;
+    }
+    
+    fromJson(json);
     
     ofLogNotice("TrackerSequencer") << "State loaded from " << filename;
     return true;
@@ -860,6 +872,12 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             } else {
                 guiState.editBufferCache.clear();
                 guiState.editBufferInitializedCache = false;
+            }
+            
+            // If ParameterCell exited edit mode via Enter, check if it needs refocus
+            // This maintains focus after saving with Enter (unified refocus system)
+            if (!nowEditing && wasEditing && cell.getShouldRefocus()) {
+                guiState.shouldRefocusCurrentCell = true;
             }
             
             // If ParameterCell entered edit mode, sync that
@@ -1432,6 +1450,14 @@ void TrackerSequencer::applyPendingEdit() {
 //--------------------------------------------------------------
 // Module interface implementation
 //--------------------------------------------------------------
+std::string TrackerSequencer::getName() const {
+    return "TrackerSequencer";
+}
+
+ModuleType TrackerSequencer::getType() const {
+    return ModuleType::SEQUENCER;
+}
+
 std::vector<ParameterDescriptor> TrackerSequencer::getParameters() {
     return getAvailableParameters();
 }
@@ -1585,8 +1611,8 @@ std::string TrackerSequencer::formatParameterValue(const std::string& paramName,
         // Integer parameters: no decimal places
         snprintf(buf, sizeof(buf), "%d", (int)std::round(value));
     } else {
-        // Float parameters: 2 decimal places (standard for all float params)
-        snprintf(buf, sizeof(buf), "%.2f", value);
+        // Float parameters: 3 decimal places (0.001 precision) - unified for all float params
+        snprintf(buf, sizeof(buf), "%.3f", value);
     }
     
     return std::string(buf);
@@ -2027,9 +2053,12 @@ void TrackerSequencer::configureParameterCellCallbacks(ParameterCell& cell, int 
     };
     
     // formatValue callback - uses TrackerSequencer's formatting (static method)
-    cell.formatValue = [paramName](float value) -> std::string {
-        return formatParameterValue(paramName, value);
-    };
+    // Only set for dynamic parameters - fixed columns (Index, Length) use ParameterCell's built-in formatting
+    if (!isFixedCol) {
+        cell.formatValue = [paramName](float value) -> std::string {
+            return formatParameterValue(paramName, value);
+        };
+    }
     
     // parseValue callback - uses default parsing (can be enhanced if needed)
     // ParameterCell already has default parsing, so we can leave this unset

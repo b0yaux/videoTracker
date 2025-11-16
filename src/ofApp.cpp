@@ -5,6 +5,7 @@
 //
 
 #include "ofApp.h"
+#include "gui/GUIConstants.h"
 #include <filesystem>
 #include <future>
 
@@ -27,48 +28,119 @@ void ofApp::setup() {
     std::string savedMediaDir = loadMediaDirectory();
     bool foundDataDir = false;
     
-    if (!savedMediaDir.empty() && ofDirectory(savedMediaDir).exists()) {
-        mediaPool.setDataDirectory(savedMediaDir);
-        foundDataDir = true;
-    } else {
-        // Fallback to default paths
-        std::vector<std::string> possiblePaths;
-        try {
-            std::string cwd = ofFilePath::getCurrentWorkingDirectory();
-            possiblePaths.push_back(cwd + "/bin/data");
-            possiblePaths.push_back(cwd + "/data");
-        } catch (const std::filesystem::filesystem_error& e) {
-            ofLogWarning("ofApp") << "Filesystem error getting current directory: " << e.what();
-        } catch (const std::exception& e) {
-            ofLogWarning("ofApp") << "Exception getting current directory: " << e.what();
-        } catch (...) {
-            ofLogWarning("ofApp") << "Unknown exception getting current directory";
+    // Initialize ParameterRouter with ModuleRegistry
+    // Note: ParameterRouter can be initialized with nullptr and setRegistry() called later
+    // But we initialize it here for clarity
+    parameterRouter.setRegistry(&moduleRegistry);
+    
+    // Initialize SessionManager
+    sessionManager = SessionManager(&clock, &moduleRegistry, &moduleFactory, &parameterRouter);
+    
+    // Try to load session first (if it exists)
+    bool sessionLoaded = false;
+    if (ofFile("session.json").exists()) {
+        ofLogNotice("ofApp") << "Found session.json, loading session...";
+        if (sessionManager.loadSession("session.json")) {
+            sessionLoaded = true;
+            ofLogNotice("ofApp") << "✓ Session loaded successfully";
+            
+            // Get modules from registry after loading (they were recreated with session UUIDs)
+            trackerSequencer = std::dynamic_pointer_cast<TrackerSequencer>(
+                moduleRegistry.getModule(TRACKER_INSTANCE_NAME));
+            mediaPool = std::dynamic_pointer_cast<MediaPool>(
+                moduleRegistry.getModule(MEDIAPOOL_INSTANCE_NAME));
+            
+            if (!trackerSequencer || !mediaPool) {
+                ofLogWarning("ofApp") << "Session loaded but default modules not found, creating defaults...";
+                sessionLoaded = false; // Fall through to create defaults
+            }
+        } else {
+            ofLogWarning("ofApp") << "Failed to load session, creating default modules...";
         }
-        possiblePaths.push_back("/Users/jaufre/works/of_v0.12.1_osx_release/addons/ofxMediaObjects/example-audiovisualSequencer/bin/data");
+    }
+    
+    // Create default modules if session wasn't loaded
+    if (!sessionLoaded) {
+        trackerSequencer = std::dynamic_pointer_cast<TrackerSequencer>(
+            moduleFactory.createTrackerSequencer(TRACKER_INSTANCE_NAME));
+        mediaPool = std::dynamic_pointer_cast<MediaPool>(
+            moduleFactory.createMediaPool(MEDIAPOOL_INSTANCE_NAME));
         
-        for (const auto& path : possiblePaths) {
-            if (ofDirectory(path).exists()) {
-                mediaPool.setDataDirectory(path);
-                saveMediaDirectory(path); // Save for next launch
-                foundDataDir = true;
-                break;
+        if (!trackerSequencer || !mediaPool) {
+            ofLogError("ofApp") << "Failed to create modules via factory";
+            return;
+        }
+        
+        // Register modules in registry
+        std::string trackerUUID = moduleFactory.getUUID(TRACKER_INSTANCE_NAME);
+        std::string poolUUID = moduleFactory.getUUID(MEDIAPOOL_INSTANCE_NAME);
+        
+        if (!moduleRegistry.registerModule(trackerUUID, trackerSequencer, TRACKER_INSTANCE_NAME)) {
+            ofLogError("ofApp") << "Failed to register TrackerSequencer in registry";
+            return;
+        }
+        
+        if (!moduleRegistry.registerModule(poolUUID, mediaPool, MEDIAPOOL_INSTANCE_NAME)) {
+            ofLogError("ofApp") << "Failed to register MediaPool in registry";
+            return;
+        }
+    }
+    
+    // Load media directory with error handling
+    try {
+        if (!savedMediaDir.empty() && ofDirectory(savedMediaDir).exists()) {
+            ofLogNotice("ofApp") << "Loading saved media directory: " << savedMediaDir;
+            mediaPool->setDataDirectory(savedMediaDir);
+            foundDataDir = true;
+            ofLogNotice("ofApp") << "✓ Successfully loaded media directory with " << mediaPool->getNumPlayers() << " players";
+        } else {
+            // Fallback to default paths
+            std::vector<std::string> possiblePaths;
+            try {
+                std::string cwd = ofFilePath::getCurrentWorkingDirectory();
+                possiblePaths.push_back(cwd + "/bin/data");
+                possiblePaths.push_back(cwd + "/data");
+            } catch (const std::filesystem::filesystem_error& e) {
+                ofLogWarning("ofApp") << "Filesystem error getting current directory: " << e.what();
+            } catch (const std::exception& e) {
+                ofLogWarning("ofApp") << "Exception getting current directory: " << e.what();
+            } catch (...) {
+                ofLogWarning("ofApp") << "Unknown exception getting current directory";
+            }
+            possiblePaths.push_back("/Users/jaufre/works/of_v0.12.1_osx_release/addons/ofxMediaObjects/example-audiovisualSequencer/bin/data");
+            
+            for (const auto& path : possiblePaths) {
+                if (ofDirectory(path).exists()) {
+                    ofLogNotice("ofApp") << "Trying fallback media directory: " << path;
+                    mediaPool->setDataDirectory(path);
+                    saveMediaDirectory(path); // Save for next launch
+                    foundDataDir = true;
+                    ofLogNotice("ofApp") << "✓ Successfully loaded media directory with " << mediaPool->getNumPlayers() << " players";
+                    break;
+                }
+            }
+            
+            if (!foundDataDir) {
+                ofLogWarning("ofApp") << "⚠️ No data directory found in any of the tried paths - MediaPool will be empty";
             }
         }
-        
-        if (!foundDataDir) {
-            ofLogError("ofApp") << "❌ No data directory found in any of the tried paths";
-        }
+    } catch (const std::exception& e) {
+        ofLogError("ofApp") << "❌ Exception while loading media directory: " << e.what();
+        ofLogError("ofApp") << "Continuing without media directory...";
+    } catch (...) {
+        ofLogError("ofApp") << "❌ Unknown exception while loading media directory";
+        ofLogError("ofApp") << "Continuing without media directory...";
     }
     
     
     // Setup TrackerSequencer with clock reference
-    trackerSequencer.setup(&clock, numSteps);
+    trackerSequencer->setup(&clock, numSteps);
     
-    // Auto-load saved state if it exists
-    trackerSequencer.loadState("tracker_sequencer_state.json");
+    // Note: If session was loaded, module data is already loaded via fromJson()
+    // If not, we'll initialize with defaults below
     
     // Setup MediaPool directory change callback
-    mediaPool.setDirectoryChangeCallback([this](const std::string& path) {
+    mediaPool->setDirectoryChangeCallback([this](const std::string& path) {
         saveMediaDirectory(path);
     });
     
@@ -76,10 +148,10 @@ void ofApp::setup() {
     // Register step event listener
     // Modular connection: MediaPool subscribes to TrackerSequencer trigger events
     // This replaces the old routing logic in ofApp::onTrackerStepEvent()
-    mediaPool.subscribeToTrackerSequencer(&trackerSequencer);
+    mediaPool->subscribeToTrackerSequencer(trackerSequencer.get());
     
     // Legacy: Keep old event listener for backward compatibility (can be removed later)
-    trackerSequencer.addStepEventListener([this](int step, float duration, const PatternCell& cell) {
+    trackerSequencer->addStepEventListener([this](int step, float duration, const PatternCell& cell) {
         onTrackerStepEvent(step, duration, cell);
     });
     
@@ -87,24 +159,28 @@ void ofApp::setup() {
     clock.setup();
     
     // Setup MediaPool with clock reference
-    mediaPool.setup(&clock);
+    mediaPool->setup(&clock);
     
-    // Initialize MediaPoolGUI with reference to mediaPool
-    mediaPoolGUI.setMediaPool(mediaPool);
+    // Initialize GUIManager with registry
+    guiManager.setRegistry(&moduleRegistry);
+    
+    // Sync GUIManager with registry (creates GUI objects for registered modules)
+    guiManager.syncWithRegistry();
+    
+    // Legacy: Initialize MediaPoolGUI with reference to mediaPool (for backward compatibility)
+    mediaPoolGUI.setMediaPool(*mediaPool);
     
     // Setup TrackerSequencer callbacks for UI queries
-    trackerSequencer.setIndexRangeCallback([this]() {
-        return mediaPool.getNumPlayers();
+    trackerSequencer->setIndexRangeCallback([this]() {
+        return mediaPool->getNumPlayers();
     });
     
-    // Setup parameter synchronization between TrackerSequencer and MediaPool
+    // Setup parameter routing using ParameterRouter (Phase 1: replaces ParameterSync)
     // Connect TrackerSequencer currentStepPosition to MediaPool position (bidirectional)
     // Sync only when clock is paused (for editing)
-    parameterSync.connect(
-        &trackerSequencer,
-        "currentStepPosition",
-        &mediaPool,
-        "position",
+    parameterRouter.connect(
+        std::string(TRACKER_INSTANCE_NAME) + ".currentStepPosition",
+        std::string(MEDIAPOOL_INSTANCE_NAME) + ".position",
         [this]() {
             // Only sync when paused (for editing)
             return !clock.isPlaying();
@@ -112,34 +188,32 @@ void ofApp::setup() {
     );
     
     // Reverse connection (MediaPool -> TrackerSequencer)
-    parameterSync.connect(
-        &mediaPool,
-        "position",
-        &trackerSequencer,
-        "currentStepPosition",
+    parameterRouter.connect(
+        std::string(MEDIAPOOL_INSTANCE_NAME) + ".position",
+        std::string(TRACKER_INSTANCE_NAME) + ".currentStepPosition",
         [this]() {
             // Only sync when paused AND when MediaPool is not in manual preview
             // This allows manual preview to work independently
-            return !clock.isPlaying() && !mediaPool.isManualPreview();
+            return !clock.isPlaying() && !mediaPool->isManualPreview();
         }
     );
     
     // Set up parameter change callbacks for both modules
-    trackerSequencer.setParameterChangeCallback([this](const std::string& paramName, float value) {
+    trackerSequencer->setParameterChangeCallback([this](const std::string& paramName, float value) {
         if (paramName == "currentStepPosition") {
-            parameterSync.notifyParameterChange(&trackerSequencer, paramName, value);
+            parameterRouter.notifyParameterChange(trackerSequencer.get(), paramName, value);
         }
     });
     
-    mediaPool.setParameterChangeCallback([this](const std::string& paramName, float value) {
+    mediaPool->setParameterChangeCallback([this](const std::string& paramName, float value) {
         if (paramName == "position") {
-            parameterSync.notifyParameterChange(&mediaPool, paramName, value);
+            parameterRouter.notifyParameterChange(mediaPool.get(), paramName, value);
         }
     });
     
     // TrackerSequencer now uses Clock's beat events for sample-accurate timing
     // Add step event listener for visual feedback (legacy - can be removed later)
-    trackerSequencer.addStepEventListener([this](int step, float duration, const PatternCell& cell) {
+    trackerSequencer->addStepEventListener([this](int step, float duration, const PatternCell& cell) {
         lastTriggeredStep = step;
     });
     
@@ -152,30 +226,84 @@ void ofApp::setup() {
     // Connect Clock transport events to MediaPool for proper state management
     clock.addTransportListener([this](bool isPlaying) {
         // Forward transport events to MediaPool
-        mediaPool.onTransportChanged(isPlaying);
+        mediaPool->onTransportChanged(isPlaying);
     });
     
     
     // Setup GUI
     setupGUI();
     
+    // Setup FileBrowser callbacks (utility panel, not a module)
+    // Set up import callback - import files to selected MediaPool instance
+    fileBrowser.setImportCallback([this](const std::vector<std::string>& files, const std::string& instanceName) {
+        auto module = moduleRegistry.getModule(instanceName);
+        if (!module) {
+            ofLogError("ofApp") << "Module not found: " << instanceName;
+            return;
+        }
+        
+        auto mediaPool = std::dynamic_pointer_cast<MediaPool>(module);
+        if (!mediaPool) {
+            ofLogError("ofApp") << "Module is not a MediaPool: " << instanceName;
+            return;
+        }
+        
+        // TODO: Use FileImporter for proper validation (Phase 2)
+        // For now, just log the files that would be imported
+        ofLogNotice("ofApp") << "Importing " << files.size() << " file(s) to " << instanceName;
+        for (const auto& file : files) {
+            ofLogNotice("ofApp") << "  - " << file;
+        }
+    });
+    
+    // Set up get instances callback - return available MediaPool instances
+    fileBrowser.setGetInstancesCallback([this]() {
+        std::vector<std::string> instances;
+        auto mediaPools = moduleRegistry.getModulesByType(ModuleType::INSTRUMENT);
+        for (const auto& module : mediaPools) {
+            if (std::dynamic_pointer_cast<MediaPool>(module)) {
+                // Get human name for this module
+                moduleRegistry.forEachModule([&instances, &module](const std::string& uuid, const std::string& name, std::shared_ptr<Module> m) {
+                    if (m == module) {
+                        instances.push_back(name);
+                    }
+                });
+            }
+        }
+        return instances;
+    });
+    
     // Setup MenuBar with callbacks
     menuBar.setup(
-        [this]() { trackerSequencer.saveState("tracker_sequencer_state.json"); },
-        [this]() { trackerSequencer.loadState("tracker_sequencer_state.json"); },
+        [this]() { sessionManager.saveSession("session.json"); },  // Save full session
+        [this]() { sessionManager.loadSession("session.json"); },  // Load full session
         [this]() { saveLayout(); },
-        [this]() { loadLayout(); }
+        [this]() { loadLayout(); },
+        [this](const std::string& moduleType) { addModule(moduleType); },
+        [this]() { 
+            bool visible = viewManager.isFileBrowserVisible();
+            viewManager.setFileBrowserVisible(!visible);
+        },
+        [this]() { 
+            bool visible = viewManager.isConsoleVisible();
+            viewManager.setConsoleVisible(!visible);
+        }
     );
     
+    // Setup Console with callbacks
+    console.setup(&moduleRegistry, &guiManager);
+    console.setOnAddModule([this](const std::string& type) { addModule(type); });
+    console.setOnRemoveModule([this](const std::string& name) { removeModule(name); });
+    
     // Setup ViewManager with panel objects and sound stream
+    // Use new instance-aware setup with GUIManager
     viewManager.setup(
         &clock,
         &clockGUI,
         &soundOutput,
-        &trackerSequencer,
-        &trackerSequencerGUI,
-        &mediaPool,
-        &mediaPoolGUI,
+        &guiManager,
+        &fileBrowser,
+        &console,
         &soundStream
     );
     
@@ -186,11 +314,18 @@ void ofApp::setup() {
     // Setup InputRouter with system references
     inputRouter.setup(
         &clock,
-        &trackerSequencer,
+        trackerSequencer.get(),
         &trackerSequencerGUI,
         &viewManager,
-        &mediaPool,
-        &mediaPoolGUI
+        mediaPool.get(),
+        &mediaPoolGUI,
+        &console
+    );
+    
+    // Set session save/load callbacks for keyboard shortcut (S key)
+    inputRouter.setSessionCallbacks(
+        [this]() { sessionManager.saveSession("session.json"); },
+        [this]() { sessionManager.loadSession("session.json"); }
     );
     
     // Setup InputRouter state callbacks
@@ -200,23 +335,20 @@ void ofApp::setup() {
     inputRouter.setLastTriggeredStep(&lastTriggeredStep);
     inputRouter.setShowGUI(&showGUI);
     
-    // Try to load saved state, otherwise use default pattern
-    if (!trackerSequencer.loadState("tracker_sequencer_state.json")) {
-        // Initialize pattern with some default steps if no saved state
-        if (mediaPool.getNumPlayers() > 0) {
+    // Initialize default pattern if session wasn't loaded and no media available
+    // (If session was loaded, pattern data is already loaded via fromJson())
+    if (!sessionLoaded) {
+        if (mediaPool->getNumPlayers() > 0) {
             PatternCell cell0(0, 0.0f, 1.0f, 1.0f, 1.0f);
-            trackerSequencer.setCell(0, cell0);
+            trackerSequencer->setCell(0, cell0);
             
-            if (mediaPool.getNumPlayers() > 1) {
+            if (mediaPool->getNumPlayers() > 1) {
                 PatternCell cell4(1, 0.0f, 1.2f, 1.0f, 1.0f);
-                trackerSequencer.setCell(4, cell4);
+                trackerSequencer->setCell(4, cell4);
                 
                 PatternCell cell8(0, 0.5f, 1.0f, 1.0f, 1.0f);
-                trackerSequencer.setCell(8, cell8);
+                trackerSequencer->setCell(8, cell8);
             }
-            
-            // Save the default pattern
-            trackerSequencer.saveState("tracker_sequencer_state.json");
         } else {
             ofLogWarning("ofApp") << "No media items available for pattern initialization";
         }
@@ -225,7 +357,14 @@ void ofApp::setup() {
     // Clock listener is set up in setupTimeObjects()
     
     // Initialize first active player after everything is set up
-    mediaPool.initializeFirstActivePlayer();
+    // NOTE: This is now also called in setDataDirectory(), but we call it here
+    // as a safety measure in case no directory was loaded
+    // Only initialize if we have players (setDataDirectory already initialized if directory was loaded)
+    if (mediaPool->getNumPlayers() > 0) {
+        mediaPool->initializeFirstActivePlayer();
+    } else {
+        ofLogNotice("ofApp") << "No media players available - skipping active player initialization";
+    }
     
     // Load default layout on startup
     loadLayout();
@@ -234,42 +373,48 @@ void ofApp::setup() {
 //--------------------------------------------------------------
 void ofApp::update() {
     // PERFORMANCE: Only update the active player, not all 117 players
-    auto currentPlayer = mediaPool.getActivePlayer();
+    // CRITICAL: getActivePlayer() now validates the pointer is still valid
+    auto currentPlayer = mediaPool->getActivePlayer();
     if (currentPlayer) {
-        // CRITICAL FIX: Always call update() to check for gate ending
-        // The gate ending check in MediaPlayer::update() must run every frame
-        // to detect when scheduledStopActive expires, even if player appears stopped
-        currentPlayer->update();
-        
-        // Process visual pipeline - only when actually playing (performance optimization)
-        if (currentPlayer->isPlaying() && currentPlayer->videoEnabled.get() && currentPlayer->isVideoLoaded()) {
-            auto& videoPlayer = currentPlayer->getVideoPlayer();
-            videoPlayer.update();  // Just update, no FBO processing needed
+        // Double-check player is still valid before accessing (defensive programming)
+        try {
+            // CRITICAL FIX: Always call update() to check for gate ending
+            // The gate ending check in MediaPlayer::update() must run every frame
+            // to detect when scheduledStopActive expires, even if player appears stopped
+            currentPlayer->update();
+            
+            // Process visual pipeline - only when actually playing (performance optimization)
+            if (currentPlayer->isPlaying() && currentPlayer->videoEnabled.get() && currentPlayer->isVideoLoaded()) {
+                auto& videoPlayer = currentPlayer->getVideoPlayer();
+                videoPlayer.update();  // Just update, no FBO processing needed
+            }
+        } catch (const std::exception& e) {
+            ofLogError("ofApp") << "Exception updating player: " << e.what();
+            // Player might be invalid - getActivePlayer will reset it next time
+        } catch (...) {
+            ofLogError("ofApp") << "Unknown exception updating player";
+            // Player might be invalid - getActivePlayer will reset it next time
         }
     }
     
     // Update MediaPool for end-of-media detection
-    mediaPool.update();
+    mediaPool->update();
     
     // Update step active state (clears manually triggered steps when duration expires)
-    trackerSequencer.updateStepActiveState();
+    trackerSequencer->updateStepActiveState();
     
     // Connect active player (internal flag check prevents redundant connections)
     // PERFORMANCE: Only call connectActivePlayer when player is actually playing or just started
     // The playerConnected flag prevents redundant connections, but we avoid calling it every frame
     // when nothing is playing to reduce overhead
-    if (currentPlayer && (currentPlayer->isPlaying() || !mediaPool.isPlayerConnected())) {
-        mediaPool.connectActivePlayer(soundOutput, visualOutput);
+    // CRITICAL: Re-get currentPlayer in case it was reset during update()
+    currentPlayer = mediaPool->getActivePlayer();
+    if (currentPlayer && (currentPlayer->isPlaying() || !mediaPool->isPlayerConnected())) {
+        mediaPool->connectActivePlayer(soundOutput, visualOutput);
     }
 
-
-    // PERFORMANCE: Rate-limit parameter synchronization to 15Hz instead of 60Hz
-    // Most parameters don't change every frame, so we can reduce CPU overhead by checking less frequently
-    static int syncFrameCounter = 0;
-    if (++syncFrameCounter >= 4) {  // Sync every 4 frames (15Hz instead of 60Hz)
-        parameterSync.update();
-        syncFrameCounter = 0;
-    }
+    // Note: ParameterRouter uses event-based routing (notifyParameterChange)
+    // No periodic update needed - routing happens immediately when parameters change
     
     // PERFORMANCE: Periodic auto-save every 30 seconds (async to avoid frame drops)
     // File I/O in update loop can cause 10-50ms stuttering every 30 seconds
@@ -282,7 +427,7 @@ void ofApp::update() {
         lastAutoSave = elapsed;  // Update immediately to prevent multiple triggers
         // Async save in background thread to avoid blocking main thread
         auto future = std::async(std::launch::async, [this]() {
-            trackerSequencer.saveState("tracker_sequencer_state.json");
+            sessionManager.saveSession("session.json");
             saveInProgress = false;  // Reset flag after save completes
             ofLogVerbose("ofApp") << "Periodic auto-save completed";
         });
@@ -296,7 +441,7 @@ void ofApp::draw() {
         ofBackground(0, 0, 0);
         
         // Draw video if available and currently playing
-        auto currentPlayer = mediaPool.getActivePlayer();
+        auto currentPlayer = mediaPool->getActivePlayer();
         if (currentPlayer && currentPlayer->isVideoLoaded() && 
             currentPlayer->videoEnabled.get() && currentPlayer->isPlaying()) {
             try {
@@ -326,9 +471,9 @@ void ofApp::draw() {
 
 //--------------------------------------------------------------
 void ofApp::exit() {
-    // Auto-save TrackerSequencer state before exiting
-    if (trackerSequencer.saveState("tracker_sequencer_state.json")) {
-        ofLogNotice("ofApp") << "TrackerSequencer state saved to file";
+    // Auto-save full session before exiting
+    if (sessionManager.saveSession("session.json")) {
+        ofLogNotice("ofApp") << "Session saved to file";
     }
     
     clock.stop();
@@ -337,6 +482,10 @@ void ofApp::exit() {
 
 //--------------------------------------------------------------
 void ofApp::audioOut(ofSoundBuffer& buffer) {
+    // Process queued parameter commands from GUI thread (lock-free)
+    // This ensures parameter changes are applied in the audio thread context
+    parameterRouter.processCommands();
+    
     // Process audio-rate clock first (sample-accurate timing)
     clock.audioOut(buffer);
     
@@ -356,6 +505,20 @@ void ofApp::audioOut(ofSoundBuffer& buffer) {
 
 //--------------------------------------------------------------
 void ofApp::keyPressed(ofKeyEventArgs& keyEvent) {
+    // All keyboard input is now handled in InputRouter:
+    // - Cmd+':' toggles Console
+    // - Console arrow keys for history navigation
+    // - Panel navigation (Ctrl+Tab)
+    // - Tracker input
+    // - MediaPool input
+    // - Global shortcuts
+    
+    // Check for MenuBar shortcuts (MAJ+a for Add Module)
+    bool shiftPressed = (keyEvent.modifiers & OF_KEY_SHIFT) != 0;
+    if (menuBar.handleKeyPress(keyEvent.key, shiftPressed)) {
+        return;
+    }
+    
     // Route all keyboard input through InputRouter
     // If InputRouter handled the key, return early to prevent ImGui from processing it
     if (inputRouter.handleKeyPress(keyEvent)) {
@@ -369,8 +532,8 @@ void ofApp::keyPressed(ofKeyEventArgs& keyEvent) {
 //--------------------------------------------------------------
 void ofApp::mousePressed(int x, int y, int button) {
     // Handle mouse clicks through TrackerSequencer
-    if (showGUI) {
-        trackerSequencer.handleMouseClick(x, y, button);
+    if (showGUI && trackerSequencer) {
+        trackerSequencer->handleMouseClick(x, y, button);
     }
 }
 
@@ -396,7 +559,11 @@ void ofApp::onTrackerStepEvent(int step, float duration, const PatternCell& cell
     ofLogVerbose("ofApp") << "TrackerSequencer step event: step=" << step << ", duration=" << duration << "s, length=" << cell.length;
     
     // Synchronize ofApp::currentStep with TrackerSequencer::currentStep (for UI display)
-    currentStep = step;
+    if (trackerSequencer) {
+        currentStep = trackerSequencer->getCurrentStep();
+    } else {
+        currentStep = step;
+    }
     
     // NOTE: MediaPool is now triggered via the modular event system
     // The old routing logic below has been moved to MediaPool::onTrigger()
@@ -444,69 +611,8 @@ void ofApp::setupGUI() {
     // Set up ImGui with keyboard navigation
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    ImGuiStyle& style = ImGui::GetStyle();
- 
-    style.Colors[ImGuiCol_DockingEmptyBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
-
-    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.15f, 0.15f, 0.15f, 0.4f);           // Window background
-    style.Colors[ImGuiCol_ChildBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.6f);         // Child background
-    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.95f);           // Popup background
-    style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.5f);   // Modal dimming
-
-    style.Colors[ImGuiCol_MenuBarBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.8f);         // Menu bar background
-
-    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.65f);       // Window title background
-    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.2f, 0.0f, 0.4f, 0.65f);    // Active title background
-    // style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.05f, 0.05f, 0.05f, 0.7f); // Collapsed title background
-    
-    style.Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);      // Scrollbar background
-    style.Colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.3f, 0.3f, 0.3f, 0.8f);    // Scrollbar grab
-    style.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.4f, 0.4f, 0.4f, 0.9f); // Scrollbar hover
-    style.Colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.5f, 0.5f, 0.5f, 1.0f); // Scrollbar active
-    
-    style.Colors[ImGuiCol_ResizeGrip] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);       // Resize grip
-    // style.Colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.3f, 0.3f, 0.3f, 0.9f); // Resize grip hover
-    //style.Colors[ImGuiCol_ResizeGripActive] = ImVec4(0.4f, 0.4f, 0.4f, 1.0f); // Resize grip active
-    
-    style.Colors[ImGuiCol_Tab] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);              // Tab background
-    style.Colors[ImGuiCol_TabHovered] = ImVec4(0.2f, 0.2f, 0.2f, 0.6f);      // Tab hover
-    style.Colors[ImGuiCol_TabActive] = ImVec4(0.01f, 0.01f, 0.01f, 0.8f);        // Tab active
-    style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.05f, 0.05f, 0.05f, 0.7f);  // Tab unfocused
-    style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.15f, 0.15f, 0.15f, 0.8f); // Tab unfocused active
-    
-    style.Colors[ImGuiCol_Separator] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);          // Separator color
-    style.Colors[ImGuiCol_SeparatorHovered] = ImVec4(0.3f, 0.3f, 0.3f, 0.9f);   // Separator hover
-    style.Colors[ImGuiCol_SeparatorActive] = ImVec4(0.4f, 0.4f, 0.4f, 1.0f);    // Separator active
-    
-    // Table / Grid colors
-    style.Colors[ImGuiCol_TableHeaderBg] = ImVec4(0.01f, 0.01f, 0.01f, 0.8f);   // Table headers
-    style.Colors[ImGuiCol_TableBorderStrong] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f); // Dark borders
-    style.Colors[ImGuiCol_TableBorderLight] = ImVec4(0.4f, 0.4f, 0.4f, 0.6f);  // Lighter borders
-    // Row backgrounds: standard grey (individual rows can override for empty/playback states)
-    style.Colors[ImGuiCol_TableRowBg] = ImVec4(0.05f, 0.05f, 0.05f, 0.5f);       // Row backgrounds
-    style.Colors[ImGuiCol_TableRowBgAlt] = ImVec4(0.05f, 0.05f, 0.05f, 0.5f); // Alternative transparent rows
-
-    style.Colors[ImGuiCol_Header] = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);          // Dark headers
-    // style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);   // Dark hover
-    // style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.3f, 0.3f, 0.3f, 0.9f);    // Dark active
-    
-    style.Colors[ImGuiCol_Button] = ImVec4(0.3f, 0.3f, 0.3f, 0.8f);          // Dark buttons
-    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.1f, 0.1f, 0.9f, 0.9f);   // Dark hover
-    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.04f, 0.04f, 0.04f, 1.0f);    // Dark active
-   
-    style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.5f, 0.5f, 0.5f, 0.8f);      // Gray sliders
-    style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.6f, 0.6f, 0.6f, 1.0f); // Gray active
-    
-    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.03f, 0.03f, 0.03f, 0.75f);     // Dark frames
-    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.2f, 0.2f, 0.8f, 0.8f);  // Dark hover
-    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.15f, 0.15f, 0.15f, 0.9f); // Dark active
-    
-    style.Colors[ImGuiCol_Text] = ImVec4(0.9f, 0.9f, 0.9f, 1.0f);            // Light text
-    style.Colors[ImGuiCol_TextDisabled] = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);    // Disabled text
-    
-    style.Colors[ImGuiCol_Border] = ImVec4(0.2f, 0.2f, 0.2f, 0.8f);         // Dark borders
-    style.Colors[ImGuiCol_BorderShadow] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);    // No shadow
-    
+    // Apply centralized color theme
+    GUIConstants::applyImGuiStyle();
 }
 
 //--------------------------------------------------------------
@@ -594,11 +700,17 @@ void ofApp::drawGUI() {
         // This prevents ImGui from capturing Tab before our keyPressed handler
         io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
         
+        // Layout loading will be handled manually via menu buttons
+        
+        // Menu bar at top of main window
+        menuBar.draw();
+        
         // PERFORMANCE: Cache navigation state - only update ConfigFlags when state actually changes
         // Changing ConfigFlags every frame forces ImGui to rebuild navigation tables (2-5ms overhead)
         // Only update when the state transitions, not every frame
         static bool lastNavState = true;
-        bool shouldEnableNav = !(viewManager.getCurrentPanelIndex() == 2 && trackerSequencerGUI.getIsEditingCell());
+        bool shouldEnableNav = !(viewManager.getCurrentPanelIndex() == 2 && trackerSequencerGUI.getIsEditingCell()) &&
+                               !(viewManager.isConsoleVisible() && console.isInputTextFocused());
         
         if (shouldEnableNav != lastNavState) {
             // State changed - update ConfigFlags only now
@@ -607,33 +719,28 @@ void ofApp::drawGUI() {
                 ofLogNotice("ofApp") << "[NAV_DEBUG] Enabled keyboard navigation";
             } else {
                 io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-                ofLogNotice("ofApp") << "[NAV_DEBUG] Disabled keyboard navigation (cell editing)";
+                ofLogNotice("ofApp") << "[NAV_DEBUG] Disabled keyboard navigation (cell editing or console input)";
             }
             lastNavState = shouldEnableNav;
         }
-        
-        // Layout loading will be handled manually via menu buttons
-        
-        // Menu bar at top of main window
-        menuBar.draw();
 
         ImGuiViewport* viewport = ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos(viewport->WorkPos);
-        ImGui::SetNextWindowSize(viewport->WorkSize);
-        ImGui::SetNextWindowViewport(viewport->ID);
-        ImGui::SetNextWindowBgAlpha(0.0f);
         
-        ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | 
-                                       ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-                                       ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
+        // Use DockSpaceOverViewport for more reliable docking (newer ImGui API)
+        // This ensures the dockspace is always properly created and cleaned up
+        // It handles Begin/End internally, so we don't need to worry about matching calls
+        // Signature: DockSpaceOverViewport(ImGuiID dockspace_id = 0, const ImGuiViewport* viewport = NULL, ImGuiDockNodeFlags flags = 0, ...)
+        ImGui::DockSpaceOverViewport(0, viewport, ImGuiDockNodeFlags_PassthruCentralNode);
         
-                if (ImGui::Begin("DockSpace", nullptr, window_flags)) {
-                    ImGui::DockSpace(ImGui::GetID("MyDockSpace"), ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
-
-                    // Draw all panels using ViewManager
-                    viewManager.draw();
-                }
-                ImGui::End();
+        // Draw all panels using ViewManager
+        // Wrap in try-catch to ensure exceptions don't break the frame
+        try {
+            viewManager.draw();
+        } catch (const std::exception& e) {
+            ofLogError("ofApp") << "Exception in viewManager.draw(): " << e.what();
+        } catch (...) {
+            ofLogError("ofApp") << "Unknown exception in viewManager.draw()";
+        }
 
         // Navigation is already enabled (or will be re-enabled next frame if in edit mode)
         gui.end();
@@ -704,6 +811,129 @@ void ofApp::saveMediaDirectory(const std::string& path) {
     ofFile settingsFile("media_settings.json", ofFile::WriteOnly);
     settingsFile << settings.dump(4);
     ofLogNotice("ofApp") << "Saved media directory: " << path;
+}
+
+//--------------------------------------------------------------
+void ofApp::addModule(const std::string& moduleType) {
+    ofLogNotice("ofApp") << "Adding module: " << moduleType;
+    
+    std::shared_ptr<Module> newModule;
+    std::string instanceName;
+    
+    if (moduleType == "MediaPool") {
+        // Generate unique name (e.g., "pool2", "pool3", etc.)
+        int poolNum = 2;
+        do {
+            instanceName = "pool" + std::to_string(poolNum);
+            poolNum++;
+        } while (moduleRegistry.hasModule(instanceName));
+        
+        newModule = std::dynamic_pointer_cast<MediaPool>(
+            moduleFactory.createMediaPool(instanceName));
+        
+        if (newModule) {
+            auto mediaPool = std::dynamic_pointer_cast<MediaPool>(newModule);
+            if (mediaPool) {
+                // Setup MediaPool with clock reference
+                mediaPool->setup(&clock);
+                
+                // Try to use saved media directory
+                std::string savedMediaDir = loadMediaDirectory();
+                if (!savedMediaDir.empty() && ofDirectory(savedMediaDir).exists()) {
+                    mediaPool->setDataDirectory(savedMediaDir);
+                }
+                
+                // Setup directory change callback
+                mediaPool->setDirectoryChangeCallback([this](const std::string& path) {
+                    saveMediaDirectory(path);
+                });
+            }
+        }
+    } else if (moduleType == "TrackerSequencer") {
+        // Generate unique name (e.g., "tracker2", "tracker3", etc.)
+        int trackerNum = 2;
+        do {
+            instanceName = "tracker" + std::to_string(trackerNum);
+            trackerNum++;
+        } while (moduleRegistry.hasModule(instanceName));
+        
+        newModule = std::dynamic_pointer_cast<TrackerSequencer>(
+            moduleFactory.createTrackerSequencer(instanceName));
+        
+        if (newModule) {
+            auto tracker = std::dynamic_pointer_cast<TrackerSequencer>(newModule);
+            if (tracker) {
+                // Setup TrackerSequencer with clock reference
+                tracker->setup(&clock, numSteps);
+                
+                // Setup index range callback
+                tracker->setIndexRangeCallback([this]() {
+                    return mediaPool->getNumPlayers();
+                });
+            }
+        }
+    } else {
+        ofLogError("ofApp") << "Unknown module type: " << moduleType;
+        return;
+    }
+    
+    if (!newModule) {
+        ofLogError("ofApp") << "Failed to create module: " << moduleType;
+        return;
+    }
+    
+    // Get UUID from factory
+    std::string uuid = moduleFactory.getUUID(instanceName);
+    if (uuid.empty()) {
+        ofLogError("ofApp") << "Failed to get UUID for module: " << instanceName;
+        return;
+    }
+    
+    // Register module in registry
+    if (!moduleRegistry.registerModule(uuid, newModule, instanceName)) {
+        ofLogError("ofApp") << "Failed to register module in registry: " << instanceName;
+        return;
+    }
+    
+    ofLogNotice("ofApp") << "✓ Successfully created and registered: " << instanceName 
+                         << " (UUID: " << uuid << ")";
+    
+    // Sync GUIManager to create GUI objects for new instance
+    guiManager.syncWithRegistry();
+    
+    // Make the new instance visible by default
+    guiManager.setInstanceVisible(instanceName, true);
+    
+    ofLogNotice("ofApp") << "✓ Synced GUIManager (GUI panel created for " << instanceName << ")";
+    ofLogNotice("ofApp") << "✓ Made " << instanceName << " visible";
+}
+
+//--------------------------------------------------------------
+void ofApp::removeModule(const std::string& instanceName) {
+    ofLogNotice("ofApp") << "Removing module: " << instanceName;
+    
+    // Check if module exists
+    if (!moduleRegistry.hasModule(instanceName)) {
+        ofLogWarning("ofApp") << "Module not found: " << instanceName;
+        return;
+    }
+    
+    // Prevent removing default instances
+    if (instanceName == MEDIAPOOL_INSTANCE_NAME || instanceName == TRACKER_INSTANCE_NAME) {
+        ofLogWarning("ofApp") << "Cannot remove default instance: " << instanceName;
+        return;
+    }
+    
+    // Remove from registry
+    if (!moduleRegistry.removeModule(instanceName)) {
+        ofLogError("ofApp") << "Failed to remove module from registry: " << instanceName;
+        return;
+    }
+    
+    // Sync GUIManager (removes GUI objects for deleted modules)
+    guiManager.syncWithRegistry();
+    
+    ofLogNotice("ofApp") << "✓ Successfully removed module: " << instanceName;
 }
 
 

@@ -4,6 +4,7 @@
 #include <vector>
 #include <map>
 #include <functional>
+#include "ofJson.h"
 
 // Parameter type enumeration
 enum class ParameterType {
@@ -30,6 +31,7 @@ struct ParameterDescriptor {
 
 // Module type enumeration (SunVox-style: sequencers separate, modules are instruments/effects)
 enum class ModuleType {
+    SEQUENCER,    // TrackerSequencer - generates triggers
     INSTRUMENT,   // MediaPool, MIDIOutput - responds to triggers
     EFFECT,       // Future: video effects, audio effects
     UTILITY       // Future: routing, mixing, utilities
@@ -87,6 +89,17 @@ public:
     
     // Optional: draw GUI (for modules that need visual representation)
     virtual void draw() {}
+    
+    // Serialization interface
+    // Each module implements its own serialization logic
+    virtual ofJson toJson() const = 0;
+    virtual void fromJson(const ofJson& json) = 0;
+    
+    // Get module type name for serialization (e.g., "TrackerSequencer", "MediaPool")
+    // Default implementation returns getName() - override only if different
+    virtual std::string getTypeName() const {
+        return getName();
+    }
 
 protected:
     // Parameter change callback for synchronization systems

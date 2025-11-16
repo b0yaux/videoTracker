@@ -6,6 +6,7 @@
 
 #include "Clock.h"
 #include "ofxImGui.h"
+#include "ofJson.h"
 
 //--------------------------------------------------------------
 Clock::Clock() 
@@ -269,4 +270,26 @@ float Clock::getSampleRate() const {
 void Clock::onBPMChanged() {
     // This method can be extended to notify other components
     // about BPM changes if needed in the future
+}
+
+//--------------------------------------------------------------
+ofJson Clock::toJson() const {
+    ofJson json;
+    json["bpm"] = currentBpm.load();
+    json["stepsPerBeat"] = stepsPerBeat;
+    // Note: isPlaying is intentionally not saved (transient state)
+    return json;
+}
+
+//--------------------------------------------------------------
+void Clock::fromJson(const ofJson& json) {
+    if (json.contains("bpm")) {
+        float bpm = json["bpm"];
+        setBPM(bpm);
+    }
+    if (json.contains("stepsPerBeat")) {
+        int spb = json["stepsPerBeat"];
+        setStepsPerBeat(spb);
+    }
+    // Note: isPlaying is intentionally not loaded (transient state)
 }

@@ -30,7 +30,9 @@ public:
     
     // Audio-specific parameters (forwarded from audioPlayer)
     ofParameter<float> volume;
-    ofParameter<float> pitch;
+    
+    // Granular-style loop control
+    ofParameter<float> loopSize;  // Loop size in seconds (0.0 to duration, affects playback when in LOOP play style)
     
     // Video-specific parameters (forwarded from videoPlayer)
     ofParameter<float> brightness;

@@ -56,7 +56,7 @@ public:
     // Edit operations
     void applyValue();
     void cancelEdit();
-    void adjustValue(int delta);
+    void adjustValue(int delta, float customStepSize = 0.0f);  // customStepSize: 0.0f = use default stepIncrement
     
     // Display and formatting
     std::string formatDisplayText(float value) const;
@@ -84,6 +84,9 @@ public:
     float getDragStartY() const { return dragStartY; }
     float getDragStartX() const { return dragStartX; }
     float getLastDragValue() const { return lastDragValue; }
+    
+    // Refocus state management (for maintaining focus after exiting edit mode)
+    bool getShouldRefocus() const { return shouldRefocus; }
     
     // Callbacks - set these to connect to your data model
     std::function<float()> getCurrentValue;              // Get current value for display
@@ -124,7 +127,11 @@ private:
     // Internal state
     bool isEditing = false;
     bool editBufferInitialized = false;
+    bool bufferModifiedByUser = false;  // Track if buffer was modified by user input (vs initialized from current value)
     std::string editBuffer;
+    
+    // Frame tracking to prevent double-processing of input
+    int lastProcessedFrame = -1;  // Track which frame we last processed input on
     
     // Drag state
     bool isDragging = false;
@@ -144,7 +151,9 @@ private:
     void applyDragValue(float newValue);
     
     // String utility helpers
-    static bool isOnlyDashes(const std::string& str);
+    // Check if string represents empty/NaN value placeholder ("--")
+    // The "--" string is used to represent NaN (empty cell, no value)
+    static bool isEmpty(const std::string& str);
     static std::string trimWhitespace(const std::string& str);
     
     // ImGui state management helpers

@@ -1,5 +1,6 @@
 #pragma once
 #include "ofMain.h"
+#include <functional>
 
 class Clock;
 class TrackerSequencer;
@@ -7,6 +8,7 @@ class TrackerSequencerGUI;
 class ViewManager;
 class MediaPool;
 class MediaPoolGUI;
+class Console;
 
 class InputRouter {
 public:
@@ -20,7 +22,14 @@ public:
         TrackerSequencerGUI* trackerGUI,
         ViewManager* viewManager,
         MediaPool* mediaPool,
-        MediaPoolGUI* mediaPoolGUI
+        MediaPoolGUI* mediaPoolGUI,
+        Console* console
+    );
+    
+    // Set callbacks for session save/load (called by 'S' key)
+    void setSessionCallbacks(
+        std::function<void()> onSaveSession,
+        std::function<void()> onLoadSession
     );
 
     // Callbacks for state that needs to be updated
@@ -46,12 +55,17 @@ private:
     ViewManager* viewManager = nullptr;
     MediaPool* mediaPool = nullptr;
     MediaPoolGUI* mediaPoolGUI = nullptr;
+    Console* console = nullptr;
 
     // State references (optional - can be nullptr)
     // Note: Play state comes from Clock reference (single source of truth)
     int* currentStep = nullptr;
     int* lastTriggeredStep = nullptr;
     bool* showGUI = nullptr;
+
+    // Session save/load callbacks
+    std::function<void()> onSaveSession;
+    std::function<void()> onLoadSession;
 
     // Keyboard capture state
     bool imGuiCapturingKeyboard = false;

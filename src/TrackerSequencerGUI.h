@@ -2,15 +2,23 @@
 
 #include "TrackerSequencer.h"
 #include "Pattern.h"
+#include "gui/ModuleGUI.h"
 
 // Forward declarations for ImGui types
 typedef unsigned int ImGuiID;
 typedef unsigned int ImU32;
 
-class TrackerSequencerGUI {
+class ModuleRegistry;  // Forward declaration
+
+class TrackerSequencerGUI : public ModuleGUI {
 public:
     TrackerSequencerGUI();
+    
+    // Legacy method (for backward compatibility during migration)
     void draw(TrackerSequencer& sequencer);
+    
+    // Override draw to call base class (which calls drawContent)
+    void draw();
     
     // Sync edit state from ImGui focus - called from InputRouter when keys are pressed
     // Note: This is now an instance method since GUI state is managed by TrackerSequencerGUI
@@ -23,6 +31,7 @@ public:
     const std::string& getEditBufferCache() const { return editBufferCache; }
     std::string& getEditBufferCache() { return editBufferCache; }
     bool getEditBufferInitializedCache() const { return editBufferInitializedCache; }
+    bool getShouldRefocusCurrentCell() const { return shouldRefocusCurrentCell; }
     
     // GUI state setters
     void setEditCell(int step, int column) { 
@@ -31,18 +40,27 @@ public:
     }
     void setInEditMode(bool editing) { isEditingCell = editing; }
     void setEditBufferInitializedCache(bool init) { editBufferInitializedCache = init; }
+    void setShouldRefocusCurrentCell(bool refocus) { shouldRefocusCurrentCell = refocus; }
     void clearCellFocus();
     
     // Check if keyboard input should be routed to sequencer
     bool isKeyboardFocused() const { return (editStep >= 0 && editColumn >= 0); }
     
+protected:
+    // Implement ModuleGUI::drawContent() - draws panel-specific content
+    void drawContent() override;
+    
 private:
+    // Helper to get current TrackerSequencer instance from registry
+    TrackerSequencer* getTrackerSequencer() const;
+    
     // GUI state (moved from TrackerSequencer)
     int editStep = -1;      // Currently selected row for editing (-1 = none)
     int editColumn = -1;    // Currently selected column for editing (-1 = none, 0 = step number, 1+ = column index)
     bool isEditingCell = false; // True when in edit mode (typing numeric value)
     std::string editBufferCache; // Cache for edit buffer to persist across frames
     bool editBufferInitializedCache = false; // Cache for edit buffer initialized state
+    bool shouldRefocusCurrentCell = false; // For maintaining focus after exiting edit mode via Enter
     
     // Performance optimization: dirty flag to avoid expensive string formatting every frame
     bool patternDirty;

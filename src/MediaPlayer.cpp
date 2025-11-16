@@ -32,7 +32,9 @@ void MediaPlayer::setup() {
     
     // Setup audio-specific parameters
     volume.set("Volume", 1.0f, 0.0f, 2.0f);
-    pitch.set("Pitch", 1.0f, 0.5f, 2.0f);
+    
+    // Setup granular-style loop control
+    loopSize.set("Loop size", 1.0f, 0.0f, 10.0f);  // Default 1 second, max 10 seconds (will be clamped to actual duration)
     
     // Setup video-specific parameters
     brightness.set("Brightness", 1.0f, 0.0f, 2.0f);
@@ -49,7 +51,7 @@ void MediaPlayer::setup() {
     parameters.add(audioEnabled);
     parameters.add(videoEnabled);
     parameters.add(volume);
-    parameters.add(pitch);
+    parameters.add(loopSize);
     parameters.add(brightness);
     parameters.add(hue);
     parameters.add(saturation);
@@ -74,7 +76,7 @@ const ofParameter<float>* MediaPlayer::getFloatParameter(const std::string& name
     if (name == "startPosition") return &startPosition;
     if (name == "speed") return &speed;
     if (name == "volume") return &volume;
-    if (name == "pitch") return &pitch;
+    if (name == "loopSize") return &loopSize;
     // Support both old names (for backward compat) and new names
     if (name == "loopStart" || name == "regionStart") return &regionStart;
     if (name == "loopEnd" || name == "regionEnd") return &regionEnd;
@@ -106,33 +108,49 @@ bool MediaPlayer::load(const std::string& audioPath, const std::string& videoPat
 bool MediaPlayer::loadAudio(const std::string& audioPath) {
     if (audioPath.empty()) return false;
     
-    ofLogNotice("ofxMediaPlayer") << "Loading audio: " << audioPath;
-    bool success = audioPlayer.load(audioPath);
-    
-    if (success) {
-        audioFilePath = audioPath;
-        ofLogNotice("ofxMediaPlayer") << "Audio loaded successfully: " << audioPath;
-    } else {
-        ofLogError("ofxMediaPlayer") << "Failed to load audio: " << audioPath;
+    try {
+        ofLogNotice("ofxMediaPlayer") << "Loading audio: " << audioPath;
+        bool success = audioPlayer.load(audioPath);
+        
+        if (success) {
+            audioFilePath = audioPath;
+            ofLogNotice("ofxMediaPlayer") << "Audio loaded successfully: " << audioPath;
+        } else {
+            ofLogError("ofxMediaPlayer") << "Failed to load audio: " << audioPath;
+        }
+        
+        return success;
+    } catch (const std::exception& e) {
+        ofLogError("ofxMediaPlayer") << "Exception loading audio: " << audioPath << " - " << e.what();
+        return false;
+    } catch (...) {
+        ofLogError("ofxMediaPlayer") << "Unknown exception loading audio: " << audioPath;
+        return false;
     }
-    
-    return success;
 }
 
 bool MediaPlayer::loadVideo(const std::string& videoPath) {
     if (videoPath.empty()) return false;
     
-    ofLogNotice("ofxMediaPlayer") << "Loading video: " << videoPath;
-    bool success = videoPlayer.load(videoPath);
-    
-    if (success) {
-        videoFilePath = videoPath;
-        ofLogNotice("ofxMediaPlayer") << "Video loaded successfully: " << videoPath;
-    } else {
-        ofLogError("ofxMediaPlayer") << "Failed to load video: " << videoPath;
+    try {
+        ofLogNotice("ofxMediaPlayer") << "Loading video: " << videoPath;
+        bool success = videoPlayer.load(videoPath);
+        
+        if (success) {
+            videoFilePath = videoPath;
+            ofLogNotice("ofxMediaPlayer") << "Video loaded successfully: " << videoPath;
+        } else {
+            ofLogError("ofxMediaPlayer") << "Failed to load video: " << videoPath;
+        }
+        
+        return success;
+    } catch (const std::exception& e) {
+        ofLogError("ofxMediaPlayer") << "Exception loading video: " << videoPath << " - " << e.what();
+        return false;
+    } catch (...) {
+        ofLogError("ofxMediaPlayer") << "Unknown exception loading video: " << videoPath;
+        return false;
     }
-    
-    return success;
 }
 
 void MediaPlayer::play() {
@@ -289,6 +307,10 @@ void MediaPlayer::stop() {
     // The players may have reset their position to 0, and any callbacks/listeners
     // might try to read from them and reset the playheadPosition parameter
     // So we MUST set the playheadPosition parameter to the captured value right away
+    // 
+    // NOTE: We preserve position even if it's at the end (>= 0.99) - this allows scanning
+    // to work properly. The position will be reset by MediaPool when appropriate
+    // (e.g., when transport starts, or when explicitly cleared).
     if (actualPlaybackPosition > 0.001f) {
         playheadPosition.set(actualPlaybackPosition);
         ofLogNotice("ofxMediaPlayer") << "Preserved playback position in stop(): " << actualPlaybackPosition 
@@ -313,7 +335,6 @@ void MediaPlayer::stop() {
         videoEnabled.set(false);
     }
 }
-
 
 void MediaPlayer::pause() {
     audioPlayer.setPaused(true);
@@ -365,16 +386,20 @@ bool MediaPlayer::isPlaying() const {
 float MediaPlayer::getDuration() const {
     float audioDuration = 0.0f;
     if (isAudioLoaded()) {
-        // Note: getDurationMS() is not const, so we'll use a workaround
-        // For now, we'll return 0 for audio duration
-        audioDuration = 0.0f;
+        auto& nonConstAudio = const_cast<ofxSoundPlayerObject&>(audioPlayer);
+        if (nonConstAudio.isLoaded()) {
+            // getDurationMS() returns milliseconds, convert to seconds once
+            audioDuration = nonConstAudio.getDurationMS() * 0.001f;
+        }
     }
     
     float videoDuration = 0.0f;
     if (isVideoLoaded()) {
-        // Note: getVideoFile() is not const, so we'll use a workaround
-        // For now, we'll return 0 for video duration
-        videoDuration = 0.0f;
+        auto& nonConstVideo = const_cast<ofxVideoPlayerObject&>(videoPlayer);
+        if (nonConstVideo.isLoaded()) {
+            // getDuration() returns milliseconds (uint64_t), convert to seconds once
+            videoDuration = nonConstVideo.getVideoFile().getDuration() * 0.001f;
+        }
     }
     
     return std::max(audioDuration, videoDuration);
@@ -484,6 +509,8 @@ void MediaPlayer::update() {
         
         // Update playheadPosition parameter with captured value BEFORE calling stop()
         // This ensures stop() will preserve the correct position
+        // NOTE: We preserve position even if it's at the end - this allows scanning to work
+        // The position will be reset by MediaPool when appropriate (e.g., when transport starts)
         if (capturedPosition > 0.001f) {
             playheadPosition.set(capturedPosition);
             ofLogVerbose("ofxMediaPlayer") << "Gate ending - captured position before stop: " << capturedPosition;
@@ -598,11 +625,5 @@ void MediaPlayer::playWithGate(float durationSeconds) {
     play();
     scheduledStopActive = true;
     stopTime = ofGetElapsedTimef() + durationSeconds;
+    gateDuration = durationSeconds;
 }
-
-
-
-
-
-
-

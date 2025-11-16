@@ -1,8 +1,10 @@
 #include "TrackerSequencerGUI.h"
 // Note: TrackerSequencer.h is already included by TrackerSequencerGUI.h
 #include "ParameterCell.h"
+#include "core/ModuleRegistry.h"
 #include "ofxImGui.h"
 #include "ofLog.h"
+#include "gui/GUIConstants.h"
 #include <cmath>  // For std::round
 #include <map>    // For paramRanges map
 
@@ -34,12 +36,44 @@ void TrackerSequencerGUI::clearCellFocus() {
     isEditingCell = false;
     editBufferCache.clear();
     editBufferInitializedCache = false;
+    shouldRefocusCurrentCell = false;
 }
 
 void TrackerSequencerGUI::draw(TrackerSequencer& sequencer) {
+    // Legacy method: draw with direct reference (for backward compatibility)
     drawPatternChain(sequencer);
     drawTrackerStatus(sequencer);
     drawPatternGrid(sequencer);
+}
+
+TrackerSequencer* TrackerSequencerGUI::getTrackerSequencer() const {
+    // If instance-aware (has registry and instanceName), use that
+    if (getRegistry() && !getInstanceName().empty()) {
+        auto module = getRegistry()->getModule(getInstanceName());
+        if (!module) return nullptr;
+        return dynamic_cast<TrackerSequencer*>(module.get());
+    }
+    
+    // Fallback: return nullptr (no legacy direct reference for TrackerSequencer)
+    return nullptr;
+}
+
+void TrackerSequencerGUI::draw() {
+    // Call base class draw (handles visibility, title bar, enabled state)
+    ModuleGUI::draw();
+}
+
+void TrackerSequencerGUI::drawContent() {
+    // Instance-aware draw method
+    TrackerSequencer* sequencer = getTrackerSequencer();
+    if (!sequencer) {
+        ImGui::Text("Instance '%s' not found", getInstanceName().empty() ? "unknown" : getInstanceName().c_str());
+        return;
+    }
+    
+    drawPatternChain(*sequencer);
+    drawTrackerStatus(*sequencer);
+    drawPatternGrid(*sequencer);
 }
 
 void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
@@ -91,15 +125,15 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
         // Color coding: blue for current pattern, gray for current chain position, dark for others, red tint if disabled
         ImU32 bgColor;
         if (isDisabled) {
-            bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.4f, 0.2f, 0.2f, 1.0f));  // Red tint for disabled
+            bgColor = GUIConstants::toU32(GUIConstants::Outline::DisabledBg);
         } else if (isCurrentPattern && isPlaying) {
-            bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.0f, 0.9f, 0.0f, 0.6f));  // Bright green when playing
+            bgColor = GUIConstants::toU32(GUIConstants::Active::PatternPlaying);
         } else if (isCurrentPattern) {
-            bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.1f, 0.1f, 0.9f, 0.8f));  // Blue for current pattern
+            bgColor = GUIConstants::toU32(GUIConstants::Active::Pattern);
         } else if (isCurrentChainEntry) {
-            bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.4f, 0.4f, 0.4f, 1.0f));  // Gray for current chain entry
+            bgColor = GUIConstants::toU32(GUIConstants::Active::ChainEntry);
         } else {
-            bgColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.25f, 0.25f, 0.25f, 1.0f));  // Dark for others
+            bgColor = GUIConstants::toU32(GUIConstants::Active::ChainEntryInactive);
         }
         
         ImDrawList* drawList = ImGui::GetWindowDrawList();
@@ -110,13 +144,13 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
         
         // Draw border for current chain entry
         if (isCurrentChainEntry) {
-            ImU32 borderColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
+            ImU32 borderColor = GUIConstants::toU32(GUIConstants::Active::ChainEntryBorder);
             drawList->AddRect(cursorPos, ImVec2(cursorPos.x + cellSize.x, cursorPos.y + cellSize.y), borderColor, 0.0f, 0, 1.5f);
         }
         
         // Draw diagonal line if disabled
         if (isDisabled) {
-            ImU32 lineColor = ImGui::ColorConvertFloat4ToU32(ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+            ImU32 lineColor = GUIConstants::toU32(GUIConstants::Outline::Disabled);
             drawList->AddLine(cursorPos, ImVec2(cursorPos.x + cellSize.x, cursorPos.y + cellSize.y), lineColor, 2.0f);
         }
         
@@ -242,7 +276,7 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
         
         // Style the repeat count cell to match pattern cell
         if (isCurrentChainEntry) {
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, GUIConstants::Frame::ChainEntry);
         }
         
         if (ImGui::InputText("##repeat", repeatBuf, sizeof(repeatBuf), 
@@ -524,9 +558,6 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
             }
         }
         
-        // Check hover state before EndTable (while table is still the active item)
-        bool tableHovered = ImGui::IsItemHovered();
-        
         ImGui::EndTable();
         
         // NOTE: Empty space click handling is now done in ViewManager::drawTrackerPanel
@@ -556,10 +587,10 @@ void TrackerSequencerGUI::drawPatternRow(TrackerSequencer& sequencer, int step, 
     ImGui::TableNextRow();
     
     // Static cached colors for performance (calculated once at initialization)
-    static ImU32 activeStepColor = ImGui::GetColorU32(ImVec4(0.0f, 0.85f, 0.0f, 0.5f));
-    static ImU32 inactiveStepColor = ImGui::GetColorU32(ImVec4(0.2f, 0.7f, 0.2f, 0.2f));
-    static ImU32 rowBgColor = ImGui::GetColorU32(ImVec4(0.01f, 0.01f, 0.01f, 0.5f)); // Filled row background (darker)
-    static ImU32 emptyRowBgColor = ImGui::GetColorU32(ImVec4(0.05f, 0.05f, 0.05f, 0.1f)); // Empty row background (very subtle)
+    static ImU32 activeStepColor = GUIConstants::toU32(GUIConstants::Active::StepBright);
+    static ImU32 inactiveStepColor = GUIConstants::toU32(GUIConstants::Active::StepDim);
+    static ImU32 rowBgColor = GUIConstants::toU32(GUIConstants::Background::TableRowFilled);
+    static ImU32 emptyRowBgColor = GUIConstants::toU32(GUIConstants::Background::TableRowEmpty);
     
     // Check if row is fully empty (all cells are NaN/empty)
     // A row is empty if the PatternCell's index is < 0 (which means all values are empty/NaN)
@@ -630,7 +661,7 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
     ImGui::TableNextColumn();
     
     // Set step number cell background to black (like column headers)
-    static ImU32 stepNumberBgColor = ImGui::GetColorU32(ImVec4(0.05f, 0.05f, 0.05f, 0.8f));
+    static ImU32 stepNumberBgColor = GUIConstants::toU32(GUIConstants::Background::StepNumber);
     ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, stepNumberBgColor);
     
     // Get cell rect for red outline (before drawing button)
@@ -653,8 +684,8 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
     // Apply button styling for active steps (pushed appearance with green tint)
     if (isStepActive) {
         // Use green-tinted active state for pushed appearance
-        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetColorU32(ImVec4(0.2f, 0.7f, 0.2f, 0.8f))); // Green active state
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetColorU32(ImVec4(0.25f, 0.75f, 0.25f, 0.9f))); // Brighter green on hover
+        ImGui::PushStyleColor(ImGuiCol_Button, GUIConstants::Active::StepButton);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, GUIConstants::Active::StepButtonHover);
     }
     
     // CRITICAL: Prevent ImGui from auto-focusing step number cells when clicking empty space
@@ -747,8 +778,8 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
             pendingRowOutline.rowXMax = cellMax.x + 1; // Will be updated after all cells drawn
             
             // Static cached colors for row outline (calculated once at initialization)
-            static ImU32 rowOrangeOutlineColor = ImGui::GetColorU32(ImVec4(1.0f, 0.5f, 0.0f, 1.0f));
-            static ImU32 rowRedOutlineColor = ImGui::GetColorU32(ImVec4(1.0f, 0.0f, 0.0f, 1.0f));
+            static ImU32 rowOrangeOutlineColor = GUIConstants::toU32(GUIConstants::Outline::Orange);
+            static ImU32 rowRedOutlineColor = GUIConstants::toU32(GUIConstants::Outline::Red);
             
             // Orange outline when in edit mode, red outline when just selected (use cached colors)
             pendingRowOutline.color = (isSelected && isEditingCell)
@@ -759,7 +790,7 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
             ImDrawList* drawList = ImGui::GetWindowDrawList();
             if (drawList) {
                 // Static cached color for step number outline
-                static ImU32 stepNumberOutlineColor = ImGui::GetColorU32(ImVec4(1.0f, 0.0f, 0.0f, 1.0f));
+                static ImU32 stepNumberOutlineColor = GUIConstants::toU32(GUIConstants::Outline::Red);
                 ImVec2 outlineMin = ImVec2(cellMin.x - 1, cellMin.y - 1);
                 ImVec2 outlineMax = ImVec2(cellMax.x + 1, cellMax.y + 1);
                 drawList->AddRect(outlineMin, outlineMax, stepNumberOutlineColor, 0.0f, 0, 2.0f); // 2px border
@@ -803,12 +834,16 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
     
     // Determine focus state
     bool isFocused = (cachedEditStep == step && cachedEditColumn == editColumnValue);
-    // Note: shouldFocusFirstCell and shouldRefocusCurrentCell flags removed - GUI manages its own focus state
+    // Note: shouldFocusFirstCell flag removed - GUI manages its own focus state
     bool shouldFocusFirst = false;  // Can be re-implemented if needed
-    bool shouldRefocusCurrentCell = false;  // Can be re-implemented if needed
+    // Check if we need to refocus this cell (from GUI state - set when Enter exits edit mode)
+    // ParameterCell's internal shouldRefocus flag is automatically used in draw(), but we also
+    // pass it explicitly from GUI state for persistence across frames (cells are recreated each frame)
+    bool shouldRefocus = (cachedEditStep == step && cachedEditColumn == editColumnValue && shouldRefocusCurrentCell);
     
-    // Draw using ParameterCell
-    ParameterCellInteraction interaction = paramCell.draw(uniqueId, isFocused, shouldFocusFirst, shouldRefocusCurrentCell);
+    // Draw using ParameterCell (ParameterCell will automatically use its internal shouldRefocus flag if set,
+    // but we also pass it from GUI state for persistence since cells are recreated each frame)
+    ParameterCellInteraction interaction = paramCell.draw(uniqueId, isFocused, shouldFocusFirst, shouldRefocus);
     
     // Sync state back from ParameterCell to GUI state
     if (interaction.focusChanged) {
@@ -827,8 +862,19 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
     
     if (interaction.clicked) {
         // Cell was clicked - focus it but don't enter edit mode yet
+        // CRITICAL: Ensure editStep/editColumn are set so keyboard input works
+        // This ensures that when Enter or numeric keys are pressed, the cell is found as selected
+        int previousStep = editStep;
         setEditCell(step, editColumnValue);
         setInEditMode(false);
+        anyCellFocusedThisFrame = true;
+        
+        // When paused, sync playback position and trigger step (walk through)
+        bool stepChanged = (previousStep != step);
+        bool fromHeaderRow = (previousStep == -1);
+        if (fromHeaderRow || stepChanged) {
+            syncPlaybackToEditIfPaused(sequencer, step, stepChanged, fromHeaderRow);
+        }
         // Note: ParameterCell manages its own edit buffer state
     }
     
@@ -869,6 +915,11 @@ void TrackerSequencerGUI::drawParameterCell(TrackerSequencer& sequencer, int ste
         setInEditMode(false);
         editBufferCache.clear();
         editBufferInitializedCache = false;
+    }
+    
+    // Clear refocus flag after using it (only for the cell that was refocused)
+    if (shouldRefocus && isSelected) {
+        shouldRefocusCurrentCell = false;
     }
     
     // Early exit if requested (prevents further processing for this cell)

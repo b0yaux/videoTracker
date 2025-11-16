@@ -22,8 +22,15 @@
 #include "implot.h"
 #include "gui/MenuBar.h"
 #include "gui/ViewManager.h"
+#include "gui/GUIManager.h"
+#include "gui/Console.h"
+#include "gui/FileBrowser.h"
 #include "input/InputRouter.h"
-#include "ParameterSync.h"
+#include "Module.h"
+#include "core/ModuleFactory.h"
+#include "core/ModuleRegistry.h"
+#include "core/ParameterRouter.h"
+#include "core/SessionManager.h"
 
 class ofApp : public ofBaseApp {
 public:
@@ -48,12 +55,22 @@ private:
     Clock clock;
     ClockGUI clockGUI;
     
-    // Media pool system
-    MediaPool mediaPool;
-    MediaPoolGUI mediaPoolGUI;
+    // Module management system (Phase 1: Core Architecture)
+    ModuleFactory moduleFactory;
+    ModuleRegistry moduleRegistry;
+    ParameterRouter parameterRouter;
+    SessionManager sessionManager;
     
-    // TrackerSequencer for pattern management
-    TrackerSequencer trackerSequencer;
+    // Module instances (stored as shared_ptr, accessed via registry)
+    // Keep raw pointers for backward compatibility with existing code during migration
+    std::shared_ptr<TrackerSequencer> trackerSequencer;
+    std::shared_ptr<MediaPool> mediaPool;
+    
+    // GUI management (Phase 3: Multiple Instances)
+    GUIManager guiManager;
+    
+    // GUI components (legacy - kept for backward compatibility during migration)
+    MediaPoolGUI mediaPoolGUI;
     TrackerSequencerGUI trackerSequencerGUI;
     
     // Sound objects
@@ -75,9 +92,8 @@ private:
     MenuBar menuBar;
     ViewManager viewManager;
     InputRouter inputRouter;
-    
-    // Parameter synchronization system
-    ParameterSync parameterSync;
+    Console console;
+    FileBrowser fileBrowser;  // File browser panel
     
     // GUI state
     bool showGUI = true;
@@ -105,4 +121,12 @@ private:
     // Layout management
     void saveLayout();
     void loadLayout();
+    
+    // Module management
+    void addModule(const std::string& moduleType);
+    void removeModule(const std::string& instanceName);
+    
+    // Module instance names (for registry lookup)
+    static constexpr const char* TRACKER_INSTANCE_NAME = "tracker1";
+    static constexpr const char* MEDIAPOOL_INSTANCE_NAME = "pool1";
 };
