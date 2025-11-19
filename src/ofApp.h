@@ -44,6 +44,9 @@ public:
     void mousePressed(int x, int y, int button);
     void windowResized(int w, int h);
     
+    // Drag and drop support
+    void dragEvent(ofDragInfo dragInfo);
+    
     // Audio callbacks
     void audioOut(ofSoundBuffer& buffer);
     
@@ -97,6 +100,7 @@ private:
     
     // GUI state
     bool showGUI = true;
+    bool showDemoWindow = false;
     // Note: isPlaying removed - use clock.isPlaying() directly (Clock is single source of truth for transport)
     int numSteps = 16;
     
@@ -105,10 +109,6 @@ private:
     // Current step for GUI display (last triggered step)
     int currentStep = 0;
     int lastTriggeredStep = 0;  // Track the last step that was actually triggered
-    
-    // Media directory persistence
-    std::string loadMediaDirectory();
-    void saveMediaDirectory(const std::string& path);
     
     // Methods
     void setupSoundObjects();  // Minimal setup - audio device management is in ViewManager

@@ -14,7 +14,8 @@ void MenuBar::setup(
     std::function<void()> onLoadLayout_fn,
     std::function<void(const std::string& moduleType)> onAddModule_fn,
     std::function<void()> onToggleFileBrowser_fn,
-    std::function<void()> onToggleConsole_fn
+    std::function<void()> onToggleConsole_fn,
+    std::function<void()> onToggleDemoWindow_fn
 ) {
     onSavePattern = onSavePattern_fn;
     onLoadPattern = onLoadPattern_fn;
@@ -23,6 +24,7 @@ void MenuBar::setup(
     onAddModule = onAddModule_fn;
     onToggleFileBrowser = onToggleFileBrowser_fn;
     onToggleConsole = onToggleConsole_fn;
+    onToggleDemoWindow = onToggleDemoWindow_fn;
 
     ofLogNotice("MenuBar") << "Setup complete";
 }
@@ -104,6 +106,10 @@ void MenuBar::drawViewMenu() {
         }
         if (ImGui::MenuItem("Console")) {
             if (onToggleConsole) onToggleConsole();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("ImGui Demo", "Ctrl+D")) {
+            if (onToggleDemoWindow) onToggleDemoWindow();
         }
         ImGui::EndMenu();
     }

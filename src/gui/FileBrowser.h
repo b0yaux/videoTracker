@@ -6,7 +6,6 @@
 #include <string>
 #include <vector>
 #include <set>
-#include <filesystem>
 #include <memory>
 #include <functional>
 
@@ -46,11 +45,13 @@ private:
     std::vector<std::string> directories_;
     std::vector<std::string> files_;
     std::string searchFilter_;
+    bool directoryInitialized_ = false;  // Track if directory has been loaded
+    std::string lastSyncedPath_;  // Track last synced path for navigation bar
     
     // Selection state
-    std::vector<std::string> selectedFiles_;
+    std::set<std::string> selectedFiles_;  // Changed to set for faster lookup
     std::string previewFile_;  // Currently previewed file
-    int lastSelectedIndex_ = -1;  // Last selected file index (for shift-click range selection)
+    std::string lastSelectedPath_;  // Last selected file path (for shift-click range selection)
     
     // Media preview
     std::unique_ptr<MediaPlayer> previewPlayer_;  // For previewing selected media
@@ -78,6 +79,16 @@ private:
     void drawFileList();
     void drawMediaPreview();
     void drawImportControls();
+    
+    // Tree view methods
+    void drawDirectoryTree(const std::string& path, int depth = 0);
+    void drawDirectoryNode(const std::string& fullPath, const std::string& name, int depth);
+    void drawFileNode(const std::string& fullPath, const std::string& name, int depth);
+    
+    // Selection handling
+    void handleDirectoryClick(const std::string& fullPath);
+    void handleFileClick(const std::string& fullPath);
+    std::vector<std::string> getSelectedMediaFiles() const;  // Get only media files from selection
     
     // Path utilities (cross-platform)
     std::string normalizePath(const std::string& path) const;

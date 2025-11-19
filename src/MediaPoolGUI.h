@@ -1,9 +1,10 @@
 #pragma once
 #include "ofxImGui.h"
 #include "ofxSoundObjects.h"
-#include "ParameterCell.h"
+#include "CellWidget.h"
 #include "Module.h"  // For ParameterDescriptor
 #include "gui/ModuleGUI.h"
+#include "gui/CellGrid.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -40,16 +41,15 @@ protected:
     // Implement ModuleGUI::drawContent() - draws panel-specific content
     void drawContent() override;
     
+    // Implement ModuleGUI::handleFileDrop() - handles file drops from FileBrowser
+    bool handleFileDrop(const std::vector<std::string>& filePaths) override;
+    
 private:
     // Legacy: keep for backward compatibility (will be removed)
     MediaPool* mediaPool = nullptr;
     
     // Helper to get current MediaPool instance from registry
     MediaPool* getMediaPool() const;
-    
-    // Search functionality
-    char searchBuffer[256];
-    std::string searchFilter;
     
     // Waveform visualization
     float waveformHeight;
@@ -104,19 +104,21 @@ private:
     
     // GUI section methods
     void drawDirectoryControls();
-    void drawSearchBar();
     void drawMediaList();
     void drawWaveform();
     void drawWaveformControls(const ImVec2& canvasPos, const ImVec2& canvasMax, float canvasWidth, float canvasHeight);  // Draw markers and controls on top of waveform
     void drawWaveformPreview(MediaPlayer* player, float width, float height);  // Draw waveform preview in tooltip
     void drawParameters();  // New: Draw parameter editing section as one-row table
-    void drawMediaIndexButton(int columnIndex, size_t numParamColumns);  // Draw media index button (play/pause trigger)
-    void drawPlayStyleButton(int columnIndex, size_t numParamColumns);  // Draw PlayStyle button (cycles ONCE/LOOP/NEXT)
     
-    // Helper method to create and configure ParameterCell for a parameter (similar to TrackerSequencer)
-    ParameterCell createParameterCellForParameter(const ParameterDescriptor& paramDesc);
+    // Helper methods to create CellWidget instances for fixed column buttons
+    CellWidget createPlayStyleButtonWidget(int columnIndex);
+    CellWidget createMediaIndexButtonWidget(int columnIndex);
     
-    // Helper method to handle ParameterCell keyboard input (reduces duplication)
+    // Helper method to create and configure CellWidget for a parameter
+    // Renamed from createParameterCellForParameter (ParameterCell abstraction removed)
+    CellWidget createCellWidgetForParameter(const ParameterDescriptor& paramDesc);
+    
+    // Helper method to handle CellWidget keyboard input (reduces duplication)
     // Returns true if key was handled, false otherwise
     bool handleParameterCellKeyPress(const ParameterDescriptor& paramDesc, int key, bool ctrlPressed, bool shiftPressed);
     
@@ -128,8 +130,17 @@ private:
     // Helper method to draw position scan mode selector button in header
     void drawPositionScanModeButton(const ImVec2& cellStartPos, float columnWidth, float cellMinY);
     
+    // Helper method to get editable parameters (filters out "note" parameter)
+    std::vector<ParameterDescriptor> getEditableParameters() const;
+    
     // Helper methods for per-index zoom state
     std::pair<float, float> getWaveformZoomState(size_t index) const;  // Returns {zoom, offset} for given index
     void setWaveformZoomState(size_t index, float zoom, float offset);  // Sets zoom and offset for given index
+    
+    // Drag-and-drop visual feedback
+    void drawDragDropOverlay();
+    
+    // CellGrid instance for reusable table rendering
+    CellGrid cellGrid;
 };
 

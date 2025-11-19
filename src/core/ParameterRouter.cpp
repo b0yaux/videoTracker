@@ -170,6 +170,36 @@ std::vector<std::pair<std::string, std::string>> ParameterRouter::getConnections
     return result;
 }
 
+std::vector<std::shared_ptr<Module>> ParameterRouter::getConnectedModules(const std::string& instanceName) const {
+    std::set<std::string> connectedInstanceNames;
+    
+    // Find all connections where this instance appears as source or target
+    for (const auto& conn : connections) {
+        std::string sourceInstance = conn.sourcePath.getInstanceName();
+        std::string targetInstance = conn.targetPath.getInstanceName();
+        
+        if (sourceInstance == instanceName) {
+            connectedInstanceNames.insert(targetInstance);
+        } else if (targetInstance == instanceName) {
+            connectedInstanceNames.insert(sourceInstance);
+        }
+    }
+    
+    // Resolve instance names to modules
+    std::vector<std::shared_ptr<Module>> result;
+    if (!registry) return result;
+    
+    result.reserve(connectedInstanceNames.size());
+    for (const auto& name : connectedInstanceNames) {
+        auto module = registry->getModule(name);
+        if (module) {
+            result.push_back(module);
+        }
+    }
+    
+    return result;
+}
+
 void ParameterRouter::notifyParameterChange(Module* module, const std::string& paramName, float value) {
     if (!registry || !module) {
         return;

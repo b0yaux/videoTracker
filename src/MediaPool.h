@@ -62,6 +62,7 @@ public:
     // File pairing strategy
     void mediaPair();      // Match by base filename
     void pairByIndex();    // Pair in order (1st audio + 1st video, etc.)
+    void completeDeferredLoading();  // Complete media loading that was deferred during session restore
     
     // Access media players
     MediaPlayer* getMediaPlayer(size_t index);
@@ -89,6 +90,10 @@ public:
     // File management
     void clear();
     void refresh();
+    
+    // Individual file addition (for drag-and-drop support)
+    bool addMediaFile(const std::string& filePath);
+    void addMediaFiles(const std::vector<std::string>& filePaths);
     
     // Setup method
     void setup(Clock* clockRef);
@@ -321,5 +326,17 @@ private:
     static constexpr float POSITION_EPSILON = 0.001f;      // Small difference threshold for position comparisons
     static constexpr float POSITION_THRESHOLD = 0.01f;     // Significant position threshold (for video seeking, position memory)
     static constexpr float PARAMETER_EPSILON = 0.001f;     // Small difference threshold for parameter comparisons
+    
+    // Flag to defer media loading during session restore (prevents blocking)
+    bool deferMediaLoading_ = false;
+    
+    // Store player parameters for deferred loading (after mediaPair creates players)
+    struct DeferredPlayerParams {
+        std::string audioFile;
+        std::string videoFile;
+        ofJson paramsJson;
+    };
+    std::vector<DeferredPlayerParams> deferredPlayerParams_;
+    size_t deferredActivePlayerIndex_ = 0;
 };
 

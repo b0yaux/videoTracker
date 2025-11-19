@@ -1,20 +1,18 @@
 #include "MediaPoolGUI.h"
 #include "MediaPool.h"  // Includes PlayStyle enum
 #include "MediaPlayer.h"
-#include "ParameterCell.h"
+#include "CellWidget.h"
 #include "Module.h"
 #include "core/ModuleRegistry.h"
 #include "gui/GUIConstants.h"
 #include "gui/MediaPreview.h"
+#include <limits>
 
 MediaPoolGUI::MediaPoolGUI() 
     : mediaPool(nullptr), waveformHeight(100.0f), parentWidgetId(0), 
       isParentWidgetFocused(false), requestFocusMoveToParentWidget(false),
       editingColumnIndex(-1), shouldFocusFirstCell(false), shouldRefocusCurrentCell(false),
       anyCellFocusedThisFrame(false) {
-    // Initialize search buffer
-    memset(searchBuffer, 0, sizeof(searchBuffer));
-    searchFilter = "";
 }
 
 void MediaPoolGUI::setMediaPool(MediaPool& pool) {
@@ -24,8 +22,10 @@ void MediaPoolGUI::setMediaPool(MediaPool& pool) {
 
 MediaPool* MediaPoolGUI::getMediaPool() const {
     // If instance-aware (has registry and instanceName), use that
-    if (getRegistry() && !getInstanceName().empty()) {
-        auto module = getRegistry()->getModule(getInstanceName());
+    ModuleRegistry* reg = ModuleGUI::getRegistry();
+    std::string instanceName = ModuleGUI::getInstanceName();
+    if (reg && !instanceName.empty()) {
+        auto module = reg->getModule(instanceName);
         if (!module) return nullptr;
         return dynamic_cast<MediaPool*>(module.get());
     }
@@ -82,12 +82,25 @@ void MediaPoolGUI::drawWaveformPreview(MediaPlayer* player, float width, float h
 }
 
 void MediaPoolGUI::drawContent() {
+    // Skip drawing when window is collapsed to avoid accessing invalid window properties
+    // This is a safety check in case drawContent() is called despite the ViewManager check
+    if (ImGui::IsWindowCollapsed()) {
+        return;
+    }
+    
     // Get current MediaPool instance (handles null case)
     MediaPool* pool = getMediaPool();
     if (!pool) {
-        ImGui::Text("Instance '%s' not found", getInstanceName().empty() ? "unknown" : getInstanceName().c_str());
+        std::string instanceName = ModuleGUI::getInstanceName();
+        ImGui::Text("Instance '%s' not found", instanceName.empty() ? "unknown" : instanceName.c_str());
+        // Still set up drag drop target even if pool is null
+        setupDragDropTarget();
         return;
     }
+    
+    // Wrap content in a child window to enable drag & drop target
+    // The child window acts as the drop target area
+    ImGui::BeginChild("MediaPoolContent", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar);
     
     // Draw parameter editing section
     drawParameters();
@@ -95,10 +108,9 @@ void MediaPoolGUI::drawContent() {
     // Draw waveform on top
     drawWaveform(); 
     
-    // Calculate space needed for bottom controls (search bar + directory controls + separators)
-    // Estimate: search bar (~ImGui::GetTextLineHeight() + padding), directory controls (~button height + padding), separators
-    float bottomControlsHeight = ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemSpacing.y * 2 + 
-                                 ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y + 
+    // Calculate space needed for bottom controls (directory controls + separators)
+    // Estimate: directory controls (~button height + padding), separators
+    float bottomControlsHeight = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y + 
                                  ImGui::GetStyle().ItemSpacing.y * 2; // Separators and spacing
     
     // Get remaining space after waveform (already accounts for waveform height)
@@ -116,8 +128,12 @@ void MediaPoolGUI::drawContent() {
     drawMediaList();
     ImGui::EndChild();
     
-    drawSearchBar();
     drawDirectoryControls();
+    
+    // Set up drag & drop target on the child window (must be called before EndChild)
+    setupDragDropTarget();
+    
+    ImGui::EndChild(); // End MediaPoolContent
 }
 
 void MediaPoolGUI::drawDirectoryControls() {
@@ -143,21 +159,698 @@ void MediaPoolGUI::drawDirectoryControls() {
     ImGui::Separator();
 }
 
-void MediaPoolGUI::drawSearchBar() {
-    ImGui::Separator();
-    ImGui::Text("Search:");
-    ImGui::SameLine();
-    // Add a thin grey outline to the search bar
-    ImVec2 frameMin = ImGui::GetCursorScreenPos();
-    ImVec2 frameMax = ImVec2(frameMin.x + ImGui::CalcItemWidth(), frameMin.y + ImGui::GetFrameHeight());
-    bool edited = ImGui::InputText("##search", searchBuffer, sizeof(searchBuffer));
-    ImGui::GetWindowDrawList()->AddRect(frameMin, frameMax, GUIConstants::toU32(GUIConstants::Border::SearchBar), 1.0f, 0, 1.0f);
-    if (edited) {
-        searchFilter = std::string(searchBuffer);
+
+
+/// MARK: - PARAMETERS
+/// @brief create a CellWidget for a given ParameterDescriptor
+/// @param paramDesc 
+/// @return CellWidget
+CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor& paramDesc) {
+    CellWidget cell;
+    cell.parameterName = paramDesc.name;
+    cell.isInteger = (paramDesc.type == ParameterType::INT);
+    cell.setValueRange(paramDesc.minValue, paramDesc.maxValue, paramDesc.defaultValue);
+    cell.calculateStepIncrement();
+    
+    // Set up getCurrentValue callback - capture mediaPool to get active player dynamically
+    // This ensures we always get the current active player, not a stale reference
+    cell.getCurrentValue = [this, paramDesc]() -> float {
+        MediaPool* pool = getMediaPool();
+        if (!pool) return std::numeric_limits<float>::quiet_NaN();
+        
+        auto activePlayer = pool->getActivePlayer();
+        if (!activePlayer) return std::numeric_limits<float>::quiet_NaN();
+        
+        // Special handling for "position" parameter: show startPosition instead of playheadPosition
+        // (playheadPosition is already visually displayed as the green playhead in the waveform)
+        if (paramDesc.name == "position") {
+            return activePlayer->startPosition.get();
+        }
+        
+        // Use MediaPlayer's helper method for cleaner parameter access
+        const auto* param = activePlayer->getFloatParameter(paramDesc.name);
+        if (param) {
+            return param->get();
+        }
+        return std::numeric_limits<float>::quiet_NaN();
+    };
+    
+    // Set up onValueApplied callback
+    cell.onValueApplied = [this, paramDesc](const std::string&, float value) {
+        MediaPool* pool = getMediaPool();
+        if (pool && pool->getActivePlayer()) {
+            pool->setParameter(paramDesc.name, value, true);
+        }
+    };
+    
+    // Set up onValueRemoved callback: reset to default value (double-click to reset)
+    cell.onValueRemoved = [this, paramDesc](const std::string&) {
+        MediaPool* pool = getMediaPool();
+        if (pool && pool->getActivePlayer()) {
+            pool->setParameter(paramDesc.name, paramDesc.defaultValue, true);
+        }
+    };
+    
+    // Set up formatValue callback (use openFrameworks ofToString for modern C++ string formatting)
+    // Unified precision: 0.001 (3 decimal places) for all float parameters
+    // Special handling for loopSize: logarithmic mapping for better precision at low values (1-100ms granular range)
+    if (paramDesc.name == "loopSize") {
+        // Logarithmic mapping: slider value (0.0-1.0) maps to loopSize (0.001s to 10s)
+        // This provides better precision at low values (1-100ms = 0.001-0.1s)
+        const float MIN_LOOP_SIZE = 0.001f;  // 1ms minimum
+        const float MAX_LOOP_SIZE = 10.0f;   // 10s maximum
+        
+        // Set cell value range to slider range (0.0-1.0) for logarithmic mapping
+        // Calculate default slider value from default seconds value (1.0s)
+        float defaultSeconds = 1.0f;
+        float defaultSliderValue = 0.0f;
+        if (defaultSeconds > MIN_LOOP_SIZE && defaultSeconds < MAX_LOOP_SIZE) {
+            defaultSliderValue = std::log(defaultSeconds / MIN_LOOP_SIZE) / std::log(MAX_LOOP_SIZE / MIN_LOOP_SIZE);
+        } else if (defaultSeconds >= MAX_LOOP_SIZE) {
+            defaultSliderValue = 1.0f;
+        }
+        cell.setValueRange(0.0f, 1.0f, defaultSliderValue);
+        cell.calculateStepIncrement();
+        
+        // Map slider value to logarithmic range
+        cell.getCurrentValue = [this, paramDesc, MIN_LOOP_SIZE, MAX_LOOP_SIZE]() -> float {
+            MediaPool* pool = getMediaPool();
+            if (!pool) return paramDesc.defaultValue;
+            
+            auto activePlayer = pool->getActivePlayer();
+            if (!activePlayer) return paramDesc.defaultValue;
+            
+            // Get actual loopSize value in seconds
+            float actualValue = activePlayer->loopSize.get();
+            
+            // Map from linear seconds to logarithmic slider value (0.0-1.0)
+            // Inverse of: value = MIN * pow(MAX/MIN, sliderValue)
+            if (actualValue <= MIN_LOOP_SIZE) return 0.0f;
+            if (actualValue >= MAX_LOOP_SIZE) return 1.0f;
+            float sliderValue = std::log(actualValue / MIN_LOOP_SIZE) / std::log(MAX_LOOP_SIZE / MIN_LOOP_SIZE);
+            return sliderValue;
+        };
+        
+        // Map slider value back to actual seconds
+        cell.onValueApplied = [this, paramDesc, MIN_LOOP_SIZE, MAX_LOOP_SIZE](const std::string&, float sliderValue) {
+            MediaPool* pool = getMediaPool();
+            if (!pool) return;
+            
+            // Clamp slider value to [0.0, 1.0]
+            sliderValue = std::max(0.0f, std::min(1.0f, sliderValue));
+            
+            // Map from logarithmic slider value to linear seconds
+            // value = MIN * pow(MAX/MIN, sliderValue)
+            float actualValue = MIN_LOOP_SIZE * std::pow(MAX_LOOP_SIZE / MIN_LOOP_SIZE, sliderValue);
+            
+            // Clamp to actual duration if available
+            auto activePlayer = getMediaPool()->getActivePlayer();
+            if (activePlayer) {
+                float duration = activePlayer->getDuration();
+                if (duration > 0.001f) {
+                    actualValue = std::min(actualValue, duration);
+                }
+            }
+            
+            getMediaPool()->setParameter(paramDesc.name, actualValue, true);
+        };
+        
+        // Format display value: show actual seconds with appropriate precision
+        cell.formatValue = [MIN_LOOP_SIZE, MAX_LOOP_SIZE](float sliderValue) -> std::string {
+            // Map slider value to actual seconds for display
+            sliderValue = std::max(0.0f, std::min(1.0f, sliderValue));
+            float actualValue = MIN_LOOP_SIZE * std::pow(MAX_LOOP_SIZE / MIN_LOOP_SIZE, sliderValue);
+            
+            // Use appropriate precision based on value magnitude:
+            // - 5 decimals for values < 0.01s (10ms) - granular synthesis range
+            // - 4 decimals for values < 0.1s (100ms)
+            // - 3 decimals for values >= 0.1s
+            if (actualValue < 0.01f) {
+                return ofToString(actualValue, 5) + "s";
+            } else if (actualValue < 0.1f) {
+                return ofToString(actualValue, 4) + "s";
+            } else {
+                return ofToString(actualValue, 3) + "s";
+            }
+        };
+    } else {
+        // Standard linear mapping for other parameters
+        cell.formatValue = [paramDesc](float value) -> std::string {
+            if (paramDesc.type == ParameterType::INT) {
+                return ofToString((int)std::round(value));
+            } else {
+                return ofToString(value, 3); // 3 decimal places (0.001 precision) for all float parameters
+            }
+        };
     }
-    ImGui::Separator();
+    
+    return cell;
 }
 
+
+
+/// MARK: - P Descritpor
+// ParameterDescriptor : Returns a vector of ParameterDescriptor objects representing editable parameters.
+// Parameters named "note" are excluded from the returned vector.
+std::vector<ParameterDescriptor> MediaPoolGUI::getEditableParameters() const {
+    auto params = getMediaPool()->getParameters();
+    std::vector<ParameterDescriptor> editableParams;
+    for (const auto& param : params) {
+        if (param.name != "note") {
+            editableParams.push_back(param);
+        }
+    }
+    return editableParams;
+}
+
+
+void MediaPoolGUI::drawParameters() {
+    MediaPool* pool = getMediaPool();
+    if (!pool) return;
+    
+    ImGui::Separator();
+    // Get available parameters from MediaPool
+    auto editableParams = getEditableParameters();
+    
+    if (editableParams.empty()) {
+        ImGui::Text("No editable parameters available");
+        return;
+    }
+    
+    // Create a focusable parent widget BEFORE the table for navigation (similar to TrackerSequencer)
+    ImGui::PushID("MediaPoolParametersParent");
+    
+    // Handle parent widget focus requests
+    if (requestFocusMoveToParentWidget) {
+        ImGui::SetKeyboardFocusHere(0); // Request focus for the upcoming widget
+        isParentWidgetFocused = true;
+        clearCellFocus();
+        requestFocusMoveToParentWidget = false;
+    }
+    
+    // Create an invisible button as the parent widget (similar to TrackerSequencer)
+    // CRITICAL: InvisibleButton requires non-zero size (ImGui assertion)
+    // Use minimum size of 1x1 pixels to satisfy the requirement
+    ImGui::InvisibleButton("##MediaPoolParamsParent", ImVec2(1, 1));
+    
+    // Handle clicks on parent widget - clear cell focus when clicked
+    if (ImGui::IsItemClicked(0)) {
+        clearCellFocus();
+        isParentWidgetFocused = true;
+    }
+    
+    // Check if parent widget is focused
+    if (ImGui::IsItemFocused()) {
+        isParentWidgetFocused = true;
+    } else if (isParentWidgetFocused && !ImGui::IsAnyItemFocused()) {
+        // Parent widget lost focus - update state
+        isParentWidgetFocused = false;
+    }
+    
+    parentWidgetId = ImGui::GetItemID();
+    ImGui::PopID();
+    
+    // Note: Table styling is handled by CellGrid (CellPadding, ItemSpacing)
+    
+    // Reset focus tracking at start of frame
+    anyCellFocusedThisFrame = false;
+    
+    // Use versioned table ID to reset column order if needed (change version number to force reset)
+    static int tableVersion = 2; // Increment this to reset all saved column settings (v2: added STYLE column)
+    std::string tableId = "MediaPoolParameters_v" + std::to_string(tableVersion);
+    
+    // Configure CellGrid
+    cellGrid.setTableId(tableId);
+    cellGrid.setTableFlags(ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                 ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable |
+                                 ImGuiTableFlags_SizingStretchProp);
+    cellGrid.setCellPadding(ImVec2(2, 2));
+    cellGrid.setItemSpacing(ImVec2(1, 1));
+    cellGrid.enableReordering(true);
+        
+    // Convert editableParams to CellGrid column configuration
+    // Add Index and Play style as regular columns at the beginning
+    std::vector<CellGridColumnConfig> tableColumnConfig;
+    // Add Index column (not removable, not draggable)
+    tableColumnConfig.push_back(CellGridColumnConfig("mediaIndex", "Index", false, 0, false));
+    // Add Play style column (not removable, not draggable)
+    tableColumnConfig.push_back(CellGridColumnConfig("playStyle", "Play style", false, 1, false));
+    // Add all editable parameters (all removable)
+    for (const auto& paramDesc : editableParams) {
+        tableColumnConfig.push_back(CellGridColumnConfig(
+            paramDesc.name, paramDesc.displayName, true, 0));  // isRemovable = true for all parameters
+        }
+    cellGrid.setColumnConfiguration(tableColumnConfig);
+    cellGrid.setAvailableParameters(editableParams);
+    
+    // Setup callbacks for CellGrid
+    CellGridCallbacks callbacks;
+    callbacks.getFocusedRow = [this]() -> int {
+        return (editingColumnIndex >= 0) ? 0 : -1; // Single row table, row 0 if focused, -1 if not
+    };
+    callbacks.isCellFocused = [this](int row, int col) -> bool {
+        // col is now absolute column index
+        return (editingColumnIndex == col);
+    };
+    callbacks.onCellFocusChanged = [](int row, int col) {
+        // This will be handled by syncStateFromCell
+    };
+    callbacks.onCellClicked = [](int row, int col) {
+        // This will be handled by syncStateFromCell
+    };
+    callbacks.createCellWidget = [this](int row, int col, const CellGridColumnConfig& colConfig) -> CellWidget {
+        // Use parameter name directly from colConfig - no need to search through all parameters
+        const std::string& paramName = colConfig.parameterName;
+        
+        // Handle special button columns
+        if (paramName == "mediaIndex") {
+            return createMediaIndexButtonWidget(col);
+        } else if (paramName == "playStyle") {
+            return createPlayStyleButtonWidget(col);
+        }
+        
+        // Skip "note" parameter (not editable in GUI, only used internally)
+        if (paramName == "note") {
+            return CellWidget();
+        }
+        
+        // Look up parameter descriptor by name
+        // TODO: Could optimize with a parameter name -> ParameterDescriptor map for O(1) lookup
+        auto editableParams = getEditableParameters();
+        for (const auto& paramDesc : editableParams) {
+            if (paramDesc.name == paramName) {
+                return createCellWidgetForParameter(paramDesc);
+            }
+        }
+        return CellWidget(); // Return empty cell if not found
+    };
+    callbacks.getCellValue = [this, pool](int row, int col, const CellGridColumnConfig& colConfig) -> float {
+        // Use parameter name directly from colConfig - no index conversion needed
+        const std::string& paramName = colConfig.parameterName;
+        
+        // Handle special button columns (return 0.0f as they don't have numeric values)
+        if (paramName == "mediaIndex" || paramName == "playStyle") {
+            return 0.0f;
+        }
+        
+        auto activePlayer = pool->getActivePlayer();
+        if (!activePlayer) {
+            // Fallback: look up default value from available parameters
+            auto editableParams = getEditableParameters();
+            for (const auto& paramDesc : editableParams) {
+                if (paramDesc.name == paramName) {
+                    return paramDesc.defaultValue;
+                }
+            }
+            return 0.0f;
+        }
+        
+        // SPECIAL CASE: "position" parameter shows startPosition instead of playheadPosition
+        // (playheadPosition is visually displayed as green playhead in waveform)
+        // This allows editing the start position independently from the playhead
+        if (paramName == "position") {
+            return activePlayer->startPosition.get();
+        }
+        
+        // Use MediaPlayer's helper method for parameter access
+        const auto* param = activePlayer->getFloatParameter(paramName);
+        if (param) {
+            return param->get();
+        }
+        
+        // Fallback: look up default value from available parameters
+        auto editableParams = getEditableParameters();
+        for (const auto& paramDesc : editableParams) {
+            if (paramDesc.name == paramName) {
+                return paramDesc.defaultValue;
+            }
+        }
+        return 0.0f;
+    };
+    callbacks.setCellValue = [pool](int row, int col, float value, const CellGridColumnConfig& colConfig) {
+        // Use parameter name directly from colConfig - no index conversion needed
+        const std::string& paramName = colConfig.parameterName;
+        
+        // Skip button columns (they handle their own state changes)
+        if (paramName == "mediaIndex" || paramName == "playStyle") {
+            return;
+        }
+        
+        auto activePlayer = pool->getActivePlayer();
+        if (!activePlayer) return;
+        
+        // Use MediaPool's unified parameter setting API
+        pool->setParameter(paramName, value, true);
+    };
+    callbacks.onRowStart = [](int row, bool isPlaybackRow, bool isEditRow) {
+        // Set row background color
+        ImU32 rowBgColor = GUIConstants::toU32(GUIConstants::Background::TableRowFilled);
+        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, rowBgColor);
+    };
+    callbacks.syncStateToCell = [this](int row, int col, CellWidget& cell) {
+        // col is now absolute column index
+        bool isSelected = (editingColumnIndex == col);
+        cell.setSelected(isSelected);
+        cell.setEditing(isEditingParameter && isSelected);
+        
+        if (isEditingParameter && isSelected) {
+            cell.setEditBuffer(editBufferCache, editBufferInitializedCache);
+        }
+            
+        // Restore drag state - use parameter name directly from cell (no index conversion needed)
+        if (!draggingParameter.empty() && cell.parameterName == draggingParameter) {
+            cell.setDragState(true, dragStartY, dragStartX, lastDragValue);
+        }
+    };
+    callbacks.syncStateFromCell = [this](int row, int col, const CellWidget& cell, const CellWidgetInteraction& interaction) {
+        // col is now absolute column index
+        bool isSelected = (editingColumnIndex == col);
+        
+        // Use parameter name directly from cell - no index conversion needed
+        const std::string& paramName = cell.parameterName;
+        if (paramName.empty()) return;  // Skip if cell has no parameter name
+        
+        // Sync focus state
+            // CRITICAL: Check if cell is actually focused (including after refocus)
+            // This ensures focus is maintained after Enter validation even if focusChanged is false
+            bool actuallyFocused = ImGui::IsItemFocused();
+            if (interaction.focusChanged || (actuallyFocused && isSelected)) {
+                int previousColumn = editingColumnIndex;
+                editingParameter = paramName;
+                editingColumnIndex = col;  // Use absolute column index directly
+                anyCellFocusedThisFrame = true;
+                isParentWidgetFocused = false;
+                
+                if (previousColumn != col && isEditingParameter) {
+                    isEditingParameter = false;
+                    editBufferCache.clear();
+                    editBufferInitializedCache = false;
+                }
+            }
+            
+            if (interaction.clicked) {
+                editingParameter = paramName;
+                editingColumnIndex = col;  // Use absolute column index directly
+                isEditingParameter = false;
+                anyCellFocusedThisFrame = true;
+                isParentWidgetFocused = false;
+            }
+            
+        // Sync drag state
+        if (cell.getIsDragging()) {
+                    draggingParameter = paramName;
+            dragStartY = cell.getDragStartY();
+            dragStartX = cell.getDragStartX();
+            lastDragValue = cell.getLastDragValue();
+                    // Maintain focus during drag
+                    editingColumnIndex = col;  // Use absolute column index directly
+                    editingParameter = paramName;
+                    anyCellFocusedThisFrame = true;
+        } else if (draggingParameter == paramName && !cell.getIsDragging()) {
+                    draggingParameter.clear();
+            }
+            
+            // Sync edit mode state
+        if (cell.isEditingMode()) {
+                isEditingParameter = true;
+            editBufferCache = cell.getEditBuffer();
+            editBufferInitializedCache = cell.isEditBufferInitialized();
+            anyCellFocusedThisFrame = true;
+        } else if (isEditingParameter && isSelected && !cell.isEditingMode()) {
+                isEditingParameter = false;
+                editBufferCache.clear();
+                editBufferInitializedCache = false;
+            
+            if (cell.shouldRefocus() && isSelected) {
+                shouldRefocusCurrentCell = true;
+                anyCellFocusedThisFrame = true;  // ADD THIS: Prevent focus from being cleared
+            }
+            }
+            
+        // Clear refocus flag only when cell is actually focused after refocus
+        // Don't clear it just because focus changed - wait until refocus succeeds
+        if (shouldRefocusCurrentCell && isSelected && ImGui::IsItemFocused()) {
+                shouldRefocusCurrentCell = false;
+            }
+    };
+    // Track if header was clicked to clear button cell focus
+    bool headerClickedThisFrame = false;
+    
+    // Setup header click callback to detect when headers are clicked
+    callbacks.onHeaderClicked = [&headerClickedThisFrame](int col) {
+        headerClickedThisFrame = true;
+    };
+    
+    // Setup custom header rendering callback for Position parameter (scan mode button only, no popup)
+    callbacks.drawCustomHeader = [this, pool, &headerClickedThisFrame](int col, const CellGridColumnConfig& colConfig, ImVec2 cellStartPos, float columnWidth, float cellMinY) -> bool {
+        if (colConfig.parameterName == "position") {
+            // Draw column name first (standard header)
+            ImGui::TableHeader(colConfig.displayName.c_str());
+            
+            // Check if header was clicked
+            if (ImGui::IsItemClicked(0)) {
+                headerClickedThisFrame = true;
+            }
+            
+            // Draw scan mode selector button (right-aligned in header)
+            if (pool) {
+                drawPositionScanModeButton(cellStartPos, columnWidth, cellMinY);
+            }
+            return true; // Header was drawn by custom callback
+        } else {
+            // Default header for other parameters (use CellGrid's default rendering)
+            // Header click detection happens in CellGrid via onHeaderClicked callback
+            return false; // Let CellGrid handle default rendering
+        }
+        };
+        cellGrid.setCallbacks(callbacks);
+    
+    // Begin table (single row, no fixed columns)
+    cellGrid.beginTable(1, 0); // 1 row, 0 fixed columns
+    
+    // Draw headers (handled by CellGrid automatically)
+    // Header click detection happens in the custom header callback above
+    cellGrid.drawHeaders(0, nullptr);
+    
+    // Draw single row (handled by CellGrid automatically)
+    cellGrid.drawRow(0, 0, false, false, nullptr);
+        
+        // Clear shouldFocusFirstCell flag after drawing
+        if (shouldFocusFirstCell) {
+            shouldFocusFirstCell = false;
+        }
+        
+        // Clear focus if:
+        // 1. Header was clicked (navigating to header row)
+        // 2. No cell was focused this frame AND we had a column focused (clicked outside grid)
+        // 3. CRITICAL: Don't clear focus if we're dragging - this prevents focus loss during smooth dragging
+        if (headerClickedThisFrame || 
+            (editingColumnIndex >= 0 && !anyCellFocusedThisFrame && !isEditingParameter && !shouldRefocusCurrentCell && draggingParameter.empty())) {
+            clearCellFocus();
+        }
+        
+    // End table
+    cellGrid.endTable();
+    
+    // Check for clicks outside the grid (after table ends)
+    // This handles clicks on empty space within the window
+    if (editingColumnIndex >= 0 && ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
+        clearCellFocus();
+    }
+}
+
+void MediaPoolGUI::clearCellFocus() {
+    editingColumnIndex = -1;
+    editingParameter.clear();
+    isEditingParameter = false;
+    editBufferCache.clear();
+    editBufferInitializedCache = false;
+    draggingParameter.clear();
+}
+
+// Sync edit state from ImGui focus - called from InputRouter when keys are pressed
+void MediaPoolGUI::syncEditStateFromImGuiFocus(MediaPoolGUI& gui) {
+    // Check if editingColumnIndex is already valid (GUI sync already happened)
+    if (gui.editingColumnIndex >= 0) {
+        // If editingParameter is empty but editingColumnIndex is set, look it up from column config
+        if (gui.editingParameter.empty() && gui.mediaPool) {
+            // Get column configuration from CellGrid
+            auto columnConfig = gui.cellGrid.getColumnConfiguration();
+            if (gui.editingColumnIndex >= 0 && (size_t)gui.editingColumnIndex < columnConfig.size()) {
+                gui.editingParameter = columnConfig[gui.editingColumnIndex].parameterName;
+            }
+        }
+        return; // Already synced
+    }
+    
+    // GUI draw sync should handle this every frame
+    // If not set, handleKeyPress will default gracefully
+}
+
+
+
+/// MARK: - Button Widget Creation
+/// @brief Create CellWidget for PlayStyle button (cycles ONCE/LOOP/NEXT)
+CellWidget MediaPoolGUI::createPlayStyleButtonWidget(int columnIndex) {
+    CellWidget widget;
+    widget.cellType = CellWidgetType::BUTTON;
+    widget.parameterName = "playStyle";
+    widget.enableStateCycling = true;
+    
+    MediaPool* pool = getMediaPool();
+    
+    // Get button label dynamically based on current style
+    widget.getButtonLabel = [pool]() -> std::string {
+        if (!pool) return "ONCE";
+        PlayStyle currentStyle = pool->getPlayStyle();
+        switch (currentStyle) {
+            case PlayStyle::ONCE: return "ONCE";
+            case PlayStyle::LOOP: return "LOOP";
+            case PlayStyle::NEXT: return "NEXT";
+            default: return "ONCE";
+        }
+    };
+    
+    // Get tooltip dynamically
+    widget.getButtonTooltip = [pool]() -> std::string {
+        if (!pool) return "Play Style: ONCE\nClick to cycle: ONCE → LOOP → NEXT";
+        PlayStyle currentStyle = pool->getPlayStyle();
+        switch (currentStyle) {
+            case PlayStyle::ONCE:
+                return "Play Style: ONCE\nClick to cycle: ONCE → LOOP → NEXT";
+            case PlayStyle::LOOP:
+                return "Play Style: LOOP\nClick to cycle: LOOP → NEXT → ONCE";
+            case PlayStyle::NEXT:
+                return "Play Style: NEXT\nClick to cycle: NEXT → ONCE → LOOP";
+            default:
+                return "Play Style: ONCE\nClick to cycle: ONCE → LOOP → NEXT";
+        }
+    };
+    
+    // Cycle state on click
+    widget.onButtonCycleState = [pool]() {
+        if (!pool) return;
+        PlayStyle currentStyle = pool->getPlayStyle();
+        PlayStyle nextStyle;
+        switch (currentStyle) {
+            case PlayStyle::ONCE:
+                nextStyle = PlayStyle::LOOP;
+                break;
+            case PlayStyle::LOOP:
+                nextStyle = PlayStyle::NEXT;
+                break;
+            case PlayStyle::NEXT:
+                nextStyle = PlayStyle::ONCE;
+                break;
+        }
+        pool->setPlayStyle(nextStyle);
+    };
+    
+    // Button is never "active" (green) - always shows normal state
+    widget.isButtonActive = []() -> bool {
+        return false;
+    };
+    
+    return widget;
+}
+
+/// @brief Create CellWidget for MediaIndex button (shows index and toggles playback)
+CellWidget MediaPoolGUI::createMediaIndexButtonWidget(int columnIndex) {
+    CellWidget widget;
+    widget.cellType = CellWidgetType::BUTTON;
+    widget.parameterName = "mediaIndex";
+    widget.enableStateCycling = false; // Not a cycling button, it's a toggle
+    
+    MediaPool* pool = getMediaPool();
+    
+    // Get button label dynamically (shows current index or "--")
+    widget.getButtonLabel = [pool]() -> std::string {
+        if (!pool) return "--";
+        size_t currentIndex = pool->getCurrentIndex();
+        size_t numPlayers = pool->getNumPlayers();
+        
+        if (numPlayers > 0) {
+            int displayIndex = (int)(currentIndex + 1);
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%02d", displayIndex);
+            return std::string(buf);
+        }
+        return "--";
+    };
+    
+    // Button is active (green) when current media is playing
+    widget.isButtonActive = [pool]() -> bool {
+        if (!pool) return false;
+        
+        size_t currentIndex = pool->getCurrentIndex();
+        size_t numPlayers = pool->getNumPlayers();
+        auto activePlayer = pool->getActivePlayer();
+        
+        if (activePlayer != nullptr && currentIndex < numPlayers) {
+            auto currentPlayer = pool->getMediaPlayer(currentIndex);
+            if (currentPlayer == activePlayer) {
+                // Button is green if mode is MANUAL_PREVIEW OR SEQUENCER_ACTIVE
+                // This syncs with both manual clicks and external sequencer triggers
+                return (pool->isManualPreview() || pool->isSequencerActive()) 
+                       && currentPlayer->isPlaying();
+            }
+        }
+        return false;
+    };
+    
+    // Handle button click - toggle playback
+    widget.onButtonClicked = [pool]() {
+        if (!pool) return;
+        
+        size_t currentIndex = pool->getCurrentIndex();
+        size_t numPlayers = pool->getNumPlayers();
+        
+        if (numPlayers == 0) return;
+        
+        auto currentPlayer = pool->getMediaPlayer(currentIndex);
+        if (!currentPlayer) return;
+        
+        // Only toggle manual preview - don't interfere with sequencer playback
+        // If sequencer is active, button click does nothing (sequencer controls playback)
+        if (pool->isManualPreview()) {
+            // Currently in MANUAL_PREVIEW mode - stop it
+            currentPlayer->stop();
+            pool->setModeIdle();  // Transition to IDLE immediately
+        } else if (pool->isIdle()) {
+            // Not playing (IDLE) - start manual preview
+            // Note: If SEQUENCER_ACTIVE, we don't do anything (sequencer is in control)
+            // CRITICAL FIX: Convert relative startPosition to absolute position for playMediaManual
+            // playMediaManual expects absolute position (0.0-1.0), but startPosition is relative within region
+            float relativeStartPos = currentPlayer->startPosition.get();
+            float regionStartVal = currentPlayer->regionStart.get();
+            float regionEndVal = currentPlayer->regionEnd.get();
+            float regionSize = regionEndVal - regionStartVal;
+            
+            float absoluteStartPosition;
+            if (regionSize > 0.001f) {
+                // Convert relative position to absolute within region
+                absoluteStartPosition = regionStartVal + relativeStartPos * regionSize;
+            } else {
+                // If region is invalid, use relative position directly
+                absoluteStartPosition = relativeStartPos;
+            }
+            
+            // Clamp to valid range
+            absoluteStartPosition = std::max(0.0f, std::min(1.0f, absoluteStartPosition));
+            
+            pool->playMediaManual(currentIndex, absoluteStartPosition);
+        }
+        // If isSequencerActive(), do nothing - sequencer controls playback
+    };
+    
+    return widget;
+}
+
+
+
+/// MARK: - MEDIA LIST
+/// @brief draw the media list
+/// @return void
 void MediaPoolGUI::drawMediaList() {
     // Create a focusable parent widget BEFORE the list for navigation
     // This widget can receive focus when exiting the list via Ctrl+Enter or UP key on first item
@@ -190,11 +883,7 @@ void MediaPoolGUI::drawMediaList() {
         isParentWidgetFocused = ImGui::IsItemFocused();
     }
     
-    // Label for the media list - make it non-navigable
-    // This prevents clicking on the title from triggering list focus
-    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true); // Prevent navigation to this text
-    ImGui::Text("Available Media:");
-    ImGui::PopItemFlag(); // Restore navigation flag
+
     ImGui::PopID();
     
     // Track if any list item is focused (to update parent widget focus state)
@@ -215,27 +904,6 @@ void MediaPoolGUI::drawMediaList() {
         auto playerFileNames = pool->getPlayerFileNames();
         
         for (size_t i = 0; i < playerNames.size(); i++) {
-            // Filter by search term
-            if (!searchFilter.empty()) {
-                std::string lowerName = playerNames[i];
-                std::string lowerSearch = searchFilter;
-                std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
-                std::transform(lowerSearch.begin(), lowerSearch.end(), lowerSearch.begin(), ::tolower);
-                
-                // Also check file names if available
-                bool nameMatches = (lowerName.find(lowerSearch) != std::string::npos);
-                bool fileMatches = false;
-                if (i < playerFileNames.size() && !playerFileNames[i].empty()) {
-                    std::string lowerFileName = playerFileNames[i];
-                    std::transform(lowerFileName.begin(), lowerFileName.end(), lowerFileName.begin(), ::tolower);
-                    fileMatches = (lowerFileName.find(lowerSearch) != std::string::npos);
-                }
-                
-                if (!nameMatches && !fileMatches) {
-                    continue; // Skip non-matching items
-                }
-            }
-            
             auto player = pool->getMediaPlayer(i);
             if (player) {
                 // Check if this is the currently active player
@@ -319,7 +987,6 @@ void MediaPoolGUI::drawMediaList() {
                 if (ImGui::IsItemHovered()) {
                     // Use shared preview utility
                     MediaPreview::drawMediaTooltip(player, static_cast<int>(i));
-                    ImGui::Text("Click to play/pause");
                 }
                 
                 // Add right-click context menu
@@ -366,8 +1033,12 @@ void MediaPoolGUI::drawMediaList() {
                 // Status indicators are now included in the main display name
             }
         }
-    ImGui::Separator();
+    } else {
+        // Show message when no media files are loaded
+        ImGui::TextDisabled("No media files loaded");
+        ImGui::TextDisabled("Drag files here or use 'Browse Directory' to add media");
     }
+    ImGui::Separator();
     
     // Update previous index after processing list (for scroll sync on next frame)
     previousMediaIndex = currentIndex;
@@ -388,12 +1059,10 @@ void MediaPoolGUI::drawMediaList() {
 
 }
 
+/// MARK: - WAVEFORM
+/// @brief draw waveform for the active player
 void MediaPoolGUI::drawWaveform() {
     auto currentPlayer = getMediaPool()->getActivePlayer();
-    if (!currentPlayer) {
-        ImGui::Text("No active player to display waveform.");
-        return;
-    }
     
     // Get current media index for per-index zoom state
     size_t currentIndex = getMediaPool()->getCurrentIndex();
@@ -425,7 +1094,24 @@ void MediaPoolGUI::drawWaveform() {
     float canvasHeight = canvasMax.y - canvasPos.y;
     float centerY = canvasPos.y + canvasHeight * 0.5f;
     
-    // CRITICAL: Check if dragging a ParameterCell - prevents interference with waveform interactions
+    // Always draw the background rectangle
+    ImU32 bgColor = GUIConstants::toIM_COL32(GUIConstants::Background::Waveform);
+    drawList->AddRectFilled(canvasPos, canvasMax, bgColor);
+    
+    // If no player, show message and return early
+    if (!currentPlayer) {
+        // Draw message centered in the waveform rectangle
+        const char* message = "No active player to display waveform.";
+        ImVec2 textSize = ImGui::CalcTextSize(message);
+        ImVec2 textPos = ImVec2(
+            canvasPos.x + (canvasWidth - textSize.x) * 0.5f,
+            canvasPos.y + (canvasHeight - textSize.y) * 0.5f
+        );
+        drawList->AddText(textPos, GUIConstants::toIM_COL32(GUIConstants::Text::Disabled), message);
+        return;
+    }
+    
+    // CRITICAL: Check if dragging a CellWidget - prevents interference with waveform interactions
     bool isDraggingParameter = !draggingParameter.empty();
     
     // Handle zoom and pan interactions
@@ -459,7 +1145,7 @@ void MediaPoolGUI::drawWaveform() {
             waveformOffset = newOffset;
         }
         
-        // Handle panning with middle mouse or Shift+drag (only if not dragging a marker or ParameterCell)
+        // Handle panning with middle mouse or Shift+drag (only if not dragging a marker or CellWidget)
         bool isPanning = false;
         if (draggingMarker == WaveformMarker::NONE) {
             isPanning = ImGui::IsMouseDown(2) || (ImGui::IsMouseDragging(0) && ImGui::GetIO().KeyShift);
@@ -493,7 +1179,6 @@ void MediaPoolGUI::drawWaveform() {
     // Calculate visible time range
     float visibleRange = 1.0f / waveformZoom;
     float visibleStart = waveformOffset;
-    float visibleEnd = waveformOffset + visibleRange;
     
     // Check if we have audio data to draw waveform
     bool hasAudioData = false;
@@ -555,10 +1240,8 @@ void MediaPoolGUI::drawWaveform() {
         }
     }
     
-    // Draw fallback transparent black rectangle for video-only players
-    ImU32 bgColor = GUIConstants::toIM_COL32(GUIConstants::Background::Waveform);
-    drawList->AddRectFilled(canvasPos, canvasMax, bgColor);
-    
+    // Background rectangle already drawn earlier (before early return for no player case)
+    // Only draw waveform if we have audio data
     if (hasAudioData) {
         // Draw actual waveform
         float amplitudeScale = canvasHeight * WAVEFORM_AMPLITUDE_SCALE;
@@ -585,6 +1268,13 @@ void MediaPoolGUI::drawWaveform() {
     drawWaveformControls(canvasPos, canvasMax, canvasWidth, canvasHeight);
 }
 
+/// MARK: - WF ctrls
+/// @brief draw controls for the waveform
+/// @param canvasPos 
+/// @param canvasMax 
+/// @param canvasWidth 
+/// @param canvasHeight 
+/// @return void
 void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& canvasMax, float canvasWidth, float canvasHeight) {
     MediaPool* pool = getMediaPool();
     if (!pool) return;
@@ -592,7 +1282,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
     auto currentPlayer = pool->getActivePlayer();
     if (!currentPlayer) return;
     
-    // CRITICAL: Check if dragging a ParameterCell - prevents interference with waveform interactions
+    // CRITICAL: Check if dragging a CellWidget - prevents interference with waveform interactions
     bool isDraggingParameter = !draggingParameter.empty();
     
     ImDrawList* drawList = ImGui::GetWindowDrawList();
@@ -693,7 +1383,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
     }
     
     // Handle mouse interaction
-    // CRITICAL: Don't process waveform mouse interactions when dragging a ParameterCell
+    // CRITICAL: Don't process waveform mouse interactions when dragging a CellWidget
     // This prevents interference between parameter dragging and waveform interactions
     // (isDraggingParameter is already defined above)
     if ((isCanvasHovered || isCanvasActive) && !isDraggingParameter) {
@@ -795,7 +1485,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
         // Handle scrubbing during playback (when dragging playhead area)
         // CRITICAL: Scrubbing only affects playheadPosition, not startPosition (decoupled)
         // startPosition should remain unchanged during scrubbing
-        // Also skip if dragging a ParameterCell to prevent interference
+        // Also skip if dragging a CellWidget to prevent interference
         if (draggingMarker == WaveformMarker::NONE && ImGui::IsMouseDragging(0) && !isDraggingParameter) {
             auto player = getMediaPool()->getActivePlayer();
             if (player && player->isPlaying()) {
@@ -978,785 +1668,76 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
     }
 }
 
-ParameterCell MediaPoolGUI::createParameterCellForParameter(const ParameterDescriptor& paramDesc) {
-    ParameterCell cell;
-    cell.parameterName = paramDesc.name;
-    cell.isInteger = (paramDesc.type == ParameterType::INT);
-    cell.setValueRange(paramDesc.minValue, paramDesc.maxValue, paramDesc.defaultValue);
-    cell.calculateStepIncrement();
-    
-    // Set up getCurrentValue callback - capture mediaPool to get active player dynamically
-    // This ensures we always get the current active player, not a stale reference
-    cell.getCurrentValue = [this, paramDesc]() -> float {
-        MediaPool* pool = getMediaPool();
-        if (!pool) return paramDesc.defaultValue;
-        
-        auto activePlayer = pool->getActivePlayer();
-        if (!activePlayer) return paramDesc.defaultValue;
-        
-        // Special handling for "position" parameter: show startPosition instead of playheadPosition
-        // (playheadPosition is already visually displayed as the green playhead in the waveform)
-        if (paramDesc.name == "position") {
-            return activePlayer->startPosition.get();
-        }
-        
-        // Use MediaPlayer's helper method for cleaner parameter access
-        const auto* param = activePlayer->getFloatParameter(paramDesc.name);
-        if (param) {
-            return param->get();
-        }
-        return paramDesc.defaultValue;
-    };
-    
-    // Set up onValueApplied callback
-    cell.onValueApplied = [this, paramDesc](const std::string&, float value) {
-        MediaPool* pool = getMediaPool();
-        if (pool) {
-            pool->setParameter(paramDesc.name, value, true);
-        }
-    };
-    
-    // Set up formatValue callback (use openFrameworks ofToString for modern C++ string formatting)
-    // Unified precision: 0.001 (3 decimal places) for all float parameters
-    // Special handling for loopSize: logarithmic mapping for better precision at low values (1-100ms granular range)
-    if (paramDesc.name == "loopSize") {
-        // Logarithmic mapping: slider value (0.0-1.0) maps to loopSize (0.001s to 10s)
-        // This provides better precision at low values (1-100ms = 0.001-0.1s)
-        const float MIN_LOOP_SIZE = 0.001f;  // 1ms minimum
-        const float MAX_LOOP_SIZE = 10.0f;   // 10s maximum
-        
-        // Set cell value range to slider range (0.0-1.0) for logarithmic mapping
-        // Calculate default slider value from default seconds value (1.0s)
-        float defaultSeconds = 1.0f;
-        float defaultSliderValue = 0.0f;
-        if (defaultSeconds > MIN_LOOP_SIZE && defaultSeconds < MAX_LOOP_SIZE) {
-            defaultSliderValue = std::log(defaultSeconds / MIN_LOOP_SIZE) / std::log(MAX_LOOP_SIZE / MIN_LOOP_SIZE);
-        } else if (defaultSeconds >= MAX_LOOP_SIZE) {
-            defaultSliderValue = 1.0f;
-        }
-        cell.setValueRange(0.0f, 1.0f, defaultSliderValue);
-        cell.calculateStepIncrement();
-        
-        // Map slider value to logarithmic range
-        cell.getCurrentValue = [this, paramDesc, MIN_LOOP_SIZE, MAX_LOOP_SIZE]() -> float {
-            MediaPool* pool = getMediaPool();
-            if (!pool) return paramDesc.defaultValue;
-            
-            auto activePlayer = pool->getActivePlayer();
-            if (!activePlayer) return paramDesc.defaultValue;
-            
-            // Get actual loopSize value in seconds
-            float actualValue = activePlayer->loopSize.get();
-            
-            // Map from linear seconds to logarithmic slider value (0.0-1.0)
-            // Inverse of: value = MIN * pow(MAX/MIN, sliderValue)
-            if (actualValue <= MIN_LOOP_SIZE) return 0.0f;
-            if (actualValue >= MAX_LOOP_SIZE) return 1.0f;
-            float sliderValue = std::log(actualValue / MIN_LOOP_SIZE) / std::log(MAX_LOOP_SIZE / MIN_LOOP_SIZE);
-            return sliderValue;
-        };
-        
-        // Map slider value back to actual seconds
-        cell.onValueApplied = [this, paramDesc, MIN_LOOP_SIZE, MAX_LOOP_SIZE](const std::string&, float sliderValue) {
-            MediaPool* pool = getMediaPool();
-            if (!pool) return;
-            
-            // Clamp slider value to [0.0, 1.0]
-            sliderValue = std::max(0.0f, std::min(1.0f, sliderValue));
-            
-            // Map from logarithmic slider value to linear seconds
-            // value = MIN * pow(MAX/MIN, sliderValue)
-            float actualValue = MIN_LOOP_SIZE * std::pow(MAX_LOOP_SIZE / MIN_LOOP_SIZE, sliderValue);
-            
-            // Clamp to actual duration if available
-            auto activePlayer = getMediaPool()->getActivePlayer();
-            if (activePlayer) {
-                float duration = activePlayer->getDuration();
-                if (duration > 0.001f) {
-                    actualValue = std::min(actualValue, duration);
-                }
-            }
-            
-            getMediaPool()->setParameter(paramDesc.name, actualValue, true);
-        };
-        
-        // Format display value: show actual seconds with appropriate precision
-        cell.formatValue = [MIN_LOOP_SIZE, MAX_LOOP_SIZE](float sliderValue) -> std::string {
-            // Map slider value to actual seconds for display
-            sliderValue = std::max(0.0f, std::min(1.0f, sliderValue));
-            float actualValue = MIN_LOOP_SIZE * std::pow(MAX_LOOP_SIZE / MIN_LOOP_SIZE, sliderValue);
-            
-            // Use appropriate precision based on value magnitude:
-            // - 5 decimals for values < 0.01s (10ms) - granular synthesis range
-            // - 4 decimals for values < 0.1s (100ms)
-            // - 3 decimals for values >= 0.1s
-            if (actualValue < 0.01f) {
-                return ofToString(actualValue, 5) + "s";
-            } else if (actualValue < 0.1f) {
-                return ofToString(actualValue, 4) + "s";
-            } else {
-                return ofToString(actualValue, 3) + "s";
-            }
-        };
-    } else {
-        // Standard linear mapping for other parameters
-        cell.formatValue = [paramDesc](float value) -> std::string {
-            if (paramDesc.type == ParameterType::INT) {
-                return ofToString((int)std::round(value));
-            } else {
-                return ofToString(value, 3); // 3 decimal places (0.001 precision) for all float parameters
-            }
-        };
+/// MARK: - WF zoom
+/// @brief get the zoom state for a given index
+/// @param index 
+/// @return std::pair<float, float>
+std::pair<float, float> MediaPoolGUI::getWaveformZoomState(size_t index) const {
+    auto it = waveformZoomState.find(index);
+    if (it != waveformZoomState.end()) {
+        return it->second;  // Return stored {zoom, offset}
     }
-    
-    return cell;
+    // Default values: no zoom (1.0), no offset (0.0)
+    return std::make_pair(1.0f, 0.0f);
 }
 
-bool MediaPoolGUI::handleParameterCellKeyPress(const ParameterDescriptor& paramDesc, int key, bool ctrlPressed, bool shiftPressed) {
-    // Create ParameterCell for the parameter
-    ParameterCell cell = createParameterCellForParameter(paramDesc);
-    
-    // Sync state from MediaPoolGUI to ParameterCell
-    bool isSelected = (editingParameter == paramDesc.name);
-    cell.isSelected = isSelected;
-    
-    // Track if we were in edit mode before handling the key
-    bool wasInEditMode = isEditingParameter && isSelected;
-    
-    // If we're entering edit mode via direct typing, enter edit mode now
-    // Otherwise, use the current edit mode state
-    if (isEditingParameter && !cell.isEditingMode()) {
-        cell.enterEditMode();
-    } else {
-        cell.setEditing(isEditingParameter && isSelected);
-    }
-    
-    if (isEditingParameter && isSelected) {
-        cell.setEditBuffer(editBufferCache);
-    }
-    
-    // Delegate keyboard handling to ParameterCell
-    bool handled = cell.handleKeyPress(key, ctrlPressed, shiftPressed);
-    
-    if (handled) {
-        // Sync edit mode state back from ParameterCell to MediaPoolGUI
-        bool nowInEditMode = cell.isEditingMode();
-        isEditingParameter = nowInEditMode;
-        if (isEditingParameter) {
-            editBufferCache = cell.getEditBuffer();
-            editBufferInitializedCache = cell.isEditBufferInitialized();
-        } else {
-            editBufferCache.clear();
-            editBufferInitializedCache = false;
-        }
-        
-        // If we exited edit mode (especially via Enter key), request refocus to maintain cell focus
-        if (wasInEditMode && !nowInEditMode && key == OF_KEY_RETURN) {
-            shouldRefocusCurrentCell = true;
-        }
-        
-        // Disable/enable ImGui keyboard navigation based on edit mode
-        ImGuiIO& io = ImGui::GetIO();
-        if (isEditingParameter) {
-            io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-        } else {
-            io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        }
-    }
-    
-    return handled;
+/// @brief set the zoom state for a given index
+void MediaPoolGUI::setWaveformZoomState(size_t index, float zoom, float offset) {
+    waveformZoomState[index] = std::make_pair(zoom, offset);
 }
 
-void MediaPoolGUI::drawParameters() {
-    MediaPool* pool = getMediaPool();
-    if (!pool) return;
-    
-    ImGui::Separator();
-    // Get available parameters from MediaPool
-    auto params = getMediaPool()->getParameters();
-    auto activePlayer = getMediaPool()->getActivePlayer();
-    
-    if (!activePlayer || params.empty()) {
-        ImGui::Text("No parameters available");
-        return;
-    }
-    // Filter out "note" parameter (it's not editable in the GUI, only used internally)
-    // Keep parameters in their natural order from MediaPool::getParameters()
-    std::vector<ParameterDescriptor> editableParams;
-    for (const auto& param : params) {
-        if (param.name != "note") {
-            editableParams.push_back(param);
-        }
-    }
-    
-    if (editableParams.empty()) {
-        ImGui::Text("No editable parameters available");
-        return;
-    }
-    
-    // Create a focusable parent widget BEFORE the table for navigation (similar to TrackerSequencer)
-    ImGui::PushID("MediaPoolParametersParent");
-    
-    // Handle parent widget focus requests
-    if (requestFocusMoveToParentWidget) {
-        ImGui::SetKeyboardFocusHere(0); // Request focus for the upcoming widget
-        isParentWidgetFocused = true;
-        clearCellFocus();
-        requestFocusMoveToParentWidget = false;
-    }
-    
-    // Create an invisible button as the parent widget (similar to TrackerSequencer)
-    // CRITICAL: InvisibleButton requires non-zero size (ImGui assertion)
-    // Use minimum size of 1x1 pixels to satisfy the requirement
-    ImGui::InvisibleButton("##MediaPoolParamsParent", ImVec2(1, 1));
-    
-    // Handle clicks on parent widget - clear cell focus when clicked
-    if (ImGui::IsItemClicked(0)) {
-        clearCellFocus();
-        isParentWidgetFocused = true;
-    }
-    
-    // Check if parent widget is focused
-    if (ImGui::IsItemFocused()) {
-        isParentWidgetFocused = true;
-    } else if (isParentWidgetFocused && !ImGui::IsAnyItemFocused()) {
-        // Parent widget lost focus - update state
-        isParentWidgetFocused = false;
-    }
-    
-    parentWidgetId = ImGui::GetItemID();
-    ImGui::PopID();
-    
-    // Tracker-style table styling
-    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(2, 2));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(1, 1));
-    
-    // Table flags (responsive sizing - columns stretch to fill available width)
-    // Allow column reordering with memory - columns can be moved by dragging headers
-    ImGuiTableFlags flags = ImGuiTableFlags_Borders | 
-                           ImGuiTableFlags_RowBg | 
-                           ImGuiTableFlags_Resizable |
-                           ImGuiTableFlags_Reorderable | // Allow column reordering (saved in ImGui settings)
-                           ImGuiTableFlags_SizingStretchProp; // Responsive: columns stretch proportionally
-    
-    int totalColumns = 2 + (int)editableParams.size(); // Media index column + PlayStyle column + parameter columns
-    
-    // Reset focus tracking at start of frame
-    anyCellFocusedThisFrame = false;
-    
-    // Use versioned table ID to reset column order if needed (change version number to force reset)
-    // This allows us to reset saved column positions while keeping reorderability
-    static int tableVersion = 2; // Increment this to reset all saved column settings (v2: added STYLE column)
-    std::string tableId = "MediaPoolParameters_v" + std::to_string(tableVersion);
-    
-    if (ImGui::BeginTable(tableId.c_str(), totalColumns, flags)) {
-        // Setup index column: Fixed width, reorderable (user can move it, but we set it first)
-        ImGui::TableSetupColumn("Index", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        
-        // Setup PlayStyle column: Fixed width, reorderable
-        ImGui::TableSetupColumn("Play style", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        
-        // Setup parameter columns (stretch to fill remaining width, equal weight, reorderable)
-        for (const auto& paramDesc : editableParams) {
-            ImGui::TableSetupColumn(paramDesc.displayName.c_str(), ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        }
-        
-        ImGui::TableSetupScrollFreeze(0, 1);
-        
-        // Header row
-        ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
-        
-        // Media index column header
-        ImGui::TableSetColumnIndex(0);
-        ImGui::TableHeader("Index");
-        
-        // PlayStyle column header
-        ImGui::TableSetColumnIndex(1);
-        ImGui::TableHeader("Play style");
-        
-        // Parameter column headers
-        for (size_t i = 0; i < editableParams.size(); i++) {
-            ImGui::TableSetColumnIndex((int)i + 2);
-            const auto& paramDesc = editableParams[i];
-            
-            // Special handling for Position parameter (start position from sequencer): add scan mode selector
-            if (paramDesc.name == "position") {
-                // Get cell position and width before drawing header (similar to TrackerSequencerGUI)
-                ImVec2 cellStartPos = ImGui::GetCursorScreenPos();
-                float columnWidth = ImGui::GetColumnWidth();
-                float cellMinY = cellStartPos.y;
-                
-                // Draw column name first (standard header)
-                ImGui::TableHeader(paramDesc.displayName.c_str());
-                
-                // Draw scan mode selector button (right-aligned in header)
-                if (pool) {
-                    drawPositionScanModeButton(cellStartPos, columnWidth, cellMinY);
-                }
-            } else {
-                // Standard header for other parameters
-                ImGui::TableHeader(paramDesc.displayName.c_str());
-            }
-        }
-        
-        // Single data row (no steps dimension)
-        ImGui::TableNextRow();
-        
-        // Set row background color (darker and more opaque)
-        ImU32 rowBgColor = GUIConstants::toU32(GUIConstants::Background::TableRowFilled);
-        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, rowBgColor);
-        
-        // Draw media index button (first column, column index 0) - similar to step number button in TrackerSequencer
-        ImGui::TableSetColumnIndex(0);
-        drawMediaIndexButton(0, editableParams.size());
-        
-        // Draw PlayStyle button (second column, column index 1)
-        ImGui::TableSetColumnIndex(1);
-        drawPlayStyleButton(1, editableParams.size());
-        
-        // Draw parameter cells (remaining columns, column indices 2+)
-        for (size_t i = 0; i < editableParams.size(); i++) {
-            ImGui::TableSetColumnIndex((int)i + 2);
-            const auto& paramDesc = editableParams[i];
-            int columnIndex = (int)i + 2; // Column index (2-based for parameters, 0=Index, 1=Play style)
-            
-            ImGui::PushID((int)(i + 2000)); // Unique ID for parameter cells
-            
-            // Create ParameterCell for this parameter using helper method
-            ParameterCell paramCell = createParameterCellForParameter(paramDesc);
-            
-            // Sync state from MediaPoolGUI to ParameterCell
-            bool isSelected = (editingColumnIndex == columnIndex);
-            paramCell.isSelected = isSelected;
-            paramCell.setEditing(isEditingParameter && isSelected);
-            if (isEditingParameter && isSelected) {
-                paramCell.setEditBuffer(editBufferCache);
-            }
-            
-            // Restore drag state if this parameter is being dragged
-            bool isDraggingThis = (draggingParameter == paramDesc.name);
-            if (isDraggingThis) {
-                paramCell.setDragState(true, dragStartY, dragStartX, lastDragValue);
-            }
-            
-            // Determine focus state (similar to TrackerSequencer)
-            bool isFocused = (editingColumnIndex == columnIndex);
-            bool shouldFocusFirst = (columnIndex == 2 && shouldFocusFirstCell); // First parameter column is now at index 2 (0=Index, 1=Play style)
-            bool shouldRefocus = (editingColumnIndex == columnIndex && shouldRefocusCurrentCell);
-            
-            // Draw ParameterCell (use ImGui's ID system for unique identification)
-            int uniqueId = ImGui::GetID(paramDesc.name.c_str());
-            
-            ParameterCellInteraction interaction = paramCell.draw(uniqueId, isFocused, shouldFocusFirst, shouldRefocus);
-            
-            // Sync state back from ParameterCell to MediaPoolGUI (similar to TrackerSequencer)
-            if (interaction.focusChanged) {
-                int previousColumn = editingColumnIndex;
-                editingParameter = paramDesc.name;
-                editingColumnIndex = columnIndex;
-                anyCellFocusedThisFrame = true;
-                isParentWidgetFocused = false;
-                
-                // Exit edit mode if navigating to a different column
-                if (previousColumn != columnIndex && isEditingParameter) {
-                    isEditingParameter = false;
-                    editBufferCache.clear();
-                    editBufferInitializedCache = false;
-                }
-            }
-            
-            if (interaction.clicked) {
-                // Cell was clicked - focus it but don't enter edit mode yet
-                editingParameter = paramDesc.name;
-                editingColumnIndex = columnIndex;
-                isEditingParameter = false;
-                anyCellFocusedThisFrame = true;
-                isParentWidgetFocused = false;
-            }
-            
-            // Sync drag state (maintain focus during drag)
-            // CRITICAL: Always check drag state if we're dragging this parameter, even if mouse is outside cell
-            // This ensures drag continues across entire window (Blender-style)
-            // Helper lambda to sync drag state (matches TrackerSequencerGUI pattern exactly)
-            auto syncDragState = [&](bool isDragging) {
-                if (isDragging) {
-                    draggingParameter = paramDesc.name;
-                    dragStartY = paramCell.getDragStartY();
-                    dragStartX = paramCell.getDragStartX();
-                    lastDragValue = paramCell.getLastDragValue();
-                    // Maintain focus during drag
-                    editingColumnIndex = columnIndex;
-                    editingParameter = paramDesc.name;
-                    // CRITICAL: Set anyCellFocusedThisFrame to true during drag to prevent focus from being cleared
-                    // This ensures smooth dragging even when mouse moves outside the cell
-                    anyCellFocusedThisFrame = true;
-                } else {
-                    draggingParameter.clear();
-                }
-            };
-            
-            if (interaction.dragStarted || interaction.dragEnded || paramCell.getIsDragging() || isDraggingThis) {
-                if (paramCell.getIsDragging()) {
-                    // Drag is active - sync state (this handles both newly started and continuing drags)
-                    // CRITICAL: Only check paramCell.getIsDragging(), not interaction.dragStarted
-                    // This ensures we sync on every frame while dragging, not just when drag starts
-                    syncDragState(true);
-                } else if (isDraggingThis && !paramCell.getIsDragging()) {
-                    // Drag ended - clear drag state
-                    syncDragState(false);
-                }
-            }
-            
-            // Sync edit mode state
-            if (paramCell.isEditingMode()) {
-                isEditingParameter = true;
-                editBufferCache = paramCell.getEditBuffer();
-                editBufferInitializedCache = paramCell.isEditBufferInitialized();
-            } else if (isEditingParameter && isSelected && !paramCell.isEditingMode()) {
-                isEditingParameter = false;
-                editBufferCache.clear();
-                editBufferInitializedCache = false;
-            }
-            
-            // Clear refocus flag after using it
-            if (shouldRefocus) {
-                shouldRefocusCurrentCell = false;
-            }
-            
-            ImGui::PopID();
-        }
-        
-        // Clear shouldFocusFirstCell flag after drawing
-        if (shouldFocusFirstCell) {
-            shouldFocusFirstCell = false;
-        }
-        
-        // After drawing all cells, if column is set but no cell was focused, clear focus
-        // CRITICAL: Don't clear focus if we're dragging - this prevents focus loss during smooth dragging
-        if (editingColumnIndex >= 0 && !anyCellFocusedThisFrame && !isEditingParameter && !shouldRefocusCurrentCell && draggingParameter.empty()) {
-            clearCellFocus();
-        }
-        
-        ImGui::EndTable();
-    }
-    
-    ImGui::PopStyleVar(2);
-}
 
-void MediaPoolGUI::clearCellFocus() {
-    editingColumnIndex = -1;
-    editingParameter.clear();
-    isEditingParameter = false;
-    editBufferCache.clear();
-    editBufferInitializedCache = false;
-    draggingParameter.clear();
-}
-
-// Sync edit state from ImGui focus - called from InputRouter when keys are pressed
-void MediaPoolGUI::syncEditStateFromImGuiFocus(MediaPoolGUI& gui) {
-    // Check if editingColumnIndex is already valid (GUI sync already happened)
-    if (gui.editingColumnIndex >= 0) {
-        // If editingParameter is empty but editingColumnIndex is set, look it up
-        if (gui.editingParameter.empty() && gui.mediaPool) {
-            auto params = gui.getMediaPool()->getParameters();
-            std::vector<ParameterDescriptor> editableParams;
-            for (const auto& param : params) {
-                if (param.name != "note") {
-                    editableParams.push_back(param);
-                }
-            }
-            // editingColumnIndex is 2-based for parameters (0 = Index button, 1 = Play style button)
-            if (gui.editingColumnIndex > 1 && (size_t)(gui.editingColumnIndex - 2) < editableParams.size()) {
-                gui.editingParameter = editableParams[gui.editingColumnIndex - 2].name;
-            }
-        }
-        return; // Already synced
-    }
-    
-    // GUI draw sync should handle this every frame
-    // If not set, handleKeyPress will default gracefully
-}
-
-void MediaPoolGUI::drawPlayStyleButton(int columnIndex, size_t numParamColumns) {
-    MediaPool* pool = getMediaPool();
-    if (!pool) return;
-    
-    PlayStyle currentStyle = pool->getPlayStyle();
-    
-    // Get button label based on current style
-    const char* styleLabel = "ONCE";
-    const char* styleTooltip = "Play Style: ONCE\nClick to cycle: ONCE → LOOP → NEXT";
-    switch (currentStyle) {
-        case PlayStyle::ONCE:
-            styleLabel = "ONCE";
-            styleTooltip = "Play Style: ONCE\nClick to cycle: ONCE → LOOP → NEXT";
-            break;
-        case PlayStyle::LOOP:
-            styleLabel = "LOOP";
-            styleTooltip = "Play Style: LOOP\nClick to cycle: LOOP → NEXT → ONCE";
-            break;
-        case PlayStyle::NEXT:
-            styleLabel = "NEXT";
-            styleTooltip = "Play Style: NEXT\nClick to cycle: NEXT → ONCE → LOOP";
-            break;
-    }
-    
-    // Draw button
-    if (ImGui::Button(styleLabel, ImVec2(-1, 0))) {
-        // Cycle through styles: ONCE → LOOP → NEXT → ONCE
-        PlayStyle nextStyle;
-        switch (currentStyle) {
-            case PlayStyle::ONCE:
-                nextStyle = PlayStyle::LOOP;
-                break;
-            case PlayStyle::LOOP:
-                nextStyle = PlayStyle::NEXT;
-                break;
-            case PlayStyle::NEXT:
-                nextStyle = PlayStyle::ONCE;
-                break;
-        }
-        getMediaPool()->setPlayStyle(nextStyle);
-    }
-    
-    // Tooltip on hover
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("%s", styleTooltip);
-    }
-}
-
-void MediaPoolGUI::drawMediaIndexButton(int columnIndex, size_t numParamColumns) {
-    MediaPool* pool = getMediaPool();
-    if (!pool) return;
-    
-    size_t currentIndex = pool->getCurrentIndex();
-    size_t numPlayers = pool->getNumPlayers();
-    auto activePlayer = pool->getActivePlayer();
-    
-    // Format button text: show current index (1-based) or "--" if no media
-    std::string indexText;
-    if (numPlayers > 0) {
-        int displayIndex = (int)(currentIndex + 1);
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%02d", displayIndex);
-        indexText = buf;
-    } else {
-        indexText = "--";
-    }
-    
-    // Determine focus state
-    bool shouldRefocus = (editingColumnIndex == columnIndex && shouldRefocusCurrentCell);
-    
-    if (shouldRefocus) {
-        ImGui::SetKeyboardFocusHere(0);
-    }
-    
-    // SIMPLIFIED: Button state is based on mode - supports both manual and sequencer playback
-    // Button is green if media is playing (either MANUAL_PREVIEW or SEQUENCER_ACTIVE)
-    // Button is grey if IDLE (stopped)
-    bool isCurrentMediaPlaying = false;
-    if (activePlayer != nullptr && currentIndex < numPlayers) {
-        auto currentPlayer = getMediaPool()->getMediaPlayer(currentIndex);
-        if (currentPlayer == activePlayer) {
-            // Button is green if mode is MANUAL_PREVIEW OR SEQUENCER_ACTIVE
-            // This syncs with both manual clicks and external sequencer triggers
-            isCurrentMediaPlaying = (getMediaPool()->isManualPreview() || getMediaPool()->isSequencerActive()) 
-                        && currentPlayer->isPlaying();
-        }
-    }
-    
-    // Apply button styling for active playback
-    if (isCurrentMediaPlaying) {
-        ImGui::PushStyleColor(ImGuiCol_Button, GUIConstants::Active::StepButton);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, GUIConstants::Active::StepButtonHover);
-    }
-    
-    ImGui::PushItemFlag(ImGuiItemFlags_NoNavDefaultFocus, true);
-    bool buttonClicked = ImGui::Button(indexText.c_str(), ImVec2(-1, 0));
-    ImGui::PopItemFlag();
-    
-    if (shouldRefocus) {
-        ImGui::SetKeyboardFocusHere(-1);
-        ImGuiIO& io = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    }
-    
-    if (isCurrentMediaPlaying) {
-        ImGui::PopStyleColor(2);
-    }
-    
-    // SIMPLIFIED: Handle button click - simple toggle logic
-    bool spacebarPressed = ImGui::IsKeyPressed(ImGuiKey_Space, false);
-    
-    if (buttonClicked && !spacebarPressed && numPlayers > 0) {
-        auto currentPlayer = getMediaPool()->getMediaPlayer(currentIndex);
-        if (currentPlayer) {
-            // Only toggle manual preview - don't interfere with sequencer playback
-            // If sequencer is active, button click does nothing (sequencer controls playback)
-            if (getMediaPool()->isManualPreview()) {
-                // Currently in MANUAL_PREVIEW mode - stop it
-                currentPlayer->stop();
-                getMediaPool()->setModeIdle();  // Transition to IDLE immediately
-            } else if (getMediaPool()->isIdle()) {
-                // Not playing (IDLE) - start manual preview
-                // Note: If SEQUENCER_ACTIVE, we don't do anything (sequencer is in control)
-                // CRITICAL FIX: Convert relative startPosition to absolute position for playMediaManual
-                // playMediaManual expects absolute position (0.0-1.0), but startPosition is relative within region
-                float relativeStartPos = currentPlayer->startPosition.get();
-                float regionStartVal = currentPlayer->regionStart.get();
-                float regionEndVal = currentPlayer->regionEnd.get();
-                float regionSize = regionEndVal - regionStartVal;
-                
-                float absoluteStartPosition;
-                if (regionSize > 0.001f) {
-                    // Convert relative position to absolute within region
-                    absoluteStartPosition = regionStartVal + relativeStartPos * regionSize;
-                } else {
-                    // If region is invalid, use relative position directly
-                    absoluteStartPosition = relativeStartPos;
-                }
-                
-                // Clamp to valid range
-                absoluteStartPosition = std::max(0.0f, std::min(1.0f, absoluteStartPosition));
-                
-                getMediaPool()->playMediaManual(currentIndex, absoluteStartPosition);
-            }
-            // If isSequencerActive(), do nothing - sequencer controls playback
-        }
-    }
-    
-    // ONE-WAY SYNC: ImGui focus → MediaPoolGUI state
-    bool actuallyFocused = ImGui::IsItemFocused();
-    if (actuallyFocused) {
-        bool itemWasClicked = ImGui::IsItemClicked(0);
-        bool keyboardNavActive = (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
-        
-        if (itemWasClicked || keyboardNavActive || shouldRefocus) {
-            anyCellFocusedThisFrame = true;
-            bool columnChanged = (editingColumnIndex != columnIndex);
-            
-            if (isEditingParameter && columnChanged) {
-                return;
-            }
-            
-            editingColumnIndex = columnIndex;
-            editingParameter.clear();
-            isParentWidgetFocused = false;
-            
-            if (shouldRefocus) {
-                shouldRefocusCurrentCell = false;
-            }
-            
-            if (columnChanged && isEditingParameter) {
-                isEditingParameter = false;
-                editBufferCache.clear();
-                editBufferInitializedCache = false;
-            }
-        }
-    }
-}
-
+/// MARK: - KEY PRESS
 bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
     // CRITICAL FIX: If editingColumnIndex is set but editingParameter is empty,
     // look up the parameter name from the column index
     // This handles cases where focus was synced from ImGui but editingParameter wasn't set yet
-    if (editingColumnIndex > 1 && editingParameter.empty() && mediaPool) {
-        auto params = getMediaPool()->getParameters();
-        // Filter out "note" parameter (it's not editable in the GUI)
-        std::vector<ParameterDescriptor> editableParams;
-        for (const auto& param : params) {
-            if (param.name != "note") {
-                editableParams.push_back(param);
+    if (editingColumnIndex >= 0 && editingParameter.empty()) {
+        auto columnConfig = cellGrid.getColumnConfiguration();
+        if (editingColumnIndex >= 0 && (size_t)editingColumnIndex < columnConfig.size()) {
+            const std::string& paramName = columnConfig[editingColumnIndex].parameterName;
+            // Only set editingParameter for non-button columns
+            if (paramName != "mediaIndex" && paramName != "playStyle") {
+                editingParameter = paramName;
             }
-        }
-        // editingColumnIndex is 2-based for parameters (0 = IDX button, 1 = STYLE button)
-        if (editingColumnIndex > 1 && (size_t)(editingColumnIndex - 2) < editableParams.size()) {
-            editingParameter = editableParams[editingColumnIndex - 2].name;
         }
     }
     
+    // Helper function to check if current column is editable (not a button)
+    auto isEditableColumn = [this]() -> bool {
+        if (editingColumnIndex < 0) return false;
+        auto columnConfig = cellGrid.getColumnConfiguration();
+        if ((size_t)editingColumnIndex >= columnConfig.size()) return false;
+        const std::string& paramName = columnConfig[editingColumnIndex].parameterName;
+        return paramName != "mediaIndex" && paramName != "playStyle";
+    };
+    
     // Handle direct typing (numeric keys, decimal point, operators) - auto-enter edit mode
     // This matches TrackerSequencer behavior: typing directly enters edit mode
+    // NOTE: Once edit mode is entered, CellGrid's internal input handling (via CellWidget::handleInputInDraw)
+    // will process the actual key input during draw(). We just need to set the edit mode state here.
     if ((key >= '0' && key <= '9') || key == '.' || key == '-' || key == '+' || key == '*' || key == '/') {
         // Check if we have a valid parameter column focused (not Index or Play style button)
-        if (!isEditingParameter && editingColumnIndex > 1) {
-            // Find the parameter descriptor
-            auto params = getMediaPool()->getParameters();
-            const ParameterDescriptor* paramDesc = nullptr;
-            
-            // If editingParameter is set, use it; otherwise look up by column index
-            if (!editingParameter.empty()) {
-                for (const auto& param : params) {
-                    if (param.name == editingParameter) {
-                        paramDesc = &param;
-                        break;
-                    }
-                }
-            } else {
-                // Look up by column index
-                std::vector<ParameterDescriptor> editableParams;
-                for (const auto& param : params) {
-                    if (param.name != "note") {
-                        editableParams.push_back(param);
-                    }
-                }
-                if (editingColumnIndex > 1 && (size_t)(editingColumnIndex - 2) < editableParams.size()) {
-                    paramDesc = &editableParams[editingColumnIndex - 2];
-                    editingParameter = paramDesc->name; // Set it for future use
+        if (!isEditingParameter && isEditableColumn()) {
+            // Ensure editingParameter is set
+            if (editingParameter.empty()) {
+                auto columnConfig = cellGrid.getColumnConfiguration();
+                if (editingColumnIndex >= 0 && (size_t)editingColumnIndex < columnConfig.size()) {
+                    editingParameter = columnConfig[editingColumnIndex].parameterName;
                 }
             }
             
-            if (paramDesc) {
-                // Enter edit mode first (similar to TrackerSequencer)
+            if (!editingParameter.empty()) {
+                // Enter edit mode - CellGrid will handle the actual key input during draw()
                 isEditingParameter = true;
                 
                 // Disable ImGui keyboard navigation when entering edit mode
                 ImGuiIO& io = ImGui::GetIO();
                 io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
                 
-                // Now handle the key via helper method (which will create cell, enter edit mode, and handle key)
-                // The helper method will sync state back
-                return handleParameterCellKeyPress(*paramDesc, key, ctrlPressed, shiftPressed);
-            }
-        }
-    }
-    
-    // If a parameter is selected and in edit mode, delegate to ParameterCell
-    if (!editingParameter.empty() && isEditingParameter) {
-        // Find the parameter descriptor
-        auto params = getMediaPool()->getParameters();
-        const ParameterDescriptor* paramDesc = nullptr;
-        for (const auto& param : params) {
-            if (param.name == editingParameter) {
-                paramDesc = &param;
-                break;
-            }
-        }
-        
-        if (!paramDesc) return false;
-        
-        // Use helper method to handle key press (reduces duplication)
-        return handleParameterCellKeyPress(*paramDesc, key, ctrlPressed, shiftPressed);
-    }
-    
-    // Handle arrow key navigation (similar to TrackerSequencer)
-    // CRITICAL: In edit mode, arrow keys adjust values (don't navigate)
-    if (isEditingParameter && editingColumnIndex >= 0) {
-        // In edit mode: Arrow keys adjust values
-        if (key == OF_KEY_UP || key == OF_KEY_DOWN || key == OF_KEY_LEFT || key == OF_KEY_RIGHT) {
-            // Ensure we have the parameter descriptor
-            if (!editingParameter.empty()) {
-                auto params = getMediaPool()->getParameters();
-                const ParameterDescriptor* paramDesc = nullptr;
-                for (const auto& param : params) {
-                    if (param.name == editingParameter) {
-                        paramDesc = &param;
-                        break;
-                    }
-                }
-                if (paramDesc) {
-                    return handleParameterCellKeyPress(*paramDesc, key, ctrlPressed, shiftPressed);
-                }
+                // Don't consume the key - let it pass through to ImGui so CellGrid can handle it
+                // CellGrid's CellWidget::handleInputInDraw() will process it during draw()
+                return false;
             }
         }
     }
@@ -1778,7 +1759,15 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
         }
     }
     
-    // Handle keyboard shortcuts for parameter navigation
+    // In edit mode: Let CellGrid handle arrow keys and other input internally
+    // CellGrid's CellWidget::handleInputInDraw() will process them during draw()
+    if (isEditingParameter && editingColumnIndex >= 0) {
+        // Let ImGui pass the key through so CellGrid can handle it
+        // This includes arrow keys (for value adjustment) and all other keys
+        return false;
+    }
+    
+    // Handle keyboard shortcuts for parameter navigation (special modifier combinations)
     switch (key) {
         case OF_KEY_RETURN:
             if (ctrlPressed || shiftPressed) {
@@ -1793,21 +1782,15 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
                     return true;
                 }
             }
-            if (editingColumnIndex > 1 && !isEditingParameter) {
+            if (isEditableColumn() && !isEditingParameter) {
                 // Enter on selected parameter column: Enter edit mode
-                // (Column 0 is Index button, column 1 is Play style button, which don't support editing)
+                // (Index and Play style buttons don't support editing)
                 
                 // Ensure editingParameter is set
-                if (editingParameter.empty() && mediaPool) {
-                    auto params = getMediaPool()->getParameters();
-                    std::vector<ParameterDescriptor> editableParams;
-                    for (const auto& param : params) {
-                        if (param.name != "note") {
-                            editableParams.push_back(param);
-                        }
-                    }
-                    if (editingColumnIndex > 1 && (size_t)(editingColumnIndex - 2) < editableParams.size()) {
-                        editingParameter = editableParams[editingColumnIndex - 2].name;
+                if (editingParameter.empty()) {
+                    auto columnConfig = cellGrid.getColumnConfiguration();
+                    if (editingColumnIndex >= 0 && (size_t)editingColumnIndex < columnConfig.size()) {
+                        editingParameter = columnConfig[editingColumnIndex].parameterName;
                     }
                 }
                 
@@ -1815,27 +1798,37 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
                     isEditingParameter = true;
                     ImGuiIO& io = ImGui::GetIO();
                     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-                    return true;
+                    // Don't consume Enter - let CellGrid handle it so it can enter edit mode properly
+                    return false;
                 }
             }
             break;
             
         case OF_KEY_ESC:
+            // IMPORTANT: Only handle ESC when in edit mode. When NOT in edit mode, let ESC pass through
+            // to ImGui so it can use ESC to escape contained navigation contexts (like scrollable tables)
             if (isEditingParameter) {
+                // Exit edit mode - CellGrid will handle the actual ESC key processing
+                // We just set the state here so it's ready when CellGrid processes it
                 isEditingParameter = false;
                 editBufferCache.clear();
                 editBufferInitializedCache = false;
                 ImGuiIO& io = ImGui::GetIO();
                 io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
                 shouldRefocusCurrentCell = true; // Refocus cell after exiting edit mode
-                return true;
+                // Let CellGrid handle ESC so it can properly exit edit mode and sync state
+                return false;
             }
+            // NOT in edit mode: Let ESC pass through to ImGui for navigation escape
             break;
     }
     
+    // All other keys: Let CellGrid handle them internally via CellWidget::handleInputInDraw()
     return false;
 }
 
+/// MARK: - SCAN MODE
+/// @brief draw button for position scan mode
 void MediaPoolGUI::drawPositionScanModeButton(const ImVec2& cellStartPos, float columnWidth, float cellMinY) {
     MediaPool* pool = getMediaPool();
     if (!pool) return;
@@ -1908,15 +1901,15 @@ void MediaPoolGUI::drawPositionScanModeButton(const ImVec2& cellStartPos, float 
     ImGui::PopID();
 }
 
-std::pair<float, float> MediaPoolGUI::getWaveformZoomState(size_t index) const {
-    auto it = waveformZoomState.find(index);
-    if (it != waveformZoomState.end()) {
-        return it->second;  // Return stored {zoom, offset}
+bool MediaPoolGUI::handleFileDrop(const std::vector<std::string>& filePaths) {
+    MediaPool* pool = getMediaPool();
+    if (!pool || filePaths.empty()) {
+        return false;
     }
-    // Default values: no zoom (1.0), no offset (0.0)
-    return std::make_pair(1.0f, 0.0f);
+    
+    // Add files to MediaPool
+    pool->addMediaFiles(filePaths);
+    return true;
 }
 
-void MediaPoolGUI::setWaveformZoomState(size_t index, float zoom, float offset) {
-    waveformZoomState[index] = std::make_pair(zoom, offset);
-}
+

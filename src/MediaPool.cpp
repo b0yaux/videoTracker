@@ -1,4 +1,3 @@
-
 #include "MediaPool.h"
 #include "MediaPlayer.h"
 #include "TrackerSequencer.h"
@@ -137,6 +136,93 @@ void MediaPool::mediaPair() {
     }
     
     ofLogNotice("ofxMediaPool") << "Created " << players.size() << " media players";
+}
+
+void MediaPool::completeDeferredLoading() {
+    // This method is called after session restore to complete media loading
+    // that was deferred to prevent blocking during session load
+    if (deferMediaLoading_) {
+        ofLogNotice("ofxMediaPool") << "Completing deferred media loading...";
+        deferMediaLoading_ = false;
+        mediaPair();  // This creates the players
+        
+        // NOW load parameters for the newly created players
+        // Match players by file paths since indices might have changed
+        for (const auto& deferredParams : deferredPlayerParams_) {
+            // Find the player that matches these file paths
+            for (size_t i = 0; i < players.size(); i++) {
+                auto player = players[i].get();
+                if (!player) continue;
+                
+                bool audioMatch = deferredParams.audioFile.empty() ? 
+                    player->getAudioFilePath().empty() : 
+                    player->getAudioFilePath() == deferredParams.audioFile;
+                bool videoMatch = deferredParams.videoFile.empty() ? 
+                    player->getVideoFilePath().empty() : 
+                    player->getVideoFilePath() == deferredParams.videoFile;
+                
+                if (audioMatch && videoMatch) {
+                    // Found matching player - load parameters
+                    auto paramsJson = deferredParams.paramsJson;
+                    
+                    if (paramsJson.contains("startPosition")) {
+                        player->startPosition.set(paramsJson["startPosition"]);
+                    }
+                    if (paramsJson.contains("speed")) {
+                        player->speed.set(paramsJson["speed"]);
+                    }
+                    if (paramsJson.contains("volume")) {
+                        player->volume.set(paramsJson["volume"]);
+                    }
+                    if (paramsJson.contains("loop")) {
+                        player->loop.set(paramsJson["loop"]);
+                    }
+                    if (paramsJson.contains("loopSize")) {
+                        player->loopSize.set(paramsJson["loopSize"]);
+                    }
+                    if (paramsJson.contains("regionStart")) {
+                        player->regionStart.set(paramsJson["regionStart"]);
+                    }
+                    if (paramsJson.contains("regionEnd")) {
+                        player->regionEnd.set(paramsJson["regionEnd"]);
+                    }
+                    if (paramsJson.contains("audioEnabled")) {
+                        player->audioEnabled.set(paramsJson["audioEnabled"]);
+                    }
+                    if (paramsJson.contains("videoEnabled")) {
+                        player->videoEnabled.set(paramsJson["videoEnabled"]);
+                    }
+                    if (paramsJson.contains("brightness")) {
+                        player->brightness.set(paramsJson["brightness"]);
+                    }
+                    if (paramsJson.contains("hue")) {
+                        player->hue.set(paramsJson["hue"]);
+                    }
+                    if (paramsJson.contains("saturation")) {
+                        player->saturation.set(paramsJson["saturation"]);
+                    }
+                    
+                    ofLogNotice("MediaPool") << "Restored parameters for player " << i;
+                    break; // Found and loaded, move to next deferred params
+                }
+            }
+        }
+        
+        // Clear deferred params after loading
+        deferredPlayerParams_.clear();
+        
+        // Restore active player index
+        if (deferredActivePlayerIndex_ < players.size()) {
+            currentIndex = deferredActivePlayerIndex_;
+        } else if (!players.empty()) {
+            currentIndex = 0;
+        }
+        
+        // Initialize active player if we have players
+        if (!players.empty()) {
+            initializeFirstActivePlayer();
+        }
+    }
 }
 
 
@@ -361,6 +447,150 @@ void MediaPool::clear() {
 void MediaPool::refresh() {
     scanDirectory(dataDirectory);
     mediaPair();
+}
+
+//--------------------------------------------------------------
+// Individual file addition (for drag-and-drop support)
+bool MediaPool::addMediaFile(const std::string& filePath) {
+    // Validate file exists
+    ofFile file(filePath);
+    if (!file.exists()) {
+        ofLogWarning("ofxMediaPool") << "File does not exist: " << filePath;
+        return false;
+    }
+    
+    // Check if file is a valid media file
+    std::string filename = ofFilePath::getFileName(filePath);
+    bool isAudio = isAudioFile(filename);
+    bool isVideo = isVideoFile(filename);
+    
+    if (!isAudio && !isVideo) {
+        ofLogWarning("ofxMediaPool") << "File is not a valid media file: " << filePath;
+        return false;
+    }
+    
+    // CRITICAL: Lock mutex to prevent accessing players while they're being modified
+    std::lock_guard<std::mutex> lock(stateMutex);
+    
+    // Check if file is already in the list (avoid duplicates)
+    if (isAudio) {
+        for (const auto& existingFile : audioFiles) {
+            if (existingFile == filePath) {
+                ofLogNotice("ofxMediaPool") << "File already in pool: " << filePath;
+                return false; // Already exists, but not an error
+            }
+        }
+    } else if (isVideo) {
+        for (const auto& existingFile : videoFiles) {
+            if (existingFile == filePath) {
+                ofLogNotice("ofxMediaPool") << "File already in pool: " << filePath;
+                return false; // Already exists, but not an error
+            }
+        }
+    }
+    
+    // Add file to appropriate list
+    if (isAudio) {
+        audioFiles.push_back(filePath);
+        ofLogNotice("ofxMediaPool") << "Added audio file: " << filePath;
+    } else if (isVideo) {
+        videoFiles.push_back(filePath);
+        ofLogNotice("ofxMediaPool") << "Added video file: " << filePath;
+    }
+    
+    // If deferring media loading (during session restore), just add to lists and return
+    // Media will be loaded later via mediaPair()
+    if (deferMediaLoading_) {
+        return true;
+    }
+    
+    // Try to pair with existing files
+    std::string baseName = getBaseName(filePath);
+    
+    if (isAudio) {
+        // Look for matching video file
+        for (const auto& videoFile : videoFiles) {
+            if (getBaseName(videoFile) == baseName && videoFile != filePath) {
+                // Found matching video - create paired player
+                auto player = std::make_unique<MediaPlayer>();
+                bool loaded = player->load(filePath, videoFile);
+                if (loaded) {
+                    players.push_back(std::move(player));
+                    ofLogNotice("ofxMediaPool") << "Created paired player: " << filename << " + " << ofFilePath::getFileName(videoFile);
+                    return true;
+                } else {
+                    ofLogWarning("ofxMediaPool") << "Failed to load paired media: " << filePath << " + " << videoFile;
+                }
+            }
+        }
+        // No matching video found - create audio-only player
+        auto player = std::make_unique<MediaPlayer>();
+        bool loaded = player->loadAudio(filePath);
+        if (loaded) {
+            players.push_back(std::move(player));
+            ofLogNotice("ofxMediaPool") << "Created audio-only player: " << filename;
+            return true;
+        } else {
+            ofLogWarning("ofxMediaPool") << "Failed to load audio: " << filePath;
+            // Remove from list if loading failed
+            audioFiles.pop_back();
+            return false;
+        }
+    } else if (isVideo) {
+        // Look for matching audio file
+        for (const auto& audioFile : audioFiles) {
+            if (getBaseName(audioFile) == baseName && audioFile != filePath) {
+                // Found matching audio - check if already paired
+                // If audio was already paired, we need to update the existing player
+                // For now, create a new paired player (existing one will remain)
+                // TODO: Could improve this to update existing player instead
+                auto player = std::make_unique<MediaPlayer>();
+                bool loaded = player->load(audioFile, filePath);
+                if (loaded) {
+                    players.push_back(std::move(player));
+                    ofLogNotice("ofxMediaPool") << "Created paired player: " << ofFilePath::getFileName(audioFile) << " + " << filename;
+                    return true;
+                } else {
+                    ofLogWarning("ofxMediaPool") << "Failed to load paired media: " << audioFile << " + " << filePath;
+                }
+            }
+        }
+        // No matching audio found - create video-only player
+        auto player = std::make_unique<MediaPlayer>();
+        bool loaded = player->loadVideo(filePath);
+        if (loaded) {
+            players.push_back(std::move(player));
+            ofLogNotice("ofxMediaPool") << "Created video-only player: " << filename;
+            return true;
+        } else {
+            ofLogWarning("ofxMediaPool") << "Failed to load video: " << filePath;
+            // Remove from list if loading failed
+            videoFiles.pop_back();
+            return false;
+        }
+    }
+    
+    return false;
+}
+
+void MediaPool::addMediaFiles(const std::vector<std::string>& filePaths) {
+    int successCount = 0;
+    int failCount = 0;
+    
+    for (const auto& filePath : filePaths) {
+        if (addMediaFile(filePath)) {
+            successCount++;
+        } else {
+            failCount++;
+        }
+    }
+    
+    ofLogNotice("ofxMediaPool") << "Added " << successCount << " files, " << failCount << " failed";
+    
+    // If we added files successfully, try to initialize first active player if pool was empty
+    if (successCount > 0 && players.empty() == false && activePlayer == nullptr) {
+        initializeFirstActivePlayer();
+    }
 }
 
 // Helper methods
@@ -1207,60 +1437,32 @@ void MediaPool::processEventQueue() {
             setActivePlayer(mediaIndex);
         }
         
-        // Extract parameters from TriggerEvent map
+        // MODULAR: Process ALL parameters from event dynamically
+        // Iterate through all parameters in the event and apply them to the player
         // If parameter is not in event, use current player value (not default) to preserve GUI settings
         // This allows MediaPool GUI to control parameters when not triggered from sequencer
-        auto getParamValue = [&](const std::string& paramName, float defaultValue) -> float {
-            auto descIt = std::find_if(paramDescriptors.begin(), paramDescriptors.end(),
-                [&](const ParameterDescriptor& desc) { return desc.name == paramName; });
-            
-            float minVal = 0.0f;
-            float maxVal = 1.0f;
-            if (descIt != paramDescriptors.end()) {
-                minVal = descIt->minValue;
-                maxVal = descIt->maxValue;
-            }
-            
-            auto eventIt = event.parameters.find(paramName);
-            if (eventIt != event.parameters.end()) {
-                // Parameter is in event - use it (clamped to valid range)
-                return std::max(minVal, std::min(maxVal, eventIt->second));
-            }
-            
-            // Parameter NOT in event - use current player value instead of default
-            // This preserves GUI settings when triggering manually (not from sequencer)
-            // Special handling for "position" parameter (uses startPosition, not a regular parameter)
-            if (paramName == "position") {
-                float currentValue = player->startPosition.get();
-                // Clamp current value to valid range
-                return std::max(minVal, std::min(maxVal, currentValue));
-            }
-            
-            const auto* param = player->getFloatParameter(paramName);
-            if (param) {
-                float currentValue = param->get();
-                // Clamp current value to valid range
-                return std::max(minVal, std::min(maxVal, currentValue));
-            }
-            
-            // Fallback to default if parameter doesn't exist on player
-            return defaultValue;
-        };
         
-        float position = getParamValue("position", defaults.count("position") > 0 ? defaults["position"] : 0.0f);
-        float speed = getParamValue("speed", defaults.count("speed") > 0 ? defaults["speed"] : 1.0f);
-        float volume = getParamValue("volume", defaults.count("volume") > 0 ? defaults["volume"] : 1.0f);
+        // Special handling for "position" parameter (maps to startPosition, needs region clamping)
+        float position = 0.0f;
+        bool positionInEvent = false;
+        auto positionIt = event.parameters.find("position");
+        if (positionIt != event.parameters.end()) {
+            position = positionIt->second;
+            positionInEvent = true;
+        } else {
+            // Position not in event - use current player value (position memory)
+            position = player->startPosition.get();
+        }
         
         // Clamp position to region bounds
         float regionStartVal = player->regionStart.get();
         float regionEndVal = player->regionEnd.get();
         float regionSize = regionEndVal - regionStartVal;
+        float clampedPosition = std::max(0.0f, std::min(1.0f, position));
         
-        float clampedPosition = position;
-        if (regionSize > 0.001f) {
-            clampedPosition = std::max(0.0f, std::min(1.0f, position));
-        } else {
-            clampedPosition = std::max(0.0f, std::min(1.0f, position));
+        // Set position if it was in event or if it changed
+        if (positionInEvent && std::abs(player->startPosition.get() - clampedPosition) > PARAMETER_EPSILON) {
+            player->startPosition.set(clampedPosition);
         }
         
         // Audio/video always enabled for sequencer triggers
@@ -1271,17 +1473,39 @@ void MediaPool::processEventQueue() {
             player->videoEnabled.set(true);
         }
         
-        // Set volume
-        if (std::abs(player->volume.get() - volume) > PARAMETER_EPSILON) {
-            player->volume.set(volume);
+        // Process all other parameters from event dynamically
+        // Skip "note" (handled separately) and "position" (handled above)
+        for (const auto& paramPair : event.parameters) {
+            const std::string& paramName = paramPair.first;
+            float paramValue = paramPair.second;
+            
+            // Skip special parameters
+            if (paramName == "note" || paramName == "position") {
+                continue;
         }
         
-        // Set playback parameters
-        if (std::abs(player->startPosition.get() - clampedPosition) > PARAMETER_EPSILON) {
-            player->startPosition.set(clampedPosition);
-        }
-        if (std::abs(player->speed.get() - speed) > PARAMETER_EPSILON) {
-            player->speed.set(speed);
+            // Get parameter descriptor for validation
+            auto descIt = std::find_if(paramDescriptors.begin(), paramDescriptors.end(),
+                [&](const ParameterDescriptor& desc) { return desc.name == paramName; });
+            
+            // Clamp value to parameter range if descriptor found
+            float clampedValue = paramValue;
+            if (descIt != paramDescriptors.end()) {
+                clampedValue = std::max(descIt->minValue, std::min(descIt->maxValue, paramValue));
+            }
+            
+            // Use MediaPlayer's getFloatParameter to check if parameter exists
+            auto* param = player->getFloatParameter(paramName);
+            if (param) {
+                // Parameter exists on player - set it
+                float currentValue = param->get();
+                if (std::abs(currentValue - clampedValue) > PARAMETER_EPSILON) {
+                    param->set(clampedValue);
+                }
+            } else {
+                // Parameter doesn't exist on player - log warning but continue
+                ofLogVerbose("MediaPool") << "Parameter '" << paramName << "' not found on MediaPlayer, skipping";
+            }
         }
         
         // Set loop based on play style
@@ -1487,9 +1711,6 @@ std::string MediaPool::getName() const {
 ofJson MediaPool::toJson() const {
     ofJson json;
     
-    // Save directory
-    json["directory"] = dataDirectory;
-    
     // Save active player index
     json["activePlayerIndex"] = currentIndex;
     
@@ -1500,13 +1721,19 @@ ofJson MediaPool::toJson() const {
     json["playStyle"] = static_cast<int>(currentPlayStyle);
     
     // Save all players with their file paths and parameters
+    // File paths are saved as-is (should already be absolute from file system)
     ofJson playersArray = ofJson::array();
+    std::lock_guard<std::mutex> lock(stateMutex);
     for (size_t i = 0; i < players.size(); i++) {
         auto player = players[i].get();
         if (player) {
             ofJson playerJson;
-            playerJson["audioFile"] = player->getAudioFilePath();
-            playerJson["videoFile"] = player->getVideoFilePath();
+            std::string audioPath = player->getAudioFilePath();
+            std::string videoPath = player->getVideoFilePath();
+            
+            // Save file paths (empty string if not set)
+            playerJson["audioFile"] = audioPath;
+            playerJson["videoFile"] = videoPath;
             
             // Save MediaPlayer parameters
             ofJson paramsJson;
@@ -1533,15 +1760,7 @@ ofJson MediaPool::toJson() const {
 }
 
 void MediaPool::fromJson(const ofJson& json) {
-    // Load directory
-    if (json.contains("directory")) {
-        std::string dir = json["directory"];
-        if (!dir.empty() && ofDirectory(dir).exists()) {
-            setDataDirectory(dir);
-        }
-    }
-    
-    // Load scan mode
+    // Load scan mode and play style first (before loading players)
     if (json.contains("scanMode")) {
         int modeInt = json["scanMode"];
         if (modeInt >= 0 && modeInt <= 3) {
@@ -1549,7 +1768,6 @@ void MediaPool::fromJson(const ofJson& json) {
         }
     }
     
-    // Load play style
     if (json.contains("playStyle")) {
         int styleInt = json["playStyle"];
         if (styleInt >= 0 && styleInt <= 2) {
@@ -1557,67 +1775,112 @@ void MediaPool::fromJson(const ofJson& json) {
         }
     }
     
-    // Load players (if directory wasn't set, we still try to load player parameters)
+    // Load players from saved file paths
     if (json.contains("players") && json["players"].is_array()) {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        
+        // Clear existing players
+        if (activePlayer) {
+            disconnectActivePlayer();
+            activePlayer = nullptr;
+            playerConnected = false;
+        }
+        clear();
+        
+        // Set flag to defer media loading during session restore to prevent blocking
+        deferMediaLoading_ = true;
+        
         auto playersArray = json["players"];
+        deferredPlayerParams_.clear();
+        deferredPlayerParams_.reserve(playersArray.size());
         
-        // First, ensure we have enough players
-        // If directory was loaded, players should already be created
-        // Otherwise, we can't restore players without file paths
-        
-        // Load player parameters for existing players
-        for (size_t i = 0; i < playersArray.size() && i < players.size(); i++) {
+        // First pass: Add file paths directly to lists (skip addMediaFile to avoid file existence checks)
+        for (int i = 0; i < playersArray.size(); i++) {
             auto playerJson = playersArray[i];
-            auto player = players[i].get();
+            std::string audioFile = playerJson.value("audioFile", "");
+            std::string videoFile = playerJson.value("videoFile", "");
             
-            if (player && playerJson.contains("parameters")) {
-                auto paramsJson = playerJson["parameters"];
-                
-                if (paramsJson.contains("startPosition")) {
-                    player->startPosition.set(paramsJson["startPosition"]);
+            // Skip if both files are missing
+            if (audioFile.empty() && videoFile.empty()) {
+                ofLogWarning("MediaPool") << "Skipping player " << i << ": no audio or video file specified";
+                continue;
+            }
+            
+            // During session restore, just add paths directly to lists without checking existence
+            // File existence will be checked later when mediaPair() is called
+            if (!audioFile.empty()) {
+                // Check if already in list (avoid duplicates)
+                bool alreadyExists = false;
+                for (const auto& existingFile : audioFiles) {
+                    if (existingFile == audioFile) {
+                        alreadyExists = true;
+                        break;
+                    }
                 }
-                if (paramsJson.contains("speed")) {
-                    player->speed.set(paramsJson["speed"]);
-                }
-                if (paramsJson.contains("volume")) {
-                    player->volume.set(paramsJson["volume"]);
-                }
-                if (paramsJson.contains("loop")) {
-                    player->loop.set(paramsJson["loop"]);
-                }
-                if (paramsJson.contains("loopSize")) {
-                    player->loopSize.set(paramsJson["loopSize"]);
-                }
-                if (paramsJson.contains("regionStart")) {
-                    player->regionStart.set(paramsJson["regionStart"]);
-                }
-                if (paramsJson.contains("regionEnd")) {
-                    player->regionEnd.set(paramsJson["regionEnd"]);
-                }
-                if (paramsJson.contains("audioEnabled")) {
-                    player->audioEnabled.set(paramsJson["audioEnabled"]);
-                }
-                if (paramsJson.contains("videoEnabled")) {
-                    player->videoEnabled.set(paramsJson["videoEnabled"]);
-                }
-                if (paramsJson.contains("brightness")) {
-                    player->brightness.set(paramsJson["brightness"]);
-                }
-                if (paramsJson.contains("hue")) {
-                    player->hue.set(paramsJson["hue"]);
-                }
-                if (paramsJson.contains("saturation")) {
-                    player->saturation.set(paramsJson["saturation"]);
+                if (!alreadyExists) {
+                    audioFiles.push_back(audioFile);
+                    ofLogNotice("MediaPool") << "Added audio file path: " << audioFile;
                 }
             }
+            
+            if (!videoFile.empty()) {
+                // Check if already in list (avoid duplicates)
+                bool alreadyExists = false;
+                for (const auto& existingFile : videoFiles) {
+                    if (existingFile == videoFile) {
+                        alreadyExists = true;
+                        break;
+                    }
+                }
+                if (!alreadyExists) {
+                    videoFiles.push_back(videoFile);
+                    ofLogNotice("MediaPool") << "Added video file path: " << videoFile;
+                }
+            }
+            
+            // Store player parameters for loading after mediaPair() creates players
+            // We'll match by file paths since indices might change
+            if (playerJson.contains("parameters")) {
+                deferredPlayerParams_.push_back({
+                    audioFile,
+                    videoFile,
+                    playerJson["parameters"]
+                });
+            }
         }
+        
+        // Store active player index for restoration after players are created
+        if (json.contains("activePlayerIndex")) {
+            deferredActivePlayerIndex_ = json["activePlayerIndex"];
+        } else {
+            deferredActivePlayerIndex_ = 0;
+        }
+        
+        // DON'T try to load parameters here - players don't exist yet!
+        // Parameters will be loaded in completeDeferredLoading() after mediaPair() creates players
+        
+        // Keep defer flag true - media loading will happen later in ofApp::setup()
+        // Don't call mediaPair() here - it will be called after session load completes
+        // deferMediaLoading_ remains true until completeDeferredLoading() is called
+        // This prevents blocking during session restore
     }
-    
-    // Load active player index (after players are loaded)
-    if (json.contains("activePlayerIndex")) {
-        int index = json["activePlayerIndex"];
-        if (index >= 0 && index < (int)players.size()) {
-            setCurrentIndex(index);
+    // Legacy support: If no players array but directory exists, use directory-based loading
+    // This handles old session files that only saved the directory path
+    else if (json.contains("directory")) {
+        ofLogNotice("MediaPool") << "Loading from legacy directory-based format";
+        std::string dir = json["directory"];
+        if (!dir.empty() && ofDirectory(dir).exists()) {
+            setDataDirectory(dir);
+            
+            // Restore active player index
+            if (json.contains("activePlayerIndex")) {
+                int index = json["activePlayerIndex"];
+                if (index >= 0 && index < (int)players.size()) {
+                    setCurrentIndex(index);
+                }
+            }
+        } else {
+            ofLogWarning("MediaPool") << "Legacy directory not found: " << dir;
         }
     }
 }
@@ -1632,13 +1895,22 @@ std::vector<ParameterDescriptor> MediaPool::getParameters() {
     // MediaPool parameters that can be controlled by TrackerSequencer
     // These are the parameters that TrackerSequencer sends in trigger events
     // MediaPool maps these to MediaPlayer parameters
+    
+    // Core playback parameters
     params.push_back(ParameterDescriptor("note", ParameterType::INT, 0.0f, 127.0f, 0.0f, "Note/Media Index"));
     params.push_back(ParameterDescriptor("position", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Position"));
     params.push_back(ParameterDescriptor("speed", ParameterType::FLOAT, -10.0f, 10.0f, 1.0f, "Speed"));
     params.push_back(ParameterDescriptor("volume", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Volume"));
+    
+    // Region and loop control
     params.push_back(ParameterDescriptor("loopSize", ParameterType::FLOAT, 0.0f, 10.0f, 1.0f, "Loop Size (seconds)"));
     params.push_back(ParameterDescriptor("regionStart", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Region Start"));
     params.push_back(ParameterDescriptor("regionEnd", ParameterType::FLOAT, 0.0f, 1.0f, 1.0f, "Region End"));
+    
+    // Video-specific parameters (color correction)
+    params.push_back(ParameterDescriptor("brightness", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Brightness"));
+    params.push_back(ParameterDescriptor("hue", ParameterType::FLOAT, 0.0f, 360.0f, 0.0f, "Hue"));
+    params.push_back(ParameterDescriptor("saturation", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Saturation"));
     
     return params;
 }
@@ -1725,6 +1997,18 @@ void MediaPool::setParameter(const std::string& paramName, float value, bool not
                 return true;
             }
             return false;
+        } else if (name == "brightness") {
+            oldValue = activePlayer->brightness.get();
+            activePlayer->brightness.set(val);
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
+        } else if (name == "hue") {
+            oldValue = activePlayer->hue.get();
+            activePlayer->hue.set(val);
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
+        } else if (name == "saturation") {
+            oldValue = activePlayer->saturation.get();
+            activePlayer->saturation.set(val);
+            return std::abs(oldValue - val) > PARAMETER_EPSILON;
         }
         // Unknown parameter - return false (not applied)
         return false;
@@ -1781,5 +2065,6 @@ ScanMode MediaPool::getScanMode() const {
     std::lock_guard<std::mutex> lock(stateMutex);
     return positionScan.getMode();
 }
+
 
 

@@ -20,7 +20,8 @@ public:
         std::function<void()> onLoadLayout,
         std::function<void(const std::string& moduleType)> onAddModule = nullptr,
         std::function<void()> onToggleFileBrowser = nullptr,
-        std::function<void()> onToggleConsole = nullptr
+        std::function<void()> onToggleConsole = nullptr,
+        std::function<void()> onToggleDemoWindow = nullptr
     );
 
     // Called every frame in ofApp::draw()
@@ -48,6 +49,7 @@ private:
     std::function<void(const std::string& moduleType)> onAddModule;
     std::function<void()> onToggleFileBrowser;
     std::function<void()> onToggleConsole;
+    std::function<void()> onToggleDemoWindow;
 
     // UI state
     bool showControlsHelp = false;

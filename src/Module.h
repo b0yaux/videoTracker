@@ -79,7 +79,7 @@ public:
     // notify: If true, notify parameter change callback (default: true)
     virtual void setParameter(const std::string& paramName, float value, bool notify = true) = 0;
     
-    // Parameter change callback (modules can notify external systems like ParameterSync)
+    // Parameter change callback (modules can notify external systems like ParameterRouter)
     void setParameterChangeCallback(std::function<void(const std::string&, float)> callback) {
         parameterChangeCallback = callback;
     }

@@ -2,6 +2,7 @@
 #include "TrackerSequencer.h"
 #include "MediaPool.h"
 #include "core/ModuleRegistry.h"
+#include "core/ParameterRouter.h"
 #include "ofLog.h"
 #include <algorithm>
 
@@ -16,6 +17,19 @@ void GUIManager::setRegistry(ModuleRegistry* registry_) {
     registry = registry_;
 }
 
+void GUIManager::setParameterRouter(ParameterRouter* router) {
+    parameterRouter = router;
+}
+
+/**
+ * Sync GUI objects with registry (create/destroy as needed)
+ * 
+ * This is the main lifecycle management method. It:
+ * - Detects new modules in registry → creates GUI objects
+ * - Detects removed modules → destroys GUI objects
+ * 
+ * Call this whenever modules are added/removed from registry.
+ */
 void GUIManager::syncWithRegistry() {
     if (!registry) {
         ofLogWarning("GUIManager") << "Cannot sync: registry is null";
@@ -64,6 +78,7 @@ void GUIManager::syncMediaPoolGUIs() {
             ofLogNotice("GUIManager") << "Creating MediaPool GUI for instance: " << name;
             auto gui = std::make_unique<MediaPoolGUI>();
             gui->setRegistry(registry);
+            gui->setParameterRouter(parameterRouter);
             gui->setInstanceName(name);
             mediaPoolGUIs[name] = std::move(gui);
             
@@ -113,6 +128,7 @@ void GUIManager::syncTrackerGUIs() {
             ofLogNotice("GUIManager") << "Creating TrackerSequencer GUI for instance: " << name;
             auto gui = std::make_unique<TrackerSequencerGUI>();
             gui->setRegistry(registry);
+            gui->setParameterRouter(parameterRouter);
             gui->setInstanceName(name);
             trackerGUIs[name] = std::move(gui);
             

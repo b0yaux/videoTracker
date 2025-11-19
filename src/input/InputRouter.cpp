@@ -106,39 +106,8 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         }
     }
     
-    // Priority 1: Panel navigation (Ctrl+Tab / Ctrl+Shift+Tab) - check BEFORE ImGui processes
-    // On macOS, Ctrl+Tab may be transformed by the system. Detect Tab by checking:
-    // 1. Standard Tab detection (key/keycode)
-    // 2. macOS-specific: When Control is pressed, check scancode (48 = Tab on macOS)
-    const int GLFW_KEY_TAB = 258;
-    const int MACOS_SCANCODE_TAB = 48;  // Tab scancode on macOS (from logs)
-    
-    bool isTabKey = (key == OF_KEY_TAB) || (keycode == GLFW_KEY_TAB);
-    
-    // macOS workaround: When Control is pressed, also check scancode for Tab
-    // This handles cases where macOS transforms Ctrl+Tab events
-    if (!isTabKey && ctrlPressed && scancode == MACOS_SCANCODE_TAB) {
-        isTabKey = true;
-    }
-    
-    // Debug: Log Tab key detection attempts
-    if (ctrlPressed && (key == OF_KEY_TAB || keycode == GLFW_KEY_TAB || scancode == MACOS_SCANCODE_TAB)) {
-        ofLogNotice("InputRouter") << "[TAB_DEBUG] Ctrl+Tab detected: key=" << key 
-                                    << ", keycode=" << keycode 
-                                    << ", scancode=" << scancode 
-                                    << ", isTabKey=" << isTabKey;
-    }
-    
-    if (isTabKey && ctrlPressed) {
-        // Ctrl+Tab or Ctrl+Shift+Tab - handle panel navigation
-        ofLogNotice("InputRouter") << "[TAB_DEBUG] Handling Ctrl+Tab navigation";
-        if (handlePanelNavigation(keyEvent)) {
-            ofLogNotice("InputRouter") << "[TAB_DEBUG] Panel navigation handled successfully";
-            return true; // Consume the key to prevent ImGui from processing
-        } else {
-            ofLogWarning("InputRouter") << "[TAB_DEBUG] Panel navigation handler returned false";
-        }
-    }
+    // Ctrl+Tab is now handled by ImGui natively for window/panel navigation
+    // No custom handling needed - let ImGui process it
     
     updateImGuiCaptureState();
     
@@ -219,14 +188,14 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     // Handle tracker input - cells are directly navigable like other widgets
     if (tracker && inTrackerPanel) {
         
-        // PHASE 1: Arrow keys in edit mode are handled directly in ParameterCell::draw()
+        // PHASE 1: Arrow keys in edit mode are handled directly in CellWidget::draw()
         // InputRouter should skip them to prevent double-processing
         bool inEditMode = trackerGUI ? trackerGUI->getIsEditingCell() : false;
         
         if (inEditMode && (key == OF_KEY_UP || key == OF_KEY_DOWN || 
                            key == OF_KEY_LEFT || key == OF_KEY_RIGHT)) {
             // Arrow keys in edit mode: Let Phase 1 handle them
-            ofLogNotice("InputRouter") << "  Arrow key in edit mode - letting Phase 1 handle it in ParameterCell::draw()";
+            ofLogNotice("InputRouter") << "  Arrow key in edit mode - letting Phase 1 handle it in CellWidget::draw()";
             return false; // Let ImGui process it so Phase 1 can handle it
         }
         
@@ -248,13 +217,13 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
             
             // PHASE 1: If in edit mode, let Phase 1 handle Enter (validates and exits edit mode)
             if (inEditMode && !ctrlPressed && !shiftPressed) {
-                ofLogNotice("InputRouter") << "  Enter key - in edit mode, letting Phase 1 handle it in ParameterCell::draw()";
+                ofLogNotice("InputRouter") << "  Enter key - in edit mode, letting Phase 1 handle it in CellWidget::draw()";
                 return false; // Let ImGui process it so Phase 1 can handle it
             }
             
             // PHASE 1: If a tracker cell is focused (but not in edit mode), let Phase 1 handle Enter
             if (trackerCellFocused && !ctrlPressed && !shiftPressed) {
-                ofLogNotice("InputRouter") << "  Enter key - tracker cell focused, letting Phase 1 handle it in ParameterCell::draw()";
+                ofLogNotice("InputRouter") << "  Enter key - tracker cell focused, letting Phase 1 handle it in CellWidget::draw()";
                 return false; // Let ImGui process it so Phase 1 can handle it
             }
             
@@ -295,7 +264,7 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
             return false;
         }
         
-        // PHASE 1: Numeric keys are handled directly in ParameterCell::draw()
+        // PHASE 1: Numeric keys are handled directly in CellWidget::draw()
         // If we're in the tracker panel, InputRouter should NEVER process numeric keys
         // This prevents double-processing and timing issues with GUI state sync
         if (inTrackerPanel && ((key >= '0' && key <= '9') || key == '.' || key == '-' || 
@@ -316,7 +285,7 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
             
             // In tracker panel: Let Phase 1 handle ALL numeric keys
             // Phase 1 will check if cell is focused and handle accordingly
-            ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - in tracker panel, letting Phase 1 handle it in ParameterCell::draw()";
+            ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - in tracker panel, letting Phase 1 handle it in CellWidget::draw()";
             return false; // Let ImGui process it so Phase 1 can handle it
         }
         
@@ -424,20 +393,7 @@ bool InputRouter::handleGlobalShortcuts(int key) {
     return false;
 }
 
-bool InputRouter::handlePanelNavigation(ofKeyEventArgs& keyEvent) {
-    if (!viewManager) return false;
-    
-    bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-    
-    if (shiftPressed) {
-        viewManager->previousPanel();
-        logKeyPress(OF_KEY_TAB, "Navigation: Ctrl+Shift+Tab");
-    } else {
-        viewManager->nextPanel();
-        logKeyPress(OF_KEY_TAB, "Navigation: Ctrl+Tab");
-    }
-    return true;
-}
+// Removed handlePanelNavigation - Ctrl+Tab is now handled by ImGui natively
 
 bool InputRouter::handleTrackerInput(ofKeyEventArgs& keyEvent) {
     if (!tracker || !trackerGUI) return false;

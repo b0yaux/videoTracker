@@ -19,14 +19,13 @@ void ofApp::setup() {
     ofSetFrameRate(60);
     ofSetVerticalSync(true);
     ofSetLogLevel(OF_LOG_NOTICE);
+    ofSetEscapeQuitsApp(false);
     
     // Setup media library with correct path for app bundle
     std::string absolutePath;
     
-    // Try multiple possible paths
-    // Try to load saved media directory first
-    std::string savedMediaDir = loadMediaDirectory();
-    bool foundDataDir = false;
+    // Note: MediaPool state is now loaded via session serialization
+    // No need to manually load directory here
     
     // Initialize ParameterRouter with ModuleRegistry
     // Note: ParameterRouter can be initialized with nullptr and setRegistry() called later
@@ -86,63 +85,13 @@ void ofApp::setup() {
         }
     }
     
-    // Load media directory with error handling
-    try {
-        if (!savedMediaDir.empty() && ofDirectory(savedMediaDir).exists()) {
-            ofLogNotice("ofApp") << "Loading saved media directory: " << savedMediaDir;
-            mediaPool->setDataDirectory(savedMediaDir);
-            foundDataDir = true;
-            ofLogNotice("ofApp") << "✓ Successfully loaded media directory with " << mediaPool->getNumPlayers() << " players";
-        } else {
-            // Fallback to default paths
-            std::vector<std::string> possiblePaths;
-            try {
-                std::string cwd = ofFilePath::getCurrentWorkingDirectory();
-                possiblePaths.push_back(cwd + "/bin/data");
-                possiblePaths.push_back(cwd + "/data");
-            } catch (const std::filesystem::filesystem_error& e) {
-                ofLogWarning("ofApp") << "Filesystem error getting current directory: " << e.what();
-            } catch (const std::exception& e) {
-                ofLogWarning("ofApp") << "Exception getting current directory: " << e.what();
-            } catch (...) {
-                ofLogWarning("ofApp") << "Unknown exception getting current directory";
-            }
-            possiblePaths.push_back("/Users/jaufre/works/of_v0.12.1_osx_release/addons/ofxMediaObjects/example-audiovisualSequencer/bin/data");
-            
-            for (const auto& path : possiblePaths) {
-                if (ofDirectory(path).exists()) {
-                    ofLogNotice("ofApp") << "Trying fallback media directory: " << path;
-                    mediaPool->setDataDirectory(path);
-                    saveMediaDirectory(path); // Save for next launch
-                    foundDataDir = true;
-                    ofLogNotice("ofApp") << "✓ Successfully loaded media directory with " << mediaPool->getNumPlayers() << " players";
-                    break;
-                }
-            }
-            
-            if (!foundDataDir) {
-                ofLogWarning("ofApp") << "⚠️ No data directory found in any of the tried paths - MediaPool will be empty";
-            }
-        }
-    } catch (const std::exception& e) {
-        ofLogError("ofApp") << "❌ Exception while loading media directory: " << e.what();
-        ofLogError("ofApp") << "Continuing without media directory...";
-    } catch (...) {
-        ofLogError("ofApp") << "❌ Unknown exception while loading media directory";
-        ofLogError("ofApp") << "Continuing without media directory...";
-    }
-    
+    // Note: MediaPool state (including file paths) is now loaded via session serialization
+    // No need to manually load directory - it's handled by MediaPool::fromJson()
+    // If session was loaded, module data is already loaded via fromJson()
+    // If not, MediaPool will be empty and user can add files via drag-and-drop or directory browse
     
     // Setup TrackerSequencer with clock reference
     trackerSequencer->setup(&clock, numSteps);
-    
-    // Note: If session was loaded, module data is already loaded via fromJson()
-    // If not, we'll initialize with defaults below
-    
-    // Setup MediaPool directory change callback
-    mediaPool->setDirectoryChangeCallback([this](const std::string& path) {
-        saveMediaDirectory(path);
-    });
     
     
     // Register step event listener
@@ -161,8 +110,9 @@ void ofApp::setup() {
     // Setup MediaPool with clock reference
     mediaPool->setup(&clock);
     
-    // Initialize GUIManager with registry
+    // Initialize GUIManager with registry and parameter router
     guiManager.setRegistry(&moduleRegistry);
+    guiManager.setParameterRouter(&parameterRouter);
     
     // Sync GUIManager with registry (creates GUI objects for registered modules)
     guiManager.syncWithRegistry();
@@ -287,6 +237,10 @@ void ofApp::setup() {
         [this]() { 
             bool visible = viewManager.isConsoleVisible();
             viewManager.setConsoleVisible(!visible);
+        },
+        [this]() { 
+            showDemoWindow = !showDemoWindow;
+            ofLogNotice("ofApp") << "[IMGUI] Toggled Demo Window: " << (showDemoWindow ? "Visible" : "Hidden");
         }
     );
     
@@ -355,6 +309,13 @@ void ofApp::setup() {
     }
     
     // Clock listener is set up in setupTimeObjects()
+    
+    // If session was loaded, we need to load media files now (they were deferred during session restore)
+    // This prevents blocking during session load
+    if (sessionLoaded) {
+        ofLogNotice("ofApp") << "Completing deferred media loading from session...";
+        mediaPool->completeDeferredLoading();
+    }
     
     // Initialize first active player after everything is set up
     // NOTE: This is now also called in setDataDirectory(), but we call it here
@@ -548,6 +509,97 @@ void ofApp::windowResized(int w, int h) {
     ofLogNotice("ofApp") << "Window resized to " << w << "x" << h;
 }
 
+//--------------------------------------------------------------
+void ofApp::dragEvent(ofDragInfo dragInfo) {
+    if (dragInfo.files.empty()) {
+        return;
+    }
+    
+    // Get mouse position from drag info
+    ofPoint mousePos = dragInfo.position;
+    
+    // Convert to ImGui coordinates (ImGui uses screen coordinates)
+    ImVec2 imguiMousePos(mousePos.x, mousePos.y);
+    
+    // Filter valid media files
+    std::vector<std::string> validFiles;
+    for (const auto& filePath : dragInfo.files) {
+        ofFile file(filePath);
+        if (!file.exists()) {
+            continue;
+        }
+        
+        std::string ext = ofToLower(ofFilePath::getFileExt(filePath));
+        bool isAudio = (ext == "wav" || ext == "mp3" || ext == "aiff" || ext == "aif" || ext == "m4a");
+        bool isVideo = (ext == "mov" || ext == "mp4" || ext == "avi" || ext == "mkv" || ext == "webm" || ext == "hap");
+        
+        if (isAudio || isVideo) {
+            validFiles.push_back(filePath);
+        }
+    }
+    
+    if (validFiles.empty()) {
+        ofLogNotice("ofApp") << "No valid media files in drag-and-drop";
+        return;
+    }
+    
+    // Find which MediaPool window received the drop by checking all ImGui windows
+    // We need to check windows that are currently open
+    std::string targetInstanceName;
+    
+    // Get all MediaPool GUI instances
+    auto allMediaPoolGUIs = guiManager.getAllMediaPoolGUIs();
+    
+    // Check each MediaPool window to see if the drop position is within it
+    for (auto* mediaPoolGUI : allMediaPoolGUIs) {
+        if (!mediaPoolGUI) continue;
+        
+        std::string instanceName = mediaPoolGUI->getInstanceName();
+        std::string windowTitle = instanceName;  // Window title matches instance name
+        
+        // Check if window exists and is visible
+        ImGuiWindow* window = ImGui::FindWindowByName(windowTitle.c_str());
+        if (window && window->Active) {
+            // Check if mouse position is within window bounds
+            ImVec2 windowPos = window->Pos;
+            ImVec2 windowSize = window->Size;
+            ImVec2 windowMax = ImVec2(windowPos.x + windowSize.x, windowPos.y + windowSize.y);
+            
+            if (imguiMousePos.x >= windowPos.x && imguiMousePos.x <= windowMax.x &&
+                imguiMousePos.y >= windowPos.y && imguiMousePos.y <= windowMax.y) {
+                targetInstanceName = instanceName;
+                break;
+            }
+        }
+    }
+    
+    // If no specific window was found, use the first visible MediaPool instance as default
+    if (targetInstanceName.empty()) {
+        auto visibleInstances = guiManager.getVisibleInstances(ModuleType::INSTRUMENT);
+        if (!visibleInstances.empty()) {
+            targetInstanceName = *visibleInstances.begin();
+        } else if (!allMediaPoolGUIs.empty()) {
+            // Fallback to first available instance
+            targetInstanceName = allMediaPoolGUIs[0]->getInstanceName();
+        }
+    }
+    
+    // Add files to the target MediaPool instance
+    if (!targetInstanceName.empty()) {
+        auto mediaPoolModule = std::dynamic_pointer_cast<MediaPool>(
+            moduleRegistry.getModule(targetInstanceName));
+        
+        if (mediaPoolModule) {
+            ofLogNotice("ofApp") << "Adding " << validFiles.size() << " file(s) to MediaPool: " << targetInstanceName;
+            mediaPoolModule->addMediaFiles(validFiles);
+        } else {
+            ofLogWarning("ofApp") << "MediaPool instance not found: " << targetInstanceName;
+        }
+    } else {
+        ofLogWarning("ofApp") << "No MediaPool instance available for drag-and-drop";
+    }
+}
+
 
 //--------------------------------------------------------------
 void ofApp::onTrackerStepEvent(int step, float duration, const PatternCell& cell) {
@@ -732,6 +784,18 @@ void ofApp::drawGUI() {
         // Signature: DockSpaceOverViewport(ImGuiID dockspace_id = 0, const ImGuiViewport* viewport = NULL, ImGuiDockNodeFlags flags = 0, ...)
         ImGui::DockSpaceOverViewport(0, viewport, ImGuiDockNodeFlags_PassthruCentralNode);
         
+        // ImGui Demo Window with opaque background and toggleable via View menu or keyboard shortcut (Ctrl+D)
+        // Keyboard shortcut: Ctrl+D to toggle demo window
+        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
+            showDemoWindow = !showDemoWindow;
+            ofLogNotice("ofApp") << "[IMGUI] Toggled Demo Window: " << (showDemoWindow ? "Visible" : "Hidden");
+        }
+
+        if (showDemoWindow) {
+            ImGui::SetNextWindowBgAlpha(1.0f); // fully opaque
+            ImGui::ShowDemoWindow(&showDemoWindow);
+        }
+
         // Draw all panels using ViewManager
         // Wrap in try-catch to ensure exceptions don't break the frame
         try {
@@ -791,27 +855,8 @@ void ofApp::loadLayout() {
 }
 
 
-//--------------------------------------------------------------
-std::string ofApp::loadMediaDirectory() {
-    ofFile settingsFile("media_settings.json");
-    if (settingsFile.exists()) {
-        ofJson settings = ofJson::parse(settingsFile.readToBuffer().getText());
-        if (settings.contains("mediaDirectory")) {
-            return settings["mediaDirectory"].get<std::string>();
-        }
-    }
-    return "";
-}
-
-//--------------------------------------------------------------
-void ofApp::saveMediaDirectory(const std::string& path) {
-    ofJson settings;
-    settings["mediaDirectory"] = path;
-    
-    ofFile settingsFile("media_settings.json", ofFile::WriteOnly);
-    settingsFile << settings.dump(4);
-    ofLogNotice("ofApp") << "Saved media directory: " << path;
-}
+// Note: Media directory persistence removed - now handled by session serialization
+// Individual file paths are saved in MediaPool::toJson() and restored in MediaPool::fromJson()
 
 //--------------------------------------------------------------
 void ofApp::addModule(const std::string& moduleType) {
@@ -837,16 +882,8 @@ void ofApp::addModule(const std::string& moduleType) {
                 // Setup MediaPool with clock reference
                 mediaPool->setup(&clock);
                 
-                // Try to use saved media directory
-                std::string savedMediaDir = loadMediaDirectory();
-                if (!savedMediaDir.empty() && ofDirectory(savedMediaDir).exists()) {
-                    mediaPool->setDataDirectory(savedMediaDir);
-                }
-                
-                // Setup directory change callback
-                mediaPool->setDirectoryChangeCallback([this](const std::string& path) {
-                    saveMediaDirectory(path);
-                });
+                // Note: MediaPool state (file paths) is loaded via session serialization
+                // User can add files via drag-and-drop or directory browse
             }
         }
     } else if (moduleType == "TrackerSequencer") {

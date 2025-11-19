@@ -73,6 +73,7 @@ std::string PatternCell::toString() const {
 //--------------------------------------------------------------
 Pattern::Pattern(int numSteps) {
     setStepCount(numSteps);
+    initializeDefaultColumns();
 }
 
 PatternCell& Pattern::getCell(int step) {
@@ -215,6 +216,9 @@ void Pattern::doubleSteps() {
 }
 
 ofJson Pattern::toJson() const {
+    ofJson json;
+    
+    // Save cells
     ofJson patternArray = ofJson::array();
     for (size_t i = 0; i < cells.size(); i++) {
         ofJson cellJson;
@@ -230,20 +234,65 @@ ofJson Pattern::toJson() const {
         cellJson["parameters"] = paramJson;
         patternArray.push_back(cellJson);
     }
-    return patternArray;
+    json["cells"] = patternArray;
+    
+    // Save column configuration
+    ofJson columnArray = ofJson::array();
+    for (const auto& col : columnConfig) {
+        ofJson colJson;
+        colJson["parameterName"] = col.parameterName;
+        colJson["displayName"] = col.displayName;
+        colJson["isRemovable"] = col.isRemovable;
+        colJson["columnIndex"] = col.columnIndex;
+        columnArray.push_back(colJson);
+    }
+    json["columnConfig"] = columnArray;
+    
+    return json;
 }
 
 void Pattern::fromJson(const ofJson& json) {
-    if (!json.is_array()) {
-        ofLogError("Pattern") << "Invalid JSON format: expected array";
+    // Handle both old format (array of cells) and new format (object with cells and columnConfig)
+    ofJson cellsJson;
+    if (json.is_array()) {
+        // Old format: just array of cells
+        cellsJson = json;
+        // Initialize default columns for old format
+        initializeDefaultColumns();
+    } else if (json.is_object()) {
+        // New format: object with cells and columnConfig
+        if (json.contains("cells") && json["cells"].is_array()) {
+            cellsJson = json["cells"];
+        } else {
+            ofLogError("Pattern") << "Invalid JSON format: expected 'cells' array";
+            return;
+        }
+        
+        // Load column configuration if present
+        if (json.contains("columnConfig") && json["columnConfig"].is_array()) {
+            columnConfig.clear();
+            for (const auto& colJson : json["columnConfig"]) {
+                ColumnConfig col;
+                if (colJson.contains("parameterName")) col.parameterName = colJson["parameterName"];
+                if (colJson.contains("displayName")) col.displayName = colJson["displayName"];
+                if (colJson.contains("isRemovable")) col.isRemovable = colJson["isRemovable"];
+                if (colJson.contains("columnIndex")) col.columnIndex = colJson["columnIndex"];
+                columnConfig.push_back(col);
+            }
+        } else {
+            // No column config in JSON - initialize defaults
+            initializeDefaultColumns();
+        }
+    } else {
+        ofLogError("Pattern") << "Invalid JSON format: expected array or object";
         return;
     }
     
     cells.clear();
-    cells.resize(json.size());
+    cells.resize(cellsJson.size());
     
-    for (size_t i = 0; i < json.size(); i++) {
-        auto cellJson = json[i];
+    for (size_t i = 0; i < cellsJson.size(); i++) {
+        auto cellJson = cellsJson[i];
         PatternCell cell;
         
         // Load fixed fields - handle null values gracefully
@@ -286,5 +335,122 @@ void Pattern::fromJson(const ofJson& json) {
         
         cells[i] = cell;
     }
+}
+
+// Column configuration methods
+//--------------------------------------------------------------
+void Pattern::initializeDefaultColumns() {
+    columnConfig.clear();
+    // Required columns (not removable)
+    columnConfig.push_back(ColumnConfig("index", "Index", false, 0));      // isRemovable = false
+    columnConfig.push_back(ColumnConfig("length", "Length", false, 1));    // isRemovable = false
+    // Default parameter columns (removable)
+    columnConfig.push_back(ColumnConfig("position", "Position", true, 2));  // isRemovable = true
+    columnConfig.push_back(ColumnConfig("speed", "Speed", true, 3));  // isRemovable = true
+    columnConfig.push_back(ColumnConfig("volume", "Volume", true, 4));  // isRemovable = true
+}
+
+void Pattern::addColumn(const std::string& parameterName, const std::string& displayName, int position) {
+    // Don't allow duplicate parameter names
+    for (const auto& col : columnConfig) {
+        if (col.parameterName == parameterName) {
+            ofLogWarning("Pattern") << "Column for parameter '" << parameterName << "' already exists";
+            return;
+        }
+    }
+    
+    int insertPos = (position < 0 || position >= (int)columnConfig.size()) ? (int)columnConfig.size() : position;
+    
+    // Insert at specified position (new columns are removable by default)
+    columnConfig.insert(columnConfig.begin() + insertPos, ColumnConfig(parameterName, displayName, true, insertPos));
+    
+    // Update column indices
+    for (size_t i = 0; i < columnConfig.size(); i++) {
+        columnConfig[i].columnIndex = (int)i;
+    }
+}
+
+void Pattern::removeColumn(int columnIndex) {
+    if (columnIndex < 0 || columnIndex >= (int)columnConfig.size()) {
+        ofLogWarning("Pattern") << "Invalid column index: " << columnIndex;
+        return;
+    }
+    
+    // Don't allow removing non-removable columns
+    if (!columnConfig[columnIndex].isRemovable) {
+        ofLogWarning("Pattern") << "Cannot remove required column: " << columnConfig[columnIndex].parameterName;
+        return;
+    }
+    
+    // NOTE: We do NOT remove parameter values from cells when removing a column
+    // This preserves the values so they can be restored if the column is added back
+    // Parameter values are saved in Pattern::toJson() and will persist across saves/loads
+    // The column configuration only controls what's displayed in the grid, not what's stored
+    
+    columnConfig.erase(columnConfig.begin() + columnIndex);
+    
+    // Update column indices
+    for (size_t i = 0; i < columnConfig.size(); i++) {
+        columnConfig[i].columnIndex = (int)i;
+    }
+}
+
+void Pattern::reorderColumn(int fromIndex, int toIndex) {
+    if (fromIndex < 0 || fromIndex >= (int)columnConfig.size() ||
+        toIndex < 0 || toIndex >= (int)columnConfig.size()) {
+        ofLogWarning("Pattern") << "Invalid column indices for reorder: " << fromIndex << " -> " << toIndex;
+        return;
+    }
+    
+    // Move the column
+    ColumnConfig col = columnConfig[fromIndex];
+    columnConfig.erase(columnConfig.begin() + fromIndex);
+    columnConfig.insert(columnConfig.begin() + toIndex, col);
+    
+    // Update column indices
+    for (size_t i = 0; i < columnConfig.size(); i++) {
+        columnConfig[i].columnIndex = (int)i;
+    }
+}
+
+void Pattern::swapColumnParameter(int columnIndex, const std::string& newParameterName, const std::string& newDisplayName) {
+    if (columnIndex < 0 || columnIndex >= (int)columnConfig.size()) {
+        ofLogWarning("Pattern") << "Invalid column index for swap: " << columnIndex;
+        return;
+    }
+    
+    // Don't allow swapping non-removable columns
+    if (!columnConfig[columnIndex].isRemovable) {
+        ofLogWarning("Pattern") << "Cannot swap parameter for required column: " << columnConfig[columnIndex].parameterName;
+        return;
+    }
+    
+    // NOTE: We do NOT migrate or remove old parameter values when swapping
+    // This preserves all parameter values so they can be restored if the user swaps back
+    // The column configuration only controls what's displayed in the grid, not what's stored
+    // Old parameter values remain in cells and are saved/loaded with the pattern
+    
+    // Update parameter name (this only changes what the column displays)
+    columnConfig[columnIndex].parameterName = newParameterName;
+    
+    // Update display name
+    if (!newDisplayName.empty()) {
+        columnConfig[columnIndex].displayName = newDisplayName;
+    } else {
+        // Use parameter name as fallback
+        columnConfig[columnIndex].displayName = newParameterName;
+    }
+}
+
+const ColumnConfig& Pattern::getColumnConfig(int columnIndex) const {
+    static ColumnConfig emptyConfig;
+    if (columnIndex < 0 || columnIndex >= (int)columnConfig.size()) {
+        return emptyConfig;
+    }
+    return columnConfig[columnIndex];
+}
+
+int Pattern::getColumnCount() const {
+    return (int)columnConfig.size();
 }
 

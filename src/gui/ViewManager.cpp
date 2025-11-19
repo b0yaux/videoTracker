@@ -125,6 +125,16 @@ const char* ViewManager::getCurrentPanelName() const {
     return "Unknown";
 }
 
+/**
+ * Main draw function - renders all panels
+ * 
+ * ViewManager's primary responsibility: coordinate panel rendering.
+ * - Gets GUI objects from GUIManager (for module panels)
+ * - Renders each panel based on current state
+ * - Manages focus and visibility
+ * 
+ * Note: This is view-only. No business logic here.
+ */
 void ViewManager::draw() {
     // Draw panels - each panel will set focus if needed (before Begin())
     // We need to track panel changes, but update lastPanel AFTER drawing
@@ -159,22 +169,35 @@ void ViewManager::setFocusIfChanged() {
     // Keeping it for compatibility but it does nothing
 }
 
-void ViewManager::drawFocusedWindowOutline(float thickness) {
+void ViewManager::drawWindowOutline() {
+    // Skip drawing outline when window is collapsed to avoid accessing invalid window properties
+    if (ImGui::IsWindowCollapsed()) {
+        return;
+    }
+    
+    // Use foreground draw list to draw on top of everything (including scrollbars)
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+    
+    // Get window rect in screen space (includes titlebar and all decorations)
+    ImVec2 windowPos = ImGui::GetWindowPos();
+    ImVec2 windowSize = ImGui::GetWindowSize();
+    
+    // Validate window size is valid (not zero or negative)
+    if (windowSize.x <= 0 || windowSize.y <= 0) {
+        return;
+    }
+    
+    // Calculate the full window rectangle
+    ImVec2 min = windowPos;
+    ImVec2 max = ImVec2(windowPos.x + windowSize.x, windowPos.y + windowSize.y);
+    
+    // Draw outline based on focus state
     if (ImGui::IsWindowFocused()) {
-        // Use foreground draw list to draw on top of everything (including scrollbars)
-        ImDrawList* drawList = ImGui::GetForegroundDrawList();
-        
-        // Get window rect in screen space (includes titlebar and all decorations)
-        ImVec2 windowPos = ImGui::GetWindowPos();
-        ImVec2 windowSize = ImGui::GetWindowSize();
-        
-        // Calculate the full window rectangle
-        ImVec2 min = windowPos;
-        ImVec2 max = ImVec2(windowPos.x + windowSize.x, windowPos.y + windowSize.y);
-        
-        // Draw rectangle outline around the entire window (including titlebar and scrollbars)
-        // Using foreground draw list ensures it's drawn on top and not clipped
-        drawList->AddRect(min, max, GUIConstants::toU32(GUIConstants::Outline::Focus), 0.0f, 0, thickness);
+        // Draw focused outline (brighter, thicker)
+        drawList->AddRect(min, max, GUIConstants::toU32(GUIConstants::Outline::Focus), 0.0f, 0, GUIConstants::Outline::FocusThickness);
+    } else {
+        // Draw unfocused outline (dimmer, thinner)
+        drawList->AddRect(min, max, GUIConstants::toU32(GUIConstants::Outline::Unfocused), 0.0f, 0, GUIConstants::Outline::UnfocusedThickness);
     }
 }
 
@@ -186,21 +209,20 @@ void ViewManager::drawClockPanel(Panel previousPanel) {
             ImGui::SetNextWindowFocus();
         }
         
+        // ImGui::Begin() returns false when window is collapsed
+        // IMPORTANT: Always call End() even if Begin() returns false
         if (ImGui::Begin("Clock ")) {
-            // Detect mouse click on panel background (not on widgets) to switch focus
-            // Only switch if clicking on the window background, not on interactive widgets
-            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                navigateToPanel(Panel::CLOCK);
+            // Only draw content if window is not collapsed (to avoid accessing invalid window properties)
+            if (!ImGui::IsWindowCollapsed()) {
+                if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
+                    navigateToPanel(Panel::CLOCK);
+                }
+                
+                clockGUI->draw(*clock);
+                drawWindowOutline();
             }
-            
-            // Clock controls
-            clockGUI->draw(*clock);
-            
-            // Draw focus outline if this window is focused
-            drawFocusedWindowOutline();
-            
-            ImGui::End();
         }
+        ImGui::End();  // Always call End() regardless of Begin() return value
     }
 }
 
@@ -211,9 +233,9 @@ void ViewManager::drawAudioOutputPanel(Panel previousPanel) {
         ImGui::SetNextWindowFocus();
     }
     
+    // ImGui::Begin() returns false when window is collapsed
+    // IMPORTANT: Always call End() even if Begin() returns false
     if (ImGui::Begin("Audio Output")) {
-        // Detect mouse click on panel background (not on widgets) to switch focus
-        // Only switch if clicking on the window background, not on interactive widgets
         if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
             navigateToPanel(Panel::AUDIO_OUTPUT);
         }
@@ -232,26 +254,21 @@ void ViewManager::drawAudioOutputPanel(Panel previousPanel) {
             }
             
             if (audioDeviceChanged && soundStream) {
-                // Re-setup audio stream with new device, preserving listener
                 setupAudioStream();
                 audioDeviceChanged = false;
             }
         }
         
-        // Volume control
         ImGui::SliderFloat("Volume", &globalVolume, 0.0f, 1.0f, "%.2f");
         
-        // Audio level visualization
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, GUIConstants::Plot::Histogram);
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, GUIConstants::Plot::Histogram);
         ImGui::ProgressBar(currentAudioLevel, ImVec2(-1, 0), "");
-            ImGui::PopStyleColor();
+        ImGui::PopStyleColor();
         ImGui::Text("Level: %.3f", currentAudioLevel);
         
-        // Draw focus outline if this window is focused
-        drawFocusedWindowOutline();
-        
-        ImGui::End();
+        drawWindowOutline();
     }
+    ImGui::End();  // Always call End() regardless of Begin() return value
 }
 
 void ViewManager::drawTrackerPanel(Panel previousPanel) {
@@ -262,24 +279,18 @@ void ViewManager::drawTrackerPanel(Panel previousPanel) {
             ImGui::SetNextWindowFocus();
         }
         
+        // ImGui::Begin() returns false when window is collapsed
+        // IMPORTANT: Always call End() even if Begin() returns false
         if (ImGui::Begin("Tracker Sequencer")) {
-            // Detect mouse click on panel background (not on widgets) to switch focus
-            // Only switch if clicking on the window background, not on interactive widgets
-            // This allows clicking on tracker cells to work regardless of which panel is "current"
             if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
                 navigateToPanel(Panel::TRACKER);
-                // CRITICAL: Clear cell focus when clicking empty space to prevent auto-focus loop
-                // This prevents ImGui from auto-focusing the first cell when clicking empty space
                 trackerGUI->clearCellFocus();
             }
             
             trackerGUI->draw(*tracker);
-            
-            // Draw focus outline if this window is focused
-            drawFocusedWindowOutline();
-            
-            ImGui::End();
+            drawWindowOutline();
         }
+        ImGui::End();  // Always call End() regardless of Begin() return value
     }
 }
 
@@ -291,21 +302,17 @@ void ViewManager::drawMediaPoolPanel(Panel previousPanel) {
             ImGui::SetNextWindowFocus();
         }
         
+        // ImGui::Begin() returns false when window is collapsed
+        // IMPORTANT: Always call End() even if Begin() returns false
         if (ImGui::Begin("Media Pool")) {
-            // Detect mouse click on panel background (not on widgets) to switch focus
-            // Only switch if clicking on the window background, not on interactive widgets
-            // This allows clicking on media pool items to work regardless of which panel is "current"
             if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
                 navigateToPanel(Panel::MEDIA_POOL);
             }
             
-            mediaPoolGUI->draw();  // Delegate to separate GUI
-            
-            // Draw focus outline if this window is focused
-            drawFocusedWindowOutline();
-            
-            ImGui::End();
+            mediaPoolGUI->draw();
+            drawWindowOutline();
         }
+        ImGui::End();  // Always call End() regardless of Begin() return value
     }
 }
 
@@ -336,29 +343,45 @@ void ViewManager::drawTrackerPanels(Panel previousPanel) {
             }
         }
         
-        // Disable scrolling on main window - only child regions should scroll
-        // Use NoTitleBar so we can draw custom title bar with integrated ON/OFF toggle
-        ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoScrollbar | 
-                                      ImGuiWindowFlags_NoScrollWithMouse |
-                                      ImGuiWindowFlags_NoTitleBar;
+        // Setup window properties (applies default size if saved)
+        trackerGUI->setupWindow();
         
+        // Disable scrolling on main window - only child regions should scroll
+        // Use native ImGui title bar - toggle button will be drawn on top of it
+        ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoScrollbar | 
+                                      ImGuiWindowFlags_NoScrollWithMouse;
+        
+        // ImGui::Begin() returns false when window is collapsed
+        // IMPORTANT: Always call End() even if Begin() returns false
         if (ImGui::Begin(windowTitle.c_str(), nullptr, windowFlags)) {
-            // Draw custom title bar with integrated ON/OFF toggle
-            trackerGUI->drawCustomTitleBar();
-            
-            // Detect mouse click on panel background
-            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                navigateToPanel(Panel::TRACKER);
-                trackerGUI->clearCellFocus();
+            // Only draw content if window is not collapsed (to avoid accessing invalid window properties)
+            if (!ImGui::IsWindowCollapsed()) {
+                // Draw ON/OFF toggle button in ImGui's native title bar
+                trackerGUI->drawTitleBarToggle();
+                
+                if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
+                    navigateToPanel(Panel::TRACKER);
+                    trackerGUI->clearCellFocus();
+                }
+                
+                trackerGUI->draw();
+                
+                // Save layout if window was resized (only save size, not position)
+                ImVec2 currentSize = ImGui::GetWindowSize();
+                static std::map<std::string, ImVec2> previousSizes;
+                std::string windowId = windowTitle;
+                auto it = previousSizes.find(windowId);
+                if (it == previousSizes.end() || it->second.x != currentSize.x || it->second.y != currentSize.y) {
+                    if (it != previousSizes.end()) {
+                        trackerGUI->saveDefaultLayout();
+                    }
+                    previousSizes[windowId] = currentSize;
+                }
+                
+                drawWindowOutline();
             }
-            
-            trackerGUI->draw();  // Calls ModuleGUI::draw() which draws content only
-            
-            // Draw focus outline if this window is focused
-            drawFocusedWindowOutline();
-            
-            ImGui::End();
         }
+        ImGui::End();  // Always call End() regardless of Begin() return value
     }
 }
 
@@ -389,28 +412,44 @@ void ViewManager::drawMediaPoolPanels(Panel previousPanel) {
             }
         }
         
-        // Disable scrolling on main window - only child regions should scroll
-        // Use NoTitleBar so we can draw custom title bar with integrated ON/OFF toggle
-        ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoScrollbar | 
-                                      ImGuiWindowFlags_NoScrollWithMouse |
-                                      ImGuiWindowFlags_NoTitleBar;
+        // Setup window properties (applies default size if saved)
+        mediaPoolGUI->setupWindow();
         
+        // Disable scrolling on main window - only child regions should scroll
+        // Use native ImGui title bar - toggle button will be drawn on top of it
+        ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoScrollbar | 
+                                      ImGuiWindowFlags_NoScrollWithMouse;
+        
+        // ImGui::Begin() returns false when window is collapsed
+        // IMPORTANT: Always call End() even if Begin() returns false
         if (ImGui::Begin(windowTitle.c_str(), nullptr, windowFlags)) {
-            // Draw custom title bar with integrated ON/OFF toggle
-            mediaPoolGUI->drawCustomTitleBar();
-            
-            // Detect mouse click on panel background
-            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                navigateToPanel(Panel::MEDIA_POOL);
+            // Only draw content if window is not collapsed (to avoid accessing invalid window properties)
+            if (!ImGui::IsWindowCollapsed()) {
+                // Draw ON/OFF toggle button in ImGui's native title bar
+                mediaPoolGUI->drawTitleBarToggle();
+                
+                if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
+                    navigateToPanel(Panel::MEDIA_POOL);
+                }
+                
+                mediaPoolGUI->draw();
+                
+                // Save layout if window was resized (only save size, not position)
+                ImVec2 currentSize = ImGui::GetWindowSize();
+                static std::map<std::string, ImVec2> previousSizes;
+                std::string windowId = windowTitle;
+                auto it = previousSizes.find(windowId);
+                if (it == previousSizes.end() || it->second.x != currentSize.x || it->second.y != currentSize.y) {
+                    if (it != previousSizes.end()) {
+                        mediaPoolGUI->saveDefaultLayout();
+                    }
+                    previousSizes[windowId] = currentSize;
+                }
+                
+                drawWindowOutline();
             }
-            
-            mediaPoolGUI->draw();  // Calls ModuleGUI::draw() which draws content only
-            
-            // Draw focus outline if this window is focused
-            drawFocusedWindowOutline();
-            
-            ImGui::End();
         }
+        ImGui::End();  // Always call End() regardless of Begin() return value
     }
 }
 
@@ -460,45 +499,28 @@ void ViewManager::drawFileBrowserPanel(Panel previousPanel) {
     ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoScrollbar | 
                                   ImGuiWindowFlags_NoScrollWithMouse;
     
-    // Always call Begin() so ImGui can track window state even when collapsed
+    // ImGui::Begin() returns false when window is collapsed
+    // IMPORTANT: Always call End() even if Begin() returns false
     if (ImGui::Begin("File Browser", nullptr, windowFlags)) {
-        // Track last visibility state to only update collapse when it changes
-        static bool lastFileBrowserVisible = false;
-        if (fileBrowserVisible_ != lastFileBrowserVisible) {
-            // Visibility state changed - update collapse state (after Begin())
-            ImGui::SetWindowCollapsed(!fileBrowserVisible_, ImGuiCond_Always);
-            lastFileBrowserVisible = fileBrowserVisible_;
-        }
-        
-        // Sync visibility state with ImGui's window collapsed state
-        // If user manually expands a collapsed window, update visibility to true
+        // Window is open - safe to use window functions
         bool isCollapsed = ImGui::IsWindowCollapsed();
+        
+        // Sync visibility state
         if (!isCollapsed && !fileBrowserVisible_) {
-            // User manually expanded the window - sync our state
             fileBrowserVisible_ = true;
-            lastFileBrowserVisible = true;
         }
         
-        // Detect mouse click on panel background
-        if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-            navigateToPanel(Panel::FILE_BROWSER);
-        }
-        
-        // Draw panel content directly (FileBrowser is a utility panel, not a module)
-        // Wrap in try-catch to ensure End() is always called even if draw() throws
-        try {
+        // Only draw content when not collapsed
+        if (!isCollapsed) {
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
+                navigateToPanel(Panel::FILE_BROWSER);
+            }
+            
             fileBrowser->draw();
-        } catch (const std::exception& e) {
-            ofLogError("ViewManager") << "Exception in fileBrowser->draw(): " << e.what();
-        } catch (...) {
-            ofLogError("ViewManager") << "Unknown exception in fileBrowser->draw()";
+            drawWindowOutline();
         }
-        
-        // Draw focus outline if this window is focused
-        drawFocusedWindowOutline();
-        
-        ImGui::End();
     }
+    ImGui::End();  // Always call End() regardless of Begin() return value
 }
 
 void ViewManager::drawConsolePanel(Panel previousPanel) {
@@ -532,49 +554,34 @@ void ViewManager::drawConsolePanel(Panel previousPanel) {
         ImGui::SetNextWindowFocus();
     }
     
-    // Standard window flags for utility panel (no special title bar needed)
-    ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoScrollbar | 
-                                  ImGuiWindowFlags_NoScrollWithMouse;
+    // No special flags needed - Console handles its own styling and scrolling
+    ImGuiWindowFlags windowFlags = 0;
     
-    // Always call Begin() so ImGui can track window state for docking
-    // This allows the window to be docked and its layout to be user-customizable
-    // We do NOT programmatically control collapse/expand - let user and ImGui handle it
-    bool* pOpen = nullptr;  // Don't use close button - visibility controlled by ViewManager
+    // ImGui::Begin() returns false when window is collapsed
+    // IMPORTANT: Always call End() even if Begin() returns false
+    bool* pOpen = nullptr;
     if (ImGui::Begin("Console", pOpen, windowFlags)) {
-        // Sync Console's internal state with ViewManager (in case user manually expanded)
-        // If user manually expands a collapsed window, consider it "visible"
+        // Window is open and not collapsed - safe to use window functions
         bool isCollapsed = ImGui::IsWindowCollapsed();
+        
+        // Sync visibility state
         if (!isCollapsed && !consoleVisible_) {
-            // User manually expanded the window - sync our state
             consoleVisible_ = true;
             lastConsoleVisible = true;
             console->open();
         }
         
-        // Detect mouse click on panel background
-        if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-            navigateToPanel(Panel::CONSOLE);
-        }
-        
-        // Only draw content if console is "visible" (colon key toggle)
-        // Window is always drawn to maintain docking state
-        if (consoleVisible_) {
-            // Draw panel content (Console::drawContent() draws only the content, no Begin/End)
-            // Wrap in try-catch to ensure End() is always called even if drawContent() throws
-            try {
-                console->drawContent();
-            } catch (const std::exception& e) {
-                ofLogError("ViewManager") << "Exception in console->drawContent(): " << e.what();
-            } catch (...) {
-                ofLogError("ViewManager") << "Unknown exception in console->drawContent()";
+        // Only draw content when visible and not collapsed
+        if (consoleVisible_ && !isCollapsed) {
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
+                navigateToPanel(Panel::CONSOLE);
             }
+            
+            console->drawContent();
+            drawWindowOutline();
         }
-        // When hidden, window is collapsed but still tracked by ImGui for docking
-        
-        // Draw focus outline if this window is focused
-        drawFocusedWindowOutline();
-        
-        ImGui::End();
     }
+    ImGui::End();  // Always call End() regardless of Begin() return value
 }
+
 

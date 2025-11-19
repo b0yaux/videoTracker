@@ -1,11 +1,19 @@
 #include "Console.h"
+
 #include "core/ModuleRegistry.h"
+
 #include "gui/GUIManager.h"
+
 #include "Module.h"
+
 #include "ofLog.h"
+
 #include <sstream>
+
 #include <algorithm>
+
 #include <cctype>
+
 #include <cstring>
 
 Console::Console() {
@@ -82,8 +90,7 @@ bool Console::handleArrowKeys(int key) {
 }
 
 void Console::draw() {
-    // Always draw the window (even when collapsed) so ImGui can save its state
-    // Set window size and position (follow MenuBar pattern)
+    // Simple, clean console window
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowSize(ImVec2(600, 400), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(
@@ -92,20 +99,16 @@ void Console::draw() {
         ImVec2(0.5f, 0.5f)
     );
     
-    // Collapse window when hidden to preserve layout state
-    // Always sync collapse state with visibility so menu toggle works
+    // Collapse window when hidden
     ImGui::SetNextWindowCollapsed(!isOpen, ImGuiCond_Always);
     
-    // Disable scrolling on main window - only child region should scroll
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+    // Simple window flags - let ImGui handle scrolling naturally
+    ImGuiWindowFlags flags = ImGuiWindowFlags_None;
     
-    // Always call Begin() so ImGui can track window state even when collapsed
     if (ImGui::Begin("Console", &isOpen, flags)) {
-        // Sync visibility state with ImGui's window collapsed state
-        // If user manually expands a collapsed window, update isOpen to true
+        // Sync visibility state
         bool isCollapsed = ImGui::IsWindowCollapsed();
         if (!isCollapsed && !isOpen) {
-            // User manually expanded the window - sync our state
             isOpen = true;
         }
         drawContent();
@@ -126,36 +129,44 @@ void Console::drawContent() {
                              0.0f, 0, GUIConstants::Outline::FocusThickness);
         }
     }
-    // Output log with scrolling
-    ImGui::BeginChild("ScrollingRegion", 
-                     ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), 
-                     false, 
-                     ImGuiWindowFlags_HorizontalScrollbar);
     
-    // Draw all log items
-    for (const auto& item : items) {
-        // Color code output based on prefix
-        if (item.find("Error:") == 0 || item.find("error:") == 0) {
-            ImGui::PushStyleColor(ImGuiCol_Text, GUIConstants::Text::Warning);
-            ImGui::TextUnformatted(item.c_str());
-            ImGui::PopStyleColor();
-        } else if (item.find(">") == 0) {
-            // Command input (slightly dimmed)
-            ImGui::PushStyleColor(ImGuiCol_Text, GUIConstants::Text::Info);
-            ImGui::TextUnformatted(item.c_str());
-            ImGui::PopStyleColor();
-        } else {
-            ImGui::TextUnformatted(item.c_str());
+    // Build log text buffer from items (only rebuild if items changed)
+    if (logTextDirty) {
+        logTextBuffer.clear();
+        for (size_t i = 0; i < items.size(); ++i) {
+            const auto& item = items[i];
+            logTextBuffer += item;
+            if (i < items.size() - 1) {
+                logTextBuffer += "\n";
+            }
         }
+        // InputTextMultiline needs a mutable buffer with extra space
+        size_t currentSize = logTextBuffer.size();
+        size_t bufferSize = std::max(currentSize + 1024, static_cast<size_t>(8192));
+        logTextBuffer.reserve(bufferSize);
+        logTextBuffer.resize(bufferSize, '\0');
+        logTextDirty = false;
     }
     
-    // Auto-scroll to bottom (always enabled)
-    if (scrollToBottom || ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f) {
+    // Simple approach: use InputTextMultiline directly for display, selection, and scrolling
+    // Reserve space for input line at bottom
+    ImVec2 availableSize = ImGui::GetContentRegionAvail();
+    float inputLineHeight = ImGui::GetFrameHeightWithSpacing();
+    ImVec2 logSize(availableSize.x, availableSize.y - inputLineHeight);
+    
+    ImGuiInputTextFlags multilineFlags = ImGuiInputTextFlags_ReadOnly | 
+                                         ImGuiInputTextFlags_NoHorizontalScroll;
+    
+    char* logTextPtr = const_cast<char*>(logTextBuffer.data());
+    ImGui::InputTextMultiline("##ConsoleLog", logTextPtr, logTextBuffer.capacity(),
+                              logSize, multilineFlags);
+    
+    // Auto-scroll to bottom when new content is added
+    // InputTextMultiline has internal scrolling - SetScrollHereY works on the current window
+    if (scrollToBottom) {
         ImGui::SetScrollHereY(1.0f);
         scrollToBottom = false;
     }
-    
-    ImGui::EndChild();
     
     ImGui::Separator();
     
@@ -164,12 +175,15 @@ void Console::drawContent() {
     ImGuiInputTextFlags inputFlags = ImGuiInputTextFlags_EnterReturnsTrue | 
                                      ImGuiInputTextFlags_EscapeClearsAll;
     
-    // Auto-focus input on window appearing
-    if (ImGui::IsWindowAppearing()) {
+    // Auto-focus input on window appearing or when console is opened
+    if (ImGui::IsWindowAppearing() || shouldFocusInput) {
         ImGui::SetKeyboardFocusHere();
+        shouldFocusInput = false;
     }
     
-    // Draw InputText widget first
+    // Draw InputText widget
+    // Focus management: input line gets focus on window open/command execution
+    // User can click log area to select text, but typing will naturally go to input line
     bool inputTextReturned = ImGui::InputText("##input", inputBuffer, sizeof(inputBuffer), inputFlags);
     
     // Check if InputText is actually focused/active (must check AFTER InputText call)
@@ -195,10 +209,6 @@ void Console::drawContent() {
     if (reclaimFocus) {
         ImGui::SetKeyboardFocusHere(-1);
     }
-    
-    // Show hint
-    ImGui::SameLine();
-    ImGui::TextDisabled("(Press : to close)");
 }
 
 void Console::executeCommand(const std::string& command) {
@@ -389,18 +399,22 @@ void Console::cmdHelp() {
     addLog("=== Shortcuts ===");
     addLog("  :                    - Toggle console");
     addLog("  Up/Down arrows       - Navigate command history");
+    addLog("  Ctrl+C / Cmd+C       - Copy selected text");
 }
 
 void Console::cmdClear() {
     items.clear();
+    logTextDirty = true; // Mark buffer as dirty
     addLog("Console cleared.");
 }
 
 void Console::addLog(const std::string& text) {
     items.push_back(text);
+    logTextDirty = true; // Mark buffer as dirty when items change
     // Keep last 1000 lines (more efficient than my original approach)
     if (items.size() > 1000) {
         items.erase(items.begin(), items.begin() + 500);
+        logTextDirty = true;
     }
 }
 

@@ -12,11 +12,26 @@ class MediaPool;
 /**
  * ModuleFactory - Creates module instances with UUID and human-readable names
  * 
+ * RESPONSIBILITY: Module instance creation and identity management
+ * 
  * Features:
  * - Auto-generates UUID for each instance using Poco::UUID
  * - Auto-generates human-readable names (e.g., "TrackerSequencer_1")
  * - Supports custom human-readable names
  * - Returns shared_ptr for automatic memory management
+ * - Tracks UUID ↔ human name mappings
+ * 
+ * Separation of Concerns:
+ * - ModuleFactory: Creates modules and manages their identity (UUID/name)
+ * - ModuleRegistry: Stores and retrieves modules by UUID/name
+ * - GUIManager: Creates/destroys GUI objects for modules (one per instance)
+ * - ViewManager: Renders panels and manages view state (navigation, focus)
+ * 
+ * Usage Flow:
+ *   1. ModuleFactory creates module → returns shared_ptr<Module>
+ *   2. ModuleRegistry registers module → stores by UUID/name
+ *   3. GUIManager syncs with registry → creates GUI objects
+ *   4. ViewManager draws panels → uses GUIManager to get GUI objects
  */
 class ModuleFactory {
 public:

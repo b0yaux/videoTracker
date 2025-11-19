@@ -29,6 +29,7 @@ class GUIManager;
  * Shortcuts:
  *   : (colon)             - Toggle console
  *   Up/Down arrows        - Navigate command history
+ *   Ctrl+C / Cmd+C        - Copy selected text to clipboard
  *   Tab                   - Auto-complete (future)
  */
 class Console {
@@ -68,9 +69,12 @@ private:
     char inputBuffer[512] = "";
     std::vector<std::string> history;
     std::vector<std::string> items;  // Console output lines
+    std::string logTextBuffer;  // Combined log text for multiline input (for text selection)
+    bool logTextDirty = true;  // Flag to rebuild logTextBuffer when items change
     int historyPos = -1;
     bool scrollToBottom = false;
     bool inputTextWasFocused = false;  // Track if InputText was focused in last draw()
+    bool shouldFocusInput = false;  // Flag to focus input field in next frame (after ViewManager processing)
     
     ModuleRegistry* registry = nullptr;
     GUIManager* guiManager = nullptr;

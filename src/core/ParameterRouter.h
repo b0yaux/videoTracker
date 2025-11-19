@@ -86,6 +86,14 @@ public:
     std::vector<std::pair<std::string, std::string>> getConnectionsTo(const std::string& targetPath) const;
     
     /**
+     * Get all modules connected to a given instance (by instance name)
+     * Finds connections where the instance appears as either source or target
+     * @param instanceName Module instance name (e.g., "tracker1")
+     * @return Vector of shared_ptr to connected modules
+     */
+    std::vector<std::shared_ptr<Module>> getConnectedModules(const std::string& instanceName) const;
+    
+    /**
      * Notify that a parameter has changed (called by modules)
      * @param module Module that changed
      * @param paramName Parameter name that changed

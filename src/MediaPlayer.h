@@ -15,6 +15,7 @@ public:
     // Composition - contains audio and video players
     ofxSoundPlayerObject audioPlayer;
     ofxVideoPlayerObject videoPlayer;
+    ofxHSV hsvAdjust;  // HSV color adjustment processor for video
     
     // Enable/disable toggles
     ofParameter<bool> audioEnabled;
@@ -95,6 +96,9 @@ private:
     void onSpeedChanged(float& speed);
     void onLoopChanged(bool& loop);
     void onVolumeChanged(float& vol);
+    void onBrightnessChanged(float& value);
+    void onHueChanged(float& value);
+    void onSaturationChanged(float& value);
     
     // Internal state
     bool isSetup;

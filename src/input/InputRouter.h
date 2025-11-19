@@ -72,7 +72,7 @@ private:
 
     // Handler methods for different input categories
     bool handleGlobalShortcuts(int key);
-    bool handlePanelNavigation(ofKeyEventArgs& keyEvent);
+    // Removed handlePanelNavigation - Ctrl+Tab is now handled by ImGui natively
     bool handleTrackerInput(ofKeyEventArgs& keyEvent);
 
     // Helper to check ImGui capture state

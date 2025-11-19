@@ -18,6 +18,12 @@ void MediaPlayer::setup() {
     // Setup video player
     videoPlayer.setName("Video Player");
     
+    // Setup HSV adjustment processor
+    hsvAdjust.setName("HSV Adjust");
+    
+    // Connect video player to HSV processor
+    videoPlayer.connectTo(hsvAdjust);
+    
     // Setup synchronized parameters
     playheadPosition.set("Playhead position", 0.0f, 0.0f, 1.0f);  // Current playhead position (updates during playback)
     startPosition.set("Start position", 0.0f, 0.0f, 1.0f);  // Start position for playback (synced with tracker)
@@ -64,6 +70,16 @@ void MediaPlayer::setup() {
     loop.addListener(this, &MediaPlayer::onLoopChanged);
     volume.addListener(this, &MediaPlayer::onVolumeChanged);
     
+    // Sync HSV parameters from MediaPlayer to ofxHSV processor
+    brightness.addListener(this, &MediaPlayer::onBrightnessChanged);
+    hue.addListener(this, &MediaPlayer::onHueChanged);
+    saturation.addListener(this, &MediaPlayer::onSaturationChanged);
+    
+    // Initialize HSV parameters
+    hsvAdjust.brightness.set(brightness.get());
+    hsvAdjust.hue.set(hue.get());
+    hsvAdjust.saturation.set(saturation.get());
+    
     // Parameters are managed directly by ofxMediaPlayer
     // No need to forward to underlying players since they don't have media parameters
     
@@ -80,6 +96,10 @@ const ofParameter<float>* MediaPlayer::getFloatParameter(const std::string& name
     // Support both old names (for backward compat) and new names
     if (name == "loopStart" || name == "regionStart") return &regionStart;
     if (name == "loopEnd" || name == "regionEnd") return &regionEnd;
+    // Video-specific parameters (color correction)
+    if (name == "brightness") return &brightness;
+    if (name == "hue") return &hue;
+    if (name == "saturation") return &saturation;
     return nullptr;
 }
 
@@ -406,11 +426,25 @@ float MediaPlayer::getDuration() const {
 }
 
 void MediaPlayer::update() {
-    // PERFORMANCE CRITICAL: Only update video player when actually playing
-    // videoPlayer.update() can be expensive (texture updates, buffer operations)
-    // Don't call it when stopped/paused - this causes lag even with empty patterns
-    if (isPlaying() && isVideoLoaded() && videoEnabled.get()) {
-        videoPlayer.update();  // Only update when actually playing
+    // Update video player when video is loaded (needed for texture updates)
+    // Process visual chain whenever video is loaded (not just when playing) so HSV adjustments
+    // are visible even when paused or when adjusting sliders
+    if (isVideoLoaded() && videoEnabled.get()) {
+        // Only update video player when actually playing (performance optimization)
+        // videoPlayer.update() can be expensive (texture updates, buffer operations)
+        if (isPlaying()) {
+            videoPlayer.update();
+        }
+        
+        // Process visual chain: videoPlayer -> hsvAdjust
+        // This ensures HSV adjustments are applied even when paused
+        ofFbo emptyInput;
+        videoPlayer.process(emptyInput, videoPlayer.getOutputBuffer());
+        
+        ofFbo& videoOutput = videoPlayer.getOutputBuffer();
+        if (videoOutput.isAllocated()) {
+            hsvAdjust.process(videoOutput, hsvAdjust.getOutputBuffer());
+        }
     }
     
     // Sync position parameter with actual playback position
@@ -618,6 +652,21 @@ void MediaPlayer::onVolumeChanged(float& vol) {
         // Use the underlying sound player's setVolume method
         audioPlayer.setVolume(vol);
     }
+}
+
+void MediaPlayer::onBrightnessChanged(float& value) {
+    // Sync brightness to HSV processor
+    hsvAdjust.brightness.set(value);
+}
+
+void MediaPlayer::onHueChanged(float& value) {
+    // Sync hue to HSV processor
+    hsvAdjust.hue.set(value);
+}
+
+void MediaPlayer::onSaturationChanged(float& value) {
+    // Sync saturation to HSV processor
+    hsvAdjust.saturation.set(value);
 }
 
 // Simple gating - just play and schedule a stop

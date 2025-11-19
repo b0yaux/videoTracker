@@ -26,6 +26,7 @@ namespace GUIConstants {
         constexpr ImVec4 Title = ImVec4(0.01f, 0.01f, 0.01f, 0.65f);
         constexpr ImVec4 TitleActive = ImVec4(0.01f, 0.01f, 0.01f, 0.65f);
         constexpr ImVec4 DockingEmpty = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+        constexpr ImVec4 DockingPreview = ImVec4(0.9f, 0.1f, 0.1f, 0.4f); // Blue preview when docking, matches Button::Hovered theme
         constexpr ImVec4 ModalDim = ImVec4(0.0f, 0.0f, 0.0f, 0.5f);
         
         // Table/Grid backgrounds
@@ -33,12 +34,12 @@ namespace GUIConstants {
         constexpr ImVec4 TableRow = ImVec4(0.0f, 0.0f, 0.0f, 0.05f);
         constexpr ImVec4 TableRowAlt = ImVec4(0.0f, 0.0f, 0.0f, 0.1f);
         constexpr ImVec4 TableRowFilled = ImVec4(0.01f, 0.01f, 0.01f, 0.5f);
-        constexpr ImVec4 TableRowEmpty = ImVec4(0.05f, 0.05f, 0.05f, 0.1f);
+        constexpr ImVec4 TableRowEmpty = ImVec4(0.05f, 0.05f, 0.05f, 0.05f); // Reduced opacity for empty rows
         constexpr ImVec4 StepNumber = ImVec4(0.05f, 0.05f, 0.05f, 0.8f);
         
         // Waveform
-        constexpr ImVec4 Waveform = ImVec4(0.0f, 0.0f, 0.0f, 0.39f); // ~100/255 alpha
-        constexpr ImVec4 WaveformTrimmed = ImVec4(0.5f, 0.5f, 0.5f, 0.39f); // Grey, semi-transparent
+        constexpr ImVec4 Waveform = ImVec4(0.0f, 0.0f, 0.0f, 0.55f); // ~100/255 alpha
+        constexpr ImVec4 WaveformTrimmed = ImVec4(0.4f, 0.4f, 0.4f, 0.36f); // Grey, semi-transparent
     }
     
     // Text colors
@@ -109,6 +110,10 @@ namespace GUIConstants {
         constexpr ImVec4 Focus = ImVec4(0.4f, 0.4f, 0.4f, 1.0f); // Grey outline for focused panels
         constexpr float FocusThickness = 1.0f; // Thickness for focused window outline
         
+        // Unfocused outline for GUI panels
+        constexpr ImVec4 Unfocused = ImVec4(0.2f, 0.2f, 0.2f, 0.6f); // Dimmer grey outline for unfocused panels
+        constexpr float UnfocusedThickness = 0.5f; // Thinner thickness for unfocused window outline
+        
         // Disabled state
         constexpr ImVec4 Disabled = ImVec4(0.8f, 0.2f, 0.2f, 1.0f); // Red line for disabled
         constexpr ImVec4 DisabledBg = ImVec4(0.4f, 0.2f, 0.2f, 1.0f); // Red tint background
@@ -153,6 +158,7 @@ namespace GUIConstants {
         constexpr ImVec4 Grab = ImVec4(0.3f, 0.3f, 0.3f, 0.8f);
         constexpr ImVec4 GrabHovered = ImVec4(0.4f, 0.4f, 0.4f, 0.9f);
         constexpr ImVec4 GrabActive = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+        constexpr float Size = 5.0f; // Scrollbar width (default ImGui is 16.0f)
     }
     
     // ============================================================================
@@ -160,11 +166,11 @@ namespace GUIConstants {
     // ============================================================================
     
     namespace Tab {
-        constexpr ImVec4 Default = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);
-        constexpr ImVec4 Hovered = ImVec4(0.2f, 0.2f, 0.2f, 0.6f);
+        constexpr ImVec4 Default = ImVec4(0.01f, 0.01f, 0.01f, 0.8f);
+        constexpr ImVec4 Hovered = ImVec4(0.4f, 0.4f, 0.4f, 0.6f);
         constexpr ImVec4 Active = ImVec4(0.01f, 0.01f, 0.01f, 0.8f);
-        constexpr ImVec4 Unfocused = ImVec4(0.05f, 0.05f, 0.05f, 0.7f);
-        constexpr ImVec4 UnfocusedActive = ImVec4(0.15f, 0.15f, 0.15f, 0.8f);
+        constexpr ImVec4 Unfocused = ImVec4(0.0f, 0.0f, 0.0f, 0.5f);
+        constexpr ImVec4 UnfocusedActive = ImVec4(0.01f, 0.01f, 0.01f, 0.5f);
     }
     
     // ============================================================================
@@ -178,6 +184,38 @@ namespace GUIConstants {
     }
     
     // ============================================================================
+    // DOCKING APPEARANCE
+    // ============================================================================
+    //
+    // IMPORTANT: When windows are docked vs undocked, ImGui uses different rendering:
+    //
+    // UNDOCKED (Floating) Windows:
+    //   - Use Title Bar: ImGuiCol_TitleBg, ImGuiCol_TitleBgActive
+    //   - Show window borders and resize grips
+    //   - Window background: ImGuiCol_WindowBg
+    //
+    // DOCKED Windows:
+    //   - Use Tabs: ImGuiCol_Tab, ImGuiCol_TabActive, ImGuiCol_TabHovered, etc.
+    //   - Tab bar replaces title bar when multiple windows are docked together
+    //   - Window background: ImGuiCol_WindowBg (same as undocked)
+    //   - Separators between docked panels use DockingSeparatorSize
+    //
+    // To make docked and undocked windows look similar:
+    //   - Match Tab colors to TitleBg colors
+    //   - Or use IsWindowDocked() to conditionally style
+    //
+    namespace Docking {
+        // Thickness of separators between docked panels (default ImGui is 2.0f)
+        // Smaller values = thinner separators
+        constexpr float SeparatorSize = 0.75f;  // Thinner separators for cleaner look
+    
+        // Note: Docking::WindowBg actually doesn't affect the docked panel windowbg.
+        // It is left here for documentation/reference only.
+        constexpr ImVec4 WindowBg = ImVec4(0.15f, 0.15f, 0.15f, 0.0f);  // Same as Background::Window by default
+        
+    }
+    
+    // ============================================================================
     // HEADER COLORS
     // ============================================================================
     
@@ -186,7 +224,17 @@ namespace GUIConstants {
     }
     
     // ============================================================================
-    // RESIZE GRIP COLORS
+    // FILE BROWSER COLORS
+    // ============================================================================
+    
+    namespace FileBrowser {
+        // Selection highlight colors - brighter and more visible
+        constexpr ImVec4 Selected = ImVec4(0.2f, 0.4f, 0.8f, 0.6f); // Bright blue selection
+        constexpr ImVec4 SelectedHovered = ImVec4(0.25f, 0.45f, 0.85f, 0.7f); // Slightly brighter on hover
+    }
+    
+    // ============================================================================
+    // RESIZE GRIP COLORS 
     // ============================================================================
     
     namespace ResizeGrip {
@@ -197,7 +245,7 @@ namespace GUIConstants {
     // PARAMETER CELL COLORS
     // ============================================================================
     
-    namespace ParameterCell {
+    namespace CellWidget {
         constexpr ImVec4 FillBar = ImVec4(0.5f, 0.5f, 0.5f, 0.25f); // Grey fill bar
     }
     

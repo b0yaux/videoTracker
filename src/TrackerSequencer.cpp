@@ -6,6 +6,7 @@
 #include "ofxImGui.h"  // Add this line for ImGui support
 #include <cmath>  // For std::round
 #include <limits>  // For std::numeric_limits
+#include <set>
 
 // TrackerSequencer implementation
 //--------------------------------------------------------------
@@ -43,10 +44,7 @@ void TrackerSequencer::setup(Clock* clockRef, int steps) {
         getCurrentPattern().setStepCount(steps);
     }
     
-    // Initialize default column configuration if empty
-            if (columnConfig.empty()) {
-                initializeDefaultColumns();
-            }
+    // Column configuration is now per-pattern (initialized in Pattern constructor)
             
             // Connect to Clock's time events for sample-accurate timing
     if (clock) {
@@ -209,6 +207,7 @@ void TrackerSequencer::randomizePattern() {
 }
 
 void TrackerSequencer::randomizeColumn(int columnIndex) {
+    const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
     if (columnIndex < 0 || columnIndex >= (int)columnConfig.size()) {
         ofLogWarning("TrackerSequencer") << "Invalid column index for randomization: " << columnIndex;
         return;
@@ -399,17 +398,8 @@ ofJson TrackerSequencer::toJson() const {
     json["currentStep"] = playbackStep;  // Save playback step for backward compatibility
     // Note: GUI state (editStep, etc.) no longer saved here - managed by TrackerSequencerGUI
     
-    // Save column configuration
-    ofJson columnArray = ofJson::array();
-    for (const auto& col : columnConfig) {
-        ofJson colJson;
-        colJson["parameterName"] = col.parameterName;
-        colJson["displayName"] = col.displayName;
-        colJson["isFixed"] = col.isFixed;
-        colJson["columnIndex"] = col.columnIndex;
-        columnArray.push_back(colJson);
-    }
-    json["columnConfig"] = columnArray;
+    // Column configuration is now saved per-pattern (in Pattern::toJson)
+    // No need to save it here - each pattern saves its own columnConfig
     
     // Save multi-pattern support
     json["currentPatternIndex"] = currentPatternIndex;
@@ -464,38 +454,7 @@ void TrackerSequencer::fromJson(const ofJson& json) {
     }
     // Note: GUI state (editStep, etc.) no longer loaded here - managed by TrackerSequencerGUI
     
-    // Load column configuration (migration: use defaults if missing)
-    if (json.contains("columnConfig") && json["columnConfig"].is_array()) {
-        columnConfig.clear();
-        auto columnArray = json["columnConfig"];
-        for (const auto& colJson : columnArray) {
-            if (colJson.contains("parameterName") && colJson.contains("displayName")) {
-                std::string paramName = colJson["parameterName"];
-                std::string displayName = colJson["displayName"];
-                bool isFixed = colJson.contains("isFixed") ? (bool)colJson["isFixed"] : false;
-                int colIndex = colJson.contains("columnIndex") ? (int)colJson["columnIndex"] : (int)columnConfig.size();
-                columnConfig.push_back(ColumnConfig(paramName, displayName, isFixed, colIndex));
-            }
-        }
-        
-        // Ensure we have at least the fixed columns (index and length)
-        // MODULAR: Check for required fixed columns using isFixed flag
-        bool hasIndex = false;
-        bool hasLength = false;
-        for (const auto& col : columnConfig) {
-            if (col.isFixed && col.parameterName == "index") hasIndex = true;
-            if (col.isFixed && col.parameterName == "length") hasLength = true;
-        }
-        
-        if (!hasIndex || !hasLength || columnConfig.empty()) {
-            ofLogNotice("TrackerSequencer") << "Column configuration missing or incomplete, using defaults";
-            initializeDefaultColumns();
-        }
-    } else {
-        // Migration: old file format - initialize default columns
-        ofLogNotice("TrackerSequencer") << "Old pattern file format detected, initializing default column configuration";
-        initializeDefaultColumns();
-    }
+    // Column configuration is now per-pattern (loaded in Pattern::fromJson)
     
     // Load multi-pattern support (new format)
     if (json.contains("patterns") && json["patterns"].is_array()) {
@@ -780,6 +739,23 @@ void TrackerSequencer::triggerStep(int step) {
     triggerEvt.duration = duration;
     triggerEvt.step = step;  // Include step number for position memory modes
     
+    // Check chance parameter (internal) - only trigger if random roll succeeds
+    // Chance is 0-100, default 100 (always trigger)
+    int chance = 100;
+    if (cell.hasParameter("chance")) {
+        chance = (int)std::round(cell.getParameterValue("chance", 100.0f));
+        chance = std::max(0, std::min(100, chance)); // Clamp to 0-100
+    }
+    
+    // Roll for chance (0-100)
+    if (chance < 100) {
+        int roll = (int)(ofRandom(0.0f, 100.0f));
+        if (roll >= chance) {
+            // Chance failed - don't trigger this step
+            return;
+        }
+    }
+    
     // Map PatternCell parameters to TrackerSequencer parameters
     // "note" is the sequencer's parameter name (maps to cell.index for MediaPool)
     if (cell.index >= 0) {
@@ -788,23 +764,46 @@ void TrackerSequencer::triggerStep(int step) {
         triggerEvt.parameters["note"] = -1.0f; // Rest/empty step
     }
     
-    // MODULAR: Iterate through all available parameters dynamically
-    // Only add parameters to event if they are explicitly set in the cell
-    // This allows position memory: if position is not set, MediaPool will use current position
-    auto availableParams = getAvailableParameters();
-    for (const auto& param : availableParams) {
-        // Skip "note" - it's handled separately above
-        if (param.name == "note") continue;
-        
-        // Only add parameter if explicitly set in cell
-        // If not set, don't add to event - Module will use default or position memory
-        if (cell.hasParameter(param.name)) {
-            float value = cell.getParameterValue(param.name, param.defaultValue);
-            // Validate value using parameter ranges (clamp to valid range)
-            float clampedValue = std::max(param.minValue, std::min(param.maxValue, value));
-            triggerEvt.parameters[param.name] = clampedValue;
+    // Get internal parameter names to exclude from trigger event
+    // Internal parameters (note, chance) are sequencer-specific and not sent to external modules
+    auto internalParams = getInternalParameters();
+    std::set<std::string> internalParamNames;
+    for (const auto& param : internalParams) {
+        internalParamNames.insert(param.name);
+    }
+    
+    // MODULAR: Only send parameters that are in the current pattern's column configuration
+    // This ensures we only send parameters that are actually displayed/used in the grid
+    // Skip internal parameters (note, chance) - they're sequencer-specific and not sent to modules
+    const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
+    std::set<std::string> columnParamNames;
+    for (const auto& col : columnConfig) {
+        // Skip required columns (index, length) - they're handled separately
+        if (col.parameterName != "index" && col.parameterName != "length") {
+            columnParamNames.insert(col.parameterName);
         }
-        // If parameter NOT set, don't add to event - Module will handle defaults/position memory
+    }
+    
+    // Only send parameters that are both:
+    // 1. In the cell's parameterValues (explicitly set)
+    // 2. In the current pattern's column configuration (actually displayed in grid)
+    // 3. Not internal parameters (note, chance)
+    for (const auto& paramPair : cell.parameterValues) {
+        const std::string& paramName = paramPair.first;
+        float paramValue = paramPair.second;
+        
+        // Skip internal parameters - they're sequencer-specific and not sent to modules
+        if (internalParamNames.find(paramName) != internalParamNames.end()) {
+            continue;
+        }
+        
+        // Only send if parameter is in the current pattern's column configuration
+        if (columnParamNames.find(paramName) != columnParamNames.end()) {
+            // Add parameter to trigger event
+            // Note: We don't validate ranges here because we don't have access to parameter descriptors
+            // MediaPool will validate ranges when it receives the parameter
+            triggerEvt.parameters[paramName] = paramValue;
+        }
     }
     
     // Broadcast trigger event to all subscribers (modular!)
@@ -837,14 +836,14 @@ void TrackerSequencer::handleMouseClick(int x, int y, int button) {
 }
 
 bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed, GUIState& guiState) {
-    // If a cell is selected (editStep/editColumn are valid), delegate to ParameterCell
+    // If a cell is selected (editStep/editColumn are valid), delegate to CellWidget
     // This handles both editing cells and selected cells (for auto-entering edit mode)
     if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-        // Create ParameterCell for current cell and delegate keyboard handling
-        ParameterCell cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
+        // Create CellWidget for current cell and delegate keyboard handling
+        CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
         
-        // Sync state from GUI state to ParameterCell
-        cell.isSelected = true;
+        // Sync state from GUI state to CellWidget
+        cell.setSelected(true);
         if (guiState.isEditingCell) {
             // Set editing state first (this will initialize buffer with current value)
             cell.setEditing(true);
@@ -874,13 +873,13 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 guiState.editBufferInitializedCache = false;
             }
             
-            // If ParameterCell exited edit mode via Enter, check if it needs refocus
+            // If CellWidget exited edit mode via Enter, check if it needs refocus
             // This maintains focus after saving with Enter (unified refocus system)
-            if (!nowEditing && wasEditing && cell.getShouldRefocus()) {
+            if (!nowEditing && wasEditing && cell.shouldRefocus()) {
                 guiState.shouldRefocusCurrentCell = true;
             }
             
-            // If ParameterCell entered edit mode, sync that
+            // If CellWidget entered edit mode, sync that
             if (nowEditing && !wasEditing) {
                 // Disable ImGui keyboard navigation when entering edit mode
                 ImGuiIO& io = ImGui::GetIO();
@@ -923,8 +922,8 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             if (guiState.isEditingCell) {
                 // Should have been handled by ParameterCell above, but handle fallback
                 if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-                    ParameterCell cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.isSelected = true;
+                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
+                    cell.setSelected(true);
                     cell.setEditing(true);
                     cell.applyValue(); // Confirm edit
                 }
@@ -944,11 +943,12 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                     return true;
                 }
                 // Data column: Enter edit mode
+                const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
                 if (guiState.editColumn > 0 && guiState.editColumn <= (int)columnConfig.size()) {
                     guiState.isEditingCell = true;
                     // Initialize via ParameterCell (ParameterCell manages its own edit buffer)
-                    ParameterCell cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.isSelected = true;
+                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
+                    cell.setSelected(true);
                     cell.enterEditMode();
                     // Cache edit buffer after entering edit mode
                     guiState.editBufferCache = cell.getEditBuffer();
@@ -969,6 +969,7 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 }
                 // No cell selected: Enter grid and select first data cell
                 int stepCount = getCurrentPattern().getStepCount();
+                const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
                 if (stepCount > 0 && !columnConfig.empty()) {
                     ofLogNotice("TrackerSequencer") << "[DEBUG] [SET editStep] Enter key - setting editStep to 0, editColumn to 1 (Enter grid)";
                     guiState.editStep = 0;
@@ -982,6 +983,8 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             return false;
             
         // Escape: Exit edit mode (should be handled by ParameterCell, but handle fallback)
+        // IMPORTANT: Only handle ESC when in edit mode. When NOT in edit mode, let ESC pass through
+        // to ImGui so it can use ESC to escape contained navigation contexts (like scrollable tables)
         case OF_KEY_ESC:
             if (guiState.isEditingCell) {
                 guiState.isEditingCell = false;
@@ -994,6 +997,7 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 
                 return true;
             }
+            // NOT in edit mode: Let ESC pass through to ImGui for navigation escape
             return false;
             
         // Backspace and Delete: Should be handled by ParameterCell above
@@ -1026,8 +1030,8 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 // In edit mode: Should be handled by ParameterCell above
                 // Fallback: adjust value directly
                 if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-                    ParameterCell cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.isSelected = true;
+                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
+                    cell.setSelected(true);
                     cell.setEditing(true);
                     cell.adjustValue(1);
                     return true;
@@ -1078,8 +1082,8 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 // In edit mode: Should be handled by ParameterCell above
                 // Fallback: adjust value directly
                 if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-                    ParameterCell cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.isSelected = true;
+                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
+                    cell.setSelected(true);
                     cell.setEditing(true);
                     cell.adjustValue(-1);
                     return true;
@@ -1112,8 +1116,8 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 // In edit mode: Should be handled by ParameterCell above
                 // Fallback: adjust value directly
                 if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-                    ParameterCell cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.isSelected = true;
+                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
+                    cell.setSelected(true);
                     cell.setEditing(true);
                     cell.adjustValue(-1);
                     return true;
@@ -1143,8 +1147,8 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 // In edit mode: Should be handled by ParameterCell above
                 // Fallback: adjust value directly
                 if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-                    ParameterCell cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.isSelected = true;
+                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
+                    cell.setSelected(true);
                     cell.setEditing(true);
                     cell.adjustValue(1);
                     return true;
@@ -1153,6 +1157,7 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             }
             // Not in edit mode: Navigate to cell to the right
             if (isValidStep(guiState.editStep) && guiState.editColumn >= 0) {
+                const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
                 int maxColumn = (int)columnConfig.size();
                 if (guiState.editColumn == 0) {
                     // At step number column - move to first data column (column 1)
@@ -1195,12 +1200,13 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             // If not in edit mode, check if we should auto-enter edit mode or handle media selection
             if (!guiState.isEditingCell) {
                 // Check if we have a valid cell focused
+                const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
                 if (isValidStep(guiState.editStep) && guiState.editColumn > 0 && guiState.editColumn <= (int)columnConfig.size()) {
                     // We have a valid cell: enter edit mode and delegate to ParameterCell
                     // Use the general handler approach to ensure proper state management
                     guiState.isEditingCell = true;
-                    ParameterCell cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.isSelected = true;
+                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
+                    cell.setSelected(true);
                     // Enter edit mode (this initializes buffer with current value)
                     cell.enterEditMode();
                     // For direct typing, clear the buffer so the digit replaces the current value
@@ -1248,11 +1254,12 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             // If not in edit mode, auto-enter edit mode if we have a valid cell focused
             if (!guiState.isEditingCell) {
                 // Check if we have a valid cell focused
+                const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
                 if (isValidStep(guiState.editStep) && guiState.editColumn > 0 && guiState.editColumn <= (int)columnConfig.size()) {
                     // We have a valid cell: enter edit mode and delegate to ParameterCell
                     guiState.isEditingCell = true;
-                    ParameterCell cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.isSelected = true;
+                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
+                    cell.setSelected(true);
                     // Enter edit mode (this initializes buffer with current value)
                     cell.enterEditMode();
                     // For direct typing, clear the buffer so the decimal/minus replaces the current value
@@ -1314,99 +1321,8 @@ bool TrackerSequencer::isValidStep(int step) const {
     return step >= 0 && step < getCurrentPattern().getStepCount();
 }
 
-// Column configuration methods
-//--------------------------------------------------------------
-void TrackerSequencer::initializeDefaultColumns() {
-    columnConfig.clear();
-    columnConfig.push_back(ColumnConfig("index", "Index", true, 0));      // Fixed
-    columnConfig.push_back(ColumnConfig("length", "Length", true, 1));    // Fixed
-    columnConfig.push_back(ColumnConfig("position", "Position", false, 2));
-    columnConfig.push_back(ColumnConfig("speed", "Speed", false, 3));
-    columnConfig.push_back(ColumnConfig("volume", "Volume", false, 4));
-}
-
-void TrackerSequencer::addColumn(const std::string& parameterName, const std::string& displayName, int position) {
-    // Don't allow duplicate parameter names
-    for (const auto& col : columnConfig) {
-        if (col.parameterName == parameterName) {
-            ofLogWarning("TrackerSequencer") << "Column for parameter '" << parameterName << "' already exists";
-            return;
-        }
-    }
-    
-    int insertPos = (position < 0 || position >= (int)columnConfig.size()) ? (int)columnConfig.size() : position;
-    
-    // Insert at specified position
-    columnConfig.insert(columnConfig.begin() + insertPos, ColumnConfig(parameterName, displayName, false, insertPos));
-    
-    // Update column indices
-    for (size_t i = 0; i < columnConfig.size(); i++) {
-        columnConfig[i].columnIndex = (int)i;
-    }
-}
-
-void TrackerSequencer::removeColumn(int columnIndex) {
-    if (columnIndex < 0 || columnIndex >= (int)columnConfig.size()) {
-        ofLogWarning("TrackerSequencer") << "Invalid column index: " << columnIndex;
-        return;
-    }
-    
-    // Don't allow removing fixed columns
-    if (columnConfig[columnIndex].isFixed) {
-        ofLogWarning("TrackerSequencer") << "Cannot remove fixed column: " << columnConfig[columnIndex].parameterName;
-        return;
-    }
-    
-    columnConfig.erase(columnConfig.begin() + columnIndex);
-    
-    // Update column indices
-    for (size_t i = 0; i < columnConfig.size(); i++) {
-        columnConfig[i].columnIndex = (int)i;
-    }
-}
-
-void TrackerSequencer::reorderColumn(int fromIndex, int toIndex) {
-    if (fromIndex < 0 || fromIndex >= (int)columnConfig.size() ||
-        toIndex < 0 || toIndex >= (int)columnConfig.size()) {
-        ofLogWarning("TrackerSequencer") << "Invalid column indices for reorder: " << fromIndex << " -> " << toIndex;
-        return;
-    }
-    
-    // Don't allow moving fixed columns
-    if (columnConfig[fromIndex].isFixed) {
-        ofLogWarning("TrackerSequencer") << "Cannot move fixed column: " << columnConfig[fromIndex].parameterName;
-        return;
-    }
-    
-    // Move the column
-    ColumnConfig col = columnConfig[fromIndex];
-    columnConfig.erase(columnConfig.begin() + fromIndex);
-    columnConfig.insert(columnConfig.begin() + toIndex, col);
-    
-    // Update column indices
-    for (size_t i = 0; i < columnConfig.size(); i++) {
-        columnConfig[i].columnIndex = (int)i;
-    }
-}
-
-bool TrackerSequencer::isColumnFixed(int columnIndex) const {
-    if (columnIndex < 0 || columnIndex >= (int)columnConfig.size()) {
-        return false;
-    }
-    return columnConfig[columnIndex].isFixed;
-}
-
-const TrackerSequencer::ColumnConfig& TrackerSequencer::getColumnConfig(int columnIndex) const {
-    static ColumnConfig emptyConfig;
-    if (columnIndex < 0 || columnIndex >= (int)columnConfig.size()) {
-        return emptyConfig;
-    }
-    return columnConfig[columnIndex];
-}
-
-int TrackerSequencer::getColumnCount() const {
-    return (int)columnConfig.size();
-}
+// Column configuration methods are now in Pattern class
+// TrackerSequencer methods delegate to current pattern (see TrackerSequencer.h)
 
 // Dynamic column drawing - drawParameterCell() has been moved to TrackerSequencerGUI class
 
@@ -1459,7 +1375,8 @@ ModuleType TrackerSequencer::getType() const {
 }
 
 std::vector<ParameterDescriptor> TrackerSequencer::getParameters() {
-    return getAvailableParameters();
+    // Module interface - return available parameters (without external params for backward compatibility)
+    return getAvailableParameters({});
 }
 
 void TrackerSequencer::onTrigger(TriggerEvent& event) {
@@ -1484,16 +1401,60 @@ bool TrackerSequencer::handleKeyPress(ofKeyEventArgs& keyEvent, GUIState& guiSta
     return handleKeyPress(key, ctrlPressed, shiftPressed, guiState);
 }
 
-std::vector<ParameterDescriptor> TrackerSequencer::getAvailableParameters() const {
+std::vector<ParameterDescriptor> TrackerSequencer::getInternalParameters() const {
     std::vector<ParameterDescriptor> params;
     
-    // TrackerSequencer exposes its own parameters
-    // These are the parameters that the sequencer sends in trigger events
-    // Receivers map these to their own parameters (e.g., note → mediaIndex)
+    // Internal parameters: sequencer-specific, not sent to external modules
+    // "note" - can replace or work alongside index column (0-127, maps to cell.index)
     params.push_back(ParameterDescriptor("note", ParameterType::INT, 0.0f, 127.0f, 60.0f, "Note"));
+    // "chance" - trigger probability (0-100, controls whether step triggers)
+    params.push_back(ParameterDescriptor("chance", ParameterType::INT, 0.0f, 100.0f, 100.0f, "Chance"));
+    
+    return params;
+}
+
+std::vector<ParameterDescriptor> TrackerSequencer::getAvailableParameters(const std::vector<ParameterDescriptor>& externalParams) const {
+    std::vector<ParameterDescriptor> params;
+    
+    // Start with internal parameters
+    auto internalParams = getInternalParameters();
+    params.insert(params.end(), internalParams.begin(), internalParams.end());
+    
+    // Add external parameters if provided
+    if (!externalParams.empty()) {
+        // Filter out any internal parameters that might be in external params (safety check)
+        auto internalParamNames = getInternalParameters();
+        std::set<std::string> internalNames;
+        for (const auto& param : internalParamNames) {
+            internalNames.insert(param.name);
+        }
+        
+        // Use a map to deduplicate by name (external params take precedence over hardcoded defaults)
+        std::map<std::string, ParameterDescriptor> uniqueParams;
+        
+        // First add hardcoded defaults (for backward compatibility when external params don't cover them)
+        uniqueParams["position"] = ParameterDescriptor("position", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Position");
+        uniqueParams["speed"] = ParameterDescriptor("speed", ParameterType::FLOAT, -10.0f, 10.0f, 1.0f, "Speed");
+        uniqueParams["volume"] = ParameterDescriptor("volume", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Volume");
+        
+        // Then add external params (will overwrite hardcoded defaults if they have the same name)
+        for (const auto& param : externalParams) {
+            if (internalNames.find(param.name) == internalNames.end()) {
+                uniqueParams[param.name] = param; // External params take precedence
+            }
+        }
+        
+        // Convert map to vector
+        for (const auto& pair : uniqueParams) {
+            params.push_back(pair.second);
+        }
+    } else {
+        // Backward compatibility: if no external params provided, return hardcoded defaults
+        // This maintains existing behavior when external params are not available
     params.push_back(ParameterDescriptor("position", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Position"));
     params.push_back(ParameterDescriptor("speed", ParameterType::FLOAT, -10.0f, 10.0f, 1.0f, "Speed"));
-    params.push_back(ParameterDescriptor("volume", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Volume")); // Default to 1.0 (normal volume)
+        params.push_back(ParameterDescriptor("volume", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Volume"));
+    }
     
     return params;
 }
@@ -1562,8 +1523,9 @@ float TrackerSequencer::getCurrentBpm() const {
 std::pair<float, float> TrackerSequencer::getParameterRange(const std::string& paramName) {
     // MODULAR: Use getAvailableParameters() to get ranges dynamically
     // Create temporary instance to call getAvailableParameters() (it's non-static but doesn't depend on instance state)
+    // Note: Static helper uses empty external params (backward compatibility - returns hardcoded defaults)
     static TrackerSequencer tempInstance;
-    auto params = tempInstance.getAvailableParameters();
+    auto params = tempInstance.getAvailableParameters({});
     for (const auto& param : params) {
         if (param.name == paramName) {
             return std::make_pair(param.minValue, param.maxValue);
@@ -1578,8 +1540,9 @@ std::pair<float, float> TrackerSequencer::getParameterRange(const std::string& p
 float TrackerSequencer::getParameterDefault(const std::string& paramName) {
     // MODULAR: Use getAvailableParameters() to get defaults dynamically
     // Create temporary instance to call getAvailableParameters() (it's non-static but doesn't depend on instance state)
+    // Note: Static helper uses empty external params (backward compatibility - returns hardcoded defaults)
     static TrackerSequencer tempInstance;
-    auto params = tempInstance.getAvailableParameters();
+    auto params = tempInstance.getAvailableParameters({});
     for (const auto& param : params) {
         if (param.name == paramName) {
             return param.defaultValue;
@@ -1591,8 +1554,9 @@ float TrackerSequencer::getParameterDefault(const std::string& paramName) {
 
 // MODULAR: Get parameter type dynamically from getAvailableParameters()
 ParameterType TrackerSequencer::getParameterType(const std::string& paramName) {
+    // Note: Static helper uses empty external params (backward compatibility - returns hardcoded defaults)
     static TrackerSequencer tempInstance;
-    auto params = tempInstance.getAvailableParameters();
+    auto params = tempInstance.getAvailableParameters({});
     for (const auto& param : params) {
         if (param.name == paramName) {
             return param.type;
@@ -1877,38 +1841,40 @@ void TrackerSequencer::setPatternChainEntryDisabled(int chainIndex, bool disable
     ofLogVerbose("TrackerSequencer") << "Set chain entry " << chainIndex << " disabled: " << (disabled ? "true" : "false");
 }
 
-// ParameterCell adapter methods - bridge PatternCell to ParameterCell
+// CellWidget adapter methods - bridge PatternCell to CellWidget
 //--------------------------------------------------------------
-ParameterCell TrackerSequencer::createParameterCellForColumn(int step, int column) {
-    if (!isValidStep(step) || column <= 0 || column > (int)columnConfig.size()) {
-        return ParameterCell(); // Return empty cell for invalid input
+CellWidget TrackerSequencer::createParameterCellForColumn(int step, int column) {
+    // column is absolute column index (0=step number, 1+=parameter columns)
+    // For parameter columns, convert to 0-based index: colIdx = column - 1
+    if (!isValidStep(step) || column <= 0) {
+        return CellWidget(); // Return empty cell for invalid step or step number column (column=0)
     }
     
-    int colIdx = column - 1;
+    const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
+    int colIdx = column - 1;  // Convert absolute column index to parameter column index
     if (colIdx < 0 || colIdx >= (int)columnConfig.size()) {
-        return ParameterCell();
+        return CellWidget();
     }
     
     const auto& col = columnConfig[colIdx];
-    ParameterCell cell;
+    CellWidget cell;
     
     // Configure basic properties
     cell.parameterName = col.parameterName;
-    cell.isFixed = col.isFixed;
-    if (col.isFixed) {
-        cell.fixedType = col.parameterName; // "index" or "length"
-        // Fixed columns are always integers
+    cell.isRemovable = col.isRemovable; // Columns (index, length) cannot be removed
+    if (!col.isRemovable) {
+        // Required columns (index, length) are always integers
         cell.isInteger = true;
         cell.stepIncrement = 1.0f;
     }
     
     // Set value range based on column type
-    if (col.isFixed && col.parameterName == "index") {
+    if (!col.isRemovable && col.parameterName == "index") {
         // Index column: 0 = rest, 1+ = media index (1-based display)
         int maxIndex = indexRangeCallback ? indexRangeCallback() : 127;
         cell.setValueRange(0.0f, (float)maxIndex, 0.0f);
         cell.getMaxIndex = [this]() { return indexRangeCallback ? indexRangeCallback() : 127; };
-    } else if (col.isFixed && col.parameterName == "length") {
+    } else if (!col.isRemovable && col.parameterName == "length") {
         // Length column: 1-16 range
         cell.setValueRange(1.0f, 16.0f, 1.0f);
     } else {
@@ -1931,25 +1897,28 @@ ParameterCell TrackerSequencer::createParameterCellForColumn(int step, int colum
     return cell;
 }
 
-void TrackerSequencer::configureParameterCellCallbacks(ParameterCell& cell, int step, int column) {
-    if (!isValidStep(step) || column <= 0 || column > (int)columnConfig.size()) {
-        return;
+void TrackerSequencer::configureParameterCellCallbacks(CellWidget& cell, int step, int column) {
+    // column is absolute column index (0=step number, 1+=parameter columns)
+    // For parameter columns, convert to 0-based index: colIdx = column - 1
+    if (!isValidStep(step) || column <= 0) {
+        return;  // Invalid step or step number column (column=0)
     }
     
-    int colIdx = column - 1;
+    const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
+    int colIdx = column - 1;  // Convert absolute column index to parameter column index
     if (colIdx < 0 || colIdx >= (int)columnConfig.size()) {
         return;
     }
     
     const auto& col = columnConfig[colIdx];
     std::string paramName = col.parameterName; // Capture by value for lambda
-    bool isFixedCol = col.isFixed; // Capture by value
-    std::string fixedTypeCol = col.isFixed ? col.parameterName : ""; // Capture by value
+    bool isRequiredCol = !col.isRemovable; // Capture by value
+    std::string requiredTypeCol = !col.isRemovable ? col.parameterName : ""; // Capture by value
     
     // getCurrentValue callback - returns current value from PatternCell
     // Returns NaN to indicate empty/not set (will display as "--")
     // Unified system: all empty values (Index, Length, dynamic parameters) use NaN
-    cell.getCurrentValue = [this, step, paramName, isFixedCol, fixedTypeCol]() -> float {
+    cell.getCurrentValue = [this, step, paramName, isRequiredCol, requiredTypeCol]() -> float {
         if (!isValidStep(step)) {
             // Return NaN for invalid step (will display as "--")
             return std::numeric_limits<float>::quiet_NaN();
@@ -1957,11 +1926,11 @@ void TrackerSequencer::configureParameterCellCallbacks(ParameterCell& cell, int 
         
         auto& patternCell = getCurrentPattern()[step];
         
-        if (isFixedCol && fixedTypeCol == "index") {
+        if (isRequiredCol && requiredTypeCol == "index") {
             // Index: return NaN when empty (index <= 0), otherwise return 1-based display value
             int idx = patternCell.index;
             return (idx < 0) ? std::numeric_limits<float>::quiet_NaN() : (float)(idx + 1);
-        } else if (isFixedCol && fixedTypeCol == "length") {
+        } else if (isRequiredCol && requiredTypeCol == "length") {
             // Length: return NaN when index < 0 (rest), otherwise return length
             if (patternCell.index < 0) {
                 return std::numeric_limits<float>::quiet_NaN(); // Use NaN instead of -1.0f
@@ -1979,7 +1948,7 @@ void TrackerSequencer::configureParameterCellCallbacks(ParameterCell& cell, int 
     };
     
     // onValueApplied callback - applies value to PatternCell
-    cell.onValueApplied = [this, step, colIdx, paramName, isFixedCol, fixedTypeCol](const std::string&, float value) {
+    cell.onValueApplied = [this, step, colIdx, paramName, isRequiredCol, requiredTypeCol](const std::string&, float value) {
         if (!isValidStep(step)) return;
         
         // Check if we should queue this edit (playback editing)
@@ -1993,13 +1962,13 @@ void TrackerSequencer::configureParameterCellCallbacks(ParameterCell& cell, int 
             pendingEdit.column = colIdx + 1;
             pendingEdit.parameterName = paramName;
             
-            if (isFixedCol && fixedTypeCol == "index") {
+            if (isRequiredCol && requiredTypeCol == "index") {
                 // Index: value is 1-based display, convert to 0-based storage
                 // 0 = rest (-1), 1+ = media index (0-based)
                 int indexValue = (int)std::round(value);
                 pendingEdit.isIndex = true;
                 pendingEdit.indexValue = (indexValue == 0) ? -1 : (indexValue - 1);
-            } else if (isFixedCol && fixedTypeCol == "length") {
+            } else if (isRequiredCol && requiredTypeCol == "length") {
                 // Length: clamp to 1-16
                 int lengthValue = std::max(1, std::min(16, (int)std::round(value)));
                 pendingEdit.isLength = true;
@@ -2012,11 +1981,11 @@ void TrackerSequencer::configureParameterCellCallbacks(ParameterCell& cell, int 
         } else {
             // Apply immediately
             auto& patternCell = getCurrentPattern()[step];
-            if (isFixedCol && fixedTypeCol == "index") {
+            if (isRequiredCol && requiredTypeCol == "index") {
                 // Index: value is 1-based display, convert to 0-based storage
                 int indexValue = (int)std::round(value);
                 patternCell.index = (indexValue == 0) ? -1 : (indexValue - 1);
-            } else if (isFixedCol && fixedTypeCol == "length") {
+            } else if (isRequiredCol && requiredTypeCol == "length") {
                 // Length: clamp to 1-16
                 patternCell.length = std::max(1, std::min(16, (int)std::round(value)));
             } else {
@@ -2028,7 +1997,7 @@ void TrackerSequencer::configureParameterCellCallbacks(ParameterCell& cell, int 
     };
     
     // onValueRemoved callback - removes parameter from PatternCell
-    cell.onValueRemoved = [this, step, colIdx, paramName, isFixedCol](const std::string&) {
+    cell.onValueRemoved = [this, step, colIdx, paramName, isRequiredCol, requiredTypeCol](const std::string&) {
         if (!isValidStep(step)) return;
         
         // Check if we should queue this edit (playback editing)
@@ -2043,8 +2012,18 @@ void TrackerSequencer::configureParameterCellCallbacks(ParameterCell& cell, int 
             pendingEdit.parameterName = paramName;
             pendingEdit.shouldRemove = true;
         } else {
-            // Remove immediately (only for dynamic parameters)
-            if (!isFixedCol) {
+            // Remove immediately (only for removable parameters)
+            if (isRequiredCol) {
+                // Required columns (index, length) cannot be removed - reset to default
+                auto& patternCell = getCurrentPattern()[step];
+                if (requiredTypeCol == "index") {
+                    patternCell.index = -1; // Rest
+                } else if (requiredTypeCol == "length") {
+                    patternCell.length = 1; // Default length
+                }
+                setCell(step, patternCell);
+            } else {
+                // Removable parameter - remove it
                 auto& patternCell = getCurrentPattern()[step];
                 patternCell.removeParameter(paramName);
                 setCell(step, patternCell);
@@ -2052,17 +2031,70 @@ void TrackerSequencer::configureParameterCellCallbacks(ParameterCell& cell, int 
         }
     };
     
-    // formatValue callback - uses TrackerSequencer's formatting (static method)
-    // Only set for dynamic parameters - fixed columns (Index, Length) use ParameterCell's built-in formatting
-    if (!isFixedCol) {
+    // formatValue callback - tracker-specific formatting for all columns
+    if (isRequiredCol && requiredTypeCol == "index") {
+        // Index column: 1-based display (01-99), NaN = rest
+        cell.formatValue = [](float value) -> std::string {
+            if (std::isnan(value)) {
+                return "--"; // Show "--" for NaN (empty/rest)
+            }
+            int indexVal = (int)std::round(value);
+            if (indexVal <= 0) {
+                return "--"; // Also handle edge case
+            }
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%02d", indexVal);
+            return std::string(buf);
+        };
+    } else if (isRequiredCol && requiredTypeCol == "length") {
+        // Length column: 1-16 range, formatted as "02", NaN = not set
+        cell.formatValue = [](float value) -> std::string {
+            if (std::isnan(value)) {
+                return "--"; // Show "--" for NaN (empty/not set)
+            }
+            int lengthVal = (int)std::round(value);
+            lengthVal = std::max(1, std::min(16, lengthVal)); // Clamp to 1-16
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%02d", lengthVal); // Zero-padded to 2 digits
+            return std::string(buf);
+        };
+    } else {
+        // Dynamic parameter: use TrackerSequencer's formatting
         cell.formatValue = [paramName](float value) -> std::string {
             return formatParameterValue(paramName, value);
         };
     }
     
-    // parseValue callback - uses default parsing (can be enhanced if needed)
-    // ParameterCell already has default parsing, so we can leave this unset
-    // or provide custom parsing if needed
+    // parseValue callback - tracker-specific parsing for index/length
+    if (isRequiredCol && requiredTypeCol == "index") {
+        // Index: parse as integer, handle "--" as NaN
+        cell.parseValue = [](const std::string& str) -> float {
+            if (str == "--" || str.empty()) {
+                return std::numeric_limits<float>::quiet_NaN();
+            }
+            try {
+                int val = std::stoi(str);
+                return (float)val;
+            } catch (...) {
+                return std::numeric_limits<float>::quiet_NaN();
+            }
+        };
+    } else if (isRequiredCol && requiredTypeCol == "length") {
+        // Length: parse as integer (1-16), handle "--" as NaN
+        cell.parseValue = [](const std::string& str) -> float {
+            if (str == "--" || str.empty()) {
+                return std::numeric_limits<float>::quiet_NaN();
+            }
+            try {
+                int val = std::stoi(str);
+                val = std::max(1, std::min(16, val)); // Clamp to 1-16
+                return (float)val;
+            } catch (...) {
+                return std::numeric_limits<float>::quiet_NaN();
+            }
+        };
+    }
+    // Dynamic parameters use ParameterCell's default parsing (expression evaluation)
 }
 
 

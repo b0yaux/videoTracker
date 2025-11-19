@@ -3,6 +3,7 @@
 #include "TrackerSequencer.h"
 #include "Pattern.h"
 #include "gui/ModuleGUI.h"
+#include "gui/CellGrid.h"
 
 // Forward declarations for ImGui types
 typedef unsigned int ImGuiID;
@@ -66,12 +67,13 @@ private:
     bool patternDirty;
     int lastNumSteps;
     int lastPlaybackStep;
+    int lastPatternIndex;  // Track pattern index to detect pattern switches
     
     // Track if any cell is focused during drawing (to detect header row focus)
     bool anyCellFocusedThisFrame;
     
-    // Store parent widget ID for navigation (widget created before table)
-    ImGuiID parentWidgetId;
+    // Track last editStep for auto-scroll detection
+    int lastEditStepForScroll = -1;
     
     // Row outline tracking for step number hover
     struct RowOutlineState {
@@ -85,20 +87,14 @@ private:
     };
     RowOutlineState pendingRowOutline;
     
+    // CellGrid instance for reusable table rendering
+    CellGrid cellGrid;
+    
     // Drawing methods
     void drawPatternChain(TrackerSequencer& sequencer);
     void drawTrackerStatus(TrackerSequencer& sequencer);
     void drawPatternGrid(TrackerSequencer& sequencer);
-    void drawPatternRow(TrackerSequencer& sequencer, int step, bool isPlaybackStep, bool isEditStep,
-                       bool isPlaying, int currentPlayingStep,
-                       int maxIndex, const std::map<std::string, std::pair<float, float>>& paramRanges,
-                       const std::map<std::string, float>& paramDefaults,
-                       int cachedEditStep, int cachedEditColumn, bool cachedIsEditingCell);
     void drawStepNumber(TrackerSequencer& sequencer, int step, bool isPlaybackStep,
                        bool isPlaying, int currentPlayingStep);
-    void drawParameterCell(TrackerSequencer& sequencer, int step, int colConfigIndex,
-                          int maxIndex, const std::map<std::string, std::pair<float, float>>& paramRanges,
-                          const std::map<std::string, float>& paramDefaults,
-                          int cachedEditStep, int cachedEditColumn, bool cachedIsEditingCell);
 };
 

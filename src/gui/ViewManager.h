@@ -27,6 +27,35 @@ enum class Panel {
     COUNT = 6
 };
 
+/**
+ * ViewManager - Manages view/presentation layer and panel rendering
+ * 
+ * RESPONSIBILITY: View rendering, panel navigation, and view state management
+ * 
+ * Responsibilities:
+ * - Render all panels (Clock, Audio Output, Tracker, Media Pool, File Browser, Console)
+ * - Manage panel navigation (switching between panels)
+ * - Manage focus state (which panel has keyboard focus)
+ * - Manage panel visibility for utility panels (FileBrowser, Console)
+ * - Audio device selection UI and state (audio device list, selection)
+ * - Audio volume/level visualization (UI only, actual audio processing in ofApp)
+ * 
+ * Separation of Concerns:
+ * - ModuleFactory: Creates modules and manages identity
+ * - ModuleRegistry: Stores and retrieves modules
+ * - GUIManager: Creates/destroys GUI objects, manages instance visibility
+ * - ViewManager: Renders panels, manages panel navigation/focus, audio UI state
+ * - ofApp: Audio processing, global volume application, audio level calculation
+ * 
+ * Note: ViewManager manages audio UI state (device selection, volume slider, level display)
+ *       but actual audio processing happens in ofApp. ViewManager is view-only.
+ * 
+ * Usage Flow:
+ *   1. ofApp calls viewManager.draw() each frame
+ *   2. ViewManager gets GUI objects from GUIManager
+ *   3. ViewManager renders each panel based on current panel state
+ *   4. User interactions update view state (panel selection, focus, visibility)
+ */
 class ViewManager {
 public:
     ViewManager();
@@ -143,7 +172,7 @@ private:
     // Helper to set focus when panel changes (not every frame)
     void setFocusIfChanged();
     
-    // Helper to draw outline around focused windows
-    void drawFocusedWindowOutline(float thickness = GUIConstants::Outline::FocusThickness);
+    // Helper to draw outline around windows (focused or unfocused)
+    void drawWindowOutline();
 };
 

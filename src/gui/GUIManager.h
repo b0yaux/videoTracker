@@ -10,16 +10,38 @@
 #include <string>
 #include <vector>
 
+// Forward declaration
+class ParameterRouter;
+
 /**
  * GUIManager - Manages GUI object lifecycle, one per module instance
  * 
+ * RESPONSIBILITY: GUI object lifecycle and instance visibility management
+ * 
  * Responsibilities:
- * - Create GUI objects when modules are registered
- * - Destroy GUI objects when modules are removed
- * - Maintain mapping: instance name → GUI object
- * - Provide GUI objects to ViewManager
+ * - Create GUI objects (MediaPoolGUI, TrackerSequencerGUI) when modules are registered
+ * - Destroy GUI objects when modules are removed from registry
+ * - Maintain mapping: instance name → GUI object (one GUI per module instance)
+ * - Manage instance visibility state (which module instances should be displayed)
+ * - Provide GUI objects to ViewManager for rendering
+ * 
+ * Separation of Concerns:
+ * - ModuleFactory: Creates modules and manages identity (UUID/name)
+ * - ModuleRegistry: Stores and retrieves modules
+ * - GUIManager: Creates/destroys GUI objects, manages instance visibility
+ * - ViewManager: Renders panels, manages panel navigation and focus
  * 
  * Pattern: Similar to TouchDesigner/Max/MSP where each node/object has its own panel
+ * 
+ * Usage Flow:
+ *   1. ModuleRegistry registers a new module
+ *   2. GUIManager.syncWithRegistry() detects new module
+ *   3. GUIManager creates appropriate GUI object (MediaPoolGUI or TrackerSequencerGUI)
+ *   4. ViewManager calls GUIManager to get GUI objects for rendering
+ *   5. When module is removed, GUIManager.syncWithRegistry() destroys GUI object
+ * 
+ * Note: Instance visibility (which instances to show) is managed here.
+ *       Panel visibility (FileBrowser, Console) is managed by ViewManager.
  */
 class GUIManager {
 public:
@@ -30,6 +52,16 @@ public:
      * Set the module registry (must be called before syncWithRegistry)
      */
     void setRegistry(ModuleRegistry* registry);
+    
+    /**
+     * Set the parameter router (for connection-based parameter discovery)
+     */
+    void setParameterRouter(ParameterRouter* router);
+    
+    /**
+     * Get the parameter router
+     */
+    ParameterRouter* getParameterRouter() const { return parameterRouter; }
     
     /**
      * Sync GUI objects with registry (create/destroy as needed)
@@ -86,6 +118,7 @@ public:
 
 private:
     ModuleRegistry* registry = nullptr;
+    ParameterRouter* parameterRouter = nullptr;
     
     // One GUI object per instance
     std::map<std::string, std::unique_ptr<MediaPoolGUI>> mediaPoolGUIs;

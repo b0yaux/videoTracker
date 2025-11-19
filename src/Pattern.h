@@ -6,6 +6,18 @@
 #include <vector>
 #include <map>
 
+// Column configuration for pattern grid
+struct ColumnConfig {
+    std::string parameterName;      // e.g., "position", "speed", "volume" (or "index", "length" for required)
+    std::string displayName;        // e.g., "Position", "Speed", "Volume"
+    bool isRemovable;               // true if column can be deleted (default: true). false for required columns like index/length
+    int columnIndex;                // Position in grid (0 = first column)
+    
+    ColumnConfig() : parameterName(""), displayName(""), isRemovable(true), columnIndex(0) {}
+    ColumnConfig(const std::string& param, const std::string& display, bool removable, int idx)
+        : parameterName(param), displayName(display), isRemovable(removable), columnIndex(idx) {}
+};
+
 // PatternCell represents a single step in a tracker pattern
 struct PatternCell {
     // Fixed fields (always present)
@@ -74,12 +86,23 @@ public:
     PatternCell& operator[](int step) { return cells[step]; }
     const PatternCell& operator[](int step) const { return cells[step]; }
     
+    // Column configuration management (per-pattern)
+    void initializeDefaultColumns();
+    void addColumn(const std::string& parameterName, const std::string& displayName, int position = -1);
+    void removeColumn(int columnIndex);
+    void reorderColumn(int fromIndex, int toIndex);
+    void swapColumnParameter(int columnIndex, const std::string& newParameterName, const std::string& newDisplayName = "");
+    const ColumnConfig& getColumnConfig(int columnIndex) const;
+    int getColumnCount() const;
+    const std::vector<ColumnConfig>& getColumnConfiguration() const { return columnConfig; }
+    
     // Serialization
     ofJson toJson() const;
     void fromJson(const ofJson& json);
     
 private:
     std::vector<PatternCell> cells;
+    std::vector<ColumnConfig> columnConfig;  // Per-pattern column configuration
     
     bool isValidStep(int step) const {
         return step >= 0 && step < (int)cells.size();

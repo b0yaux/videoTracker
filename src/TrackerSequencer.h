@@ -4,7 +4,7 @@
 #include "ofEvents.h"
 #include "Module.h"
 #include "Pattern.h"
-#include "ParameterCell.h"
+#include "CellWidget.h"
 #include "ofJson.h"
 #include <string>
 #include <vector>
@@ -47,9 +47,12 @@ public:
     void setParameter(const std::string& paramName, float value, bool notify = true) override;
     
     // Expose TrackerSequencer parameters (for discovery by modules)
-    // TrackerSequencer exposes its own parameters (note, position, speed, volume)
-    // Modules map these to their own parameters (e.g., note → mediaIndex)
-    std::vector<ParameterDescriptor> getAvailableParameters() const;
+    // Internal parameters: sequencer-specific (note, chance) - not sent to external modules
+    std::vector<ParameterDescriptor> getInternalParameters() const;
+    // Combined: internal + external parameters
+    // externalParams: optional list of external parameters from connected modules (provided by GUI layer)
+    // If not provided, returns internal parameters + hardcoded defaults for backward compatibility
+    std::vector<ParameterDescriptor> getAvailableParameters(const std::vector<ParameterDescriptor>& externalParams = {}) const;
     
     // Transport listener for Clock play/stop events
     void onClockTransportChanged(bool isPlaying);
@@ -160,7 +163,7 @@ public:
     PatternCell& getPatternCell(int step) { return getCurrentPattern()[step]; }
     const PatternCell& getPatternCell(int step) const { return getCurrentPattern()[step]; }
     
-    // Drag state accessors for GUI (still needed for ParameterCell interaction)
+    // Drag state accessors for GUI (still needed for CellWidget interaction)
     float getDragStartY() const { return dragStartY; }
     float getDragStartX() const { return dragStartX; }
     float getLastDragValue() const { return lastDragValue; }
@@ -175,14 +178,14 @@ public:
     // Setters
     void setStepsPerBeat(int steps);
     
-    // Parameter synchronization methods (for ParameterSync system)
+    // Parameter synchronization methods (for ParameterRouter system)
     // Get position parameter from current edit step (for sync)
     float getCurrentStepPosition() const;
     
     // Set position parameter for current edit step (for sync)
     void setCurrentStepPosition(float position);
     
-    // Parameter change callback (for ParameterSync)
+    // Parameter change callback (for ParameterRouter)
     void setParameterChangeCallback(std::function<void(const std::string&, float)> callback) {
         parameterChangeCallback = callback;
     }
@@ -193,27 +196,26 @@ private:
     void notifyStepEvent(int step, float stepLength);
     void updateStepInterval();
     
-    // Column configuration
-    struct ColumnConfig {
-        std::string parameterName;      // e.g., "position", "speed", "volume" (or "index", "length" for fixed)
-        std::string displayName;        // e.g., "Position", "Speed", "Volume"
-        bool isFixed;                   // true for "index" and "length" columns (cannot be deleted)
-        int columnIndex;                // Position in grid (0 = first column)
-        
-        ColumnConfig() : parameterName(""), displayName(""), isFixed(false), columnIndex(0) {}
-        ColumnConfig(const std::string& param, const std::string& display, bool fixed, int idx)
-            : parameterName(param), displayName(display), isFixed(fixed), columnIndex(idx) {}
-    };
-    
-    // Column configuration management
-    void initializeDefaultColumns();
-    void addColumn(const std::string& parameterName, const std::string& displayName, int position = -1);
-    void removeColumn(int columnIndex);
-    void reorderColumn(int fromIndex, int toIndex);
-    bool isColumnFixed(int columnIndex) const;
-    const ColumnConfig& getColumnConfig(int columnIndex) const;
-    int getColumnCount() const;
-    const std::vector<ColumnConfig>& getColumnConfiguration() const { return columnConfig; }  // GUI compatibility
+    // Column configuration management (delegates to current pattern)
+    // Column configuration is now stored per-pattern in Pattern class
+    // Note: ColumnConfig is defined at namespace scope in Pattern.h
+    using ColumnConfig = ::ColumnConfig;  // Alias for backward compatibility (ColumnConfig is in global namespace from Pattern.h)
+    void initializeDefaultColumns() { getCurrentPattern().initializeDefaultColumns(); }
+    void addColumn(const std::string& parameterName, const std::string& displayName, int position = -1) {
+        getCurrentPattern().addColumn(parameterName, displayName, position);
+    }
+    void removeColumn(int columnIndex) { getCurrentPattern().removeColumn(columnIndex); }
+    void reorderColumn(int fromIndex, int toIndex) { getCurrentPattern().reorderColumn(fromIndex, toIndex); }
+    void swapColumnParameter(int columnIndex, const std::string& newParameterName, const std::string& newDisplayName = "") {
+        getCurrentPattern().swapColumnParameter(columnIndex, newParameterName, newDisplayName);
+    }
+    bool isColumnFixed(int columnIndex) const {
+        const auto& col = getCurrentPattern().getColumnConfig(columnIndex);
+        return !col.isRemovable;
+    }
+    const ColumnConfig& getColumnConfig(int columnIndex) const { return getCurrentPattern().getColumnConfig(columnIndex); }
+    int getColumnCount() const { return getCurrentPattern().getColumnCount(); }
+    const std::vector<ColumnConfig>& getColumnConfiguration() const { return getCurrentPattern().getColumnConfiguration(); }
     
     // Pattern interaction methods
     bool handlePatternGridClick(int x, int y);
@@ -226,9 +228,6 @@ private:
     static std::string formatParameterValue(const std::string& paramName, float value); // Format based on parameter type
     
     Clock* clock;
-    
-    // Column configuration
-    std::vector<ColumnConfig> columnConfig;
     
     // Pattern sequencer state (app-specific)
     int stepsPerBeat = 4;
@@ -283,7 +282,7 @@ private:
     
     // Note: Cell focus management flags removed - these are GUI concerns managed by TrackerSequencerGUI
     
-    // Parameter change callback (for ParameterSync system)
+    // Parameter change callback (for ParameterRouter system)
     std::function<void(const std::string&, float)> parameterChangeCallback;
     
     // Pending edit system for playback editing
@@ -310,12 +309,12 @@ private:
     // Note: GUI state parameters added - editStep and editColumn are now passed in
     bool shouldQueueEdit(int editStep, int editColumn) const;
     
-    // ParameterCell adapter methods - bridge PatternCell to ParameterCell
-    // Creates and configures a ParameterCell for a specific step/column
-    ParameterCell createParameterCellForColumn(int step, int column);
+    // CellWidget adapter methods - bridge PatternCell to CellWidget
+    // Creates and configures a CellWidget for a specific step/column
+    CellWidget createParameterCellForColumn(int step, int column);
     
-    // Configures callbacks for a ParameterCell to connect to PatternCell operations
-    void configureParameterCellCallbacks(ParameterCell& cell, int step, int column);
+    // Configures callbacks for a CellWidget to connect to PatternCell operations
+    void configureParameterCellCallbacks(CellWidget& cell, int step, int column);
 };
 
 
