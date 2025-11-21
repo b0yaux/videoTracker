@@ -18,11 +18,8 @@ void MediaPlayer::setup() {
     // Setup video player
     videoPlayer.setName("Video Player");
     
-    // Setup HSV adjustment processor
+    // Setup HSV adjustment processor (always initialized, but only connected when video is loaded)
     hsvAdjust.setName("HSV Adjust");
-    
-    // Connect video player to HSV processor
-    videoPlayer.connectTo(hsvAdjust);
     
     // Setup synchronized parameters
     playheadPosition.set("Playhead position", 0.0f, 0.0f, 1.0f);  // Current playhead position (updates during playback)
@@ -158,6 +155,15 @@ bool MediaPlayer::loadVideo(const std::string& videoPath) {
         
         if (success) {
             videoFilePath = videoPath;
+            
+            // Connect video player to HSV processor (only when video is loaded)
+            videoPlayer.connectTo(hsvAdjust);
+            
+            // Sync HSV parameters
+            hsvAdjust.brightness.set(brightness.get());
+            hsvAdjust.hue.set(hue.get());
+            hsvAdjust.saturation.set(saturation.get());
+            
             ofLogNotice("ofxMediaPlayer") << "Video loaded successfully: " << videoPath;
         } else {
             ofLogError("ofxMediaPlayer") << "Failed to load video: " << videoPath;
@@ -438,12 +444,14 @@ void MediaPlayer::update() {
         
         // Process visual chain: videoPlayer -> hsvAdjust
         // This ensures HSV adjustments are applied even when paused
-        ofFbo emptyInput;
-        videoPlayer.process(emptyInput, videoPlayer.getOutputBuffer());
-        
-        ofFbo& videoOutput = videoPlayer.getOutputBuffer();
-        if (videoOutput.isAllocated()) {
-            hsvAdjust.process(videoOutput, hsvAdjust.getOutputBuffer());
+        if (isVideoLoaded()) {
+            ofFbo emptyInput;
+            videoPlayer.process(emptyInput, videoPlayer.getOutputBuffer());
+            
+            ofFbo& videoOutput = videoPlayer.getOutputBuffer();
+            if (videoOutput.isAllocated()) {
+                hsvAdjust.process(videoOutput, hsvAdjust.getOutputBuffer());
+            }
         }
     }
     

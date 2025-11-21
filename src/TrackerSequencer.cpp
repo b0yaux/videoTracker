@@ -3,7 +3,7 @@
 #include "Module.h"
 #include "ofLog.h"
 #include "ofJson.h"
-#include "ofxImGui.h"  // Add this line for ImGui support
+#include <imgui.h>
 #include <cmath>  // For std::round
 #include <limits>  // For std::numeric_limits
 #include <set>

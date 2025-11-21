@@ -1,5 +1,5 @@
 #pragma once
-#include "ofxImGui.h"
+#include <imgui.h>
 #include "ofxSoundObjects.h"
 #include "CellWidget.h"
 #include "Module.h"  // For ParameterDescriptor

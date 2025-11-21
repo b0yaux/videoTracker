@@ -8,7 +8,6 @@
 
 #pragma once
 
-#include "ofxImGui.h"
 #include <imgui.h>
 
 namespace GUIConstants {
@@ -160,7 +159,7 @@ namespace GUIConstants {
         constexpr ImVec4 GrabActive = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
         constexpr float Size = 5.0f; // Scrollbar width (default ImGui is 16.0f)
     }
-   
+    
     // ============================================================================
     // TAB COLORS
     // ============================================================================

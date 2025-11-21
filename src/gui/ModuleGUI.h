@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ofxImGui.h"
+#include <imgui.h>
 #include <string>
 #include <vector>
 #include <map>

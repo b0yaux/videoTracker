@@ -437,6 +437,9 @@ void ofApp::exit() {
         ofLogNotice("ofApp") << "Session saved to file";
     }
     
+    // Cleanup ImGui (wrapper handles ImPlot and ImGui cleanup)
+    gui.shutdown();
+    
     clock.stop();
     soundStream.close();
 }
@@ -500,7 +503,8 @@ void ofApp::mousePressed(int x, int y, int button) {
 
 //--------------------------------------------------------------
 void ofApp::windowResized(int w, int h) {
-    // Window resize handled by ImGui docking automatically
+    // ImGuiIntegration wrapper handles window resize automatically via event listeners
+    gui.onWindowResized(w, h);
     
     // Update visual output dimensions
     visualOutput.width.set(w);
@@ -650,21 +654,27 @@ void ofApp::setupVisualObjects() {
 
 //--------------------------------------------------------------
 void ofApp::setupGUI() {
-    // Setup ImGui with docking enabled and proper ini file handling
+    // Setup ImGui with docking enabled and ini file handling
+    // ImGuiIntegration wrapper handles window context automatically
+    // Note: wrapper's setup() takes 3 params: (window, autoDraw, flags)
+    // The 4th param (restoreGuiState) is handled automatically via ini file
     gui.setup(nullptr, true, ImGuiConfigFlags_DockingEnable);
     
-    // Initialize ImPlot
-    ImPlot::CreateContext();
-    
-    // Set ini filename for auto-loading on startup
+    // Set ini filename for auto-loading on startup (wrapper sets default, but we can override)
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = "imgui.ini";
     
-    // Set up ImGui with keyboard navigation
+    // Enable keyboard navigation
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    
+    // Note: ImPlot context is created automatically by ImGuiIntegration::setup()
+    // No need to call ImPlot::CreateContext() here
 
     // Apply centralized color theme
     GUIConstants::applyImGuiStyle();
+    
+    // Log ImGui version for verification
+    ofLogNotice("ofApp") << "ImGui Version: " << ImGui::GetVersion();
 }
 
 //--------------------------------------------------------------

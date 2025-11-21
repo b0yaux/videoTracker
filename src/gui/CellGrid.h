@@ -4,7 +4,7 @@
 #include "Module.h"  // For ParameterDescriptor
 #include "CellWidget.h"
 #include "gui/HeaderPopup.h"
-#include "ofxImGui.h"
+#include <imgui.h>
 #include <string>
 #include <vector>
 #include <functional>

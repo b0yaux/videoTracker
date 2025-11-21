@@ -5,7 +5,7 @@
 //
 
 #include "Clock.h"
-#include "ofxImGui.h"
+#include <imgui.h>
 #include "ofJson.h"
 
 //--------------------------------------------------------------

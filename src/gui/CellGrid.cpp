@@ -187,7 +187,12 @@ void CellGrid::beginTable(int numRows, int numFixedColumns) {
         // Setup parameter columns
         setupParameterColumns();
     } else {
+        // BeginTable failed - need to pop style vars that were pushed
         tableStarted = false;
+        if (scrollingEnabled) {
+            ImGui::PopStyleVar(); // Pop ScrollbarSize
+        }
+        ImGui::PopStyleVar(2); // Pop CellPadding and ItemSpacing
     }
 }
 

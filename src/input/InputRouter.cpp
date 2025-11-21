@@ -6,7 +6,7 @@
 #include "MediaPool.h"
 #include "MediaPoolGUI.h"
 #include "gui/Console.h"
-#include "ofxImGui.h"
+#include <imgui.h>
 #include "ofLog.h"
 
 InputRouter::InputRouter() {

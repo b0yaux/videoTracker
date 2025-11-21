@@ -10,7 +10,7 @@
 #include "FileBrowser.h"
 #include "Console.h"
 #include "ofxSoundObjects.h"
-#include "ofxImGui.h"
+#include <imgui.h>
 #include "ofSoundStream.h"
 #include "ofLog.h"
 

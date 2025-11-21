@@ -1875,6 +1875,7 @@ void MediaPoolGUI::drawPositionScanModeButton(const ImVec2& cellStartPos, float 
     ImGui::PushID("PositionScanMode");
     
     // Calculate button size and position (right-aligned in header)
+    // NOTE: We push style var AFTER calculating button width to avoid affecting the calculation
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
     float buttonWidth = ImGui::CalcTextSize(MODE_LABELS[currentModeIndex]).x + 
                         ImGui::GetStyle().FramePadding.x * 2.0f;

@@ -2,7 +2,7 @@
 
 #include "ofMain.h"
 #include "gui/GUIConstants.h"
-#include "ofxImGui.h"
+#include <imgui.h>
 #include <string>
 #include <vector>
 #include <functional>

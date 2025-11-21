@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ofxImGui.h"
+#include <imgui.h>
 #include "gui/GUIConstants.h"
 #include "MediaPlayer.h"
 #include <string>

@@ -1,6 +1,6 @@
 #include "CellWidget.h"
 #include "gui/GUIConstants.h"
-#include "ofxImGui.h"
+#include <imgui.h>
 #include "ofLog.h"
 #include <cmath>
 #include <algorithm>

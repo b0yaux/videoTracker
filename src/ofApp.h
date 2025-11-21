@@ -17,9 +17,9 @@
 #include "Pattern.h"
 #include "Clock.h"
 #include "ClockGUI.h"
-#include "ofxImGui.h"
-#include "imgui_internal.h" // For DockBuilder API
-#include "implot.h"
+#include "ImGuiIntegration.h"  // Direct ImGui integration wrapper (replaces ofxImGui)
+#include <imgui_internal.h> // For DockBuilder API (now resolves to addons/imgui/ version 1.92.5)
+#include <implot.h>
 #include "gui/MenuBar.h"
 #include "gui/ViewManager.h"
 #include "gui/GUIManager.h"
@@ -88,8 +88,8 @@ private:
     ofSoundStream soundStream;
     ofSoundBuffer soundBuffer;
     
-    // GUI system
-    ofxImGui::Gui gui;
+    // GUI system (using direct ImGui integration via wrapper)
+    ImGuiIntegration gui;
     
     // GUI managers
     MenuBar menuBar;

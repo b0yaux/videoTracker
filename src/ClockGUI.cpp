@@ -1,5 +1,5 @@
 #include "ClockGUI.h"
-#include "ofxImGui.h"
+#include <imgui.h>
 #include "gui/GUIConstants.h"
 
 ClockGUI::ClockGUI() {

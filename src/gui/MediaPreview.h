@@ -2,7 +2,7 @@
 
 #include "MediaPlayer.h"
 #include "gui/GUIConstants.h"
-#include "ofxImGui.h"
+#include <imgui.h>
 
 /**
  * MediaPreview - Shared utilities for media preview (waveform, video thumbnail)

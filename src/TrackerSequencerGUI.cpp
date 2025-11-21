@@ -3,7 +3,7 @@
 #include "CellWidget.h"
 #include "core/ModuleRegistry.h"
 #include "gui/HeaderPopup.h"
-#include "ofxImGui.h"
+#include <imgui.h>
 #include "ofLog.h"
 #include "gui/GUIConstants.h"
 #include <cmath>  // For std::round
