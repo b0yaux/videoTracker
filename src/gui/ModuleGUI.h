@@ -26,7 +26,10 @@ public:
     virtual ~ModuleGUI() = default;
     
     // Instance management
-    void setInstanceName(const std::string& name) { instanceName = name; }
+    void setInstanceName(const std::string& name) { 
+        instanceName = name; 
+        syncEnabledState();  // Sync with backend module when name is set
+    }
     std::string getInstanceName() const { return instanceName; }
     
     // Enable/disable state
@@ -57,6 +60,10 @@ public:
     // Uses foreground draw list to draw on top of title bar decorations
     void drawTitleBarToggle();
     
+    // Override this to hide toggle for specific module types (e.g., master outputs)
+    // Returns true if toggle should be shown, false to hide it
+    virtual bool shouldShowToggle() const { return true; }
+    
     // Main draw function - draws panel content (window is created by ViewManager)
     // Subclasses should call this from their draw() method, or override drawContent()
     void draw();
@@ -82,6 +89,44 @@ public:
     // Save all default layouts to file
     static void saveDefaultLayouts();
     
+    // Get all default layouts (for serialization)
+    static std::map<std::string, ImVec2> getAllDefaultLayouts();
+    
+    // Set all default layouts (for deserialization)
+    static void setAllDefaultLayouts(const std::map<std::string, ImVec2>& layouts);
+    
+    // Generic focus and editing state interface (for Phase 7.3/7.4)
+    // Modules that support cell editing should override these methods
+    virtual bool isEditingCell() const { return false; }
+    virtual bool isKeyboardFocused() const { return false; }
+    virtual void clearCellFocus() {}
+    
+    // Generic input handling interface (for InputRouter refactoring)
+    // Modules that handle keyboard input should override this method
+    // @param key The key code
+    // @param ctrlPressed Whether Ctrl is pressed
+    // @param shiftPressed Whether Shift is pressed
+    // @return true if the key was handled, false otherwise
+    virtual bool handleKeyPress(int key, bool ctrlPressed = false, bool shiftPressed = false) { return false; }
+    
+    // Check if this GUI can handle a specific key
+    // Used for routing decisions - returns true if GUI is focused and can handle the key
+    virtual bool canHandleKeyPress(int key) const { return isKeyboardFocused(); }
+    
+    // Per-instance window state helpers (for session restoration validation)
+    // These query ImGui's window state for this instance's window
+    // Returns true if window exists and has state, false otherwise
+    bool hasWindowState() const;
+    
+    // Get current window position (returns ImVec2(0,0) if window doesn't exist)
+    ImVec2 getWindowPosition() const;
+    
+    // Get current window size (returns ImVec2(0,0) if window doesn't exist)
+    ImVec2 getWindowSize() const;
+    
+    // Check if window is collapsed (returns false if window doesn't exist)
+    bool isWindowCollapsed() const;
+    
 protected:
     // Subclasses implement this to draw panel-specific content
     virtual void drawContent() = 0;
@@ -91,7 +136,7 @@ protected:
     virtual bool handleFileDrop(const std::vector<std::string>& filePaths) { return false; }
     
     // Helper to set up drag drop target (call at start of drawContent())
-    // Checks for FILE_BROWSER_FILES payload and calls handleFileDrop() if found
+    // Checks for FILE_PATHS payload and calls handleFileDrop() if found
     void setupDragDropTarget();
     
     // State
@@ -102,6 +147,9 @@ protected:
     ParameterRouter* parameterRouter = nullptr;
     
 private:
+    // Sync enabled state from backend module (implemented in .cpp)
+    void syncEnabledState();
+    
     // Static storage for default layouts (module type name -> size)
     static std::map<std::string, ImVec2> defaultLayouts;
     static bool layoutsLoaded;

@@ -17,16 +17,10 @@ CellGrid::CellGrid()
     , reorderingEnabled(false)
     , autoScrollEnabled(false)
     , lastFocusedRowForScroll(-1)
-    , lastProcessedFrame(-1)
-    , lastProcessedInputQueueFrame(-1)
     , tableStarted(false)
     , currentRow(-1)
     , numRows(0)
     , numFixedColumns(0)
-    , editing_(false)
-    , editBufferInitialized_(false)
-    , anyCellFocusedThisFrame_(false)
-    , shouldRefocusCurrentCell_(false)
 {
 }
 
@@ -136,8 +130,7 @@ void CellGrid::beginTable(int numRows, int numFixedColumns) {
     tableStarted = true;
     currentRow = -1;
     
-    // Reset focus tracking at start of frame
-    resetFocusTracking();
+    // Focus tracking is handled by GUI layer via callbacks
     
     // Clear fixed column setups if they don't match
     if ((int)fixedColumnSetups.size() != numFixedColumns) {
@@ -383,7 +376,7 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
     
     // Auto-scroll to focused row when it changes
     // Use internal state if available, otherwise fall back to callback
-    int focusedRow = focusedCell.isValid() ? focusedCell.row : (callbacks.getFocusedRow ? callbacks.getFocusedRow() : -1);
+    int focusedRow = callbacks.getFocusedRow ? callbacks.getFocusedRow() : -1;
     if (autoScrollEnabled && focusedRow >= 0) {
         if (focusedRow == row && focusedRow != lastFocusedRowForScroll) {
             // Use SetScrollHereY to scroll the focused row into view
@@ -422,11 +415,8 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
             callbacks.drawSpecialColumn(row, absoluteCol, colConfig);
         } else {
             // Default: draw CellWidget using retained widget cache
-            // Use internal state for focus checking (fallback to callback for backward compatibility)
-            bool isFocused = isCellFocused(row, absoluteCol);
-            if (!isFocused && callbacks.isCellFocused) {
-                isFocused = callbacks.isCellFocused(row, absoluteCol);
-            }
+            // Focus state is managed by GUI layer via callbacks
+            bool isFocused = callbacks.isCellFocused ? callbacks.isCellFocused(row, absoluteCol) : false;
             
             // Get or create cell widget (retained across frames for performance)
             // Use absolute column index for widget cache key
@@ -452,35 +442,24 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
             }
             
             // Sync state TO cell (edit buffer, drag state, selection, etc.)
-            // Use internal state first, then allow callback to override if needed
+            // State is managed by GUI layer via callbacks - no internal state needed
             cell.setSelected(isFocused);
-            cell.setEditing(editing_ && isFocused);
             
-            // Sync edit buffer from internal state
-            if (editing_ && isFocused) {
-                cell.setEditBuffer(editBufferCache_, editBufferInitialized_);
-            }
+            // Drag state is synced via syncStateToCell callback from GUI layer
             
-            // Sync drag state from internal state
-            if (isDragging(row, absoluteCol)) {
-                const auto& drag = dragState;
-                cell.setDragState(true, drag.startY, drag.startX, drag.lastValue);
-            }
-            
-            // Allow callback to override/update state if provided (for backward compatibility)
+            // Callback handles all edit state synchronization (editing mode, edit buffer, etc.)
             if (callbacks.syncStateToCell) {
                 callbacks.syncStateToCell(row, absoluteCol, cell);
             }
                 
             // Draw cell
             int uniqueId = row * 1000 + absoluteCol;  // Use absolute column index for unique ID
-            // Allow refocus if: (1) CellGrid wants to refocus and cell is focused, OR
-            //                   (2) CellWidget wants to refocus and cell is selected (may not be focused yet after exiting edit mode)
-            bool shouldRefocus = (shouldRefocusCurrentCell_ && isFocused) || (cell.shouldRefocus() && cell.isSelected());
+            // Refocus flag is managed by GUI layer via callbacks - pass shouldRefocusCurrentCell from GUI
+            // Note: CellGrid doesn't manage refocus state, it's passed from GUI layer
+            bool shouldRefocus = false;  // GUI layer should pass this via callbacks if needed
             
-            // Create input context for frame-aware input processing
-            int currentFrame = ofGetFrameNum();
-            CellWidgetInputContext inputContext(currentFrame, &lastProcessedFrame, &lastProcessedInputQueueFrame);
+            // Create input context (simplified - no frame tracking needed)
+            CellWidgetInputContext inputContext;
             
             CellWidgetInteraction interaction = cell.draw(uniqueId, isFocused, false, shouldRefocus, inputContext);
                 
@@ -488,15 +467,8 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
             // Check actual focus state after drawing (ImGui::IsItemFocused() works for last item)
             bool actuallyFocused = ImGui::IsItemFocused();
             
+            // Focus state is managed by GUI layer via callbacks
             if (interaction.focusChanged) {
-                if (actuallyFocused) {
-                    // Cell gained focus - use absolute column index
-                    setFocusedCell(row, absoluteCol);
-                } else if (focusedCell.row == row && focusedCell.col == absoluteCol) {
-                    // Focus was lost from this cell
-                    clearFocus();
-                }
-                
                 // Notify callback if provided - use absolute column index
                 if (callbacks.onCellFocusChanged) {
                     callbacks.onCellFocusChanged(row, absoluteCol);
@@ -504,7 +476,6 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
             }
             
             if (interaction.clicked) {
-                setFocusedCell(row, absoluteCol);  // Use absolute column index
                 if (callbacks.onCellClicked) {
                     callbacks.onCellClicked(row, absoluteCol);
                 }
@@ -513,36 +484,13 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
             // Update isFocused to actual state for state syncing below
             isFocused = actuallyFocused;
                 
-            // Sync state back FROM cell (edit mode, edit buffer, drag state, etc.)
-            // Update internal state from cell
-            if (cell.isEditingMode()) {
-                setEditing(true);
-                setEditBuffer(cell.getEditBuffer(), cell.isEditBufferInitialized());
-                markCellFocusedThisFrame();
-            } else if (editing_ && isFocused && !cell.isEditingMode()) {
-                // Exited edit mode
-                setEditing(false);
-                clearEditBuffer();
-                
-                if (cell.shouldRefocus()) {
-                    setShouldRefocus(true);
-                }
-            }
+            // Sync state back FROM cell - edit state is handled by callback
+            // Focus tracking is handled by GUI layer via callbacks
             
-            // Update drag state from cell - use absolute column index
-            if (cell.getIsDragging()) {
-                setDragState(row, absoluteCol, cell.getDragStartY(), cell.getDragStartX(), cell.getLastDragValue());
-                // Maintain focus during drag
-                setFocusedCell(row, absoluteCol);
-            } else if (isDragging(row, absoluteCol) && !cell.getIsDragging()) {
-                // Drag ended
-                clearDragState();
-            }
+            // Drag state is managed by GUI layer via syncStateFromCell callback
+            // No need to track it here - just pass it through
             
-            // Clear refocus flag after using it
-            if (shouldRefocusCurrentCell_ && isFocused && interaction.focusChanged) {
-                clearRefocusFlag();
-            }
+            // Refocus flag is managed by GUI layer via callbacks
             
             // Allow callback to handle additional state sync if provided (for backward compatibility)
             // Use absolute column index
@@ -633,62 +581,6 @@ void CellGrid::clearHeaderButtons(int columnIndex) {
     }
 }
 
-// State management implementation
-void CellGrid::setFocusedCell(int row, int col) {
-    // If focus is changing to a different cell, clear selection of all cached cells first
-    // This ensures only one cell is selected at a time
-    if (focusedCell.row != row || focusedCell.col != col) {
-        // Clear selection of all cached cells to prevent multiple cells from being selected
-        for (auto& pair : cellWidgets) {
-            pair.second.setSelected(false);
-        }
-    }
-    
-    focusedCell.row = row;
-    focusedCell.col = col;
-    anyCellFocusedThisFrame_ = true;
-}
-
-void CellGrid::clearFocus() {
-    // Clear selection of all cached cells when focus is cleared
-    for (auto& pair : cellWidgets) {
-        pair.second.setSelected(false);
-    }
-    
-    focusedCell.clear();
-    editing_ = false;
-    clearEditBuffer();
-    clearDragState();
-    shouldRefocusCurrentCell_ = false;
-}
-
-bool CellGrid::isCellFocused(int row, int col) const {
-    return focusedCell.row == row && focusedCell.col == col;
-}
-
-void CellGrid::setEditBuffer(const std::string& buffer, bool initialized) {
-    editBufferCache_ = buffer;
-    editBufferInitialized_ = initialized;
-}
-
-void CellGrid::clearEditBuffer() {
-    editBufferCache_.clear();
-    editBufferInitialized_ = false;
-}
-
-void CellGrid::setDragState(int row, int col, float startY, float startX, float lastValue) {
-    dragState.row = row;
-    dragState.col = col;
-    dragState.startY = startY;
-    dragState.startX = startX;
-    dragState.lastValue = lastValue;
-}
-
-void CellGrid::clearDragState() {
-    dragState.clear();
-}
-
-bool CellGrid::isDragging(int row, int col) const {
-    return dragState.row == row && dragState.col == col;
-}
+// State management - REMOVED: All state (focus, drag, edit) is now managed by GUI layer via callbacks
+// CellGrid is now a pure rendering component focused on table rendering
 

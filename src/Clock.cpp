@@ -55,12 +55,13 @@ float Clock::getBPM() const {
 void Clock::start() {
     if (!playing) {
         playing = true;
-        // Calculate samples per beat for immediate first beat
-        float current = currentBpm.load();
-        float beatsPerSecond = current / 60.0f;
-        samplesPerBeat = sampleRate / beatsPerSecond; // Use current sample rate
-        beatAccumulator = samplesPerBeat; // Trigger first beat immediately
-        ofLogNotice("Clock") << "Audio-rate clock started at BPM: " << currentBpm.load() << " (SR: " << sampleRate << ")";
+        // Reset accumulators
+        sampleAccumulator = 0.0;
+        beatAccumulator = 0.0;
+        // Don't calculate samplesPerBeat here - wait for first audioOut() call
+        // to get accurate sample rate from the actual audio stream
+        // This ensures sample-accurate timing from the start
+        ofLogNotice("Clock") << "Audio-rate clock started at BPM: " << currentBpm.load() << " (will detect SR from first buffer)";
         
         // Notify transport listeners
         for (auto& listener : transportListeners) {
@@ -151,12 +152,27 @@ void Clock::removeTransportListener() {
 void Clock::audioOut(ofSoundBuffer& buffer) {
     if (!playing) return;
     
-    // Auto-detect sample rate from buffer (only when it changes)
+    // Auto-detect sample rate from buffer (only when it changes significantly)
+    // Protect against spurious sample rate changes from device probing
     float bufferSampleRate = buffer.getSampleRate();
-    if (abs(bufferSampleRate - sampleRate) > 1.0f) {
-        sampleRate = bufferSampleRate;
-        // NO LOGGING IN AUDIO THREAD - removed ofLogNotice
-        // Recalculate timing when sample rate changes
+    
+    // Only update if sample rate is valid (> 0) and change is significant (> 1 Hz)
+    // This protects against device probing interference that might report 0 or invalid rates
+    if (bufferSampleRate > 0.0f) {
+        bool sampleRateChanged = abs(bufferSampleRate - sampleRate) > 1.0f;
+        if (sampleRateChanged && sampleRate > 0.0f) {
+            // Only update if we already have a valid sample rate (protect from initial probing)
+            sampleRate = bufferSampleRate;
+            // NO LOGGING IN AUDIO THREAD - removed ofLogNotice
+        } else if (sampleRate <= 0.0f) {
+            // First valid sample rate detection
+            sampleRate = bufferSampleRate;
+        }
+    }
+    
+    // Recalculate timing when sample rate changes OR when starting (samplesPerBeat == 0)
+    // This ensures we always have valid timing values
+    if ((sampleRate > 0.0f) && (samplesPerBeat == 0.0f || abs(bufferSampleRate - sampleRate) > 1.0f)) {
         float current = currentBpm.load();
         float beatsPerSecond = current / 60.0f;
         samplesPerBeat = sampleRate / beatsPerSecond;

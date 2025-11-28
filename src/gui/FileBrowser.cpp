@@ -1,8 +1,9 @@
 #include "FileBrowser.h"
-#include "gui/MediaPreview.h"
 #include "gui/GUIConstants.h"
 #include "ofFileUtils.h"
 #include "ofSystemUtils.h"
+#include "ofLog.h"
+#include "ofUtils.h"
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
@@ -13,16 +14,13 @@
 static std::string g_dragFilesPayload;
 
 FileBrowser::FileBrowser() 
-    : currentPath_(ofFilePath::getUserHomeDir()), previewLoaded_(false), directoryInitialized_(false) {
+    : currentPath_(ofFilePath::getUserHomeDir()), directoryInitialized_(false), previewLoaded_(false) {
     
     // Initialize media extensions
     mediaExtensions_ = {
         ".mov", ".mp4", ".avi", ".mkv", ".webm", ".hap",  // Video
         ".wav", ".mp3", ".aiff", ".aif", ".m4a"           // Audio
     };
-    
-    // Initialize preview player
-    previewPlayer_ = std::make_unique<MediaPlayer>();
     
     // DON'T call refreshDirectory() here - defer until first draw
     // This prevents blocking startup if home directory has many files
@@ -97,9 +95,6 @@ void FileBrowser::navigateToPath(const std::string& path) {
             // Clear preview when navigating
             previewFile_.clear();
             previewLoaded_ = false;
-            if (previewPlayer_) {
-                previewPlayer_->stop();
-            }
         }
     }
 }
@@ -359,7 +354,7 @@ void FileBrowser::drawDirectoryNode(const std::string& fullPath, const std::stri
         g_dragFilesPayload.append(1, '\0'); // Null terminator for this path
         g_dragFilesPayload.append(1, '\0'); // Double null to mark end
         
-        ImGui::SetDragDropPayload("FILE_BROWSER_FILES", g_dragFilesPayload.data(), g_dragFilesPayload.size());
+        ImGui::SetDragDropPayload("FILE_PATHS", g_dragFilesPayload.data(), g_dragFilesPayload.size());
         ImGui::Text("%s", name.c_str());
         ImGui::EndDragDropSource();
     }
@@ -438,7 +433,7 @@ void FileBrowser::drawFileNode(const std::string& fullPath, const std::string& n
             g_dragFilesPayload.append(1, '\0'); // Double null to mark end
             
             // Set payload with actual data (not pointer)
-            ImGui::SetDragDropPayload("FILE_BROWSER_FILES", g_dragFilesPayload.data(), g_dragFilesPayload.size());
+            ImGui::SetDragDropPayload("FILE_PATHS", g_dragFilesPayload.data(), g_dragFilesPayload.size());
             
             // Visual feedback
             if (selectedMedia.size() == 1) {
@@ -451,39 +446,37 @@ void FileBrowser::drawFileNode(const std::string& fullPath, const std::string& n
         }
     }
     
-    // Hover tooltip with preview for media files
+    // Hover tooltip with file details (lightweight - no media player)
     if (ImGui::IsItemHovered()) {
-        static std::unique_ptr<MediaPlayer> tooltipPlayer = std::make_unique<MediaPlayer>();
-        static std::string tooltipFile;
-        static std::string tooltipPath;
+        ImGui::BeginTooltip();
         
-        // Load file if needed
-        if (tooltipFile != fullPath || tooltipPath != currentPath_) {
-            tooltipPlayer->stop();
-            std::string ext = ofToLower(ofFilePath::getFileExt(fullPath));
-            bool isAudio = (ext == "wav" || ext == "mp3" || ext == "aiff" || ext == "aif" || ext == "m4a");
-            bool isVideo = (ext == "mov" || ext == "mp4" || ext == "avi" || ext == "mkv" || ext == "webm" || ext == "hap");
-            
-            if (isAudio) {
-                tooltipPlayer->loadAudio(fullPath);
-            } else if (isVideo) {
-                tooltipPlayer->loadVideo(fullPath);
-                if (tooltipPlayer->isVideoLoaded()) {
-                    tooltipPlayer->setPosition(0.1f);
-                    tooltipPlayer->getVideoPlayer().getVideoFile().update();
-                }
+        // File name
+        ImGui::Text("File: %s", name.c_str());
+        
+        // File path
+        ImGui::Text("Path: %s", fullPath.c_str());
+        
+        // File size
+        if (pathExists(fullPath)) {
+            try {
+                size_t fileSize = ofFile(fullPath).getSize();
+                ImGui::Text("Size: %s", formatFileSize(fileSize).c_str());
+            } catch (...) {
+                ImGui::Text("Size: --");
             }
-            tooltipFile = fullPath;
-            tooltipPath = currentPath_;
+        } else {
+            ImGui::Text("Size: --");
         }
         
-        // Update video player
-        if (tooltipPlayer->isVideoLoaded()) {
-            tooltipPlayer->getVideoPlayer().getVideoFile().update();
+        // File extension/type
+        std::string ext = ofToLower(ofFilePath::getFileExt(name));
+        if (!ext.empty()) {
+            std::string displayExt = ext.substr(ext[0] == '.' ? 1 : 0);
+            std::transform(displayExt.begin(), displayExt.end(), displayExt.begin(), ::toupper);
+            ImGui::Text("Type: %s", displayExt.c_str());
         }
         
-        // Draw tooltip preview
-        MediaPreview::drawMediaTooltip(tooltipPlayer.get(), -1);
+        ImGui::EndTooltip();
     }
     
     ImGui::PopID();
@@ -619,4 +612,13 @@ bool FileBrowser::isDirectory(const std::string& path) const {
     // Use openFrameworks directory utilities
     ofDirectory dir(path);
     return dir.exists() && dir.isDirectory();
+}
+
+//--------------------------------------------------------------
+void FileBrowser::setProjectDirectory(const std::string& projectDir) {
+    if (!projectDir.empty() && pathExists(projectDir) && isDirectory(projectDir)) {
+        currentPath_ = normalizePath(projectDir);
+        directoryInitialized_ = false;  // Force refresh on next draw
+        ofLogNotice("FileBrowser") << "Set project directory: " << currentPath_;
+    }
 }

@@ -6,15 +6,12 @@
 
 class Clock;
 class ClockGUI;
-class MediaPool;
-class MediaPoolGUI;
-class TrackerSequencer;
-class TrackerSequencerGUI;
 class GUIManager;
 class FileBrowser;
 class Console;
+class CommandBar;
+class AssetLibraryGUI;
 class ofxSoundOutput;
-class ofSoundStream;
 
 // Panel identifiers
 enum class Panel {
@@ -24,7 +21,8 @@ enum class Panel {
     MEDIA_POOL = 3,
     FILE_BROWSER = 4,
     CONSOLE = 5,
-    COUNT = 6
+    ASSET_LIBRARY = 6,
+    COUNT = 7
 };
 
 /**
@@ -66,25 +64,18 @@ public:
         Clock* clock,
         ClockGUI* clockGUI,
         ofxSoundOutput* audioOutput,
-        GUIManager* guiManager,  // New: GUIManager for multiple instances
+        GUIManager* guiManager,  // GUIManager for multiple instances
         FileBrowser* fileBrowser,  // File browser panel
         Console* console,  // Console panel
-        ofSoundStream* soundStream  // For audio device management
-    );
-    
-    // Legacy setup method (for backward compatibility during migration)
-    void setup(
-        Clock* clock,
-        ClockGUI* clockGUI,
-        ofxSoundOutput* audioOutput,
-        TrackerSequencer* tracker,
-        TrackerSequencerGUI* trackerGUI,
-        MediaPool* mediaPool,
-        MediaPoolGUI* mediaPoolGUI,
-        ofSoundStream* soundStream
+        CommandBar* commandBar,  // Command bar panel
+        AssetLibraryGUI* assetLibraryGUI  // Asset library panel
     );
 
-    // Panel navigation
+    // Window-based navigation (works for ALL GUI panels - preferred method)
+    void navigateToWindow(const std::string& windowName);
+    std::string getCurrentFocusedWindow() const { return currentFocusedWindow; }
+    
+    // Panel navigation (DEPRECATED: Use navigateToWindow() instead - kept for backward compatibility)
     void navigateToPanel(Panel panel);
     void nextPanel();
     void previousPanel();
@@ -97,6 +88,10 @@ public:
     // Console visibility
     void setConsoleVisible(bool visible) { consoleVisible_ = visible; }
     bool isConsoleVisible() const { return consoleVisible_; }
+    
+    // AssetLibrary visibility
+    void setAssetLibraryVisible(bool visible) { assetLibraryVisible_ = visible; }
+    bool isAssetLibraryVisible() const { return assetLibraryVisible_; }
 
     // Mouse click detection and panel switching
     void handleMouseClick(int x, int y);
@@ -108,71 +103,63 @@ public:
     int getCurrentPanelIndex() const { return static_cast<int>(currentPanel); }
     const char* getCurrentPanelName() const;
 
-    // Audio state access (for ofApp to update currentAudioLevel and set listener)
+    // Audio state access (for ofApp to update currentAudioLevel)
+    // Note: Audio device management is now handled by AudioOutputGUI
     void setCurrentAudioLevel(float level) { currentAudioLevel = level; }
     float getGlobalVolume() const { return globalVolume; }
-    void setAudioListener(ofBaseApp* listener) { audioListener = listener; }
-    
-    // Audio device management (public for ofApp to call after setting listener)
-    void setupAudioStream(ofBaseApp* audioListener = nullptr);
 
 private:
     // Panel references
     Clock* clock = nullptr;
     ClockGUI* clockGUI = nullptr;
     ofxSoundOutput* audioOutput = nullptr;
-    GUIManager* guiManager = nullptr;  // New: GUIManager for multiple instances
+    GUIManager* guiManager = nullptr;  // GUIManager for multiple instances
     FileBrowser* fileBrowser = nullptr;  // File browser panel
     Console* console = nullptr;  // Console panel
-    
-    // Legacy: keep for backward compatibility (will be removed)
-    TrackerSequencer* tracker = nullptr;
-    TrackerSequencerGUI* trackerGUI = nullptr;
-    MediaPool* mediaPool = nullptr;
-    MediaPoolGUI* mediaPoolGUI = nullptr;
-    
-    ofSoundStream* soundStream = nullptr;  // For audio device management
+    CommandBar* commandBar = nullptr;  // Command bar panel
+    AssetLibraryGUI* assetLibraryGUI = nullptr;  // Asset library panel
 
-    // Audio Output panel state (owned by ViewManager)
-    std::vector<ofSoundDevice> audioDevices;
-    int selectedAudioDevice = 0;
-    bool audioDeviceChanged = false;
+    // Audio state (owned by ViewManager)
+    // Note: Audio device selection is now handled by AudioOutputGUI
+    // Global volume is still managed here for ofApp::audioOut()
     float globalVolume = 1.0f;
     float currentAudioLevel = 0.0f;
-    ofBaseApp* audioListener = nullptr;  // Store listener for device changes
 
-    // State
+    // State - Window name-based navigation (primary system)
+    std::string currentFocusedWindow = "Clock ";  // Track focused window by name (works for ALL panels)
+    std::string lastFocusedWindow;                // Track previous focused window for change detection
+    
+    // State - Panel enum (DEPRECATED: Kept for backward compatibility)
     Panel currentPanel = Panel::CLOCK;
     Panel lastPanel = Panel::COUNT;  // Invalid, triggers focus on first draw
     bool fileBrowserVisible_ = false;  // FileBrowser visibility state
     bool consoleVisible_ = false;  // Console visibility state
+    bool assetLibraryVisible_ = false;  // AssetLibrary visibility state
 
     // Panel names for debugging/logging
-    static constexpr std::array<const char*, 6> PANEL_NAMES = {{
+    static constexpr std::array<const char*, 7> PANEL_NAMES = {{
         "Clock ",
         "Audio Output",
         "Tracker Sequencer",
         "Media Pool",
         "File Browser",
-        "Console"
+        "Console",
+        "Asset Library"
     }};
 
     // Private draw methods for each panel
-    void drawClockPanel(Panel previousPanel);
-    void drawAudioOutputPanel(Panel previousPanel);
-    void drawTrackerPanel(Panel previousPanel);  // Legacy: single instance
-    void drawMediaPoolPanel(Panel previousPanel);  // Legacy: single instance
+    void drawClockPanel();
     
-    // New: draw multiple instance panels
-    void drawTrackerPanels(Panel previousPanel);  // Draw all visible TrackerSequencer instances
-    void drawMediaPoolPanels(Panel previousPanel);  // Draw all visible MediaPool instances
-    void drawFileBrowserPanel(Panel previousPanel);  // Draw FileBrowser panel
-    void drawConsolePanel(Panel previousPanel);  // Draw Console panel
+    // Generic method to draw all visible module panels (handles all module types)
+    void drawModulePanels();
+    void drawFileBrowserPanel();  // Draw FileBrowser panel
+    void drawConsolePanel();  // Draw Console panel
+    void drawAssetLibraryPanel();  // Draw AssetLibrary panel
 
     // Helper to set focus when panel changes (not every frame)
     void setFocusIfChanged();
     
-    // Helper to draw outline around windows (focused or unfocused)
+    // Modular focus outline system - call from within window Begin/End context
     void drawWindowOutline();
 };
 

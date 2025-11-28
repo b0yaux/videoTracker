@@ -72,11 +72,13 @@ struct CellGridCallbacks {
     std::function<void(int row, int col, const CellGridColumnConfig& colConfig)> drawSpecialColumn;
     
     // Header rendering (legacy - use registerHeaderButton instead)
-    // col parameter is parameter column index (0-based within parameter columns only, for backward compatibility)
+    // col parameter is parameter column index (0-based within parameter columns only)
+    // NOTE: This is deprecated - use absolute column indices instead
     std::function<void(int col, const CellGridColumnConfig& colConfig, ImVec2 cellPos, float cellWidth)> drawHeaderButton;
     
     // Custom header rendering per column (returns true if header was drawn, false to use default)
-    // col parameter is parameter column index (0-based within parameter columns only, for backward compatibility)
+    // col parameter is parameter column index (0-based within parameter columns only)
+    // NOTE: This is deprecated - use absolute column indices instead
     std::function<bool(int col, const CellGridColumnConfig& colConfig, ImVec2 cellStartPos, float columnWidth, float cellMinY)> drawCustomHeader;
     
     // Focus management
@@ -137,6 +139,10 @@ struct CellGridCallbacks {
     
     // Auto-scroll management
     std::function<int()> getFocusedRow;  // Get currently focused row (-1 if none)
+    
+    // Refocus management (for maintaining focus after exiting edit mode via Enter)
+    // col parameter is absolute column index (0-based, includes all columns in ImGui table)
+    std::function<bool(int row, int col)> shouldRefocusCell;  // Check if cell should be refocused (e.g., after Enter exits edit mode)
 };
 
 // CellGrid - Reusable table component for parameter grids
@@ -191,58 +197,9 @@ public:
     // Widget cache management (for retained widgets across frames)
     void clearCellCache();  // Clear all cached cell widgets (call when grid structure changes)
     
-    // State management (internal state for focused cell, edit mode, etc.)
-    // These methods allow CellGrid to manage its own state, reducing duplication in GUI classes
-    struct FocusedCell {
-        int row = -1;
-        int col = -1;  // Absolute column index in ImGui table (0-based, includes all columns)
-        bool isValid() const { return row >= 0 && col >= 0; }
-        void clear() { row = -1; col = -1; }
-    };
-    
-    // Focus management
-    // col parameter is absolute column index (0-based, includes all columns in ImGui table)
-    void setFocusedCell(int row, int col);
-    FocusedCell getFocusedCell() const { return focusedCell; }
-    void clearFocus();
-    bool isCellFocused(int row, int col) const;  // col is absolute column index
-    
-    // Edit mode management
-    void setEditing(bool editing) { editing_ = editing; }
-    bool isEditing() const { return editing_; }
-    
-    // Edit buffer management
-    void setEditBuffer(const std::string& buffer, bool initialized = true);
-    std::string getEditBuffer() const { return editBufferCache_; }
-    bool isEditBufferInitialized() const { return editBufferInitialized_; }
-    void clearEditBuffer();
-    
-    // Drag state management
-    struct DragState {
-        int row = -1;
-        int col = -1;  // Absolute column index in ImGui table
-        float startY = 0.0f;
-        float startX = 0.0f;
-        float lastValue = 0.0f;
-        bool isActive() const { return row >= 0 && col >= 0; }
-        void clear() { row = -1; col = -1; startY = 0.0f; startX = 0.0f; lastValue = 0.0f; }
-    };
-    
-    // col parameter is absolute column index (0-based, includes all columns in ImGui table)
-    void setDragState(int row, int col, float startY, float startX, float lastValue);
-    DragState getDragState() const { return dragState; }
-    void clearDragState();
-    bool isDragging(int row, int col) const;  // col is absolute column index
-    
-    // Focus tracking (for detecting when focus is lost)
-    void markCellFocusedThisFrame() { anyCellFocusedThisFrame_ = true; }
-    bool wasAnyCellFocusedThisFrame() const { return anyCellFocusedThisFrame_; }
-    void resetFocusTracking() { anyCellFocusedThisFrame_ = false; }
-    
-    // Refocus flag (for maintaining focus after exiting edit mode)
-    void setShouldRefocus(bool refocus) { shouldRefocusCurrentCell_ = refocus; }
-    bool shouldRefocus() const { return shouldRefocusCurrentCell_; }
-    void clearRefocusFlag() { shouldRefocusCurrentCell_ = false; }
+    // State management - REMOVED: Focus and drag state are now managed by GUI layer via callbacks
+    // The callbacks (isCellFocused, onCellFocusChanged, syncStateFromCell) handle all state synchronization
+    // CellGrid is now a pure rendering component focused on table rendering
     
 private:
     // Configuration
@@ -271,11 +228,6 @@ private:
     // Auto-scroll state
     int lastFocusedRowForScroll;
     
-    // Frame tracking for input processing (per-grid instance)
-    // Prevents double-processing of input when multiple grids exist
-    int lastProcessedFrame;
-    int lastProcessedInputQueueFrame;
-    
     // Internal state
     bool tableStarted;
     int currentRow;
@@ -295,14 +247,7 @@ private:
     // Key: (row, col) pair, Value: CellWidget instance
     std::map<std::pair<int, int>, CellWidget> cellWidgets;
     
-    // Internal state management
-    FocusedCell focusedCell;
-    bool editing_ = false;
-    std::string editBufferCache_;
-    bool editBufferInitialized_ = false;
-    DragState dragState;
-    bool anyCellFocusedThisFrame_ = false;
-    bool shouldRefocusCurrentCell_ = false;
+    // Internal state management - REMOVED: All state (focus, drag, edit) managed by GUI layer via callbacks
     
     // Helper methods
     void updateColumnIndices();

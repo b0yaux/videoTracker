@@ -1,10 +1,39 @@
 #include "GUIManager.h"
-#include "TrackerSequencer.h"
-#include "MediaPool.h"
 #include "core/ModuleRegistry.h"
 #include "core/ParameterRouter.h"
 #include "ofLog.h"
+#include <imgui.h>
 #include <algorithm>
+
+// Static registration map - GUI classes register themselves here
+// Use function-local static (Meyer's singleton) to ensure initialization order safety
+// This guarantees the map is initialized before first use, avoiding static initialization order issues
+static std::map<std::string, GUIManager::GUICreator>& getGUICreators() {
+    static std::map<std::string, GUIManager::GUICreator> guiCreators;
+    return guiCreators;
+}
+
+//--------------------------------------------------------------
+// Static Registration Methods
+//--------------------------------------------------------------
+
+void GUIManager::registerGUIType(const std::string& typeName, GUICreator creator) {
+    auto& guiCreators = getGUICreators();
+    if (guiCreators.find(typeName) != guiCreators.end()) {
+        ofLogWarning("GUIManager") << "GUI type '" << typeName << "' already registered, overwriting";
+    }
+    guiCreators[typeName] = creator;
+    ofLogNotice("GUIManager") << "Registered GUI type: " << typeName;
+}
+
+bool GUIManager::isGUITypeRegistered(const std::string& typeName) {
+    auto& guiCreators = getGUICreators();
+    return guiCreators.find(typeName) != guiCreators.end();
+}
+
+//--------------------------------------------------------------
+// Instance Methods
+//--------------------------------------------------------------
 
 GUIManager::GUIManager() {
 }
@@ -36,107 +65,71 @@ void GUIManager::syncWithRegistry() {
         return;
     }
     
-    syncMediaPoolGUIs();
-    syncTrackerGUIs();
-}
-
-void GUIManager::syncMediaPoolGUIs() {
-    if (!registry) return;
+    // Phase 12.8: Unified sync - iterate all modules and create/destroy GUIs as needed
+    std::set<std::string> currentInstanceNames;
     
-    // Get all INSTRUMENT type modules (MediaPool is INSTRUMENT)
-    auto instruments = registry->getModulesByType(ModuleType::INSTRUMENT);
-    
-    // Build set of current MediaPool instance names
-    std::set<std::string> currentInstances;
-    for (const auto& module : instruments) {
-        // Check if it's actually a MediaPool (not just any instrument)
-        auto mediaPool = std::dynamic_pointer_cast<MediaPool>(module);
-        if (mediaPool) {
-            std::string name = getInstanceNameForModule(module);
-            if (!name.empty()) {
-                currentInstances.insert(name);
+    // Build set of current instance names from registry
+    registry->forEachModule([&currentInstanceNames, this](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
+        if (module) {
+            currentInstanceNames.insert(name);
+            
+            // Create GUI if it doesn't exist
+            if (allGUIs.find(name) == allGUIs.end()) {
+                // Double-check module still exists (race condition protection)
+                auto verifyModule = registry->getModule(name);
+                if (!verifyModule) {
+                    ofLogVerbose("GUIManager") << "Skipping GUI creation for " << name << " - module no longer exists";
+                    return;  // Skip this module, it was deleted (return from lambda)
+                }
+                
+                auto gui = createGUIForModule(module, name);
+                if (gui) {
+                    ofLogNotice("GUIManager") << "Creating GUI for instance: " << name;
+                    gui->setRegistry(registry);
+                    gui->setParameterRouter(parameterRouter);
+                    gui->setInstanceName(name);
+                    allGUIs[name] = std::move(gui);
+                    
+                    // Make newly created modules visible by default
+                    // This ensures users see modules they just created
+                    if (visibleInstances.find(name) == visibleInstances.end()) {
+                        visibleInstances.insert(name);
+                        ofLogNotice("GUIManager") << "Made new module visible by default: " << name;
+                    }
+                }
             }
         }
-    }
+    });
     
     // Remove GUIs for deleted instances
-    auto it = mediaPoolGUIs.begin();
-    while (it != mediaPoolGUIs.end()) {
-        if (currentInstances.find(it->first) == currentInstances.end()) {
-            std::string instanceName = it->first;  // Save name before erasing
-            ofLogNotice("GUIManager") << "Removing MediaPool GUI for deleted instance: " << instanceName;
-            visibleMediaPoolInstances.erase(instanceName);
-            it = mediaPoolGUIs.erase(it);
+    auto it = allGUIs.begin();
+    while (it != allGUIs.end()) {
+        if (currentInstanceNames.find(it->first) == currentInstanceNames.end()) {
+            std::string instanceName = it->first;
+            ofLogNotice("GUIManager") << "Removing GUI for deleted instance: " << instanceName;
+            visibleInstances.erase(instanceName);
+            it = allGUIs.erase(it);
         } else {
             ++it;
         }
     }
-    
-    // Create GUIs for new instances
-    for (const auto& name : currentInstances) {
-        if (mediaPoolGUIs.find(name) == mediaPoolGUIs.end()) {
-            ofLogNotice("GUIManager") << "Creating MediaPool GUI for instance: " << name;
-            auto gui = std::make_unique<MediaPoolGUI>();
-            gui->setRegistry(registry);
-            gui->setParameterRouter(parameterRouter);
-            gui->setInstanceName(name);
-            mediaPoolGUIs[name] = std::move(gui);
-            
-            // Default: make first instance visible
-            if (visibleMediaPoolInstances.empty()) {
-                visibleMediaPoolInstances.insert(name);
-            }
-        }
-    }
 }
 
-void GUIManager::syncTrackerGUIs() {
-    if (!registry) return;
+// Old sync methods removed (Phase 12.8) - replaced by unified syncWithRegistry()
+
+void GUIManager::removeGUI(const std::string& instanceName) {
+    // Remove from visible instances first
+    visibleInstances.erase(instanceName);
     
-    // Get all SEQUENCER type modules (TrackerSequencer is SEQUENCER)
-    auto sequencers = registry->getModulesByType(ModuleType::SEQUENCER);
-    
-    // Build set of current TrackerSequencer instance names
-    std::set<std::string> currentInstances;
-    for (const auto& module : sequencers) {
-        // Check if it's actually a TrackerSequencer (not just any sequencer)
-        auto tracker = std::dynamic_pointer_cast<TrackerSequencer>(module);
-        if (tracker) {
-            std::string name = getInstanceNameForModule(module);
-            if (!name.empty()) {
-                currentInstances.insert(name);
-            }
-        }
-    }
-    
-    // Remove GUIs for deleted instances
-    auto it = trackerGUIs.begin();
-    while (it != trackerGUIs.end()) {
-        if (currentInstances.find(it->first) == currentInstances.end()) {
-            std::string instanceName = it->first;  // Save name before erasing
-            ofLogNotice("GUIManager") << "Removing TrackerSequencer GUI for deleted instance: " << instanceName;
-            visibleTrackerInstances.erase(instanceName);
-            it = trackerGUIs.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    
-    // Create GUIs for new instances
-    for (const auto& name : currentInstances) {
-        if (trackerGUIs.find(name) == trackerGUIs.end()) {
-            ofLogNotice("GUIManager") << "Creating TrackerSequencer GUI for instance: " << name;
-            auto gui = std::make_unique<TrackerSequencerGUI>();
-            gui->setRegistry(registry);
-            gui->setParameterRouter(parameterRouter);
-            gui->setInstanceName(name);
-            trackerGUIs[name] = std::move(gui);
-            
-            // Default: make first instance visible
-            if (visibleTrackerInstances.empty()) {
-                visibleTrackerInstances.insert(name);
-            }
-        }
+    // Remove GUI object directly
+    // Note: ImGui windows are managed by ImGui - when we stop calling Begin/End,
+    // the window will be cleaned up automatically. We just need to remove our reference.
+    auto it = allGUIs.find(instanceName);
+    if (it != allGUIs.end()) {
+        // Explicitly reset the unique_ptr to ensure destruction happens now
+        // This ensures any cleanup in the GUI destructor happens immediately
+        it->second.reset();
+        allGUIs.erase(it);
     }
 }
 
@@ -155,80 +148,129 @@ std::string GUIManager::getInstanceNameForModule(std::shared_ptr<Module> module)
     return "";
 }
 
-MediaPoolGUI* GUIManager::getMediaPoolGUI(const std::string& instanceName) {
-    auto it = mediaPoolGUIs.find(instanceName);
-    if (it != mediaPoolGUIs.end()) {
-        return it->second.get();
-    }
-    return nullptr;
-}
-
-TrackerSequencerGUI* GUIManager::getTrackerGUI(const std::string& instanceName) {
-    auto it = trackerGUIs.find(instanceName);
-    if (it != trackerGUIs.end()) {
-        return it->second.get();
-    }
-    return nullptr;
-}
-
-std::vector<MediaPoolGUI*> GUIManager::getAllMediaPoolGUIs() {
-    std::vector<MediaPoolGUI*> result;
-    result.reserve(mediaPoolGUIs.size());
-    for (auto& pair : mediaPoolGUIs) {
-        result.push_back(pair.second.get());
-    }
-    return result;
-}
-
-std::vector<TrackerSequencerGUI*> GUIManager::getAllTrackerGUIs() {
-    std::vector<TrackerSequencerGUI*> result;
-    result.reserve(trackerGUIs.size());
-    for (auto& pair : trackerGUIs) {
-        result.push_back(pair.second.get());
-    }
-    return result;
-}
-
 void GUIManager::setInstanceVisible(const std::string& instanceName, bool visible) {
-    // Check if it's a MediaPool instance
-    if (mediaPoolGUIs.find(instanceName) != mediaPoolGUIs.end()) {
-        if (visible) {
-            visibleMediaPoolInstances.insert(instanceName);
-        } else {
-            visibleMediaPoolInstances.erase(instanceName);
-        }
-        return;
+    // Phase 12.8: Use unified visibility set
+    if (visible) {
+        visibleInstances.insert(instanceName);
+    } else {
+        visibleInstances.erase(instanceName);
     }
-    
-    // Check if it's a TrackerSequencer instance
-    if (trackerGUIs.find(instanceName) != trackerGUIs.end()) {
-        if (visible) {
-            visibleTrackerInstances.insert(instanceName);
-        } else {
-            visibleTrackerInstances.erase(instanceName);
-        }
-        return;
-    }
-    
-    ofLogWarning("GUIManager") << "Instance not found: " << instanceName;
 }
 
 bool GUIManager::isInstanceVisible(const std::string& instanceName) const {
-    if (visibleMediaPoolInstances.find(instanceName) != visibleMediaPoolInstances.end()) {
-        return true;
-    }
-    if (visibleTrackerInstances.find(instanceName) != visibleTrackerInstances.end()) {
-        return true;
-    }
-    return false;
+    // Phase 12.8: Use unified visibility set
+    return visibleInstances.find(instanceName) != visibleInstances.end();
 }
 
 std::set<std::string> GUIManager::getVisibleInstances(ModuleType type) const {
-    if (type == ModuleType::INSTRUMENT) {
-        return visibleMediaPoolInstances;
-    } else if (type == ModuleType::SEQUENCER) {
-        return visibleTrackerInstances;
+    // Phase 12.8: Filter unified visibleInstances by module type
+    std::set<std::string> result;
+    if (!registry) return result;
+    
+    for (const auto& instanceName : visibleInstances) {
+        auto module = registry->getModule(instanceName);
+        if (module && module->getType() == type) {
+            result.insert(instanceName);
+        }
     }
-    return std::set<std::string>();
+    return result;
+}
+
+// ========================================================================
+// GENERIC GUI ACCESS (Phase 12.5)
+// ========================================================================
+
+ModuleGUI* GUIManager::getGUI(const std::string& instanceName) {
+    // Phase 12.8: Use unified storage
+    auto it = allGUIs.find(instanceName);
+    if (it != allGUIs.end()) {
+        return it->second.get();
+    }
+    return nullptr;
+}
+
+std::vector<ModuleGUI*> GUIManager::getAllGUIs() {
+    // Phase 12.8: Use unified storage
+    std::vector<ModuleGUI*> result;
+    result.reserve(allGUIs.size());
+    for (auto& pair : allGUIs) {
+        if (pair.second) {
+            result.push_back(pair.second.get());
+        } else {
+            ofLogWarning("GUIManager") << "Found null unique_ptr for: " << pair.first;
+        }
+    }
+    return result;
+}
+
+std::vector<std::string> GUIManager::getAllInstanceNames() const {
+    // Return instance names instead of pointers - much safer!
+    std::vector<std::string> result;
+    result.reserve(allGUIs.size());
+    for (const auto& pair : allGUIs) {
+        if (pair.second) {  // Only include if GUI exists
+            result.push_back(pair.first);
+        }
+    }
+    return result;
+}
+
+bool GUIManager::hasGUI(const std::string& instanceName) const {
+    auto it = allGUIs.find(instanceName);
+    return it != allGUIs.end() && it->second != nullptr;
+}
+
+// ========================================================================
+// GUI FACTORY (Phase 12.8)
+// ========================================================================
+
+std::unique_ptr<ModuleGUI> GUIManager::createGUIForModule(std::shared_ptr<Module> module, const std::string& instanceName) {
+    if (!module) return nullptr;
+    
+    // Get module type name from metadata
+    auto metadata = module->getMetadata();
+    std::string typeName = metadata.typeName;
+    
+    // Use registration map to find GUI creator
+    auto& guiCreators = getGUICreators();
+    auto it = guiCreators.find(typeName);
+    if (it == guiCreators.end()) {
+        ofLogWarning("GUIManager") << "No GUI factory for module type: " << typeName << " (" << instanceName << ")";
+        return nullptr;
+    }
+    
+    // Create GUI using registered creator
+    return it->second();
+}
+
+bool GUIManager::validateWindowStates() const {
+    // Check if ImGui is initialized
+    if (ImGui::GetCurrentContext() == nullptr) {
+        ofLogWarning("GUIManager") << "Cannot validate window states: ImGui not initialized";
+        return false;
+    }
+    
+    bool allValid = true;
+    int missingCount = 0;
+    
+    // Phase 12.8: Use unified storage and visibility set
+    for (const auto& instanceName : visibleInstances) {
+        auto it = allGUIs.find(instanceName);
+        if (it != allGUIs.end() && it->second) {
+            if (!it->second->hasWindowState()) {
+                ofLogWarning("GUIManager") << "Instance '" << instanceName << "' is visible but has no window state";
+                allValid = false;
+                missingCount++;
+            }
+        }
+    }
+    
+    if (allValid) {
+        ofLogNotice("GUIManager") << "Window state validation passed: all visible instances have windows";
+    } else {
+        ofLogWarning("GUIManager") << "Window state validation failed: " << missingCount << " visible instance(s) missing windows";
+    }
+    
+    return allValid;
 }
 

@@ -23,7 +23,7 @@ namespace GUIConstants {
         constexpr ImVec4 Popup = ImVec4(0.1f, 0.1f, 0.1f, 0.95f);
         constexpr ImVec4 MenuBar = ImVec4(0.0f, 0.0f, 0.0f, 0.8f);
         constexpr ImVec4 Title = ImVec4(0.01f, 0.01f, 0.01f, 0.65f);
-        constexpr ImVec4 TitleActive = ImVec4(0.01f, 0.01f, 0.01f, 0.65f);
+        constexpr ImVec4 TitleActive = ImVec4(0.01f, 0.01f, 0.1f, 0.65f);
         constexpr ImVec4 DockingEmpty = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
         constexpr ImVec4 DockingPreview = ImVec4(0.9f, 0.1f, 0.1f, 0.4f); // Blue preview when docking, matches Button::Hovered theme
         constexpr ImVec4 ModalDim = ImVec4(0.0f, 0.0f, 0.0f, 0.5f);

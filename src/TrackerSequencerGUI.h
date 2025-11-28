@@ -28,7 +28,7 @@ public:
     // GUI state accessors (moved from TrackerSequencer)
     int getEditStep() const { return editStep; }
     int getEditColumn() const { return editColumn; }
-    bool getIsEditingCell() const { return isEditingCell; }
+    bool getIsEditingCell() const { return isEditingCell_; }
     const std::string& getEditBufferCache() const { return editBufferCache; }
     std::string& getEditBufferCache() { return editBufferCache; }
     bool getEditBufferInitializedCache() const { return editBufferInitializedCache; }
@@ -39,13 +39,17 @@ public:
         editStep = step; 
         editColumn = column; 
     }
-    void setInEditMode(bool editing) { isEditingCell = editing; }
+    void setInEditMode(bool editing) { isEditingCell_ = editing; }
     void setEditBufferInitializedCache(bool init) { editBufferInitializedCache = init; }
     void setShouldRefocusCurrentCell(bool refocus) { shouldRefocusCurrentCell = refocus; }
-    void clearCellFocus();
     
-    // Check if keyboard input should be routed to sequencer
-    bool isKeyboardFocused() const { return (editStep >= 0 && editColumn >= 0); }
+    // Override ModuleGUI generic interface (Phase 7.3/7.4)
+    bool isEditingCell() const override { return getIsEditingCell(); }
+    bool isKeyboardFocused() const override { return (editStep >= 0 && editColumn >= 0); }
+    void clearCellFocus() override;
+    
+    // Override ModuleGUI input handling (InputRouter refactoring)
+    bool handleKeyPress(int key, bool ctrlPressed = false, bool shiftPressed = false) override;
     
 protected:
     // Implement ModuleGUI::drawContent() - draws panel-specific content
@@ -58,7 +62,7 @@ private:
     // GUI state (moved from TrackerSequencer)
     int editStep = -1;      // Currently selected row for editing (-1 = none)
     int editColumn = -1;    // Currently selected column for editing (-1 = none, 0 = step number, 1+ = column index)
-    bool isEditingCell = false; // True when in edit mode (typing numeric value)
+    bool isEditingCell_ = false; // True when in edit mode (typing numeric value) - renamed to avoid conflict with override method
     std::string editBufferCache; // Cache for edit buffer to persist across frames
     bool editBufferInitializedCache = false; // Cache for edit buffer initialized state
     bool shouldRefocusCurrentCell = false; // For maintaining focus after exiting edit mode via Enter
@@ -96,5 +100,6 @@ private:
     void drawPatternGrid(TrackerSequencer& sequencer);
     void drawStepNumber(TrackerSequencer& sequencer, int step, bool isPlaybackStep,
                        bool isPlaying, int currentPlayingStep);
+    
 };
 

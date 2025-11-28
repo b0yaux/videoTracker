@@ -1,36 +1,67 @@
 #include "InputRouter.h"
 #include "Clock.h"
-#include "TrackerSequencer.h"
-#include "TrackerSequencerGUI.h"
 #include "gui/ViewManager.h"
-#include "MediaPool.h"
-#include "MediaPoolGUI.h"
 #include "gui/Console.h"
+#include "gui/CommandBar.h"
+#include "core/ModuleRegistry.h"
+#include "gui/GUIManager.h"
+#include "gui/ModuleGUI.h"
+#include "core/SessionManager.h"
+#include "core/ProjectManager.h"
+#include "gui/MenuBar.h"
+#include "AssetLibrary.h"
+#include "Module.h"
 #include <imgui.h>
+#include <imgui_internal.h>
 #include "ofLog.h"
+#include "ofFileUtils.h"
 
 InputRouter::InputRouter() {
 }
 
 void InputRouter::setup(
     Clock* clock_,
-    TrackerSequencer* tracker_,
-    TrackerSequencerGUI* trackerGUI_,
+    ModuleRegistry* registry_,
+    GUIManager* guiManager_,
     ViewManager* viewManager_,
-    MediaPool* mediaPool_,
-    MediaPoolGUI* mediaPoolGUI_,
-    Console* console_
+    Console* console_,
+    CommandBar* commandBar_
 ) {
     clock = clock_;
-    tracker = tracker_;
-    trackerGUI = trackerGUI_;
+    registry = registry_;
+    guiManager = guiManager_;
     viewManager = viewManager_;
-    mediaPool = mediaPool_;
-    mediaPoolGUI = mediaPoolGUI_;
     console = console_;
+    commandBar = commandBar_;
 
-    ofLogNotice("InputRouter") << "Setup complete";
+    ofLogNotice("InputRouter") << "Setup complete (InputRouter refactoring)";
 }
+
+// Focus-based routing helpers (generic - no module-specific types)
+ModuleGUI* InputRouter::getFocusedGUI() const {
+    if (!guiManager || !registry) return nullptr;
+    
+    // SAFE APPROACH: Use getAllInstanceNames() + getGUI() to avoid dangling pointers
+    // This prevents crashes when GUIs are deleted between frames
+    auto instanceNames = guiManager->getAllInstanceNames();
+    for (const auto& instanceName : instanceNames) {
+        auto* gui = guiManager->getGUI(instanceName);
+        if (gui && gui->isKeyboardFocused()) {
+            return gui;
+        }
+    }
+    
+    return nullptr;
+}
+
+Module* InputRouter::getModuleForGUI(ModuleGUI* gui) const {
+    if (!gui || !registry) return nullptr;
+    
+    std::string instanceName = gui->getInstanceName();
+    auto module = registry->getModule(instanceName);
+    return module ? module.get() : nullptr;
+}
+
 
 void InputRouter::setSessionCallbacks(
     std::function<void()> onSaveSession_,
@@ -38,6 +69,18 @@ void InputRouter::setSessionCallbacks(
 ) {
     onSaveSession = onSaveSession_;
     onLoadSession = onLoadSession_;
+}
+
+void InputRouter::setFileMenuCallbacks(
+    std::function<void()> onSave_,
+    std::function<void()> onSaveAs_,
+    std::function<void()> onOpen_,
+    std::function<void()> onOpenRecent_
+) {
+    onSave = onSave_;
+    onSaveAs = onSaveAs_;
+    onOpen = onOpen_;
+    onOpenRecent = onOpenRecent_;
 }
 
 // Note: setPlayState() removed - play state now comes directly from Clock reference
@@ -55,6 +98,25 @@ void InputRouter::setShowGUI(bool* showGUI_) {
     showGUI = showGUI_;
 }
 
+void InputRouter::update() {
+    // Check for Tab/Shift+Tab for panel navigation
+    // Only when ImGui doesn't want keyboard focus (not in text fields)
+    // This avoids conflicts with text input while allowing panel navigation
+    ImGuiIO& io = ImGui::GetIO();
+    
+    // Only handle Tab navigation when not in a text field
+    if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_Tab, false) && viewManager) {
+        bool shiftPressed = io.KeyShift;
+        if (shiftPressed) {
+            viewManager->previousPanel();
+            ofLogNotice("InputRouter") << "[TAB] ✅ Handled Shift+Tab - Previous Panel";
+        } else {
+            viewManager->nextPanel();
+            ofLogNotice("InputRouter") << "[TAB] ✅ Handled Tab - Next Panel";
+        }
+    }
+}
+
 bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     int key = keyEvent.key;
     int keycode = keyEvent.keycode;
@@ -65,6 +127,37 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
     bool cmdPressed = keyEvent.hasModifier(OF_KEY_COMMAND);
     
+    // Priority 0: File menu shortcuts (Cmd+S, Cmd+Shift+S, Cmd+O, Cmd+Shift+O)
+    if (cmdPressed) {
+        if (key == 's' || key == 'S') {
+            if (shiftPressed && onSaveAs) {
+                // Cmd+Shift+S: Save As
+                onSaveAs();
+                logKeyPress(key, "Global: Cmd+Shift+S Save As");
+                return true;
+            } else if (onSave) {
+                // Cmd+S: Save
+                onSave();
+                logKeyPress(key, "Global: Cmd+S Save");
+                return true;
+            }
+        }
+        
+        if (key == 'o' || key == 'O') {
+            if (shiftPressed && onOpen) {
+                // Cmd+Shift+O: Open dialog
+                onOpen();
+                logKeyPress(key, "Global: Cmd+Shift+O Open");
+                return true;
+            } else if (onOpenRecent) {
+                // Cmd+O: Open Recent (could show popup, for now just log)
+                // The menu will show recent sessions when clicked
+                logKeyPress(key, "Global: Cmd+O Open Recent (use menu)");
+                return true;
+            }
+        }
+    }
+    
     // Debug: Log Cmd+':' attempts (before check to see what we're receiving)
     if (cmdPressed && (key == ':' || key == 58 || keycode == 59)) {
         ofLogNotice("InputRouter") << "[COLON_DEBUG] Cmd+':' detected: key=" << key 
@@ -74,7 +167,7 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
                                     << ", isColonKey=" << (key == ':' || key == 58 || (keycode == 59 && shiftPressed));
     }
     
-    // Priority 0: Cmd+':' - Toggle Console (global shortcut, works everywhere)
+    // Priority 0.5: Cmd+':' - Toggle Console (global shortcut, works everywhere)
     // On macOS, ':' is Shift+';' (semicolon), so we need to check for semicolon keycode (59) with Shift
     // Also check direct ':' character (ASCII 58) and keycode 59 (semicolon)
     bool isColonKey = (key == ':' || key == 58 || (keycode == 59 && shiftPressed));
@@ -96,6 +189,43 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         return true; // Consume the key
     }
     
+    // Priority 0.5: Cmd+L - Toggle Asset Library (global shortcut, works everywhere)
+    if (cmdPressed && (key == 'l' || key == 'L') && viewManager) {
+        bool visible = viewManager->isAssetLibraryVisible();
+        viewManager->setAssetLibraryVisible(!visible);
+        
+        // Navigate to Asset Library panel when showing
+        if (!visible) {
+            viewManager->navigateToPanel(Panel::ASSET_LIBRARY);
+        }
+        
+        logKeyPress(key, "Global: Cmd+L Toggle Asset Library");
+        return true; // Consume the key
+    }
+    
+    // Priority 0.5: Cmd+B - Toggle File Browser (global shortcut, works everywhere)
+    if (cmdPressed && (key == 'b' || key == 'B') && viewManager) {
+        bool visible = viewManager->isFileBrowserVisible();
+        viewManager->setFileBrowserVisible(!visible);
+        
+        // Navigate to File Browser panel when showing
+        if (!visible) {
+            viewManager->navigateToPanel(Panel::FILE_BROWSER);
+        }
+        
+        logKeyPress(key, "Global: Cmd+B Toggle File Browser");
+        return true; // Consume the key
+    }
+    
+    // Priority 0.5: Cmd+'=' - Toggle Command Bar (global shortcut, works everywhere)
+    if (cmdPressed && (key == '=' || key == '+')) {
+        if (commandBar) {
+            commandBar->toggle();
+            logKeyPress(key, "Global: Cmd+'=' Toggle Command Bar");
+            return true; // Consume the key
+        }
+    }
+    
     // Priority 0.5: Console arrow keys for history navigation (before other handlers consume them)
     // Only handle if console is visible and input text is focused
     if (console && viewManager && viewManager->isConsoleVisible() && console->isConsoleOpen() &&
@@ -113,16 +243,15 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     
     // Priority 2: Spacebar - ALWAYS works (global transport control)
     // Handle spacebar BEFORE other checks to ensure it always works
+    // EXCEPT when console input is focused (user is typing commands)
     if (key == ' ') {
-        // Alt+Spacebar: Trigger current edit step
-        if (tracker && trackerGUI) {
-            int editStep = trackerGUI->getEditStep();
-            if (editStep >= 0) {
-                tracker->triggerStep(editStep);
-                logKeyPress(key, "Alt+Spacebar: Trigger step");
-                return true;
-            }
+        // Don't handle spacebar if console input is focused (let user type spaces)
+        if (console && viewManager && viewManager->isConsoleVisible() && console->isConsoleOpen() && 
+            console->isInputTextFocused()) {
+            // Console input is focused - let ImGui handle spacebar for text input
+            return false;  // Don't consume, let it pass through to ImGui
         }
+        
         // Regular Spacebar: Play/Stop (always works, even when ImGui has focus)
         if (handleGlobalShortcuts(key)) {
             return true;
@@ -136,183 +265,18 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         }
     }
     
-    // Priority 4: MediaPool parameter editing - check BEFORE tracker to avoid conflicts
-    // CRITICAL: Sync focus state from ImGui before checking if parameter is focused
-    // This ensures editingColumnIndex and editingParameter are set even if GUI draw sync hasn't happened yet
-    int currentPanelIndex = viewManager ? viewManager->getCurrentPanelIndex() : -1;
-    
-    if (mediaPoolGUI) {
-        MediaPoolGUI::syncEditStateFromImGuiFocus(*mediaPoolGUI);
-    }
-    
-    bool mediaPoolParameterFocused = (mediaPoolGUI && mediaPoolGUI->isKeyboardFocused());
-    
-    // Handle MediaPool parameter editing FIRST, regardless of panel index
-    // This allows editing parameters even when ViewManager thinks a different panel is active
-    if (mediaPoolGUI && mediaPoolParameterFocused) {
-        // Delegate to MediaPoolGUI for parameter editing
-        bool handled = mediaPoolGUI->handleKeyPress(key, ctrlPressed, shiftPressed);
+    // Priority 4: Generic GUI input routing - route to focused GUI
+    // Let modules handle their own shortcuts via handleKeyPress()
+    auto focusedGUI = getFocusedGUI();
+    if (focusedGUI && focusedGUI->isKeyboardFocused()) {
+        // Delegate to GUI's generic handleKeyPress method
+        // Modules handle their own shortcuts internally
+        bool handled = focusedGUI->handleKeyPress(key, ctrlPressed, shiftPressed);
         if (handled) {
             return true;
         }
-        // If MediaPoolGUI didn't handle it, let ImGui process it (for navigation)
+        // If GUI didn't handle it, let ImGui process it (for navigation)
         return false;
-    }
-    
-    // Priority 5: Tracker input - only when in tracker panel
-    // CRITICAL: Route tracker input BEFORE ImGui can consume it, even if ImGui wants keyboard
-    // This ensures Enter and numeric keys work when cells are focused
-    // 
-    // IMPORTANT: We check multiple conditions to determine if we're in the tracker panel:
-    // 1. Panel index == 2 (official tracker panel)
-    // 2. OR a tracker cell is focused (editStep/editColumn are valid)
-    // This handles both docked windows and regular panel navigation
-    bool trackerCellFocused = false;
-    bool onHeaderRow = false;
-    
-    // ALWAYS check tracker state if tracker exists, regardless of panel index
-    // This is because the user might be interacting with tracker even if ViewManager
-    // thinks a different panel is active (ImGui window focus vs ViewManager panel state)
-    if (tracker && trackerGUI) {
-        int editStep = trackerGUI->getEditStep();
-        int editColumn = trackerGUI->getEditColumn();
-        // Check if a valid cell is focused (indicates user is interacting with tracker)
-        trackerCellFocused = (editStep >= 0 && editStep < tracker->getStepCount() && editColumn >= 0);
-        // Check if on header row (editStep == -1 means no cell focused, likely on header)
-        onHeaderRow = (editStep == -1 && !trackerGUI->getIsEditingCell());
-    }
-    
-    bool isInTrackerPanel = (tracker && viewManager && currentPanelIndex == 2);
-    bool inTrackerPanel = isInTrackerPanel || trackerCellFocused || onHeaderRow;
-    
-    // Handle tracker input - cells are directly navigable like other widgets
-    if (tracker && inTrackerPanel) {
-        
-        // PHASE 1: Arrow keys in edit mode are handled directly in CellWidget::draw()
-        // InputRouter should skip them to prevent double-processing
-        bool inEditMode = trackerGUI ? trackerGUI->getIsEditingCell() : false;
-        
-        if (inEditMode && (key == OF_KEY_UP || key == OF_KEY_DOWN || 
-                           key == OF_KEY_LEFT || key == OF_KEY_RIGHT)) {
-            // Arrow keys in edit mode: Let Phase 1 handle them
-            ofLogNotice("InputRouter") << "  Arrow key in edit mode - letting Phase 1 handle it in CellWidget::draw()";
-            return false; // Let ImGui process it so Phase 1 can handle it
-        }
-        
-        // When NOT in edit mode, let ImGui handle arrow keys for navigation
-        if (!inEditMode && (key == OF_KEY_UP || key == OF_KEY_DOWN || 
-                            key == OF_KEY_LEFT || key == OF_KEY_RIGHT)) {
-            // Not in edit mode: Let ImGui handle arrow keys for native navigation
-            ofLogNotice("InputRouter") << "  Arrow key NOT in edit mode: letting ImGui handle navigation";
-            return false; // Let ImGui process arrow keys for navigation
-        }
-        
-        // Enter key: PHASE 1 handles regular Enter in edit mode
-        // InputRouter only handles special cases (Shift+Enter, Ctrl+Enter)
-        if (key == OF_KEY_RETURN) {
-            // When on header row, don't route Enter to tracker - let ImGui handle it
-            if (onHeaderRow && !ctrlPressed && !shiftPressed) {
-                return false; // Let ImGui process the key
-            }
-            
-            // PHASE 1: If in edit mode, let Phase 1 handle Enter (validates and exits edit mode)
-            if (inEditMode && !ctrlPressed && !shiftPressed) {
-                ofLogNotice("InputRouter") << "  Enter key - in edit mode, letting Phase 1 handle it in CellWidget::draw()";
-                return false; // Let ImGui process it so Phase 1 can handle it
-            }
-            
-            // PHASE 1: If a tracker cell is focused (but not in edit mode), let Phase 1 handle Enter
-            if (trackerCellFocused && !ctrlPressed && !shiftPressed) {
-                ofLogNotice("InputRouter") << "  Enter key - tracker cell focused, letting Phase 1 handle it in CellWidget::draw()";
-                return false; // Let ImGui process it so Phase 1 can handle it
-            }
-            
-            // Special cases: Shift+Enter and Ctrl+Enter are still handled by InputRouter
-            if (!trackerGUI) {
-                return false;
-            }
-            
-            // Create GUI state struct from trackerGUI
-            TrackerSequencer::GUIState guiState;
-            guiState.editStep = trackerGUI->getEditStep();
-            guiState.editColumn = trackerGUI->getEditColumn();
-            guiState.isEditingCell = trackerGUI->getIsEditingCell();
-            guiState.editBufferCache = trackerGUI->getEditBufferCache();
-            guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
-            guiState.shouldRefocusCurrentCell = trackerGUI->getShouldRefocusCurrentCell();
-            
-            if (shiftPressed) {
-                // Shift+Enter: Exit grid navigation (clear cell selection)
-                syncEditStateFromImGuiFocus();
-                guiState.editStep = trackerGUI->getEditStep();
-                guiState.editColumn = trackerGUI->getEditColumn();
-                if (tracker->handleKeyPress(key, false, true, guiState)) {
-                    trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
-                    trackerGUI->setInEditMode(guiState.isEditingCell);
-                    trackerGUI->getEditBufferCache() = guiState.editBufferCache;
-                    trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
-                    trackerGUI->setShouldRefocusCurrentCell(guiState.shouldRefocusCurrentCell);
-                    logKeyPress(key, "Tracker: Shift+Enter (exit grid)");
-                    return true;
-                }
-            } else if (ctrlPressed) {
-                // Ctrl+Enter: Special action (if any)
-                // For now, let it fall through to other handlers
-                return false;
-            }
-            // Regular Enter when not in edit mode and no cell focused - let other handlers process it
-            return false;
-        }
-        
-        // PHASE 1: Numeric keys are handled directly in CellWidget::draw()
-        // If we're in the tracker panel, InputRouter should NEVER process numeric keys
-        // This prevents double-processing and timing issues with GUI state sync
-        if (inTrackerPanel && ((key >= '0' && key <= '9') || key == '.' || key == '-' || 
-                               key == OF_KEY_BACKSPACE || key == OF_KEY_DEL)) {
-            // Check if any ImGui widget is active (like InputText fields for repeat count)
-            // If so, let ImGui handle it
-            if (ImGui::IsAnyItemActive()) {
-                ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - ImGui item active, letting ImGui handle it";
-                return false;
-            }
-            
-            // Also check WantTextInput as a fallback
-            ImGuiIO& io = ImGui::GetIO();
-            if (io.WantTextInput) {
-                ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - ImGui text input active, letting ImGui handle it";
-                return false;
-            }
-            
-            // In tracker panel: Let Phase 1 handle ALL numeric keys
-            // Phase 1 will check if cell is focused and handle accordingly
-            ofLogNotice("InputRouter") << "  Numeric key '" << (char)key << "' - in tracker panel, letting Phase 1 handle it in CellWidget::draw()";
-            return false; // Let ImGui process it so Phase 1 can handle it
-        }
-        
-        ofLogNotice("InputRouter") << "  Key not matched for tracker input, checking other handlers...";
-        
-        // Handle other tracker input with proper modifiers
-        if (handleTrackerInput(keyEvent)) {
-            ofLogNotice("InputRouter") << "  Key handled by handleTrackerInput";
-            return true;
-        }
-        
-        ofLogNotice("InputRouter") << "  Key not handled in tracker panel section";
-    } else {
-        ofLogNotice("InputRouter") << "  NOT in tracker panel (currentPanelIndex=" << currentPanelIndex 
-            << ", trackerCellFocused=" << (trackerCellFocused ? "YES" : "NO") << ")";
-    }
-    
-    // Handle MediaPool panel-specific navigation (only when in MediaPool panel)
-    bool inMediaPoolPanel = (mediaPool && viewManager && currentPanelIndex == 3);
-    if (inMediaPoolPanel && mediaPoolGUI) {
-        // Ctrl+Enter: Go up a level (focus parent container)
-        if (key == OF_KEY_RETURN && ctrlPressed && !shiftPressed) {
-            if (!mediaPoolGUI->getIsParentWidgetFocused()) {
-                mediaPoolGUI->requestFocusMoveToParent();
-                return true; // Consume the key
-            }
-        }
     }
     
     return false;
@@ -337,18 +301,6 @@ bool InputRouter::handleGlobalShortcuts(int key) {
             }
             break;
 
-        case 'r':
-        case 'R':  // R - Reset
-            if (clock) {
-                clock->reset();
-                if (tracker) tracker->reset();
-                if (currentStep) *currentStep = 0;
-                if (lastTriggeredStep) *lastTriggeredStep = 0;
-                logKeyPress(key, "Global: Reset");
-                return true;
-            }
-            break;
-
         case 'g':
         case 'G':  // G - Toggle GUI
             if (showGUI) {
@@ -358,33 +310,10 @@ bool InputRouter::handleGlobalShortcuts(int key) {
             }
             break;
 
-        case 'n':
-        case 'N':  // N - Next media
-            if (mediaPool) {
-                mediaPool->nextPlayer();
-                logKeyPress(key, "Global: Next media");
-                return true;
-            }
-            break;
-
-        case 'm':
-        case 'M':  // M - Previous media
-            if (mediaPool) {
-                mediaPool->previousPlayer();
-                logKeyPress(key, "Global: Previous media");
-                return true;
-            }
-            break;
-
         case 'S':  // S - Save session (capital S to distinguish from speed)
             if (onSaveSession) {
                 onSaveSession();
                 logKeyPress(key, "Global: Save session");
-                return true;
-            } else if (tracker) {
-                // Fallback to old behavior if callback not set
-                tracker->saveState("pattern.json");
-                logKeyPress(key, "Global: Save pattern (fallback)");
                 return true;
             }
             break;
@@ -394,37 +323,7 @@ bool InputRouter::handleGlobalShortcuts(int key) {
 }
 
 // Removed handlePanelNavigation - Ctrl+Tab is now handled by ImGui natively
-
-bool InputRouter::handleTrackerInput(ofKeyEventArgs& keyEvent) {
-    if (!tracker || !trackerGUI) return false;
-    
-    int key = keyEvent.key;
-    bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
-    bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-    
-    // Create GUI state struct from trackerGUI
-    TrackerSequencer::GUIState guiState;
-    guiState.editStep = trackerGUI->getEditStep();
-    guiState.editColumn = trackerGUI->getEditColumn();
-    guiState.isEditingCell = trackerGUI->getIsEditingCell();
-    guiState.editBufferCache = trackerGUI->getEditBufferCache();
-    guiState.editBufferInitializedCache = trackerGUI->getEditBufferInitializedCache();
-    
-    // Delegate to TrackerSequencer with proper modifier flags
-    if (tracker->handleKeyPress(key, ctrlPressed, shiftPressed, guiState)) {
-        // Update GUI state back from the modified guiState
-        trackerGUI->setEditCell(guiState.editStep, guiState.editColumn);
-        trackerGUI->setInEditMode(guiState.isEditingCell);
-        trackerGUI->getEditBufferCache() = guiState.editBufferCache;
-        trackerGUI->setEditBufferInitializedCache(guiState.editBufferInitializedCache);
-        if (currentStep) {
-            *currentStep = tracker->getCurrentStep();
-        }
-        logKeyPress(key, "Tracker input");
-        return true;
-    }
-    return false;
-}
+// Removed handleTrackerInput - modules handle their own input via handleKeyPress()
 
 void InputRouter::updateImGuiCaptureState() {
     ImGuiIO& io = ImGui::GetIO();
@@ -435,19 +334,323 @@ bool InputRouter::isImGuiCapturingKeyboard() const {
     return imGuiCapturingKeyboard;
 }
 
-bool InputRouter::isSequencerInEditMode() const {
-    return trackerGUI ? trackerGUI->getIsEditingCell() : false;
-}
-
-void InputRouter::syncEditStateFromImGuiFocus() {
-    // Sync edit state from ImGui focus before processing keys
-    // This ensures editStep/editColumn are set even if GUI draw sync hasn't happened yet
-    if (trackerGUI) {
-        trackerGUI->syncEditStateFromImGuiFocus();
-    }
-}
+// Removed isSequencerInEditMode() - module-specific, not needed in generic router
+// Removed syncEditStateFromImGuiFocus() - modules handle their own state sync
 
 void InputRouter::logKeyPress(int key, const char* context) {
     ofLogVerbose("InputRouter") << context << " - Key: " << key;
+}
+
+//--------------------------------------------------------------
+void InputRouter::handleDragEvent(ofDragInfo dragInfo, AssetLibrary* assetLibrary, ProjectManager* projectManager) {
+    if (!registry || !guiManager || !assetLibrary || !projectManager) {
+        ofLogError("InputRouter") << "Cannot handle drag event: missing dependencies";
+        return;
+    }
+    
+    if (dragInfo.files.empty()) {
+        return;
+    }
+    
+    // Get mouse position from drag info
+    ofPoint mousePos = dragInfo.position;
+    
+    // Convert to ImGui coordinates (ImGui uses screen coordinates)
+    ImVec2 imguiMousePos(mousePos.x, mousePos.y);
+    
+    // Filter valid media files
+    std::vector<std::string> validFiles;
+    for (const auto& filePath : dragInfo.files) {
+        ofFile file(filePath);
+        if (!file.exists()) {
+            continue;
+        }
+        
+        std::string ext = ofToLower(ofFilePath::getFileExt(filePath));
+        bool isAudio = (ext == "wav" || ext == "mp3" || ext == "aiff" || ext == "aif" || ext == "m4a");
+        bool isVideo = (ext == "mov" || ext == "mp4" || ext == "avi" || ext == "mkv" || ext == "webm" || ext == "hap");
+        
+        if (isAudio || isVideo) {
+            validFiles.push_back(filePath);
+        }
+    }
+    
+    if (validFiles.empty()) {
+        ofLogNotice("InputRouter") << "No valid media files in drag-and-drop";
+        return;
+    }
+    
+    // Helper function to check if a file is within project Assets directory
+    auto isFileInProjectAssets = [projectManager](const std::string& filePath) -> bool {
+        if (!projectManager->isProjectOpen()) {
+            return false;
+        }
+        std::string assetsDir = projectManager->getAssetsDirectory();
+        if (assetsDir.empty()) {
+            return false;
+        }
+        // Check if filePath starts with assetsDir
+        std::string normalizedPath = ofFilePath::getAbsolutePath(filePath);
+        std::string normalizedAssetsDir = ofFilePath::getAbsolutePath(assetsDir);
+        return normalizedPath.find(normalizedAssetsDir) == 0;
+    };
+    
+    // Check if drop is over AssetLibrary window first
+    ImGuiWindow* assetLibraryWindow = ImGui::FindWindowByName("Asset Library");
+    bool isOverAssetLibrary = false;
+    if (assetLibraryWindow && assetLibraryWindow->Active) {
+        ImVec2 windowPos = assetLibraryWindow->Pos;
+        ImVec2 windowSize = assetLibraryWindow->Size;
+        ImVec2 windowMax = ImVec2(windowPos.x + windowSize.x, windowPos.y + windowSize.y);
+        
+        if (imguiMousePos.x >= windowPos.x && imguiMousePos.x <= windowMax.x &&
+            imguiMousePos.y >= windowPos.y && imguiMousePos.y <= windowMax.y) {
+            isOverAssetLibrary = true;
+        }
+    }
+    
+    if (isOverAssetLibrary) {
+        // Drop is over AssetLibrary - import files to AssetLibrary
+        ofLogNotice("InputRouter") << "Dropping " << validFiles.size() << " file(s) to AssetLibrary";
+        assetLibrary->handleDrop(validFiles);
+        return;
+    }
+    
+    // Find which module window received the drop - generic capability-based approach
+    std::string targetInstanceName;
+    
+    // Check all modules that accept file drops to see if drop position is within their window
+    registry->forEachModule([&targetInstanceName, &imguiMousePos](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
+        if (!module || !module->hasCapability(ModuleCapability::ACCEPTS_FILE_DROP)) {
+            return;
+        }
+        
+        // Window title matches instance name
+        std::string windowTitle = name;
+        
+        // Check if window exists and is visible
+        ImGuiWindow* window = ImGui::FindWindowByName(windowTitle.c_str());
+        if (window && window->Active) {
+            // Check if mouse position is within window bounds
+            ImVec2 windowPos = window->Pos;
+            ImVec2 windowSize = window->Size;
+            ImVec2 windowMax = ImVec2(windowPos.x + windowSize.x, windowPos.y + windowSize.y);
+            
+            if (imguiMousePos.x >= windowPos.x && imguiMousePos.x <= windowMax.x &&
+                imguiMousePos.y >= windowPos.y && imguiMousePos.y <= windowMax.y) {
+                targetInstanceName = name;
+                return; // Stop iteration
+            }
+        }
+    });
+    
+    // If no specific window was found, use the first visible module that accepts file drops
+    if (targetInstanceName.empty()) {
+        // Try visible instances first (by type)
+        auto visibleInstances = guiManager->getVisibleInstances(ModuleType::INSTRUMENT);
+        for (const auto& instanceName : visibleInstances) {
+            auto module = registry->getModule(instanceName);
+            if (module && module->hasCapability(ModuleCapability::ACCEPTS_FILE_DROP)) {
+                targetInstanceName = instanceName;
+                break;
+            }
+        }
+        
+        // Fallback: find any module with ACCEPTS_FILE_DROP capability
+        if (targetInstanceName.empty()) {
+            registry->forEachModule([&targetInstanceName](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
+                if (module && module->hasCapability(ModuleCapability::ACCEPTS_FILE_DROP)) {
+                    targetInstanceName = name;
+                    return; // Stop after first match
+                }
+            });
+        }
+    }
+    
+    // Handle drop on module - generic capability-based handling
+    if (!targetInstanceName.empty()) {
+        auto targetModule = registry->getModule(targetInstanceName);
+        
+        if (targetModule && targetModule->hasCapability(ModuleCapability::ACCEPTS_FILE_DROP)) {
+            // Check if files are from project Assets directory
+            bool allFilesFromProject = true;
+            for (const auto& filePath : validFiles) {
+                if (!isFileInProjectAssets(filePath)) {
+                    allFilesFromProject = false;
+                    break;
+                }
+            }
+            
+            if (allFilesFromProject) {
+                // Files are already in project - send directly to module
+                ofLogNotice("InputRouter") << "Adding " << validFiles.size() << " file(s) from project to module: " << targetInstanceName;
+                targetModule->acceptFileDrop(validFiles);
+            } else {
+                // Files are from OS - import to AssetLibrary first, then send to module
+                ofLogNotice("InputRouter") << "Importing " << validFiles.size() << " file(s) to AssetLibrary, then sending to module: " << targetInstanceName;
+                
+                // Import files to AssetLibrary
+                std::vector<std::string> importedAssetIds = assetLibrary->importFiles(validFiles);
+                
+                // Wait a bit for conversion to start (if needed), then get converted paths
+                // For now, we'll send the original paths and let module handle it
+                // In the future, we could wait for conversion and send converted paths
+                std::vector<std::string> pathsToSend;
+                for (const auto& assetId : importedAssetIds) {
+                    std::string assetPath = assetLibrary->getAssetPath(assetId);
+                    if (!assetPath.empty()) {
+                        pathsToSend.push_back(assetPath);
+                    } else {
+                        // Fallback to original path if asset path not available
+                        // Find original path from assetId
+                        const AssetInfo* asset = assetLibrary->getAssetInfo(assetId);
+                        if (asset && !asset->originalPath.empty()) {
+                            pathsToSend.push_back(asset->originalPath);
+                        }
+                    }
+                }
+                
+                if (!pathsToSend.empty()) {
+                    targetModule->acceptFileDrop(pathsToSend);
+                }
+            }
+        } else {
+            ofLogWarning("InputRouter") << "Module instance not found or doesn't accept file drops: " << targetInstanceName;
+        }
+    } else {
+        // Find first module that accepts file drops
+        registry->forEachModule([&validFiles, &isFileInProjectAssets](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
+            if (module && module->hasCapability(ModuleCapability::ACCEPTS_FILE_DROP)) {
+                // Check if files are from project Assets directory
+                bool allFilesFromProject = true;
+                for (const auto& filePath : validFiles) {
+                    if (!isFileInProjectAssets(filePath)) {
+                        allFilesFromProject = false;
+                        break;
+                    }
+                }
+                
+                if (allFilesFromProject) {
+                    // Files are already in project - send directly to module
+                    ofLogNotice("InputRouter") << "Adding " << validFiles.size() << " file(s) from project to module: " << name;
+                    module->acceptFileDrop(validFiles);
+                } else {
+                    // Files are from OS - just log (AssetLibrary import should be done manually)
+                    ofLogNotice("InputRouter") << "Files from OS - import to AssetLibrary first, then drag to module";
+                }
+                return; // Stop after first match
+            }
+        });
+    }
+}
+
+//--------------------------------------------------------------
+void InputRouter::setupWithCallbacks(
+    Clock* clock_,
+    ModuleRegistry* registry_,
+    GUIManager* guiManager_,
+    ViewManager* viewManager_,
+    Console* console_,
+    CommandBar* commandBar_,
+    SessionManager* sessionManager,
+    ProjectManager* projectManager,
+    MenuBar* menuBar,
+    std::function<void()> onUpdateWindowTitle,
+    int* currentStep_,
+    int* lastTriggeredStep_,
+    bool* showGUI_
+) {
+    // Setup system references
+    setup(clock_, registry_, guiManager_, viewManager_, console_, commandBar_);
+    
+    // Set state references
+    setCurrentStep(currentStep_);
+    setLastTriggeredStep(lastTriggeredStep_);
+    setShowGUI(showGUI_);
+    
+    // Set session save/load callbacks for keyboard shortcut (S key)
+    setSessionCallbacks(
+        [sessionManager, onUpdateWindowTitle]() { 
+            if (sessionManager && sessionManager->saveSession("session.json")) {
+                onUpdateWindowTitle();
+            }
+        },
+        [sessionManager, onUpdateWindowTitle]() { 
+            if (sessionManager && sessionManager->loadSession("session.json")) {
+                onUpdateWindowTitle();
+            }
+        }
+    );
+    
+    // Set File menu callbacks for keyboard shortcuts
+    setFileMenuCallbacks(
+        [sessionManager, projectManager, menuBar, onUpdateWindowTitle]() { 
+            // Cmd+S: Save
+            if (!sessionManager || !projectManager) return;
+            std::string sessionName = sessionManager->getCurrentSessionName();
+            if (sessionName.empty()) {
+                if (projectManager->isProjectOpen()) {
+                    sessionName = projectManager->generateDefaultSessionName();
+                } else {
+                    sessionName = "session.json";
+                }
+            }
+            if (sessionManager->saveSession(sessionName)) {
+                onUpdateWindowTitle();
+                std::string sessionPath = projectManager->isProjectOpen() 
+                    ? projectManager->getSessionPath(sessionName)
+                    : sessionName;
+                if (!sessionPath.empty() && menuBar) {
+                    menuBar->addToRecentSessions(sessionPath);
+                }
+            }
+        },
+        [sessionManager, projectManager, menuBar, onUpdateWindowTitle]() { 
+            // Cmd+Shift+S: Save As
+            if (!sessionManager || !projectManager) return;
+            std::string defaultName = sessionManager->getCurrentSessionName();
+            if (defaultName.empty()) {
+                defaultName = projectManager->isProjectOpen() 
+                    ? projectManager->generateDefaultSessionName()
+                    : "session.json";
+            }
+            auto result = ofSystemSaveDialog(defaultName, "Save Session As");
+            if (result.bSuccess) {
+                std::string sessionName = ofFilePath::getFileName(result.filePath);
+                if (projectManager->isProjectOpen()) {
+                    sessionManager->saveSession(sessionName);
+                    onUpdateWindowTitle();
+                    if (menuBar) {
+                        menuBar->addToRecentSessions(projectManager->getSessionPath(sessionName));
+                    }
+                } else {
+                    sessionManager->saveSessionToPath(result.filePath);
+                    onUpdateWindowTitle();
+                    if (menuBar) {
+                        menuBar->addToRecentSessions(result.filePath);
+                    }
+                }
+            }
+        },
+        [sessionManager, menuBar, onUpdateWindowTitle]() { 
+            // Cmd+Shift+O: Open
+            if (!sessionManager) return;
+            auto result = ofSystemLoadDialog("Open Session", false);
+            if (result.bSuccess) {
+                if (sessionManager->loadSessionFromPath(result.filePath)) {
+                    onUpdateWindowTitle();
+                    if (menuBar) {
+                        menuBar->addToRecentSessions(result.filePath);
+                    }
+                }
+            }
+        },
+        []() { 
+            // Cmd+O: Open Recent (for now, just log - menu shows recent sessions)
+            // Could be enhanced to show a popup with recent sessions
+        }
+    );
+    
+    ofLogNotice("InputRouter") << "Setup with callbacks complete";
 }
 

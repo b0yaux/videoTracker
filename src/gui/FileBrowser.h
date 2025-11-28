@@ -2,7 +2,6 @@
 
 #include <imgui.h>
 #include "gui/GUIConstants.h"
-#include "MediaPlayer.h"
 #include <string>
 #include <vector>
 #include <set>
@@ -35,6 +34,9 @@ public:
     void setImportCallback(ImportCallback callback) { importCallback_ = callback; }
     void setGetInstancesCallback(GetInstancesCallback callback) { getInstancesCallback_ = callback; }
     
+    // Set project directory as default root
+    void setProjectDirectory(const std::string& projectDir);
+    
     // Main draw function - draws the panel content
     // Window is created by ViewManager, this just draws the content
     void draw();
@@ -53,8 +55,7 @@ private:
     std::string previewFile_;  // Currently previewed file
     std::string lastSelectedPath_;  // Last selected file path (for shift-click range selection)
     
-    // Media preview
-    std::unique_ptr<MediaPlayer> previewPlayer_;  // For previewing selected media
+    // Media preview (removed - FileBrowser is now lightweight)
     bool previewLoaded_;
     
     // Import target

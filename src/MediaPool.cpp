@@ -1,22 +1,25 @@
 #include "MediaPool.h"
 #include "MediaPlayer.h"
-#include "TrackerSequencer.h"
+#include "core/ModuleFactory.h"
 #include "ofFileUtils.h"
 #include "ofSystemUtils.h"
 #include "ofUtils.h"
 #include "ofJson.h"
 #include <unordered_map>
 #include <unordered_set>
+#include <algorithm>
 
 MediaPool::MediaPool(const std::string& dataDir) 
     : currentIndex(0), dataDirectory(dataDir), isSetup(false), currentMode(PlaybackMode::IDLE), 
       currentPlayStyle(PlayStyle::ONCE), clock(nullptr), activePlayer(nullptr), 
-      lastTransportState(false), playerConnected(false), gateTimerActive(false), gateEndTime(0.0f),
-      positionScan(ScanMode::PER_MEDIA), lastTriggeredStep(-1), activeStepContext() {
+      lastTransportState(false),
+      positionScan(ScanMode::PER_MEDIA), lastTriggeredStep(-1), activeStepContext(),
+      polyphonyMode_(PolyphonyMode::MONOPHONIC) {  // Default to monophonic for backward compatibility
     // setup() will be called later with clock reference
 }
 
 MediaPool::~MediaPool() {
+    isDestroying_ = true;  // Prevent update() from running after destruction starts
     clear();
 }
 
@@ -24,23 +27,224 @@ void MediaPool::setup(Clock* clockRef) {
     if (isSetup) return;
     
     clock = clockRef; // Store clock reference
-    ofLogNotice("ofxMediaPool") << "Setting up media library with directory: " << dataDirectory;
+    ofLogNotice("MediaPool") << "Setting up media library with directory: " << dataDirectory;
     isSetup = true;
 }
 
+//--------------------------------------------------------------
+//--------------------------------------------------------------
+void MediaPool::initialize(Clock* clock, ModuleRegistry* registry, ConnectionManager* connectionManager, 
+                          ParameterRouter* parameterRouter, bool isRestored) {
+    // Phase 2.3: Unified initialization - combines postCreateSetup and completeRestore
+    
+    // 1. Basic setup (from postCreateSetup)
+    if (clock) {
+        setup(clock);
+    }
+    
+    // 2. Complete restoration (from completeRestore) - only if restoring from session
+    if (isRestored) {
+        // Check if we have files to load (either from deferred loading or from fromJson)
+        bool hasFilesToLoad = !audioFiles.empty() || !videoFiles.empty();
+        bool shouldLoad = deferMediaLoading_ || (hasFilesToLoad && players.empty());
+        
+        if (shouldLoad) {
+            ofLogNotice("MediaPool") << "Completing deferred media loading...";
+            
+            // Only call mediaPair if we have files but no players yet
+            // This handles both the deferred loading case and cases where fromJson
+            // populated file lists but mediaPair wasn't called
+            if (hasFilesToLoad && players.empty()) {
+                ofLogNotice("MediaPool") << "Creating players from " << audioFiles.size() 
+                                         << " audio files and " << videoFiles.size() << " video files";
+                deferMediaLoading_ = false;  // Clear flag before calling mediaPair
+                mediaPair();  // This creates the players
+                
+                // Verify players were created
+                if (players.empty()) {
+                    ofLogWarning("MediaPool") << "mediaPair() completed but no players were created. "
+                                               << "Check that media files exist at saved paths.";
+                    // Log some example paths for debugging
+                    if (!audioFiles.empty()) {
+                        ofLogWarning("MediaPool") << "Example audio file path: " << audioFiles[0];
+                        ofLogWarning("MediaPool") << "File exists: " << (ofFile::doesFileExist(audioFiles[0]) ? "yes" : "no");
+                    }
+                    if (!videoFiles.empty()) {
+                        ofLogWarning("MediaPool") << "Example video file path: " << videoFiles[0];
+                        ofLogWarning("MediaPool") << "File exists: " << (ofFile::doesFileExist(videoFiles[0]) ? "yes" : "no");
+                    }
+                } else {
+                    ofLogNotice("MediaPool") << "Successfully created " << players.size() << " players from saved file paths";
+                }
+            } else {
+                deferMediaLoading_ = false;  // Clear flag even if we skip mediaPair
+                if (!hasFilesToLoad) {
+                    ofLogNotice("MediaPool") << "No files to load (audioFiles: " << audioFiles.size() 
+                                             << ", videoFiles: " << videoFiles.size() << ")";
+                }
+                if (!players.empty()) {
+                    ofLogNotice("MediaPool") << "Players already exist (" << players.size() << "), skipping mediaPair()";
+                }
+            }
+            
+            // NOW load parameters for the newly created players
+            // Match players by file paths since indices might have changed
+            size_t paramsRestored = 0;
+            for (const auto& deferredParams : deferredPlayerParams_) {
+                // Find the player that matches these file paths
+                bool found = false;
+                for (size_t i = 0; i < players.size(); i++) {
+                    auto player = players[i].get();
+                    if (!player) continue;
+                    
+                    bool audioMatch = deferredParams.audioFile.empty() ? 
+                        player->getAudioFilePath().empty() : 
+                        player->getAudioFilePath() == deferredParams.audioFile;
+                    bool videoMatch = deferredParams.videoFile.empty() ? 
+                        player->getVideoFilePath().empty() : 
+                        player->getVideoFilePath() == deferredParams.videoFile;
+                    
+                    if (audioMatch && videoMatch) {
+                        // Found matching player - load parameters
+                        auto paramsJson = deferredParams.paramsJson;
+                        
+                        if (paramsJson.contains("startPosition")) {
+                            player->startPosition.set(paramsJson["startPosition"]);
+                        }
+                        if (paramsJson.contains("speed")) {
+                            player->speed.set(paramsJson["speed"]);
+                        }
+                        if (paramsJson.contains("volume")) {
+                            player->volume.set(paramsJson["volume"]);
+                        }
+                        if (paramsJson.contains("loop")) {
+                            player->loop.set(paramsJson["loop"]);
+                        }
+                        if (paramsJson.contains("loopSize")) {
+                            player->loopSize.set(paramsJson["loopSize"]);
+                        }
+                        if (paramsJson.contains("regionStart")) {
+                            player->regionStart.set(paramsJson["regionStart"]);
+                        }
+                        if (paramsJson.contains("regionEnd")) {
+                            player->regionEnd.set(paramsJson["regionEnd"]);
+                        }
+                        if (paramsJson.contains("audioEnabled")) {
+                            player->audioEnabled.set(paramsJson["audioEnabled"]);
+                        }
+                        if (paramsJson.contains("videoEnabled")) {
+                            player->videoEnabled.set(paramsJson["videoEnabled"]);
+                        }
+                        
+                        ofLogNotice("MediaPool") << "Restored parameters for player " << i 
+                                                 << " (audio: " << deferredParams.audioFile 
+                                                 << ", video: " << deferredParams.videoFile << ")";
+                        paramsRestored++;
+                        found = true;
+                        break;
+                    }
+                }
+                
+                if (!found) {
+                    ofLogWarning("MediaPool") << "Could not find player matching audio: " 
+                                               << deferredParams.audioFile 
+                                               << ", video: " << deferredParams.videoFile;
+                }
+            }
+            
+            ofLogNotice("MediaPool") << "Restored parameters for " << paramsRestored 
+                                     << " of " << deferredPlayerParams_.size() << " players";
+            
+            // Restore active player index after players are created
+            if (deferredActivePlayerIndex_ >= 0 && deferredActivePlayerIndex_ < (int)players.size()) {
+                setCurrentIndex(deferredActivePlayerIndex_);
+                ofLogNotice("MediaPool") << "Restored active player index: " << deferredActivePlayerIndex_;
+            }
+            
+            // Clear deferred params after loading
+            deferredPlayerParams_.clear();
+            
+            // Initialize active player if we have players
+            if (!players.empty()) {
+                initializeFirstActivePlayer();
+                
+                // CRITICAL: Initialize first video frame for ALL loaded video players after session restore
+                // This prevents GUI lag and low FPS when session loads.
+                // 
+                // Problem: When session loads, players are stopped at position 0.0, so:
+                // 1. MediaPool::update() only calls player->update() for playing players
+                // 2. MediaPlayer::update() only processes video when shouldBeEnabled=true
+                // 3. shouldBeEnabled requires isPlaying() || position > 0.001f
+                // 4. ofxVideoPlayerObject::process() gates out stopped videos at position 0
+                // Result: Video textures never get initialized, causing lag until scrubbing
+                //
+                // Solution: Initialize first frame for ALL loaded videos (not just enabled ones)
+                // by setting position to a small non-zero value and calling update/process once
+                size_t videosInitialized = 0;
+                for (size_t i = 0; i < players.size(); i++) {
+                    MediaPlayer* player = players[i].get();
+                    if (player && player->isVideoLoaded()) {
+                        // Check if video file is actually loaded at lower level
+                        if (player->getVideoPlayer().getVideoFile().isLoaded()) {
+                            // Use startPosition if available (from session restore), otherwise use 0.01
+                            float initPos = player->startPosition.get() > MIN_REGION_SIZE ? 
+                                           player->startPosition.get() : INIT_POSITION;
+                            
+                            // Set position using helper function (handles both audio and video)
+                            seekPlayerToPosition(player, initPos);
+                            
+                            // CRITICAL: Call process() once to initialize the output buffer
+                            // This ensures the video texture is loaded and ready for rendering
+                            ofFbo emptyInput;
+                            player->getVideoPlayer().process(emptyInput, player->getVideoPlayer().getOutputBuffer());
+                            
+                            videosInitialized++;
+                            ofLogNotice("MediaPool") << "Initialized first frame for video player " << i 
+                                                      << " at position " << initPos;
+                        }
+                    }
+                }
+                
+                if (videosInitialized > 0) {
+                    ofLogNotice("MediaPool") << "Initialized " << videosInitialized << " video frame(s) after session restore";
+                }
+                
+                ofLogNotice("MediaPool") << "Session restore complete: " << players.size() 
+                                         << " players loaded with parameters restored";
+            } else {
+                ofLogWarning("MediaPool") << "Session restore complete but no players were created. "
+                                          << "Check that media files exist at the saved paths.";
+            }
+            
+            deferMediaLoading_ = false;  // Clear flag
+        } else {
+            ofLogNotice("MediaPool") << "No deferred loading needed (deferMediaLoading_=" 
+                                     << deferMediaLoading_ << ", hasFiles=" << hasFilesToLoad 
+                                     << ", players=" << players.size() << ")";
+        }
+    }
+}
+
+//--------------------------------------------------------------
+// DEPRECATED: Use initialize() instead
+void MediaPool::postCreateSetup(Clock* clock) {
+    // Legacy implementation - delegates to initialize()
+    initialize(clock, nullptr, nullptr, nullptr, false);
+}
+
 void MediaPool::setCustomPath(const std::string& absolutePath) {
-    ofLogNotice("ofxMediaPool") << "Setting custom absolute path: " << absolutePath;
+    ofLogNotice("MediaPool") << "Setting custom absolute path: " << absolutePath;
     
     ofDirectory dir(absolutePath);
     if (!dir.exists()) {
-        ofLogError("ofxMediaPool") << "Custom path does not exist: " << absolutePath;
+        ofLogError("MediaPool") << "Custom path does not exist: " << absolutePath;
         return;
     }
     
     dataDirectory = absolutePath;
     clear();
     
-    ofLogNotice("ofxMediaPool") << "✅ Using custom path: " << absolutePath;
+    ofLogNotice("MediaPool") << "✅ Using custom path: " << absolutePath;
     
     // Scan the custom directory
     scanMediaFiles(absolutePath, dir);
@@ -53,16 +257,16 @@ void MediaPool::scanDirectory(const std::string& path) {
     dataDirectory = path;
     clear();
     
-    ofLogNotice("ofxMediaPool") << "🔍 scanDirectory called with path: " << path;
+    ofLogNotice("MediaPool") << "🔍 scanDirectory called with path: " << path;
     
     // Simple approach: just use the provided path
     ofDirectory dir(path);
     if (!dir.exists()) {
-        ofLogError("ofxMediaPool") << "Directory does not exist: " << path;
+        ofLogError("MediaPool") << "Directory does not exist: " << path;
         return;
     }
     
-    ofLogNotice("ofxMediaPool") << "✅ Directory exists, scanning for media files...";
+    ofLogNotice("MediaPool") << "✅ Directory exists, scanning for media files...";
     
     // Scan for media files
     scanMediaFiles(path, dir);
@@ -74,8 +278,17 @@ void MediaPool::mediaPair() {
     if (activePlayer) {
         disconnectActivePlayer();
         activePlayer = nullptr;
-        playerConnected = false;
     }
+    
+    // Disconnect all players before clearing
+    for (auto& player : players) {
+        if (player) {
+            ensurePlayerAudioDisconnected(player.get());
+            ensurePlayerVideoDisconnected(player.get());
+        }
+    }
+    playerAudioConnected.clear();
+    playerVideoConnected.clear();
     
     // Clear existing players before creating new ones
     players.clear();
@@ -101,10 +314,15 @@ void MediaPool::mediaPair() {
             bool loaded = player->load(audioFile, it->second);
             // Only add player if at least one media file loaded successfully
             if (loaded) {
+                MediaPlayer* playerPtr = player.get();
                 players.push_back(std::move(player));
+                // Don't connect immediately - connections are managed dynamically when players start/stop
+                // This ensures only active players are connected, fixing video blending issues
+                playerVideoConnected[playerPtr] = false;
+                playerAudioConnected[playerPtr] = false;
                 pairedVideos.insert(audioBase);
             } else {
-                ofLogWarning("ofxMediaPool") << "Failed to load paired media: " << audioFile << " + " << it->second;
+                ofLogWarning("MediaPool") << "Failed to load paired media: " << audioFile << " + " << it->second;
             }
         } else {
             // Create audio-only player
@@ -112,9 +330,12 @@ void MediaPool::mediaPair() {
             bool loaded = player->loadAudio(audioFile);
             // Only add player if audio loaded successfully
             if (loaded) {
+                MediaPlayer* playerPtr = player.get();
                 players.push_back(std::move(player));
+                // Don't connect immediately - connections are managed dynamically when players start/stop
+                playerVideoConnected[playerPtr] = false;
             } else {
-                ofLogWarning("ofxMediaPool") << "Failed to load audio: " << audioFile;
+                ofLogWarning("MediaPool") << "Failed to load audio: " << audioFile;
             }
         }
     }
@@ -128,101 +349,24 @@ void MediaPool::mediaPair() {
             bool loaded = player->loadVideo(videoFile);
             // Only add player if video loaded successfully
             if (loaded) {
+                MediaPlayer* playerPtr = player.get();
                 players.push_back(std::move(player));
+                // Don't connect immediately - connections are managed dynamically when players start/stop
+                playerVideoConnected[playerPtr] = false;
             } else {
-                ofLogWarning("ofxMediaPool") << "Failed to load video: " << videoFile;
+                ofLogWarning("MediaPool") << "Failed to load video: " << videoFile;
             }
         }
     }
     
-    ofLogNotice("ofxMediaPool") << "Created " << players.size() << " media players";
+    ofLogNotice("MediaPool") << "Created " << players.size() << " media players";
 }
 
-void MediaPool::completeDeferredLoading() {
-    // This method is called after session restore to complete media loading
-    // that was deferred to prevent blocking during session load
-    if (deferMediaLoading_) {
-        ofLogNotice("ofxMediaPool") << "Completing deferred media loading...";
-        deferMediaLoading_ = false;
-        mediaPair();  // This creates the players
-        
-        // NOW load parameters for the newly created players
-        // Match players by file paths since indices might have changed
-        for (const auto& deferredParams : deferredPlayerParams_) {
-            // Find the player that matches these file paths
-            for (size_t i = 0; i < players.size(); i++) {
-                auto player = players[i].get();
-                if (!player) continue;
-                
-                bool audioMatch = deferredParams.audioFile.empty() ? 
-                    player->getAudioFilePath().empty() : 
-                    player->getAudioFilePath() == deferredParams.audioFile;
-                bool videoMatch = deferredParams.videoFile.empty() ? 
-                    player->getVideoFilePath().empty() : 
-                    player->getVideoFilePath() == deferredParams.videoFile;
-                
-                if (audioMatch && videoMatch) {
-                    // Found matching player - load parameters
-                    auto paramsJson = deferredParams.paramsJson;
-                    
-                    if (paramsJson.contains("startPosition")) {
-                        player->startPosition.set(paramsJson["startPosition"]);
-                    }
-                    if (paramsJson.contains("speed")) {
-                        player->speed.set(paramsJson["speed"]);
-                    }
-                    if (paramsJson.contains("volume")) {
-                        player->volume.set(paramsJson["volume"]);
-                    }
-                    if (paramsJson.contains("loop")) {
-                        player->loop.set(paramsJson["loop"]);
-                    }
-                    if (paramsJson.contains("loopSize")) {
-                        player->loopSize.set(paramsJson["loopSize"]);
-                    }
-                    if (paramsJson.contains("regionStart")) {
-                        player->regionStart.set(paramsJson["regionStart"]);
-                    }
-                    if (paramsJson.contains("regionEnd")) {
-                        player->regionEnd.set(paramsJson["regionEnd"]);
-                    }
-                    if (paramsJson.contains("audioEnabled")) {
-                        player->audioEnabled.set(paramsJson["audioEnabled"]);
-                    }
-                    if (paramsJson.contains("videoEnabled")) {
-                        player->videoEnabled.set(paramsJson["videoEnabled"]);
-                    }
-                    if (paramsJson.contains("brightness")) {
-                        player->brightness.set(paramsJson["brightness"]);
-                    }
-                    if (paramsJson.contains("hue")) {
-                        player->hue.set(paramsJson["hue"]);
-                    }
-                    if (paramsJson.contains("saturation")) {
-                        player->saturation.set(paramsJson["saturation"]);
-                    }
-                    
-                    ofLogNotice("MediaPool") << "Restored parameters for player " << i;
-                    break; // Found and loaded, move to next deferred params
-                }
-            }
-        }
-        
-        // Clear deferred params after loading
-        deferredPlayerParams_.clear();
-        
-        // Restore active player index
-        if (deferredActivePlayerIndex_ < players.size()) {
-            currentIndex = deferredActivePlayerIndex_;
-        } else if (!players.empty()) {
-            currentIndex = 0;
-        }
-        
-        // Initialize active player if we have players
-        if (!players.empty()) {
-            initializeFirstActivePlayer();
-        }
-    }
+//--------------------------------------------------------------
+// DEPRECATED: Use initialize() instead
+void MediaPool::completeRestore() {
+    // Legacy implementation - delegates to initialize() with isRestored=true
+    initialize(nullptr, nullptr, nullptr, nullptr, true);
 }
 
 
@@ -230,7 +374,7 @@ void MediaPool::pairByIndex() {
     // pairByIndex() calls clear() which already handles activePlayer reset
     clear();
     
-    ofLogNotice("ofxMediaPool") << "Pairing files by index";
+    ofLogNotice("MediaPool") << "Pairing files by index";
     
     size_t maxPairs = std::max(audioFiles.size(), videoFiles.size());
     
@@ -243,18 +387,21 @@ void MediaPool::pairByIndex() {
         bool loaded = player->load(audioFile, videoFile);
         // Only add player if at least one media file loaded successfully
         if (loaded) {
+            MediaPlayer* playerPtr = player.get();
             players.push_back(std::move(player));
-            ofLogNotice("ofxMediaPool") << "Index pair " << i << ": " 
+            // Don't connect immediately - connections are managed dynamically when players start/stop
+            playerVideoConnected[playerPtr] = false;
+            ofLogNotice("MediaPool") << "Index pair " << i << ": " 
                                            << ofFilePath::getFileName(audioFile) 
                                            << " + " << ofFilePath::getFileName(videoFile);
         } else {
-            ofLogWarning("ofxMediaPool") << "Failed to load index pair " << i << ": " 
+            ofLogWarning("MediaPool") << "Failed to load index pair " << i << ": " 
                                             << ofFilePath::getFileName(audioFile) 
                                             << " + " << ofFilePath::getFileName(videoFile);
         }
     }
     
-    ofLogNotice("ofxMediaPool") << "Created " << players.size() << " media players by index";
+    ofLogNotice("MediaPool") << "Created " << players.size() << " media players by index";
 }
 
 MediaPlayer* MediaPool::getMediaPlayer(size_t index) {
@@ -427,21 +574,33 @@ std::vector<std::string> MediaPool::getVideoFiles() const {
 }
 
 void MediaPool::clear() {
-    // CRITICAL: Reset activePlayer BEFORE clearing players to avoid dangling pointer
-    // When players vector is cleared, all unique_ptr objects are destroyed
-    // If activePlayer still points to one of them, it becomes a dangling pointer
-    // This causes crashes when update() tries to access activePlayer->playheadPosition.get()
+    // Disconnect active player first to avoid dangling pointer
     if (activePlayer) {
         disconnectActivePlayer();
         activePlayer = nullptr;
     }
     
+    // Disconnect all players from mixers (MediaPool's responsibility)
+    for (auto& player : players) {
+        if (player) {
+            ensurePlayerAudioDisconnected(player.get());
+            ensurePlayerVideoDisconnected(player.get());
+        }
+    }
+    
+    // Clear all state
     players.clear();
+    playerAudioConnected.clear();
+    playerVideoConnected.clear();
     audioFiles.clear();
     videoFiles.clear();
     currentIndex = 0;
-    positionScan.clear();  // Clear scan positions when clearing media pool
-    playerConnected = false;  // Reset connection flag since players are cleared
+    positionScan.clear();
+    scheduledStops_.clear();  // Clear scheduled stops when clearing pool
+    
+    // Note: Mixers are member objects - their destructors will safely clear
+    // internal connections with proper locking. Routers already disconnected
+    // external connections (AudioOutput/VideoOutput side).
 }
 
 void MediaPool::refresh() {
@@ -450,12 +609,76 @@ void MediaPool::refresh() {
 }
 
 //--------------------------------------------------------------
+bool MediaPool::removePlayer(size_t index) {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    
+    if (index >= players.size()) {
+        ofLogWarning("MediaPool") << "Cannot remove player: index " << index << " out of range";
+        return false;
+    }
+    
+    // If this is the active player, disconnect and reset it
+    if (activePlayer == players[index].get()) {
+        disconnectActivePlayer();
+        activePlayer = nullptr;
+    }
+    
+    // Disconnect player before removing
+    MediaPlayer* playerToRemove = players[index].get();
+    if (playerToRemove) {
+        ensurePlayerAudioDisconnected(playerToRemove);
+        ensurePlayerVideoDisconnected(playerToRemove);
+        playerAudioConnected.erase(playerToRemove);
+        playerVideoConnected.erase(playerToRemove);
+        
+        // Remove any scheduled stops for this player
+        scheduledStops_.erase(
+            std::remove_if(scheduledStops_.begin(), scheduledStops_.end(),
+                [playerToRemove](const ScheduledStop& stop) {
+                    return stop.player == playerToRemove;
+                }),
+            scheduledStops_.end()
+        );
+    }
+    
+    // Remove the player
+    players.erase(players.begin() + index);
+    
+    // Adjust currentIndex if needed
+    if (currentIndex >= players.size() && !players.empty()) {
+        // If currentIndex was at or beyond the removed player, adjust it
+        currentIndex = players.size() - 1;
+    } else if (currentIndex > index) {
+        // If currentIndex was after the removed player, decrement it
+        currentIndex--;
+    }
+    
+    // If we removed the last player, reset currentIndex
+    if (players.empty()) {
+        currentIndex = 0;
+    }
+    
+    // Also remove corresponding entries from audioFiles and videoFiles if they exist
+    // Note: This is approximate since we don't track which files correspond to which player
+    // A more accurate implementation would require tracking file-to-player mapping
+    if (index < audioFiles.size()) {
+        audioFiles.erase(audioFiles.begin() + index);
+    }
+    if (index < videoFiles.size()) {
+        videoFiles.erase(videoFiles.begin() + index);
+    }
+    
+    ofLogNotice("MediaPool") << "Removed player at index " << index << " (remaining: " << players.size() << ")";
+    return true;
+}
+
+//--------------------------------------------------------------
 // Individual file addition (for drag-and-drop support)
 bool MediaPool::addMediaFile(const std::string& filePath) {
     // Validate file exists
     ofFile file(filePath);
     if (!file.exists()) {
-        ofLogWarning("ofxMediaPool") << "File does not exist: " << filePath;
+        ofLogWarning("MediaPool") << "File does not exist: " << filePath;
         return false;
     }
     
@@ -465,7 +688,7 @@ bool MediaPool::addMediaFile(const std::string& filePath) {
     bool isVideo = isVideoFile(filename);
     
     if (!isAudio && !isVideo) {
-        ofLogWarning("ofxMediaPool") << "File is not a valid media file: " << filePath;
+        ofLogWarning("MediaPool") << "File is not a valid media file: " << filePath;
         return false;
     }
     
@@ -476,14 +699,14 @@ bool MediaPool::addMediaFile(const std::string& filePath) {
     if (isAudio) {
         for (const auto& existingFile : audioFiles) {
             if (existingFile == filePath) {
-                ofLogNotice("ofxMediaPool") << "File already in pool: " << filePath;
+                ofLogNotice("MediaPool") << "File already in pool: " << filePath;
                 return false; // Already exists, but not an error
             }
         }
     } else if (isVideo) {
         for (const auto& existingFile : videoFiles) {
             if (existingFile == filePath) {
-                ofLogNotice("ofxMediaPool") << "File already in pool: " << filePath;
+                ofLogNotice("MediaPool") << "File already in pool: " << filePath;
                 return false; // Already exists, but not an error
             }
         }
@@ -492,10 +715,10 @@ bool MediaPool::addMediaFile(const std::string& filePath) {
     // Add file to appropriate list
     if (isAudio) {
         audioFiles.push_back(filePath);
-        ofLogNotice("ofxMediaPool") << "Added audio file: " << filePath;
+        ofLogNotice("MediaPool") << "Added audio file: " << filePath;
     } else if (isVideo) {
         videoFiles.push_back(filePath);
-        ofLogNotice("ofxMediaPool") << "Added video file: " << filePath;
+        ofLogNotice("MediaPool") << "Added video file: " << filePath;
     }
     
     // If deferring media loading (during session restore), just add to lists and return
@@ -515,11 +738,14 @@ bool MediaPool::addMediaFile(const std::string& filePath) {
                 auto player = std::make_unique<MediaPlayer>();
                 bool loaded = player->load(filePath, videoFile);
                 if (loaded) {
+                    MediaPlayer* playerPtr = player.get();
                     players.push_back(std::move(player));
-                    ofLogNotice("ofxMediaPool") << "Created paired player: " << filename << " + " << ofFilePath::getFileName(videoFile);
+                    // Don't connect immediately - connections are managed dynamically when players start/stop
+                    playerVideoConnected[playerPtr] = false;
+                    ofLogNotice("MediaPool") << "Created paired player: " << filename << " + " << ofFilePath::getFileName(videoFile);
                     return true;
                 } else {
-                    ofLogWarning("ofxMediaPool") << "Failed to load paired media: " << filePath << " + " << videoFile;
+                    ofLogWarning("MediaPool") << "Failed to load paired media: " << filePath << " + " << videoFile;
                 }
             }
         }
@@ -527,11 +753,14 @@ bool MediaPool::addMediaFile(const std::string& filePath) {
         auto player = std::make_unique<MediaPlayer>();
         bool loaded = player->loadAudio(filePath);
         if (loaded) {
+            MediaPlayer* playerPtr = player.get();
             players.push_back(std::move(player));
-            ofLogNotice("ofxMediaPool") << "Created audio-only player: " << filename;
+            // Don't connect immediately - connections are managed dynamically when players start/stop
+            playerVideoConnected[playerPtr] = false;
+            ofLogNotice("MediaPool") << "Created audio-only player: " << filename;
             return true;
         } else {
-            ofLogWarning("ofxMediaPool") << "Failed to load audio: " << filePath;
+            ofLogWarning("MediaPool") << "Failed to load audio: " << filePath;
             // Remove from list if loading failed
             audioFiles.pop_back();
             return false;
@@ -540,18 +769,35 @@ bool MediaPool::addMediaFile(const std::string& filePath) {
         // Look for matching audio file
         for (const auto& audioFile : audioFiles) {
             if (getBaseName(audioFile) == baseName && audioFile != filePath) {
-                // Found matching audio - check if already paired
-                // If audio was already paired, we need to update the existing player
-                // For now, create a new paired player (existing one will remain)
-                // TODO: Could improve this to update existing player instead
+                // Found matching audio - check if there's already a player using this audio
+                // If so, remove it before creating the paired player
+                for (auto it = players.begin(); it != players.end(); ++it) {
+                    MediaPlayer* existingPlayer = it->get();
+                    if (existingPlayer && existingPlayer->getAudioFilePath() == audioFile && 
+                        existingPlayer->getVideoFilePath().empty()) {
+                        // Found audio-only player using this audio file - remove it
+                        if (activePlayer == existingPlayer) {
+                            disconnectActivePlayer();
+                            activePlayer = nullptr;
+                        }
+                        players.erase(it);
+                        ofLogNotice("MediaPool") << "Removed audio-only player to create paired player";
+                        break;
+                    }
+                }
+                
+                // Create paired player
                 auto player = std::make_unique<MediaPlayer>();
                 bool loaded = player->load(audioFile, filePath);
                 if (loaded) {
+                    MediaPlayer* playerPtr = player.get();
                     players.push_back(std::move(player));
-                    ofLogNotice("ofxMediaPool") << "Created paired player: " << ofFilePath::getFileName(audioFile) << " + " << filename;
+                    // Don't connect immediately - connections are managed dynamically when players start/stop
+                    playerVideoConnected[playerPtr] = false;
+                    ofLogNotice("MediaPool") << "Created paired player: " << ofFilePath::getFileName(audioFile) << " + " << filename;
                     return true;
                 } else {
-                    ofLogWarning("ofxMediaPool") << "Failed to load paired media: " << audioFile << " + " << filePath;
+                    ofLogWarning("MediaPool") << "Failed to load paired media: " << audioFile << " + " << filePath;
                 }
             }
         }
@@ -559,11 +805,14 @@ bool MediaPool::addMediaFile(const std::string& filePath) {
         auto player = std::make_unique<MediaPlayer>();
         bool loaded = player->loadVideo(filePath);
         if (loaded) {
+            MediaPlayer* playerPtr = player.get();
             players.push_back(std::move(player));
-            ofLogNotice("ofxMediaPool") << "Created video-only player: " << filename;
+            // Don't connect immediately - connections are managed dynamically when players start/stop
+            playerVideoConnected[playerPtr] = false;
+            ofLogNotice("MediaPool") << "Created video-only player: " << filename;
             return true;
         } else {
-            ofLogWarning("ofxMediaPool") << "Failed to load video: " << filePath;
+            ofLogWarning("MediaPool") << "Failed to load video: " << filePath;
             // Remove from list if loading failed
             videoFiles.pop_back();
             return false;
@@ -585,12 +834,22 @@ void MediaPool::addMediaFiles(const std::vector<std::string>& filePaths) {
         }
     }
     
-    ofLogNotice("ofxMediaPool") << "Added " << successCount << " files, " << failCount << " failed";
+    ofLogNotice("MediaPool") << "Added " << successCount << " files, " << failCount << " failed";
     
     // If we added files successfully, try to initialize first active player if pool was empty
     if (successCount > 0 && players.empty() == false && activePlayer == nullptr) {
         initializeFirstActivePlayer();
     }
+}
+
+//--------------------------------------------------------------
+bool MediaPool::acceptFileDrop(const std::vector<std::string>& filePaths) {
+    // Module interface implementation - delegate to addMediaFiles
+    if (filePaths.empty()) {
+        return false;
+    }
+    addMediaFiles(filePaths);
+    return true;
 }
 
 // Helper methods
@@ -617,41 +876,61 @@ std::string MediaPool::getMediaDirectory() const {
 
 // Connection management methods
 void MediaPool::setActivePlayer(size_t index) {
-    if (index >= players.size()) {
-        ofLogWarning("ofxMediaPool") << "Invalid player index: " << index;
-        return;
-    }
+    ofLogVerbose("MediaPool") << "[setActivePlayer] Called with index=" << index << " (players.size()=" << players.size() << ")";
     
-    MediaPlayer* newPlayer = players[index].get();
+    // CRITICAL: Check if mutex is already held (would cause deadlock)
+    // If called from playMediaManual which already holds the lock, we need to avoid double-locking
+    // For now, we'll try to acquire the lock - if it's already held, this will deadlock
+    // TODO: Consider making this function have an internal version that doesn't lock
     
-    // Validate that player has at least one media file loaded
-    if (!newPlayer || (!newPlayer->isAudioLoaded() && !newPlayer->isVideoLoaded())) {
-        ofLogWarning("ofxMediaPool") << "Cannot set active player at index " << index << " - no media loaded";
-        return;
-    }
-    
-    // PERFORMANCE CRITICAL FIX: Only disconnect/reset if player actually changed
-    // This prevents unnecessary reconnection attempts that cause mutex locks and warnings
-    if (activePlayer != newPlayer) {
-        // Player changed - disconnect old player (removed debug logging for performance)
-        if (activePlayer) {
-            disconnectActivePlayer();
+    try {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        ofLogVerbose("MediaPool") << "[setActivePlayer] Mutex acquired";
+        
+        if (index >= players.size()) {
+            ofLogWarning("MediaPool") << "[setActivePlayer] Invalid player index: " << index;
+            return;
         }
         
-        activePlayer = newPlayer;
-        currentIndex = index;  // Keep currentIndex in sync with activePlayer
+        MediaPlayer* newPlayer = players[index].get();
+        if (!newPlayer) {
+            ofLogWarning("MediaPool") << "[setActivePlayer] Player is null at index: " << index;
+            return;
+        }
         
-        // Reset connection flag - new player needs to be connected
-        playerConnected = false;
-    } else {
-        // Same player - keep currentIndex in sync but don't reset connection flag
-        // This prevents unnecessary reconnection attempts when setActivePlayer is called
-        // multiple times with the same index (e.g., from processEventQueue)
-        currentIndex = index;
-        // playerConnected flag remains unchanged - connections are still valid
+        // Validate that player has at least one media file loaded
+        bool hasAudio = false, hasVideo = false;
+        try {
+            hasAudio = newPlayer->isAudioLoaded();
+            hasVideo = newPlayer->isVideoLoaded();
+        } catch (const std::exception& e) {
+            ofLogError("MediaPool") << "[setActivePlayer] CRASH: Exception checking media loaded: " << e.what();
+            return;
+        }
+        
+        if (!hasAudio && !hasVideo) {
+            ofLogWarning("MediaPool") << "[setActivePlayer] Cannot set active player at index " << index << " - no media loaded";
+            return;
+        }
+        
+        // NOTE: With new routing architecture, all players are connected to internal mixers
+        // when they're created. The active player is only used for playback control, not routing.
+        // No need to connect/disconnect when active player changes.
+        if (activePlayer != newPlayer) {
+            // Player changed - update active player reference
+            activePlayer = newPlayer;
+            currentIndex = index;  // Keep currentIndex in sync with activePlayer
+            ofLogVerbose("MediaPool") << "[setActivePlayer] Active player changed to index " << index;
+        } else {
+            // Same player - keep currentIndex in sync
+            currentIndex = index;
+            ofLogVerbose("MediaPool") << "[setActivePlayer] Same player, updated index to " << index;
+        }
+        
+        // Note: Output connections are now managed externally by ofApp
+    } catch (const std::exception& e) {
+        ofLogError("MediaPool") << "[setActivePlayer] CRASH: Exception: " << e.what();
     }
-    
-    // Note: Output connections are now managed externally by ofApp
 }
 
 MediaPlayer* MediaPool::getActivePlayer() {
@@ -673,7 +952,6 @@ MediaPlayer* MediaPool::getActivePlayer() {
             } else {
                 // Player exists but has no media - reset it
                 activePlayer = nullptr;
-                playerConnected = false;
                 return nullptr;
             }
         }
@@ -681,93 +959,27 @@ MediaPlayer* MediaPool::getActivePlayer() {
     
     // activePlayer is not in the players vector - it's a dangling pointer!
     // Reset it to prevent crashes
-    ofLogWarning("ofxMediaPool") << "getActivePlayer(): activePlayer is a dangling pointer - resetting";
+    ofLogWarning("MediaPool") << "getActivePlayer(): activePlayer is a dangling pointer - resetting";
     activePlayer = nullptr;
-    playerConnected = false;
     return nullptr;
 }
 
 
 void MediaPool::connectActivePlayer(ofxSoundOutput& soundOut, ofxVisualOutput& visualOut) {
-    if (!activePlayer) {
-        return;  // No active player, silent return
-    }
-    
-    // CRITICAL: Validate that activePlayer is still valid and has media loaded
-    // activePlayer could become invalid if clear() was called or players were recreated
-    bool playerIsValid = false;
-    for (const auto& player : players) {
-        if (player.get() == activePlayer) {
-            // Found the player in the vector - validate it has media
-            if (activePlayer->isAudioLoaded() || activePlayer->isVideoLoaded()) {
-                playerIsValid = true;
-            }
-            break;
-        }
-    }
-    
-    if (!playerIsValid) {
-        // activePlayer is no longer valid - reset it
-        activePlayer = nullptr;
-        playerConnected = false;
-        return;
-    }
-    
-    // PERFORMANCE CRITICAL: Use simple flag check to avoid expensive connection state queries
-    // The flag is managed by setActivePlayer() which only resets it when player actually changes
-    // This avoids mutex locks and expensive connection state checks on every frame
-    if (playerConnected) {
-        return; // Already connected, skip expensive checks
-    }
-    
-    // PERFORMANCE CRITICAL: Check if we're already connected to this player before doing anything
-    // This avoids expensive disconnect() and connect() calls when not needed
-    bool videoAlreadyConnected = false;
-    if (activePlayer->isVideoLoaded()) {
-        auto& videoPlayer = activePlayer->getVideoPlayer();
-        // Quick check: see if we're already connected to this specific player
-        if (videoPlayer.getInputObject() == &visualOut) {
-            videoAlreadyConnected = true;
-        } else {
-            // Not connected to this player - disconnect old connections
-            visualOut.disconnect();
-        }
-    }
-    
-    // Connect audio and video outputs
-    try {
-        // Connect the MediaPlayer's audio output to the soundOutput
-        activePlayer->getAudioPlayer().connectTo(soundOut);
-        
-        // Only connect video output if not already connected to this player
-        if (activePlayer->isVideoLoaded() && !videoAlreadyConnected) {
-            visualOut.connectTo(activePlayer->getVideoPlayer());
-        }
-        
-        // Mark as connected AFTER successful connection attempts
-        // This prevents future unnecessary connection attempts
-        playerConnected = true;
-    } catch (const std::exception& e) {
-        ofLogError("ofxMediaPool") << "Failed to connect player: " << e.what();
-        // Don't set playerConnected = true on error - will retry next frame
-        return;
-    }
+    // DEPRECATED: This method is kept for backward compatibility but is no longer used.
+    // With the new routing architecture, all players are connected to internal mixers
+    // when they're created. External modules should connect to MediaPool via
+    // getAudioOutput()/getVideoOutput() instead of calling this method.
+    // This method is now a no-op.
+    (void)soundOut;  // Suppress unused parameter warning
+    (void)visualOut; // Suppress unused parameter warning
 }
 
 void MediaPool::disconnectActivePlayer() {
-    if (!activePlayer) {
-        return;
-    }
-    
-    // Disconnect audio output
-    activePlayer->getAudioPlayer().disconnect();
-    
-    // NOTE: Video disconnection is handled by checking connection state in connectActivePlayer()
-    // We don't disconnect video here because visualOut is a shared resource that persists
-    // across player changes. The connection check in connectActivePlayer() will prevent
-    // reconnection attempts when video is already connected.
-    
-    playerConnected = false;
+    // DEPRECATED: This method is kept for backward compatibility but is no longer used.
+    // With the new routing architecture, players remain connected to internal mixers
+    // throughout their lifetime. No need to disconnect when active player changes.
+    // This method is now a no-op.
 }
 
 void MediaPool::initializeFirstActivePlayer() {
@@ -777,75 +989,90 @@ void MediaPool::initializeFirstActivePlayer() {
             MediaPlayer* player = players[i].get();
             if (player && (player->isAudioLoaded() || player->isVideoLoaded())) {
                 setActivePlayer(i);
-                ofLogNotice("ofxMediaPool") << "Initialized first player as active (index " << i << ")";
+                ofLogNotice("MediaPool") << "Initialized first player as active (index " << i << ")";
                 return;
             }
         }
-        ofLogWarning("ofxMediaPool") << "No valid media players found to initialize";
+        ofLogWarning("MediaPool") << "No valid media players found to initialize";
     }
 }
 
 //--------------------------------------------------------------
-bool MediaPool::playMediaManual(size_t index, float position) {
+bool MediaPool::playMediaManual(size_t index) {
     std::lock_guard<std::mutex> lock(stateMutex);
     
-    if (index >= players.size()) {
-        ofLogWarning("ofxMediaPool") << "Invalid media index for manual playback: " << index;
-        return false;
+    if (index >= players.size()) return false;
+    MediaPlayer* player = players[index].get();
+    if (!player || (!player->isAudioLoaded() && !player->isVideoLoaded())) return false;
+    
+    // Stop previous player in MONOPHONIC mode
+    if (polyphonyMode_ == PolyphonyMode::MONOPHONIC && activePlayer && activePlayer != player) {
+        activePlayer->stop();
+        ensurePlayerAudioDisconnected(activePlayer);
+        ensurePlayerVideoDisconnected(activePlayer);
     }
+    
+    // Set active player and mode
+    activePlayer = player;
+    currentIndex = index;
+    currentMode.store(PlaybackMode::MANUAL_PREVIEW, std::memory_order_relaxed);
+    
+    // Stop current player if playing (to reset state)
+    if (player->isPlaying()) {
+        player->stop();
+        ensurePlayerAudioDisconnected(player);
+        ensurePlayerVideoDisconnected(player);
+    }
+    
+    // Re-enable audio/video (stop() disables them)
+    // CRITICAL: Don't enable underlying player loop for LOOP mode
+    // The underlying players loop at full media level (0.0-1.0), but we need region-level looping
+    // (loopStart to loopEnd based on loopSize). We handle looping manually in update().
+    if (player->isAudioLoaded()) player->audioEnabled.set(true);
+    if (player->isVideoLoaded()) player->videoEnabled.set(true);
+    player->loop.set(false);  // Always disable - looping handled manually at region level
+    
+    // Play first (this enables the players)
+    player->play();
+    
+    // Then connect to mixers (they check isPlaying(), which is now true)
+    ensurePlayerAudioConnected(player);
+    ensurePlayerVideoConnected(player);
+    
+    return true;
+}
+// Note: Old onStepTrigger methods removed - now using onTrigger() which receives TriggerEvent directly
+// stopManualPreview() removed - update() now automatically transitions MANUAL_PREVIEW → IDLE when player stops
+
+//--------------------------------------------------------------
+// Temporary playback for scrubbing (doesn't change MediaPool mode)
+void MediaPool::startTemporaryPlayback(size_t index, float position) {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    
+    if (index >= players.size()) return;
     
     MediaPlayer* player = players[index].get();
-    if (!player) {
-        ofLogWarning("ofxMediaPool") << "Media player not found for index: " << index;
-        return false;
-    }
+    if (!player || (!player->isAudioLoaded() && !player->isVideoLoaded())) return;
     
-    // Check if player has any media loaded
-    if (!player->isAudioLoaded() && !player->isVideoLoaded()) {
-        ofLogWarning("ofxMediaPool") << "No media loaded for player at index: " << index;
-        return false;
-    }
-    
-    // Stop current playback before starting new one
-    if (activePlayer && activePlayer != player) {
-        activePlayer->stop();
-    }
-    
-    // Only set active player if it's different (optimization: avoid resetting connection flag)
+    // Set active player if needed (but don't change mode)
     if (currentIndex != index || activePlayer != player) {
         setActivePlayer(index);
     }
     
-    // Transition to MANUAL_PREVIEW state (atomic write)
-    currentMode.store(PlaybackMode::MANUAL_PREVIEW, std::memory_order_relaxed);
-    
-    // Stop and reset the player for fresh playback
-    player->stop();  // Stop any current playback
+    // Stop current playback
+    player->stop();
+    ensurePlayerAudioDisconnected(player);
+    ensurePlayerVideoDisconnected(player);
     
     // Convert absolute position to relative within region
     float regionStartVal = player->regionStart.get();
     float regionEndVal = player->regionEnd.get();
-    float regionSize = regionEndVal - regionStartVal;
     
-    float relativePos = 0.0f;
-    if (regionSize > 0.001f) {
-        // Clamp to region bounds, then map to relative
-        float clampedAbsolute = std::max(regionStartVal, std::min(regionEndVal, position));
-        relativePos = (clampedAbsolute - regionStartVal) / regionSize;
-        relativePos = std::max(0.0f, std::min(1.0f, relativePos));
-    } else {
-        // If region is invalid, use position directly (clamped)
-        relativePos = std::max(0.0f, std::min(1.0f, position));
-    }
+    // Map absolute position to relative position within region using helper function
+    float relativePos = mapAbsoluteToRelative(position, regionStartVal, regionEndVal);
     
-    // PERFORMANCE CRITICAL: Only set startPosition before play() - don't set playheadPosition
-    // because that triggers onPlayheadPositionChanged() which calls expensive setPosition() (~200ms).
-    // The play() method will handle setting the actual video position efficiently.
+    // Set position and enable audio/video
     player->startPosition.set(relativePos);
-    // NOTE: Don't set player->playheadPosition here - it triggers expensive setPosition() via listener
-    // The play() method will set the position correctly based on startPosition
-    
-    // Re-enable audio/video if they were loaded (stop() disables them)
     if (player->isAudioLoaded()) {
         player->audioEnabled.set(true);
     }
@@ -853,23 +1080,68 @@ bool MediaPool::playMediaManual(size_t index, float position) {
         player->videoEnabled.set(true);
     }
     
-    // Set loop based on play style
-    bool shouldLoop = (currentPlayStyle == PlayStyle::LOOP);
-    player->loop.set(shouldLoop);
+    // Don't set loop for temporary playback - allow scrubbing past loop end
+    player->loop.set(false);
     
-    // Now play
+    // Start playback
     player->play();
     
-    ofLogNotice("ofxMediaPool") << "Manual playback started for media " << index << " at position " << position << " (state: MANUAL_PREVIEW)";
-    ofLogNotice("ofxMediaPool") << "Player state - audio enabled: " << player->audioEnabled.get() 
-                                << ", video enabled: " << player->videoEnabled.get()
-                                << ", audio loaded: " << player->isAudioLoaded()
-                                << ", video loaded: " << player->isVideoLoaded();
-    return true;
+    // Connect to mixers
+    ensurePlayerAudioConnected(player);
+    ensurePlayerVideoConnected(player);
 }
 
-// Note: Old onStepTrigger methods removed - now using onTrigger() which receives TriggerEvent directly
-// stopManualPreview() removed - update() now automatically transitions MANUAL_PREVIEW → IDLE when player stops
+void MediaPool::stopTemporaryPlayback() {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    
+    if (activePlayer && activePlayer->isPlaying()) {
+        activePlayer->stop();
+        ensurePlayerAudioDisconnected(activePlayer);
+        ensurePlayerVideoDisconnected(activePlayer);
+        // Don't change mode - keep it as it was
+    }
+}
+
+void MediaPool::startScrubbingPlayback(size_t index, float position) {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    
+    if (index >= players.size()) return;
+    
+    MediaPlayer* player = players[index].get();
+    if (!player || (!player->isAudioLoaded() && !player->isVideoLoaded())) return;
+    
+    // Set active player if needed (but don't change mode)
+    if (currentIndex != index || activePlayer != player) {
+        setActivePlayer(index);
+    }
+    
+    // Stop current playback
+    player->stop();
+    ensurePlayerAudioDisconnected(player);
+    ensurePlayerVideoDisconnected(player);
+    
+    // Enable audio/video
+    if (player->isAudioLoaded()) {
+        player->audioEnabled.set(true);
+    }
+    if (player->isVideoLoaded()) {
+        player->videoEnabled.set(true);
+    }
+    
+    // Don't set loop for scrubbing - allow scrubbing past loop end
+    player->loop.set(false);
+    
+    // Set position using MediaPlayer::setPosition() which handles both audio/video and playheadPosition
+    // Do NOT update startPosition (for scrubbing)
+    player->setPosition(position);
+    
+    // Start playback
+    player->play();
+    
+    // Connect to mixers
+    ensurePlayerAudioConnected(player);
+    ensurePlayerVideoConnected(player);
+}
 
 //--------------------------------------------------------------
 void MediaPool::stopAllMedia() {
@@ -881,9 +1153,15 @@ void MediaPool::stopAllMedia() {
         // Drain queue - events are discarded
     }
     
+    // Clear all scheduled stops (gate durations)
+    scheduledStops_.clear();
+    
     for (auto& player : players) {
         if (player) {
             player->stop();
+            // Disconnect stopped player from mixers
+            ensurePlayerAudioDisconnected(player.get());
+            ensurePlayerVideoDisconnected(player.get());
         }
     }
     
@@ -891,14 +1169,13 @@ void MediaPool::stopAllMedia() {
         disconnectActivePlayer();
     }
     
-    // Reset gate timer and transition to IDLE
-    gateTimerActive = false;
+    // Transition to IDLE
     currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
 }
 
 //--------------------------------------------------------------
 void MediaPool::setDataDirectory(const std::string& path) {
-    ofLogNotice("ofxMediaPool") << "Setting data directory to: " << path;
+    ofLogNotice("MediaPool") << "Setting data directory to: " << path;
     
     // CRITICAL: Lock mutex to prevent GUI/update loop from accessing players during directory change
     // This prevents race conditions where GUI tries to access players while they're being cleared/recreated
@@ -907,18 +1184,17 @@ void MediaPool::setDataDirectory(const std::string& path) {
     try {
         ofDirectory dir(path);
         if (!dir.exists()) {
-            ofLogError("ofxMediaPool") << "Directory does not exist: " << path;
+            ofLogError("MediaPool") << "Directory does not exist: " << path;
             return;
         }
         
-        ofLogNotice("ofxMediaPool") << "✅ Using data directory: " << path;
+        ofLogNotice("MediaPool") << "✅ Using data directory: " << path;
         
         // CRITICAL: Reset activePlayer BEFORE scanning to prevent dangling pointer access
         // This ensures no code tries to access activePlayer while we're clearing/recreating players
         if (activePlayer) {
             disconnectActivePlayer();
             activePlayer = nullptr;
-            playerConnected = false;
         }
         
         // Use the existing scanDirectory method to populate audioFiles and videoFiles
@@ -931,23 +1207,21 @@ void MediaPool::setDataDirectory(const std::string& path) {
         if (!players.empty()) {
             initializeFirstActivePlayer();
         } else {
-            ofLogWarning("ofxMediaPool") << "No valid media players created from directory: " << path;
+            ofLogWarning("MediaPool") << "No valid media players created from directory: " << path;
         }
     } catch (const std::exception& e) {
-        ofLogError("ofxMediaPool") << "Exception in setDataDirectory: " << e.what();
+        ofLogError("MediaPool") << "Exception in setDataDirectory: " << e.what();
         // Ensure activePlayer is reset on error
         if (activePlayer) {
             disconnectActivePlayer();
             activePlayer = nullptr;
-            playerConnected = false;
         }
     } catch (...) {
-        ofLogError("ofxMediaPool") << "Unknown exception in setDataDirectory";
+        ofLogError("MediaPool") << "Unknown exception in setDataDirectory";
         // Ensure activePlayer is reset on error
         if (activePlayer) {
             disconnectActivePlayer();
             activePlayer = nullptr;
-            playerConnected = false;
         }
     }
     
@@ -976,7 +1250,7 @@ void MediaPool::scanMediaFiles(const std::string& path, ofDirectory& dir) {
     
     dir.listDir();
     
-    ofLogNotice("ofxMediaPool") << "Found " << dir.size() << " files in directory";
+    ofLogNotice("MediaPool") << "Found " << dir.size() << " files in directory";
     
     // Separate audio and video files
     for (int i = 0; i < dir.size(); i++) {
@@ -990,24 +1264,24 @@ void MediaPool::scanMediaFiles(const std::string& path, ofDirectory& dir) {
         }
     }
     
-    ofLogNotice("ofxMediaPool") << "Found " << audioFiles.size() << " audio files, " << videoFiles.size() << " video files";
+    ofLogNotice("MediaPool") << "Found " << audioFiles.size() << " audio files, " << videoFiles.size() << " video files";
 }
 
 //--------------------------------------------------------------
 
 //--------------------------------------------------------------
 void MediaPool::browseForDirectory() {
-    ofLogNotice("ofxMediaPool") << "Opening directory browser...";
+    ofLogNotice("MediaPool") << "Opening directory browser...";
     
     // Use OpenFrameworks file dialog to select directory
     ofFileDialogResult result = ofSystemLoadDialog("Select Media Directory", true);
     
     if (result.bSuccess) {
         std::string selectedPath = result.getPath();
-        ofLogNotice("ofxMediaPool") << "Selected directory: " << selectedPath;
+        ofLogNotice("MediaPool") << "Selected directory: " << selectedPath;
         setDataDirectory(selectedPath);
     } else {
-        ofLogNotice("ofxMediaPool") << "Directory selection cancelled";
+        ofLogNotice("MediaPool") << "Directory selection cancelled";
     }
 }
 
@@ -1033,6 +1307,11 @@ bool MediaPool::isIdle() const {
     return currentMode.load(std::memory_order_relaxed) == PlaybackMode::IDLE;
 }
 
+bool MediaPool::isTransportPlaying() const {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    return lastTransportState;
+}
+
 void MediaPool::setModeIdle() {
     // Thread-safe transition to IDLE mode
     // Used by button handlers to immediately transition when stopping
@@ -1045,15 +1324,18 @@ void MediaPool::setModeIdle() {
 void MediaPool::setPlayStyle(PlayStyle style) {
     std::lock_guard<std::mutex> lock(stateMutex);
     currentPlayStyle = style;
-    ofLogNotice("ofxMediaPool") << "Play style set to: " << (int)style;
+    ofLogNotice("MediaPool") << "Play style set to: " << (int)style;
     
     // Apply the new style to the currently active player if it's playing
+    // CRITICAL: Don't enable underlying player loop for LOOP mode
+    // The underlying players loop at full media level (0.0-1.0), but we need region-level looping
+    // (loopStart to loopEnd based on loopSize). We handle looping manually in update().
     if (activePlayer) {
         PlaybackMode mode = currentMode.load(std::memory_order_relaxed);
         if (mode == PlaybackMode::MANUAL_PREVIEW || mode == PlaybackMode::SEQUENCER_ACTIVE) {
-            bool shouldLoop = (style == PlayStyle::LOOP);
-            activePlayer->loop.set(shouldLoop);
-            ofLogNotice("ofxMediaPool") << "Applied play style to active player - loop: " << shouldLoop;
+            // Always disable underlying loop - looping is handled manually at region level
+            activePlayer->loop.set(false);
+            ofLogNotice("MediaPool") << "Applied play style to active player - looping handled manually at region level";
         }
     }
 }
@@ -1065,38 +1347,82 @@ PlayStyle MediaPool::getPlayStyle() const {
 
 //--------------------------------------------------------------
 void MediaPool::update() {
-    PlaybackMode mode = currentMode.load(std::memory_order_relaxed);
-    float currentTime = ofGetElapsedTimef();
+    // Early exit if we're being destroyed
+    if (isDestroying_.load(std::memory_order_acquire)) {
+        return;
+    }
     
-    // Check gate timer expiration for sequencer-triggered playback
-    if (mode == PlaybackMode::SEQUENCER_ACTIVE && gateTimerActive) {
-        if (currentTime >= gateEndTime) {
-            // Gate expired - stop playback and transition to IDLE
-            if (activePlayer) {
-                // DEBUG: Log position before stop
-                float posBeforeStop = activePlayer->playheadPosition.get();
-                ofLogNotice("MediaPool") << "[GATE_END] Gate timer expired - stopping player (position before stop: " << posBeforeStop << ")";
-                activePlayer->stop();
-                // DEBUG: Log position after stop
-                float posAfterStop = activePlayer->playheadPosition.get();
-                ofLogNotice("MediaPool") << "[GATE_END] Position after stop: " << posAfterStop;
-                if (std::abs(posAfterStop - posBeforeStop) > 0.001f && posBeforeStop > 0.001f) {
-                    ofLogWarning("MediaPool") << "[GATE_END] WARNING: Position changed during stop! "
-                                               << "Before: " << posBeforeStop << ", After: " << posAfterStop;
+    // Early validation - check if we're in a valid state
+    if (players.empty() && activePlayer == nullptr) {
+        return;
+    }
+    
+    PlaybackMode mode = currentMode.load(std::memory_order_relaxed);
+    
+    // Update all playing players (this syncs playheadPosition for scheduled stop checks)
+    // Scheduled stops are checked AFTER player updates so position is synced
+    size_t playingCount = 0;
+    for (auto& player : players) {
+        if (player && player->isPlaying()) {
+            try {
+                player->update();  // Updates playhead position and handles playback state
+                playingCount++;
+            } catch (const std::exception& e) {
+                ofLogError("MediaPool") << "Exception updating player: " << e.what();
+            } catch (...) {
+                ofLogError("MediaPool") << "Unknown exception updating player";
+            }
+        }
+        // CRITICAL: Also update non-playing videos with initialized frames (position > MIN_REGION_SIZE)
+        // This ensures video textures stay fresh and prevents lag when session loads.
+        // MediaPlayer::update() will call process() for these videos (line 497) which
+        // updates the output buffer for the pull-based video chain.
+        // Only update if video is enabled and has a valid position (initialized frame).
+        else if (player && player->isVideoLoaded() && player->videoEnabled.get()) {
+            float pos = player->getVideoPlayer().getVideoFile().getPosition();
+            if (pos > MIN_REGION_SIZE) {
+                try {
+                    player->update();  // This will call process() for scrubbing preview (MediaPlayer line 497)
+                } catch (const std::exception& e) {
+                    ofLogError("MediaPool") << "Exception updating non-playing player: " << e.what();
+                } catch (...) {
+                    ofLogError("MediaPool") << "Unknown exception updating non-playing player";
                 }
             }
-            currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
-            gateTimerActive = false;
-            ofLogNotice("MediaPool") << "[GATE_END] Gate timer expired - transitioning to IDLE mode";
+        }
+    }
+    
+    // Check scheduled stops (gate duration expired) - AFTER player updates so position is synced
+    float currentTime = ofGetElapsedTimef();
+    for (auto it = scheduledStops_.begin(); it != scheduledStops_.end();) {
+        if (currentTime >= it->stopTime) {
+            // Gate duration expired - stop the player
+            if (it->player && it->player->isPlaying()) {
+                // MediaPlayer::stop() already preserves position internally, so just call stop()
+                it->player->stop();
+                ensurePlayerAudioDisconnected(it->player);
+                ensurePlayerVideoDisconnected(it->player);
+                ofLogVerbose("MediaPool") << "[GATE_STOP] Stopped player after gate duration expired";
+            }
+            it = scheduledStops_.erase(it);
+        } else {
+            ++it;
         }
     }
     
     // Process event queue FIRST to update activeStepContext before position capture
-    processEventQueue();
+    try {
+        processEventQueue();
+    } catch (const std::exception& e) {
+        ofLogError("MediaPool") << "Exception processing event queue: " << e.what();
+    } catch (...) {
+        ofLogError("MediaPool") << "Unknown exception processing event queue";
+    }
     
-    // Simplified position memory capture - always track position every frame while playing
     // CRITICAL: Validate activePlayer is still in players vector before accessing it
+    // This check is used throughout update() for all modes
     bool activePlayerIsValid = false;
+    bool isPlayerPlaying = false;
     if (activePlayer && currentIndex < players.size()) {
         // Verify activePlayer is actually in the players vector
         for (const auto& player : players) {
@@ -1104,202 +1430,159 @@ void MediaPool::update() {
                 // Also verify it has media loaded
                 if (activePlayer->isAudioLoaded() || activePlayer->isVideoLoaded()) {
                     activePlayerIsValid = true;
+                    isPlayerPlaying = activePlayer->isPlaying();
                 }
                 break;
             }
         }
     }
     
-    if (activePlayerIsValid) {
-        // Get transport state and step context
+    // Check if we should transition from SEQUENCER_ACTIVE to IDLE
+    // This handles cases where sequencer stops (module disabled, disconnected, or transport stopped)
+    mode = currentMode.load(std::memory_order_relaxed);
+    if (mode == PlaybackMode::SEQUENCER_ACTIVE) {
         bool transportIsPlaying = false;
-        int captureStep = -1;
         {
             std::lock_guard<std::mutex> lock(stateMutex);
             transportIsPlaying = lastTransportState;
-            if (mode == PlaybackMode::SEQUENCER_ACTIVE) {
-                captureStep = activeStepContext.step;
+        }
+        
+        // Transition to IDLE if:
+        // 1. Transport is stopped (sequencer won't send more triggers)
+        // 2. No active player is playing (all playback has stopped)
+        bool shouldTransitionToIdle = false;
+        
+        if (!transportIsPlaying) {
+            // Transport stopped - sequencer won't send more triggers
+            shouldTransitionToIdle = true;
+            ofLogNotice("MediaPool") << "[SEQUENCER_STOP] Transport stopped - transitioning to IDLE";
+        } else if (!activePlayerIsValid) {
+            // No active player - this can happen if sequencer module was disabled or disconnected
+            // Only transition if transport is still playing (if transport stopped, we already handled it above)
+            shouldTransitionToIdle = true;
+            ofLogNotice("MediaPool") << "[SEQUENCER_STOP] No active player - transitioning to IDLE";
+        } else if (!isPlayerPlaying) {
+            // Player stopped but transport is still playing - this is normal between triggers
+            // Keep SEQUENCER_ACTIVE mode - don't transition to IDLE
+            // The sequencer will send more triggers while transport is playing
+            // Only log occasionally to avoid spam
+            static int stopFrameCount = 0;
+            if (++stopFrameCount % 60 == 0) { // Log every second at 60fps
+                ofLogVerbose("MediaPool") << "[SEQUENCER] Player stopped between triggers (transport still playing) - staying in SEQUENCER_ACTIVE";
             }
         }
         
+        if (shouldTransitionToIdle) {
+            currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+            // Also reload mode for rest of update() function
+            mode = PlaybackMode::IDLE;
+        }
+    }
+    
+    // Simplified position memory capture - always track position every frame while playing
+    
+    if (activePlayerIsValid) {
         bool isCurrentlyPlaying = activePlayer->isPlaying();
         
-        // Check region boundaries for both sequencer playback (when transport is playing) and manual preview
-        bool shouldCheckRegionBoundaries = isCurrentlyPlaying && 
-            (transportIsPlaying || mode == PlaybackMode::MANUAL_PREVIEW);
-        
-        if (shouldCheckRegionBoundaries) {
+        // ALWAYS check boundaries when player is playing (loop handling, region end, etc.)
+        // This is independent of mode or transport state - if it's playing, we need to handle boundaries
+        // Boundary checking ensures proper loop behavior in all playback modes
+        if (isCurrentlyPlaying) {
             // Get current playhead position (absolute: 0.0-1.0 of entire media)
             float currentPosition = activePlayer->playheadPosition.get();
             float regionStartVal = activePlayer->regionStart.get();
             float regionEndVal = activePlayer->regionEnd.get();
             
-            // Ensure region bounds are valid
+            // Calculate loop bounds using helper function
+            LoopBounds loopBounds = calculateLoopBounds(activePlayer, currentPlayStyle);
+            float effectiveRegionEnd = loopBounds.end;
+            
+            // Ensure region bounds are valid (for boundary checking)
             if (regionStartVal > regionEndVal) {
                 std::swap(regionStartVal, regionEndVal);
             }
             
-            // Calculate effective loop end based on loopSize when in LOOP play style
-            float effectiveRegionEnd = regionEndVal;
-            if (currentPlayStyle == PlayStyle::LOOP) {
-                float loopSizeSeconds = activePlayer->loopSize.get();
-                if (loopSizeSeconds > 0.001f) {
-                    float duration = activePlayer->getDuration();
-                    if (duration > 0.001f) {
-                        // Convert loopSize (seconds) to normalized position (0-1)
-                        float loopSizeNormalized = loopSizeSeconds / duration;
-                        
-                        // Calculate loop start position (absolute) from startPosition (relative within region)
-                        float relativeStartPos = activePlayer->startPosition.get();
-                        float regionSize = regionEndVal - regionStartVal;
-                        float loopStartAbsolute = 0.0f;
-                        
-                        if (regionSize > 0.001f) {
-                            loopStartAbsolute = regionStartVal + relativeStartPos * regionSize;
-                        } else {
-                            loopStartAbsolute = std::max(0.0f, std::min(1.0f, relativeStartPos));
-                        }
-                        
-                        // Loop end is loop start + loopSize
-                        // CRITICAL: Must clamp to BOTH region end AND media duration (1.0)
-                        // The loop should NEVER exceed the region boundaries (region acts as outer loop)
-                        float calculatedLoopEnd = loopStartAbsolute + loopSizeNormalized;
-                        effectiveRegionEnd = std::min(regionEndVal, std::min(1.0f, calculatedLoopEnd));
-                    }
-                }
-            }
+            // CRITICAL FIX: Convert threshold to absolute time first to avoid scaling issues with long samples
+            // REGION_BOUNDARY_THRESHOLD was a fixed normalized value (0.001 = 0.1%), which becomes huge
+            // in absolute time for long samples (e.g., 0.001 * 240s = 240ms for a 4-minute sample)
+            // Fix: Use a fixed absolute time threshold (1ms) and convert to normalized based on duration
+            float duration = activePlayer->getDuration();
+            const float THRESHOLD_ABSOLUTE_SECONDS = 0.001f; // 1ms absolute threshold
+            float thresholdNormalized = (duration > MIN_DURATION) ? (THRESHOLD_ABSOLUTE_SECONDS / duration) : REGION_BOUNDARY_THRESHOLD;
             
             // Check if playhead has gone below region start (shouldn't happen, but clamp if it does)
-            const float REGION_BOUNDARY_THRESHOLD = 0.001f;
-            if (currentPosition < regionStartVal - REGION_BOUNDARY_THRESHOLD) {
-                // Playhead went below region start - clamp to region start
-                if (activePlayer->isAudioLoaded()) {
-                    activePlayer->getAudioPlayer().setPosition(regionStartVal);
-                }
-                if (activePlayer->isVideoLoaded()) {
-                    activePlayer->getVideoPlayer().getVideoFile().setPosition(regionStartVal);
-                    activePlayer->getVideoPlayer().getVideoFile().update();
-                }
-                activePlayer->playheadPosition.set(regionStartVal);
+            if (currentPosition < regionStartVal - thresholdNormalized) {
+                // Playhead went below region start - clamp to region start using helper
+                seekPlayerToPosition(activePlayer, regionStartVal);
             }
             
-            // PHASE 2 SIMPLIFICATION: Only capture for PER_STEP and GLOBAL modes
-            // PER_MEDIA mode uses MediaPlayer::playheadPosition directly (no capture needed)
-            // MediaPlayer::stop() already preserves position, so we only need to capture
-            // for modes that require step-based or global tracking
-            ScanMode scanMode = positionScan.getMode();
-            if (scanMode == ScanMode::PER_STEP || scanMode == ScanMode::GLOBAL) {
-                // Only capture for modes that need storage (PER_STEP, GLOBAL)
-                // For PER_STEP, only capture if step is valid
-                if (scanMode == ScanMode::PER_STEP) {
-                    if (mode == PlaybackMode::SEQUENCER_ACTIVE && captureStep >= 0) {
-                        size_t sizeBefore = positionScan.size();
-                        positionScan.capture(captureStep, currentIndex, currentPosition);
-                        size_t sizeAfter = positionScan.size();
-                        // Only log when scan size changes (new position stored) to avoid spam
-                        if (sizeAfter != sizeBefore) {
-                            ofLogVerbose("MediaPool") << "[SCAN_CAPTURE] PER_STEP: Step " << captureStep 
-                                                      << ", Media " << currentIndex << ", Position " << currentPosition
-                                                      << " (scan size: " << sizeBefore << " -> " << sizeAfter << ")";
-                        }
-                    }
-                } else if (scanMode == ScanMode::GLOBAL) {
-                    // GLOBAL mode: capture every frame (single shared position)
-                    size_t sizeBefore = positionScan.size();
-                    positionScan.capture(captureStep, currentIndex, currentPosition);
-                    size_t sizeAfter = positionScan.size();
-                    if (sizeAfter != sizeBefore) {
-                        ofLogVerbose("MediaPool") << "[SCAN_CAPTURE] GLOBAL: Media " << currentIndex 
-                                                  << ", Position " << currentPosition
-                                                  << " (scan size: " << sizeBefore << " -> " << sizeAfter << ")";
-                    }
-                }
-            }
-            // PER_MEDIA mode: No capture needed - MediaPlayer::playheadPosition is the source of truth
+            // Get loop start and end positions from calculated bounds
+            float loopStartPos = loopBounds.start;
+            float loopEndPos = loopBounds.end;
             
-            // Check if playhead has reached or exceeded effective region end
-            bool reachedRegionEnd = (currentPosition >= effectiveRegionEnd - REGION_BOUNDARY_THRESHOLD);
-            
-            // Calculate loop start position for granular-style looping (used when in LOOP play style)
-            float loopStartPos = regionStartVal;
+            // CRITICAL: In LOOP play style, handle looping manually
+            // We don't enable underlying player loop because it loops at full media level (0.0-1.0),
+            // but we need region-level looping (loopStart to loopEnd based on loopSize).
             if (currentPlayStyle == PlayStyle::LOOP) {
-                float relativeStartPos = activePlayer->startPosition.get();
-                float regionSize = regionEndVal - regionStartVal;
-                if (regionSize > 0.001f) {
-                    loopStartPos = regionStartVal + relativeStartPos * regionSize;
-                } else {
-                    loopStartPos = std::max(0.0f, std::min(1.0f, relativeStartPos));
+                // Check if playhead went below loop start - clamp to loop start
+                if (currentPosition < loopStartPos - thresholdNormalized) {
+                    seekPlayerToPosition(activePlayer, loopStartPos);
+                    currentPosition = loopStartPos;  // Update for subsequent checks
+                }
+                
+                // Check if playhead reached loop end - loop back to loop start
+                if (currentPosition >= loopEndPos - thresholdNormalized) {
+                    seekPlayerToPosition(activePlayer, loopStartPos);
+                    // Don't call handleRegionEnd() - we're looping, not stopping
+                    // Skip region end handling for LOOP mode
+                }
+            } else {
+                // For ONCE and NEXT modes: Check if playhead has reached region end
+                bool reachedRegionEnd = (currentPosition >= effectiveRegionEnd - thresholdNormalized);
+                if (reachedRegionEnd) {
+                    handleRegionEnd(activePlayer, currentPosition, effectiveRegionEnd, 
+                                   loopStartPos, currentPlayStyle);
                 }
             }
             
-            // Handle region end based on play style
-            if (reachedRegionEnd && !activePlayer->loop.get()) {
-                switch (currentPlayStyle) {
-                    case PlayStyle::ONCE:
-                        // ONCE mode: Stop playback but preserve position for scanning
-                        // Scanning should work even in ONCE mode - each trigger resumes from where it left off
-                        // Only reset position when media actually finishes (reaches end)
-                        // For now, just stop - position is preserved by MediaPlayer::stop()
-                        // Position will be reset by MediaPool when appropriate (e.g., transport start)
-                        activePlayer->stop();
-                        break;
-                    case PlayStyle::LOOP:
-                        // Loop back to calculated loop start position
-                        if (activePlayer->isAudioLoaded()) {
-                            activePlayer->getAudioPlayer().setPosition(loopStartPos);
-                        }
-                        if (activePlayer->isVideoLoaded()) {
-                            activePlayer->getVideoPlayer().getVideoFile().setPosition(loopStartPos);
-                            activePlayer->getVideoPlayer().getVideoFile().update();
-                        }
-                        activePlayer->playheadPosition.set(loopStartPos);
-                        break;
-                    case PlayStyle::NEXT:
-                        activePlayer->stop();
-                        break;
-                }
-            } else if (reachedRegionEnd && activePlayer->loop.get()) {
-                // Loop back to calculated loop start position when using player's internal loop
-                if (currentPosition > effectiveRegionEnd + REGION_BOUNDARY_THRESHOLD) {
-                    if (activePlayer->isAudioLoaded()) {
-                        activePlayer->getAudioPlayer().setPosition(loopStartPos);
-                    }
-                    if (activePlayer->isVideoLoaded()) {
-                        activePlayer->getVideoPlayer().getVideoFile().setPosition(loopStartPos);
-                        activePlayer->getVideoPlayer().getVideoFile().update();
-                    }
-                    activePlayer->playheadPosition.set(loopStartPos);
+            // Position capture (separate concern - only when appropriate)
+            // Get transport state and step context for position capture
+            bool transportIsPlaying = false;
+            int captureStep = -1;
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                transportIsPlaying = lastTransportState;
+                if (mode == PlaybackMode::SEQUENCER_ACTIVE) {
+                    captureStep = activeStepContext.step;
                 }
             }
             
-            // PHASE 2: Position capture is now handled above (only for PER_STEP/GLOBAL modes)
-            // MediaPlayer::stop() already preserves position in playheadPosition parameter
-            // No need for redundant capture here
-        } else if (!isCurrentlyPlaying && transportIsPlaying) {
-            // Player stopped but transport still playing
-            // NOTE: This only happens during normal playback (gate ends, region ends, etc.)
-            // When transport stops, transportIsPlaying will be false, so this won't execute
-            // PHASE 2: MediaPlayer::stop() already preserved position in playheadPosition
-            // For PER_STEP/GLOBAL modes, we capture during playback (above), not on stop
-            // No additional capture needed here
+            // Only capture position when transport is playing (sequencer) or in manual preview
+            // This prevents position from being saved after transport stops and memory is cleared
+            if (transportIsPlaying || mode == PlaybackMode::MANUAL_PREVIEW) {
+                captureScanPosition(captureStep, currentIndex, currentPosition, mode);
+            }
+        } else if (!isCurrentlyPlaying) {
+            // Player stopped - handle transitions
+            bool transportIsPlaying = false;
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                transportIsPlaying = lastTransportState;
+            }
             
-            // Transition to IDLE when playback stops
+            // Transition MANUAL_PREVIEW to IDLE when playback stops
+            // NOTE: SEQUENCER_ACTIVE is already handled by the early check above
             mode = currentMode.load(std::memory_order_relaxed);
-            if (mode == PlaybackMode::SEQUENCER_ACTIVE) {
+            if (shouldTransitionToIdle(mode, transportIsPlaying)) {
                 currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
-                gateTimerActive = false;
-                ofLogNotice("MediaPool") << "[GATE_END] Player stopped - transitioning to IDLE mode";
-            } else if (mode == PlaybackMode::MANUAL_PREVIEW) {
-                currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
-                ofLogNotice("MediaPool") << "[MANUAL_STOP] Manual preview stopped - transitioning to IDLE mode";
+                if (mode == PlaybackMode::MANUAL_PREVIEW) {
+                    ofLogNotice("MediaPool") << "[MANUAL_STOP] Manual preview stopped - transitioning to IDLE mode";
+                }
             }
         }
-        // NOTE: When transportIsPlaying is false, we don't capture position at all
-        // This prevents position from being saved after transport stops and memory is cleared
     } else if (activePlayer && !activePlayerIsValid) {
         // activePlayer is no longer valid - reset it
         activePlayer = nullptr;
-        playerConnected = false;
         currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
     }
     
@@ -1310,10 +1593,25 @@ void MediaPool::update() {
             onPlaybackEnd();
         }
     }
+    
+    // Update player connections based on current playing state
+    // This ensures connections stay in sync if players stop/start outside of our control
+    try {
+        updatePlayerConnections();
+    } catch (const std::exception& e) {
+        ofLogError("MediaPool") << "Exception in updatePlayerConnections(): " << e.what();
+    } catch (...) {
+        ofLogError("MediaPool") << "Unknown exception in updatePlayerConnections()";
+    }
 }
 
 //--------------------------------------------------------------
 void MediaPool::processEventQueue() {
+    // Don't process events if module is disabled
+    if (!isEnabled()) {
+        return;
+    }
+    
     // Get parameter descriptors for defaults and validation
     auto paramDescriptors = getParameters();
     std::map<std::string, float> defaults;
@@ -1336,8 +1634,8 @@ void MediaPool::processEventQueue() {
         // Log trigger event (safe in GUI thread)
         auto noteIt = event.parameters.find("note");
         bool positionExplicitlySet = event.parameters.find("position") != event.parameters.end();
-        ofLogVerbose("MediaPool") << "[TRIGGER] Step " << event.step << ", Note: " 
-                                   << (noteIt != event.parameters.end() ? (int)noteIt->second : -1)
+        int noteValue = (noteIt != event.parameters.end() ? (int)noteIt->second : -1);
+        ofLogVerbose("MediaPool") << "[TRIGGER] Step " << event.step << ", Note: " << noteValue
                                    << ", Position explicit: " << (positionExplicitlySet ? "YES" : "NO");
         
         // Extract mediaIndex from "note" parameter
@@ -1350,19 +1648,26 @@ void MediaPool::processEventQueue() {
         if (mediaIndex < 0) {
             if (activePlayer) {
                 activePlayer->stop();
+                // Disconnect stopped player from mixers
+                ensurePlayerAudioDisconnected(activePlayer);
+                ensurePlayerVideoDisconnected(activePlayer);
             }
-            gateTimerActive = false;
             continue;  // Process next event
         }
         
         // Validate media index
         if (mediaIndex >= (int)players.size()) {
+            ofLogWarning("MediaPool") << "[TRIGGER] INVALID mediaIndex: " << mediaIndex 
+                                      << " >= players.size(): " << players.size() 
+                                      << " - skipping event for step " << event.step;
             continue;  // Process next event
         }
         
         // Get the media player for this step
         MediaPlayer* player = players[mediaIndex].get();
         if (!player) {
+            ofLogWarning("MediaPool") << "[TRIGGER] Player at index " << mediaIndex 
+                                      << " is NULL - skipping event for step " << event.step;
             continue;  // Process next event
         }
         
@@ -1377,162 +1682,102 @@ void MediaPool::processEventQueue() {
             }
             
             // Apply position scan: restore stored scan position if position not explicitly set
-            // PHASE 1 SIMPLIFICATION: PER_MEDIA mode reads directly from MediaPlayer::playheadPosition
+            // PER_MEDIA mode reads directly from MediaPlayer::playheadPosition
             // (no need for PositionScan storage - MediaPlayer already preserves position on stop())
             if (event.parameters.find("position") == event.parameters.end()) {
-                static constexpr float POSITION_THRESHOLD = 0.01f;
-                float scanPosition = 0.0f;
-                ScanMode scanMode = positionScan.getMode();
+                float scanPosition = restoreScanPosition(event.step, mediaIndex, player);
                 
-                if (scanMode == ScanMode::PER_MEDIA) {
-                    // PHASE 1: Read directly from MediaPlayer (single source of truth)
-                    // MediaPlayer::stop() already preserves position in playheadPosition parameter
-                    scanPosition = player->playheadPosition.get();
-                    
-                    // CRITICAL: If position is at the end (>= 0.99), reset to 0.0f for fresh start
-                    // This allows scanning to work (resume from where it left off), but when media
-                    // reaches the end, the next trigger starts from the beginning
-                    static constexpr float END_THRESHOLD = 0.99f;
-                    if (scanPosition >= END_THRESHOLD) {
-                        float originalPos = scanPosition;  // Save for logging
-                        scanPosition = 0.0f;
-                        player->playheadPosition.set(0.0f);  // Reset in player too
-                        ofLogNotice("MediaPool") << "[SCAN_RESTORE] PER_MEDIA: Position at end (" 
-                                                 << originalPos << "), resetting to 0.0f for media " << mediaIndex;
-                    }
-                    
-                    // Always set position parameter (including 0.0f after reset from end)
-                    // This ensures playback starts from the correct position
+                // Always set position parameter if we got a valid scan position
+                // This ensures playback starts from the correct position
+                if (scanPosition > POSITION_THRESHOLD) {
                     event.parameters["position"] = scanPosition;
-                    if (scanPosition > POSITION_THRESHOLD) {
-                        ofLogNotice("MediaPool") << "[SCAN_RESTORE] PER_MEDIA: Using playheadPosition for media " 
-                                                 << mediaIndex << ": " << scanPosition;
-                    } else {
-                        ofLogVerbose("MediaPool") << "[SCAN_RESTORE] PER_MEDIA: Starting from beginning (position: " 
-                                                  << scanPosition << ") for media " << mediaIndex;
-                    }
-                } else {
-                    // PER_STEP or GLOBAL mode: use PositionScan storage
-                    size_t scanSizeBefore = positionScan.size();
-                    scanPosition = positionScan.restore(event.step, mediaIndex);
-                    
-                    if (scanPosition > POSITION_THRESHOLD) {
-                        event.parameters["position"] = scanPosition;
-                        ofLogNotice("MediaPool") << "[SCAN_RESTORE] " << (scanMode == ScanMode::PER_STEP ? "PER_STEP" : "GLOBAL")
-                                                 << ": Using scan position for step " << event.step 
-                                                 << ", media " << mediaIndex << ": " << scanPosition
-                                                 << " (scan size: " << scanSizeBefore << ")";
-                    } else {
-                        ofLogVerbose("MediaPool") << "[SCAN_SKIP] " << (scanMode == ScanMode::PER_STEP ? "PER_STEP" : "GLOBAL")
-                                                  << ": No scan position available for step " << event.step 
-                                                  << ", media " << mediaIndex << " (scan size: " << scanSizeBefore << ")";
-                    }
                 }
             }
         }
         
-        // Set active player if changed
-        bool playerChanged = (currentIndex != mediaIndex || activePlayer != player);
+        // Set active player if changed - protect with mutex
+        bool playerChanged = false;
+        MediaPlayer* previousActivePlayer = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            playerChanged = (currentIndex != mediaIndex || activePlayer != player);
+            previousActivePlayer = activePlayer;
+        }
+        
         if (playerChanged) {
-            setActivePlayer(mediaIndex);
-        }
-        
-        // MODULAR: Process ALL parameters from event dynamically
-        // Iterate through all parameters in the event and apply them to the player
-        // If parameter is not in event, use current player value (not default) to preserve GUI settings
-        // This allows MediaPool GUI to control parameters when not triggered from sequencer
-        
-        // Special handling for "position" parameter (maps to startPosition, needs region clamping)
-        float position = 0.0f;
-        bool positionInEvent = false;
-        auto positionIt = event.parameters.find("position");
-        if (positionIt != event.parameters.end()) {
-            position = positionIt->second;
-            positionInEvent = true;
-        } else {
-            // Position not in event - use current player value (position memory)
-            position = player->startPosition.get();
-        }
-        
-        // Clamp position to region bounds
-        float regionStartVal = player->regionStart.get();
-        float regionEndVal = player->regionEnd.get();
-        float regionSize = regionEndVal - regionStartVal;
-        float clampedPosition = std::max(0.0f, std::min(1.0f, position));
-        
-        // Set position if it was in event or if it changed
-        if (positionInEvent && std::abs(player->startPosition.get() - clampedPosition) > PARAMETER_EPSILON) {
-            player->startPosition.set(clampedPosition);
-        }
-        
-        // Audio/video always enabled for sequencer triggers
-        if (!player->audioEnabled.get()) {
-            player->audioEnabled.set(true);
-        }
-        if (!player->videoEnabled.get()) {
-            player->videoEnabled.set(true);
-        }
-        
-        // Process all other parameters from event dynamically
-        // Skip "note" (handled separately) and "position" (handled above)
-        for (const auto& paramPair : event.parameters) {
-            const std::string& paramName = paramPair.first;
-            float paramValue = paramPair.second;
-            
-            // Skip special parameters
-            if (paramName == "note" || paramName == "position") {
-                continue;
-        }
-        
-            // Get parameter descriptor for validation
-            auto descIt = std::find_if(paramDescriptors.begin(), paramDescriptors.end(),
-                [&](const ParameterDescriptor& desc) { return desc.name == paramName; });
-            
-            // Clamp value to parameter range if descriptor found
-            float clampedValue = paramValue;
-            if (descIt != paramDescriptors.end()) {
-                clampedValue = std::max(descIt->minValue, std::min(descIt->maxValue, paramValue));
-            }
-            
-            // Use MediaPlayer's getFloatParameter to check if parameter exists
-            auto* param = player->getFloatParameter(paramName);
-            if (param) {
-                // Parameter exists on player - set it
-                float currentValue = param->get();
-                if (std::abs(currentValue - clampedValue) > PARAMETER_EPSILON) {
-                    param->set(clampedValue);
+            // MONOPHONIC BEHAVIOR: Stop previous active player before switching to new one
+            // POLYPHONIC BEHAVIOR: Allow previous player to continue playing
+            if (polyphonyMode_ == PolyphonyMode::MONOPHONIC) {
+                if (previousActivePlayer && previousActivePlayer != player && previousActivePlayer->isPlaying()) {
+                    previousActivePlayer->stop();
+                    // Disconnect stopped player from mixer
+                    ensurePlayerVideoDisconnected(previousActivePlayer);
+                    ofLogVerbose("MediaPool") << "[MONO] Stopped previous active player before starting new player (index " << mediaIndex << ")";
                 }
             } else {
-                // Parameter doesn't exist on player - log warning but continue
-                ofLogVerbose("MediaPool") << "Parameter '" << paramName << "' not found on MediaPlayer, skipping";
+                // POLYPHONIC: Previous player continues playing - no stop needed
+                ofLogVerbose("MediaPool") << "[POLY] Allowing previous player to continue while starting new player (index " << mediaIndex << ")";
+            }
+            setActivePlayer(mediaIndex);  // setActivePlayer now holds its own lock
+        } else {
+            // Same player being retriggered
+            if (polyphonyMode_ == PolyphonyMode::MONOPHONIC) {
+                // MONO: Stop it first to restart from new position (prevents layering)
+                if (player && player->isPlaying()) {
+                    player->stop();
+                    // Disconnect stopped player from mixers (will reconnect when it starts again)
+                    ensurePlayerAudioDisconnected(player);
+                    ensurePlayerVideoDisconnected(player);
+                    ofLogVerbose("MediaPool") << "[MONO] Stopped same player (index " << mediaIndex 
+                                              << ") before retriggering from new position";
+                }
+            } else {
+                // POLY: Allow layering - same player can be triggered multiple times simultaneously
+                // (Each trigger creates a new playback instance if the player supports it)
+                // For now, we'll restart from new position but allow multiple instances if player supports it
+                ofLogVerbose("MediaPool") << "[POLY] Retriggering same player (index " << mediaIndex 
+                                          << ") - may layer if player supports it";
             }
         }
         
-        // Set loop based on play style
-        bool shouldLoop = (currentPlayStyle == PlayStyle::LOOP);
-        if (std::abs(player->loop.get() ? 1.0f : 0.0f - (shouldLoop ? 1.0f : 0.0f)) > PARAMETER_EPSILON) {
-            player->loop.set(shouldLoop);
-        }
+        // Apply all parameters from event using helper method
+        applyEventParameters(player, event, paramDescriptors);
         
         // Use duration directly from TriggerEvent
         float stepDurationSeconds = event.duration;
         
-        // Trigger media playback with gating
-        player->playWithGate(stepDurationSeconds);
+        // Start playback (respects loop state set by applyEventParameters)
+        player->play();
         
-        // Track gate timer for reliable gate-end detection
-        gateTimerActive = true;
-        gateEndTime = ofGetElapsedTimef() + stepDurationSeconds;
+        // Schedule stop after gate duration expires
+        // This allows LOOP mode to work correctly - player loops within bounds until gate expires
+        if (stepDurationSeconds > 0.0f) {
+            scheduledStops_.push_back({player, ofGetElapsedTimef() + stepDurationSeconds});
+        }
+        
+        // Connect player to mixers now that it's playing
+        ensurePlayerAudioConnected(player);
+        ensurePlayerVideoConnected(player);
         
         // Transition to SEQUENCER_ACTIVE if playback started
         if (player->isPlaying()) {
             currentMode.store(PlaybackMode::SEQUENCER_ACTIVE, std::memory_order_relaxed);
         } else {
-            gateTimerActive = false;
-            ofLogWarning("MediaPool") << "playWithGate() called but player is not playing - staying in IDLE mode";
+            ofLogWarning("MediaPool") << "play() called but player is not playing - staying in IDLE mode";
         }
         
         // Event processed, continue to next event in queue
+    }
+    
+    // Log warning if queue is backing up (but only occasionally to avoid spam)
+    static int warningFrameCount = 0;
+    if (++warningFrameCount % 300 == 0) { // Every 5 seconds at 60fps
+        size_t remainingQueueSize = eventQueue.size_approx();
+        if (remainingQueueSize > 100) {
+            ofLogWarning("MediaPool") << "Event queue backing up - " << remainingQueueSize 
+                                      << " events remaining (processed " << eventsProcessed 
+                                      << " this frame, maxEventsPerFrame: " << maxEventsPerFrame << ")";
+        }
     }
     
     // Check if we hit the processing limit (indicates queue might be backing up)
@@ -1555,13 +1800,24 @@ void MediaPool::onPlaybackEnd() {
     PlaybackMode mode = currentMode.load(std::memory_order_relaxed);
     if (mode != PlaybackMode::MANUAL_PREVIEW && mode != PlaybackMode::SEQUENCER_ACTIVE) return;
     
+    // Get transport state - CRITICAL: Keep SEQUENCER_ACTIVE when transport is playing
+    bool transportIsPlaying = false;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        transportIsPlaying = lastTransportState;
+    }
+    
     switch (currentPlayStyle) {
         case PlayStyle::ONCE:
             // Stop the current player
             if (activePlayer) {
                 activePlayer->stop();
             }
-            currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+            // Transition to IDLE using helper method
+            if (shouldTransitionToIdle(mode, transportIsPlaying)) {
+                currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+            }
+            // If SEQUENCER_ACTIVE and transport is playing, keep SEQUENCER_ACTIVE mode
             break;
         case PlayStyle::LOOP:
             // Already handled by loop=true
@@ -1569,7 +1825,7 @@ void MediaPool::onPlaybackEnd() {
         case PlayStyle::NEXT:
             if (players.size() > 1) {
                 size_t nextIndex = (currentIndex + 1) % players.size();
-                ofLogNotice("ofxMediaPool") << "Playing next media: " << nextIndex;
+                ofLogNotice("MediaPool") << "Playing next media: " << nextIndex;
                 
                 // Get next player and validate it's available
                 MediaPlayer* nextPlayer = players[nextIndex].get();
@@ -1595,15 +1851,26 @@ void MediaPool::onPlaybackEnd() {
                     // Start playback
                     nextPlayer->play();
                     
-                    ofLogNotice("ofxMediaPool") << "Started next media " << nextIndex << " (state: " << (mode == PlaybackMode::MANUAL_PREVIEW ? "MANUAL_PREVIEW" : "SEQUENCER_ACTIVE") << ")";
+                    ofLogNotice("MediaPool") << "Started next media " << nextIndex << " (state: " << (mode == PlaybackMode::MANUAL_PREVIEW ? "MANUAL_PREVIEW" : "SEQUENCER_ACTIVE") << ")";
                 } else {
-                    currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+                    // No next player available - only transition to IDLE if:
+                    // - MANUAL_PREVIEW mode (always transition)
+                    // - SEQUENCER_ACTIVE mode AND transport is stopped
+                    if (mode == PlaybackMode::MANUAL_PREVIEW || !transportIsPlaying) {
+                        currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+                    }
                 }
             } else {
+                // Only one player (no next player) - stop current player
                 if (activePlayer) {
                     activePlayer->stop();
                 }
-                currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+                // Only transition to IDLE if:
+                // - MANUAL_PREVIEW mode (always transition)
+                // - SEQUENCER_ACTIVE mode AND transport is stopped
+                if (mode == PlaybackMode::MANUAL_PREVIEW || !transportIsPlaying) {
+                    currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+                }
             }
             break;
     }
@@ -1630,7 +1897,6 @@ void MediaPool::onTransportChanged(bool isPlaying) {
     if (isPlaying != lastTransportState) {
         // CRITICAL: Update lastTransportState FIRST to prevent update() from capturing position
         // after we clear memory. This ensures update() sees transport as stopped immediately.
-        bool wasPlaying = lastTransportState;
         lastTransportState = isPlaying;
         
         if (isPlaying) {
@@ -1677,15 +1943,19 @@ void MediaPool::onTransportChanged(bool isPlaying) {
             activeStepContext.mediaIndex = -1;
             activeStepContext.triggerTime = 0.0f;
             
-            // Now stop players
+            // Now stop ALL players (monophonic behavior: only one should be playing, but stop all to be safe)
             // NOTE: We stop players AFTER clearing positions to prevent any position capture
             // in update() from repopulating scan
-            if (currentMode.load(std::memory_order_relaxed) == PlaybackMode::SEQUENCER_ACTIVE) {
-                gateTimerActive = false;
                 currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
                 
-                if (activePlayer && activePlayer->isPlaying()) {
-                    activePlayer->stop();
+            // Stop all players to ensure clean state (prevents players continuing after transport stops)
+            for (size_t i = 0; i < players.size(); i++) {
+                auto& player = players[i];
+                if (player && player->isPlaying()) {
+                    player->stop();
+                    // Disconnect stopped player from mixer
+                    ensurePlayerVideoDisconnected(player.get());
+                    ofLogVerbose("MediaPool") << "[TRANSPORT_STOP] Stopped player at index " << i;
                 }
             }
             
@@ -1708,6 +1978,15 @@ std::string MediaPool::getName() const {
 
 // getTypeName() uses default implementation from Module base class (returns getName())
 
+void MediaPool::setEnabled(bool enabled) {
+    Module::setEnabled(enabled);
+    
+    // Stop all media when disabled
+    if (!enabled) {
+        stopAllMedia();
+    }
+}
+
 ofJson MediaPool::toJson() const {
     ofJson json;
     
@@ -1720,10 +1999,23 @@ ofJson MediaPool::toJson() const {
     // Save play style
     json["playStyle"] = static_cast<int>(currentPlayStyle);
     
+    // Save polyphony mode
+    json["polyphonyMode"] = (polyphonyMode_ == PolyphonyMode::POLYPHONIC) ? 1.0f : 0.0f;
+    
     // Save all players with their file paths and parameters
     // File paths are saved as-is (should already be absolute from file system)
     ofJson playersArray = ofJson::array();
     std::lock_guard<std::mutex> lock(stateMutex);
+    
+    // Log how many players we're serializing
+    size_t validPlayers = 0;
+    for (size_t i = 0; i < players.size(); i++) {
+        if (players[i].get()) {
+            validPlayers++;
+        }
+    }
+    ofLogNotice("MediaPool") << "Serializing " << validPlayers << " players to session (total players: " << players.size() << ")";
+    
     for (size_t i = 0; i < players.size(); i++) {
         auto player = players[i].get();
         if (player) {
@@ -1746,15 +2038,20 @@ ofJson MediaPool::toJson() const {
             paramsJson["regionEnd"] = player->regionEnd.get();
             paramsJson["audioEnabled"] = player->audioEnabled.get();
             paramsJson["videoEnabled"] = player->videoEnabled.get();
-            paramsJson["brightness"] = player->brightness.get();
-            paramsJson["hue"] = player->hue.get();
-            paramsJson["saturation"] = player->saturation.get();
             
             playerJson["parameters"] = paramsJson;
             playersArray.push_back(playerJson);
         }
     }
     json["players"] = playersArray;
+    
+    // Log final count
+    if (playersArray.size() != validPlayers) {
+        ofLogWarning("MediaPool") << "Player count mismatch: " << validPlayers << " valid players, " 
+                                   << playersArray.size() << " serialized";
+    } else {
+        ofLogNotice("MediaPool") << "Successfully serialized " << playersArray.size() << " players to session";
+    }
     
     return json;
 }
@@ -1775,24 +2072,38 @@ void MediaPool::fromJson(const ofJson& json) {
         }
     }
     
+    // Load polyphony mode (default to MONOPHONIC for backward compatibility)
+    if (json.contains("polyphonyMode")) {
+        float modeValue = json["polyphonyMode"];
+        polyphonyMode_ = (modeValue >= 0.5f) ? PolyphonyMode::POLYPHONIC : PolyphonyMode::MONOPHONIC;
+        ofLogNotice("MediaPool") << "Loaded polyphony mode: " 
+                                  << (polyphonyMode_ == PolyphonyMode::POLYPHONIC ? "POLYPHONIC" : "MONOPHONIC");
+    } else {
+        polyphonyMode_ = PolyphonyMode::MONOPHONIC;  // Default for old sessions
+    }
+    
     // Load players from saved file paths
     if (json.contains("players") && json["players"].is_array()) {
         std::lock_guard<std::mutex> lock(stateMutex);
+        
+        auto playersArray = json["players"];
+        ofLogNotice("MediaPool") << "Loading " << playersArray.size() << " players from session...";
         
         // Clear existing players
         if (activePlayer) {
             disconnectActivePlayer();
             activePlayer = nullptr;
-            playerConnected = false;
         }
         clear();
         
         // Set flag to defer media loading during session restore to prevent blocking
         deferMediaLoading_ = true;
         
-        auto playersArray = json["players"];
         deferredPlayerParams_.clear();
         deferredPlayerParams_.reserve(playersArray.size());
+        
+        size_t filesAdded = 0;
+        size_t paramsStored = 0;
         
         // First pass: Add file paths directly to lists (skip addMediaFile to avoid file existence checks)
         for (int i = 0; i < playersArray.size(); i++) {
@@ -1819,6 +2130,7 @@ void MediaPool::fromJson(const ofJson& json) {
                 }
                 if (!alreadyExists) {
                     audioFiles.push_back(audioFile);
+                    filesAdded++;
                     ofLogNotice("MediaPool") << "Added audio file path: " << audioFile;
                 }
             }
@@ -1834,6 +2146,7 @@ void MediaPool::fromJson(const ofJson& json) {
                 }
                 if (!alreadyExists) {
                     videoFiles.push_back(videoFile);
+                    filesAdded++;
                     ofLogNotice("MediaPool") << "Added video file path: " << videoFile;
                 }
             }
@@ -1846,22 +2159,35 @@ void MediaPool::fromJson(const ofJson& json) {
                     videoFile,
                     playerJson["parameters"]
                 });
+                paramsStored++;
+            } else {
+                // Still store entry even without parameters (for file matching)
+                deferredPlayerParams_.push_back({
+                    audioFile,
+                    videoFile,
+                    ofJson::object()  // Empty params object
+                });
             }
         }
+        
+        ofLogNotice("MediaPool") << "Session restore: Added " << filesAdded << " file paths, "
+                                 << "stored " << paramsStored << " parameter sets. "
+                                 << "Deferred loading flag set. Players will be created in completeRestore().";
         
         // Store active player index for restoration after players are created
         if (json.contains("activePlayerIndex")) {
             deferredActivePlayerIndex_ = json["activePlayerIndex"];
+            ofLogNotice("MediaPool") << "Active player index to restore: " << deferredActivePlayerIndex_;
         } else {
             deferredActivePlayerIndex_ = 0;
         }
         
         // DON'T try to load parameters here - players don't exist yet!
-        // Parameters will be loaded in completeDeferredLoading() after mediaPair() creates players
+        // Parameters will be loaded in completeRestore() after mediaPair() creates players
         
-        // Keep defer flag true - media loading will happen later in ofApp::setup()
-        // Don't call mediaPair() here - it will be called after session load completes
-        // deferMediaLoading_ remains true until completeDeferredLoading() is called
+        // Keep defer flag true - media loading will happen later in completeRestore()
+        // Don't call mediaPair() here - it will be called by SessionManager after session load completes
+        // deferMediaLoading_ remains true until completeRestore() is called
         // This prevents blocking during session restore
     }
     // Legacy support: If no players array but directory exists, use directory-based loading
@@ -1889,7 +2215,40 @@ ModuleType MediaPool::getType() const {
     return ModuleType::INSTRUMENT;
 }
 
-std::vector<ParameterDescriptor> MediaPool::getParameters() {
+//--------------------------------------------------------------
+bool MediaPool::hasCapability(ModuleCapability capability) const {
+    switch (capability) {
+        case ModuleCapability::ACCEPTS_FILE_DROP:
+        case ModuleCapability::ACCEPTS_TRIGGER_EVENTS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+//--------------------------------------------------------------
+std::vector<ModuleCapability> MediaPool::getCapabilities() const {
+    return {
+        ModuleCapability::ACCEPTS_FILE_DROP,
+        ModuleCapability::ACCEPTS_TRIGGER_EVENTS
+    };
+}
+
+//--------------------------------------------------------------
+// REMOVED: getIndexRange() - use parameter system instead
+// Query getParameters() for "index" parameter's max value
+
+//--------------------------------------------------------------
+Module::ModuleMetadata MediaPool::getMetadata() const {
+    Module::ModuleMetadata metadata;
+    metadata.typeName = "MediaPool";
+    metadata.eventNames = {"onTrigger"};  // Event it accepts (not emits)
+    metadata.parameterNames = {"position"};
+    metadata.parameterDisplayNames["position"] = "Position";
+    return metadata;
+}
+
+std::vector<ParameterDescriptor> MediaPool::getParameters() const {
     std::vector<ParameterDescriptor> params;
     
     // MediaPool parameters that can be controlled by TrackerSequencer
@@ -1897,7 +2256,12 @@ std::vector<ParameterDescriptor> MediaPool::getParameters() {
     // MediaPool maps these to MediaPlayer parameters
     
     // Core playback parameters
-    params.push_back(ParameterDescriptor("note", ParameterType::INT, 0.0f, 127.0f, 0.0f, "Note/Media Index"));
+    // "index" parameter with dynamic range based on number of players
+    int maxIndex = static_cast<int>(getNumPlayers()) - 1;
+    if (maxIndex < 0) maxIndex = 0;  // Safety: at least 0
+    params.push_back(ParameterDescriptor("index", ParameterType::INT, 0.0f, static_cast<float>(maxIndex), 0.0f, "Media Index"));
+    // Keep "note" as alias for backward compatibility, but use same dynamic range
+    params.push_back(ParameterDescriptor("note", ParameterType::INT, 0.0f, static_cast<float>(maxIndex), 0.0f, "Note"));
     params.push_back(ParameterDescriptor("position", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Position"));
     params.push_back(ParameterDescriptor("speed", ParameterType::FLOAT, -10.0f, 10.0f, 1.0f, "Speed"));
     params.push_back(ParameterDescriptor("volume", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Volume"));
@@ -1907,15 +2271,39 @@ std::vector<ParameterDescriptor> MediaPool::getParameters() {
     params.push_back(ParameterDescriptor("regionStart", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Region Start"));
     params.push_back(ParameterDescriptor("regionEnd", ParameterType::FLOAT, 0.0f, 1.0f, 1.0f, "Region End"));
     
-    // Video-specific parameters (color correction)
-    params.push_back(ParameterDescriptor("brightness", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Brightness"));
-    params.push_back(ParameterDescriptor("hue", ParameterType::FLOAT, 0.0f, 360.0f, 0.0f, "Hue"));
-    params.push_back(ParameterDescriptor("saturation", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Saturation"));
+    // Polyphony control
+    params.push_back(ParameterDescriptor("polyphonyMode", ParameterType::INT, 0.0f, 1.0f, 0.0f, "Polyphony Mode"));
     
     return params;
 }
 
 void MediaPool::setParameter(const std::string& paramName, float value, bool notify) {
+    // Handle polyphonyMode parameter (module-level, not player-level)
+    if (paramName == "polyphonyMode") {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        PolyphonyMode oldMode = polyphonyMode_;
+        polyphonyMode_ = (value >= 0.5f) ? PolyphonyMode::POLYPHONIC : PolyphonyMode::MONOPHONIC;
+        
+        if (polyphonyMode_ != oldMode) {
+            // Mode changed - handle transition
+            // NOTE: We don't stop all non-active players here because:
+            // 1. It breaks video mixing (stopped players output transparent but remain connected)
+            // 2. The original mono behavior only stopped the previous active player when switching
+            // 3. Players will be properly stopped when switching in processEventQueue() and playMediaManual()
+            if (polyphonyMode_ == PolyphonyMode::MONOPHONIC) {
+                ofLogNotice("MediaPool") << "[POLYPHONY] Switched to MONOPHONIC mode - will stop previous player on next switch";
+            } else {
+                // Switching to POLY: no action needed - allow all to play
+                ofLogNotice("MediaPool") << "[POLYPHONY] Switched to POLYPHONIC mode - multiple players can play simultaneously";
+            }
+            
+            if (notify && parameterChangeCallback) {
+                parameterChangeCallback(paramName, value);
+            }
+        }
+        return;
+    }
+    
     // Continuous parameter modulation (for modulators, envelopes, etc.)
     // For MediaPool, we apply this to the active player
     // MODULAR: Use parameter mapping system instead of hardcoded checks
@@ -1955,8 +2343,8 @@ void MediaPool::setParameter(const std::string& paramName, float value, bool not
             oldValue = activePlayer->loopSize.get();
             // Clamp loopSize to valid range (0.001s minimum, up to duration or 10s max)
             float duration = activePlayer->getDuration();
-            float maxAllowed = (duration > 0.001f) ? duration : 10.0f;
-            float clampedVal = std::max(0.001f, std::min(maxAllowed, val));
+            float maxAllowed = (duration > MIN_DURATION) ? duration : 10.0f;
+            float clampedVal = std::max(MIN_LOOP_SIZE, std::min(maxAllowed, val));
             activePlayer->loopSize.set(clampedVal);
             return std::abs(oldValue - clampedVal) > PARAMETER_EPSILON;
         } else if (name == "regionStart" || name == "loopStart") {
@@ -1974,21 +2362,14 @@ void MediaPool::setParameter(const std::string& paramName, float value, bool not
             // Store it directly as relative startPosition
             oldValue = activePlayer->startPosition.get();
             if (std::abs(oldValue - val) > PARAMETER_EPSILON) {
-                // Clamp to valid relative range
-                float relativePos = std::max(0.0f, std::min(1.0f, val));
+                // Clamp to valid relative range using helper (handles ONCE mode clamping)
+                float relativePos = clampPositionForPlayback(val, currentPlayStyle);
                 activePlayer->startPosition.set(relativePos);
                 
-                // Update playheadPosition for UI display (map to absolute)
+                // Update playheadPosition for UI display (map to absolute using helper function)
                 float regionStartVal = activePlayer->regionStart.get();
                 float regionEndVal = activePlayer->regionEnd.get();
-                float regionSize = regionEndVal - regionStartVal;
-                float absolutePos = 0.0f;
-                
-                if (regionSize > 0.001f) {
-                    absolutePos = regionStartVal + relativePos * regionSize;
-                } else {
-                    absolutePos = std::max(0.0f, std::min(1.0f, relativePos));
-                }
+                float absolutePos = mapRelativeToAbsolute(relativePos, regionStartVal, regionEndVal);
                 
                 float currentPos = activePlayer->playheadPosition.get();
                 if (std::abs(currentPos - absolutePos) > POSITION_EPSILON) {
@@ -1997,18 +2378,6 @@ void MediaPool::setParameter(const std::string& paramName, float value, bool not
                 return true;
             }
             return false;
-        } else if (name == "brightness") {
-            oldValue = activePlayer->brightness.get();
-            activePlayer->brightness.set(val);
-            return std::abs(oldValue - val) > PARAMETER_EPSILON;
-        } else if (name == "hue") {
-            oldValue = activePlayer->hue.get();
-            activePlayer->hue.set(val);
-            return std::abs(oldValue - val) > PARAMETER_EPSILON;
-        } else if (name == "saturation") {
-            oldValue = activePlayer->saturation.get();
-            activePlayer->saturation.set(val);
-            return std::abs(oldValue - val) > PARAMETER_EPSILON;
         }
         // Unknown parameter - return false (not applied)
         return false;
@@ -2024,17 +2393,65 @@ void MediaPool::setParameter(const std::string& paramName, float value, bool not
     // Note: "note" parameter can't be set continuously - it's only for triggers
 }
 
-void MediaPool::subscribeToTrackerSequencer(TrackerSequencer* sequencer) {
-    if (!sequencer) {
-        ofLogError("MediaPool") << "Cannot subscribe to null TrackerSequencer";
-        return;
+float MediaPool::getParameter(const std::string& paramName) const {
+    // Handle "position" parameter - read from active player
+    if (paramName == "position") {
+        // getActivePlayer() is not const, but we're only reading, so use const_cast
+        auto* player = const_cast<MediaPool*>(this)->getActivePlayer();
+        if (player) {
+            return player->startPosition.get();
+        }
+        return 0.0f;
     }
     
-    // Subscribe to trigger events - this is the modular connection!
-    ofAddListener(sequencer->triggerEvent, this, &MediaPool::onTrigger);
+    // Handle "polyphonyMode" - module-level parameter
+    if (paramName == "polyphonyMode") {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        return (polyphonyMode_ == PolyphonyMode::POLYPHONIC) ? 1.0f : 0.0f;
+    }
+    
+    // For other parameters, read from active player
+    auto* player = const_cast<MediaPool*>(this)->getActivePlayer();
+    if (!player) {
+        // No active player - return default value from parameter descriptor
+        auto paramDescriptors = getParameters();
+        for (const auto& param : paramDescriptors) {
+            if (param.name == paramName) {
+                return param.defaultValue;
+            }
+        }
+        return 0.0f;
+    }
+    
+    // Map parameter names to MediaPlayer parameters
+    if (paramName == "speed") {
+        return player->speed.get();
+    } else if (paramName == "volume") {
+        return player->volume.get();
+    } else if (paramName == "loopSize") {
+        return player->loopSize.get();
+    } else if (paramName == "regionStart" || paramName == "loopStart") {
+        return player->regionStart.get();
+    } else if (paramName == "regionEnd" || paramName == "loopEnd") {
+        return player->regionEnd.get();
+    } else if (paramName == "note") {
+        // Note parameter represents the media index
+        // This is tricky - we'd need to track which player corresponds to which index
+        // For now, return 0.0f as it's not a continuous parameter
+        return 0.0f;
+    }
+    
+    // Unknown parameter - return default
+    return Module::getParameter(paramName);
 }
 
 void MediaPool::onTrigger(TriggerEvent& event) {
+    // Don't process triggers if module is disabled
+    if (!isEnabled()) return;
+    
+    // Increment diagnostic counter (atomic, safe from audio thread)
+    onTriggerCallCount_.fetch_add(1, std::memory_order_relaxed);
+    
     // LOCK-FREE: Push event to queue from audio thread (no mutex needed!)
     // Position memory application happens in processEventQueue() (GUI thread) to avoid race conditions
     // 
@@ -2050,6 +2467,7 @@ void MediaPool::onTrigger(TriggerEvent& event) {
     if (!eventQueue.try_enqueue(eventCopy)) {
         // Queue full - drop event silently (can't log from audio thread)
         // The GUI thread will log a warning if it detects queue issues
+        // Use atomic counter to track dropped events (increment a separate counter)
     }
 }
 
@@ -2061,10 +2479,538 @@ void MediaPool::setScanMode(ScanMode mode) {
     ofLogNotice("MediaPool") << "Position scan mode set to: " << (int)mode;
 }
 
+PolyphonyMode MediaPool::getPolyphonyMode() const {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    return polyphonyMode_;
+}
+
 ScanMode MediaPool::getScanMode() const {
     std::lock_guard<std::mutex> lock(stateMutex);
     return positionScan.getMode();
 }
 
+//--------------------------------------------------------------
+// Module routing interface - expose stable audio/video outputs via internal mixers
+ofxSoundObject* MediaPool::getAudioOutput() const {
+    return const_cast<ofxSoundMixer*>(&internalAudioMixer_);
+}
 
+ofxVisualObject* MediaPool::getVideoOutput() const {
+    return const_cast<ofxVideoMixer*>(&internalVideoMixer_);
+}
 
+//--------------------------------------------------------------
+// Port-based routing interface (Phase 1)
+std::vector<Port> MediaPool::getInputPorts() const {
+    return {
+        Port("trigger_in", PortType::EVENT_IN, false, "Trigger Input")
+    };
+}
+
+std::vector<Port> MediaPool::getOutputPorts() const {
+    return {
+        Port("audio_out", PortType::AUDIO_OUT, false, "Audio Output", 
+             const_cast<void*>(static_cast<const void*>(&internalAudioMixer_))),
+        Port("video_out", PortType::VIDEO_OUT, false, "Video Output",
+             const_cast<void*>(static_cast<const void*>(&internalVideoMixer_)))
+    };
+}
+
+//--------------------------------------------------------------
+// Internal connection management - connect/disconnect players to internal mixers
+void MediaPool::connectPlayerToInternalMixers(MediaPlayer* player) {
+    if (!player) return;
+    
+    try {
+        // Connect audio if available
+        if (player->isAudioLoaded()) {
+            player->getAudioPlayer().connectTo(internalAudioMixer_);
+        }
+        
+        // Connect video if available
+        if (player->isVideoLoaded()) {
+            player->getVideoPlayer().connectTo(internalVideoMixer_);
+        }
+        
+        ofLogNotice("MediaPool") << "Connected player to internal mixers";
+    } catch (const std::exception& e) {
+        ofLogError("MediaPool") << "Failed to connect player to internal mixers: " << e.what();
+    }
+}
+
+void MediaPool::disconnectPlayerFromInternalMixers(MediaPlayer* player) {
+    if (!player) return;
+    
+    try {
+        // Disconnect audio if connected
+        if (player->isAudioLoaded()) {
+            player->getAudioPlayer().disconnect();
+        }
+        
+        // Disconnect video if connected
+        if (player->isVideoLoaded()) {
+            player->getVideoPlayer().disconnect();
+        }
+        
+        ofLogNotice("MediaPool") << "Disconnected player from internal mixers";
+    } catch (const std::exception& e) {
+        ofLogError("MediaPool") << "Failed to disconnect player from internal mixers: " << e.what();
+    }
+}
+
+//--------------------------------------------------------------
+// Dynamic connection management: connect/disconnect players based on playing state
+void MediaPool::ensurePlayerAudioConnected(MediaPlayer* player) {
+    if (!player || !player->isAudioLoaded()) return;
+    
+    // Check if already connected (use find to avoid creating map entry)
+    auto it = playerAudioConnected.find(player);
+    if (it != playerAudioConnected.end() && it->second) return;
+    
+    // Connect if audio is enabled and playing
+    if (player->audioEnabled.get() && player->isPlaying()) {
+        try {
+            player->getAudioPlayer().connectTo(internalAudioMixer_);
+            playerAudioConnected[player] = true;
+            ofLogVerbose("MediaPool") << "[CONNECTION] Connected player audio to mixer (playing: " 
+                                      << player->isPlaying() << ", audioEnabled: " << player->audioEnabled.get() << ")";
+        } catch (const std::exception& e) {
+            ofLogError("MediaPool") << "Failed to connect player audio: " << e.what();
+        }
+    }
+}
+
+void MediaPool::ensurePlayerAudioDisconnected(MediaPlayer* player) {
+    if (!player) return;
+    
+    // Check if connected (use find to avoid creating map entry)
+    auto it = playerAudioConnected.find(player);
+    if (it == playerAudioConnected.end() || !it->second) return;
+    
+    // Disconnect if audio is disabled or stopped
+    if (!player->audioEnabled.get() || !player->isPlaying()) {
+        try {
+            if (player->isAudioLoaded()) {
+                player->getAudioPlayer().disconnect();
+            }
+            playerAudioConnected[player] = false;
+            ofLogVerbose("MediaPool") << "[CONNECTION] Disconnected player audio from mixer (playing: " 
+                                      << player->isPlaying() << ", audioEnabled: " << player->audioEnabled.get() << ")";
+        } catch (const std::exception& e) {
+            ofLogError("MediaPool") << "Failed to disconnect player audio: " << e.what();
+        }
+    }
+}
+
+void MediaPool::ensurePlayerVideoConnected(MediaPlayer* player) {
+    if (!player || !player->isVideoLoaded()) return;
+    
+    // Check if already connected (use find to avoid creating map entry)
+    auto it = playerVideoConnected.find(player);
+    if (it != playerVideoConnected.end() && it->second) return;
+    
+    // Connect if video is enabled and playing
+    if (player->videoEnabled.get() && player->isPlaying()) {
+        try {
+            player->getVideoPlayer().connectTo(internalVideoMixer_);
+            playerVideoConnected[player] = true;
+            ofLogVerbose("MediaPool") << "[CONNECTION] Connected player video to mixer (playing: " 
+                                      << player->isPlaying() << ", videoEnabled: " << player->videoEnabled.get() << ")";
+        } catch (const std::exception& e) {
+            ofLogError("MediaPool") << "Failed to connect player video: " << e.what();
+        }
+    }
+}
+
+void MediaPool::ensurePlayerVideoDisconnected(MediaPlayer* player) {
+    if (!player) return;
+    
+    // Check if connected (use find to avoid creating map entry)
+    auto it = playerVideoConnected.find(player);
+    if (it == playerVideoConnected.end() || !it->second) return;
+    
+    // Disconnect if video is disabled or stopped
+    if (!player->videoEnabled.get() || !player->isPlaying()) {
+        try {
+            if (player->isVideoLoaded()) {
+                player->getVideoPlayer().disconnect();
+            }
+            playerVideoConnected[player] = false;
+            ofLogVerbose("MediaPool") << "[CONNECTION] Disconnected player video from mixer (playing: " 
+                                      << player->isPlaying() << ", videoEnabled: " << player->videoEnabled.get() << ")";
+        } catch (const std::exception& e) {
+            ofLogError("MediaPool") << "Failed to disconnect player video: " << e.what();
+        }
+    }
+}
+
+void MediaPool::updatePlayerConnections() {
+    // Update all player connections based on current state
+    for (auto& player : players) {
+        if (!player) continue;
+        
+        // Helper lambda to update a single connection type
+        auto updateConnection = [this, &player](bool isLoaded, bool isEnabled, 
+                                                std::map<MediaPlayer*, bool>& connectionMap,
+                                                void (MediaPool::*ensureConnected)(MediaPlayer*),
+                                                void (MediaPool::*ensureDisconnected)(MediaPlayer*)) {
+            bool shouldBeConnected = isLoaded && isEnabled && player->isPlaying();
+            auto it = connectionMap.find(player.get());
+            bool isConnected = (it != connectionMap.end() && it->second);
+            
+            if (shouldBeConnected && !isConnected) {
+                (this->*ensureConnected)(player.get());
+            } else if (!shouldBeConnected && isConnected) {
+                (this->*ensureDisconnected)(player.get());
+            }
+        };
+        
+        // Update audio connections
+        updateConnection(player->isAudioLoaded(), 
+                        player->audioEnabled.get(),
+                        playerAudioConnected,
+                        &MediaPool::ensurePlayerAudioConnected,
+                        &MediaPool::ensurePlayerAudioDisconnected);
+        
+        // Update video connections
+        updateConnection(player->isVideoLoaded(),
+                        player->videoEnabled.get(),
+                        playerVideoConnected,
+                        &MediaPool::ensurePlayerVideoConnected,
+                        &MediaPool::ensurePlayerVideoDisconnected);
+    }
+}
+
+//--------------------------------------------------------------
+// Helper functions for position mapping and loop calculations
+//--------------------------------------------------------------
+float MediaPool::mapRelativeToAbsolute(float relativePos, float regionStart, float regionEnd) const {
+    float regionSize = regionEnd - regionStart;
+    if (regionSize > MIN_REGION_SIZE) {
+        return regionStart + relativePos * regionSize;
+    } else {
+        // Invalid or collapsed region - clamp relative position to valid range
+        return std::max(0.0f, std::min(1.0f, relativePos));
+    }
+}
+
+float MediaPool::mapAbsoluteToRelative(float absolutePos, float regionStart, float regionEnd) const {
+    float regionSize = regionEnd - regionStart;
+    if (regionSize > MIN_REGION_SIZE) {
+        // Clamp absolute position to region bounds first
+        float clampedAbsolute = std::max(regionStart, std::min(regionEnd, absolutePos));
+        return (clampedAbsolute - regionStart) / regionSize;
+    } else {
+        // Invalid or collapsed region - return absolute position clamped to 0-1
+        return std::max(0.0f, std::min(1.0f, absolutePos));
+    }
+}
+
+MediaPool::LoopBounds MediaPool::calculateLoopBounds(MediaPlayer* player, PlayStyle playStyle) const {
+    if (!player) {
+        return {0.0f, 1.0f};
+    }
+    
+    float regionStart = player->regionStart.get();
+    float regionEnd = player->regionEnd.get();
+    
+    // Ensure region bounds are valid
+    if (regionStart > regionEnd) {
+        std::swap(regionStart, regionEnd);
+    }
+    
+    // Calculate loop start from relative startPosition
+    float relativeStart = player->startPosition.get();
+    float loopStart = mapRelativeToAbsolute(relativeStart, regionStart, regionEnd);
+    float loopEnd = regionEnd;
+    
+    // Calculate loop end based on loopSize when in LOOP play style
+    if (playStyle == PlayStyle::LOOP) {
+        float loopSizeSeconds = player->loopSize.get();
+        if (loopSizeSeconds > MIN_LOOP_SIZE) {
+            float duration = player->getDuration();
+            if (duration > MIN_DURATION) {
+                // CRITICAL FIX: Work in absolute time (seconds) first to preserve precision
+                // Converting small time values to normalized positions loses precision for long samples
+                // Convert normalized positions to absolute time
+                float loopStartSeconds = loopStart * duration;
+                float regionEndSeconds = regionEnd * duration;
+                
+                // Calculate loop end in absolute time
+                float calculatedLoopEndSeconds = loopStartSeconds + loopSizeSeconds;
+                
+                // Clamp to region end and media duration
+                float clampedLoopEndSeconds = std::min(regionEndSeconds, std::min(duration, calculatedLoopEndSeconds));
+                
+                // Convert back to normalized position (0-1)
+                loopEnd = clampedLoopEndSeconds / duration;
+            }
+        }
+    }
+    
+    return {loopStart, loopEnd};
+}
+
+void MediaPool::seekPlayerToPosition(MediaPlayer* player, float position) const {
+    if (!player) return;
+    
+    // Use MediaPlayer::setPosition() which handles both audio and video internally
+    player->setPosition(position);
+}
+
+void MediaPool::handleRegionEnd(MediaPlayer* player, float currentPosition, 
+                                 float effectiveRegionEnd, float loopStartPos, 
+                                 PlayStyle playStyle) {
+    if (!player) return;
+    
+    // CRITICAL: This function only handles STOPPING at region end, not looping
+    // LOOP mode handles looping manually in update() by checking loopEnd and seeking to loopStart
+    // This function should never be called for LOOP mode - if it is, it's a bug
+    switch (playStyle) {
+        case PlayStyle::ONCE:
+            // ONCE mode: Stop playback but preserve position for scanning
+            // Scanning should work even in ONCE mode - each trigger resumes from where it left off
+            // Only reset position when media actually finishes (reaches end)
+            // Position is preserved by MediaPlayer::stop()
+            // Position will be reset by MediaPool when appropriate (e.g., transport start)
+            player->stop();
+            break;
+        case PlayStyle::LOOP:
+            // LOOP mode should never reach here - looping is handled in update()
+            // If we do reach here, it's a bug - log warning and loop back as fallback
+            ofLogWarning("MediaPool") << "handleRegionEnd() called for LOOP mode - this should not happen. Looping back to loopStart.";
+            seekPlayerToPosition(player, loopStartPos);
+            break;
+        case PlayStyle::NEXT:
+            // NEXT mode: Stop current player - onPlaybackEnd() will handle playing next media
+            player->stop();
+            break;
+    }
+}
+
+void MediaPool::captureScanPosition(int step, int mediaIndex, float position, PlaybackMode mode) {
+    ScanMode scanMode = positionScan.getMode();
+    
+    // PER_MEDIA mode uses MediaPlayer::playheadPosition directly (no capture needed)
+    if (scanMode == ScanMode::PER_MEDIA || scanMode == ScanMode::NONE) {
+        return;
+    }
+    
+    // PER_STEP mode: only capture if step is valid and in SEQUENCER_ACTIVE mode
+    if (scanMode == ScanMode::PER_STEP) {
+        if (mode == PlaybackMode::SEQUENCER_ACTIVE && step >= 0) {
+            // Only capture if position is valid (optimization: skip near-zero positions)
+            if (position > POSITION_THRESHOLD) {
+                size_t sizeBefore = positionScan.size();
+                positionScan.capture(step, mediaIndex, position);
+                // Only log when scan size changes (new position stored) to avoid spam
+                if (positionScan.size() != sizeBefore) {
+                    ofLogVerbose("MediaPool") << "[SCAN_CAPTURE] PER_STEP: Step " << step 
+                                              << ", Media " << mediaIndex << ", Position " << position;
+                }
+            }
+        }
+        return;
+    }
+    
+    // GLOBAL mode: capture every frame (single shared position)
+    if (scanMode == ScanMode::GLOBAL) {
+        // Only capture if position is valid (optimization: skip near-zero positions)
+        if (position > POSITION_THRESHOLD) {
+            size_t sizeBefore = positionScan.size();
+            positionScan.capture(step, mediaIndex, position);
+            // Only log when scan size changes to reduce overhead
+            if (positionScan.size() != sizeBefore) {
+                ofLogVerbose("MediaPool") << "[SCAN_CAPTURE] GLOBAL: Media " << mediaIndex 
+                                          << ", Position " << position;
+            }
+        }
+    }
+}
+
+float MediaPool::restoreScanPosition(int step, int mediaIndex, MediaPlayer* player) {
+    if (!player) return 0.0f;
+    
+    ScanMode scanMode = positionScan.getMode();
+    float scanPosition = 0.0f;
+    
+    if (scanMode == ScanMode::PER_MEDIA) {
+        // Read directly from MediaPlayer (single source of truth)
+        // MediaPlayer::stop() already preserves position in playheadPosition parameter
+        scanPosition = player->playheadPosition.get();
+        
+        // CRITICAL: If position is at the end (>= END_POSITION_THRESHOLD), reset to 0.0f for fresh start
+        // This allows scanning to work (resume from where it left off), but when media
+        // reaches the end, the next trigger starts from the beginning
+        if (scanPosition >= END_POSITION_THRESHOLD) {
+            float originalPos = scanPosition;  // Save for logging
+            scanPosition = 0.0f;
+            player->playheadPosition.set(0.0f);  // Reset in player too
+            ofLogNotice("MediaPool") << "[SCAN_RESTORE] PER_MEDIA: Position at end (" 
+                                     << originalPos << "), resetting to 0.0f for media " << mediaIndex;
+        }
+        
+        // Log restoration
+        if (scanPosition > POSITION_THRESHOLD) {
+            ofLogNotice("MediaPool") << "[SCAN_RESTORE] PER_MEDIA: Using playheadPosition for media " 
+                                     << mediaIndex << ": " << scanPosition;
+        } else {
+            ofLogVerbose("MediaPool") << "[SCAN_RESTORE] PER_MEDIA: Starting from beginning (position: " 
+                                      << scanPosition << ") for media " << mediaIndex;
+        }
+    } else {
+        // PER_STEP or GLOBAL mode: use PositionScan storage
+        size_t scanSizeBefore = positionScan.size();
+        scanPosition = positionScan.restore(step, mediaIndex);
+        
+        if (scanPosition > POSITION_THRESHOLD) {
+            ofLogNotice("MediaPool") << "[SCAN_RESTORE] " << (scanMode == ScanMode::PER_STEP ? "PER_STEP" : "GLOBAL")
+                                     << ": Using scan position for step " << step 
+                                     << ", media " << mediaIndex << ": " << scanPosition
+                                     << " (scan size: " << scanSizeBefore << ")";
+        } else {
+            ofLogVerbose("MediaPool") << "[SCAN_SKIP] " << (scanMode == ScanMode::PER_STEP ? "PER_STEP" : "GLOBAL")
+                                      << ": No scan position available for step " << step 
+                                      << ", media " << mediaIndex << " (scan size: " << scanSizeBefore << ")";
+        }
+    }
+    
+    return scanPosition;
+}
+
+bool MediaPool::shouldTransitionToIdle(PlaybackMode mode, bool transportIsPlaying) const {
+    // Transition to IDLE if:
+    // - MANUAL_PREVIEW mode (always transition when playback ends)
+    // - SEQUENCER_ACTIVE mode AND transport is stopped (transport still playing = stay in SEQUENCER_ACTIVE)
+    return (mode == PlaybackMode::MANUAL_PREVIEW || !transportIsPlaying);
+}
+
+float MediaPool::clampPositionForPlayback(float position, PlayStyle playStyle) const {
+    // First clamp to valid range (0.0-1.0)
+    float clampedPosition = std::max(0.0f, std::min(1.0f, position));
+    
+    // CRITICAL: In ONCE mode with position memory, if position is at the end (>= END_POSITION_THRESHOLD),
+    // clamp to just before the end so playback can continue instead of immediately stopping.
+    // This preserves position memory behavior while allowing playback to work.
+    if (playStyle == PlayStyle::ONCE && clampedPosition >= END_POSITION_THRESHOLD) {
+        clampedPosition = END_POSITION_THRESHOLD;
+    }
+    
+    return clampedPosition;
+}
+
+void MediaPool::applyEventParameters(MediaPlayer* player, const TriggerEvent& event, 
+                                     const std::vector<ParameterDescriptor>& descriptors) {
+    if (!player) return;
+    
+    // Special handling for "position" parameter (maps to startPosition, needs region clamping)
+    float position = 0.0f;
+    bool positionInEvent = false;
+    auto positionIt = event.parameters.find("position");
+    if (positionIt != event.parameters.end()) {
+        position = positionIt->second;
+        positionInEvent = true;
+    } else {
+        // Position not in event - use current player value (position memory)
+        position = player->startPosition.get();
+    }
+    
+    // Clamp position using helper method (handles ONCE mode end position clamping)
+    float clampedPosition = clampPositionForPlayback(position, currentPlayStyle);
+    
+    // Update playheadPosition if we clamped for ONCE mode
+    if (currentPlayStyle == PlayStyle::ONCE && position >= END_POSITION_THRESHOLD && 
+        clampedPosition == END_POSITION_THRESHOLD) {
+        player->playheadPosition.set(END_POSITION_THRESHOLD);
+        ofLogVerbose("MediaPool") << "[ONCE_MODE] Clamped end position to allow playback continuation";
+    }
+    
+    // Set position if it was in event or if it changed
+    if (positionInEvent && std::abs(player->startPosition.get() - clampedPosition) > PARAMETER_EPSILON) {
+        player->startPosition.set(clampedPosition);
+    }
+    
+    // Audio/video always enabled for sequencer triggers
+    if (!player->audioEnabled.get()) {
+        player->audioEnabled.set(true);
+    }
+    if (!player->videoEnabled.get()) {
+        player->videoEnabled.set(true);
+    }
+    
+    // Process all other parameters from event dynamically
+    // Skip "note" (handled separately) and "position" (handled above)
+    for (const auto& paramPair : event.parameters) {
+        const std::string& paramName = paramPair.first;
+        float paramValue = paramPair.second;
+        
+        // Skip special parameters
+        if (paramName == "note" || paramName == "position") {
+            continue;
+        }
+        
+        // Get parameter descriptor for validation
+        auto descIt = std::find_if(descriptors.begin(), descriptors.end(),
+            [&](const ParameterDescriptor& desc) { return desc.name == paramName; });
+        
+        // Clamp value to parameter range if descriptor found
+        float clampedValue = paramValue;
+        if (descIt != descriptors.end()) {
+            clampedValue = std::max(descIt->minValue, std::min(descIt->maxValue, paramValue));
+        }
+        
+        // Use MediaPlayer's getFloatParameter to check if parameter exists
+        auto* param = player->getFloatParameter(paramName);
+        if (param) {
+            // Parameter exists on player - set it
+            float currentValue = param->get();
+            if (std::abs(currentValue - clampedValue) > PARAMETER_EPSILON) {
+                param->set(clampedValue);
+            }
+        } else {
+            // Parameter doesn't exist on player - log warning but continue
+            ofLogVerbose("MediaPool") << "Parameter '" << paramName << "' not found on MediaPlayer, skipping";
+        }
+    }
+    
+    // CRITICAL: Don't enable underlying player loop for LOOP mode
+    // The underlying players loop at full media level (0.0-1.0), but we need region-level looping
+    // (loopStart to loopEnd based on loopSize). We handle looping manually in update().
+    // Always disable underlying loop - looping is handled manually at region level
+    player->loop.set(false);
+}
+
+//--------------------------------------------------------------
+void MediaPool::stopAllNonActivePlayersLocked() {
+    // Internal version - assumes stateMutex is already locked
+    for (size_t i = 0; i < players.size(); i++) {
+        auto& player = players[i];
+        if (player && player.get() != activePlayer && player->isPlaying()) {
+            player->stop();
+            ofLogVerbose("MediaPool") << "[POLYPHONY] Stopped non-active player at index " << i;
+        }
+    }
+}
+
+void MediaPool::stopAllNonActivePlayers() {
+    // Public version - locks mutex
+    std::lock_guard<std::mutex> lock(stateMutex);
+    stopAllNonActivePlayersLocked();
+}
+
+//--------------------------------------------------------------
+// Module Factory Registration
+//--------------------------------------------------------------
+// Auto-register MediaPool with ModuleFactory on static initialization
+// This enables true modularity - no hardcoded dependencies in ModuleFactory
+namespace {
+    struct MediaPoolRegistrar {
+        MediaPoolRegistrar() {
+            ModuleFactory::registerModuleType("MediaPool", 
+                []() -> std::shared_ptr<Module> {
+                    return std::make_shared<MediaPool>();
+                });
+        }
+    };
+    static MediaPoolRegistrar g_mediaPoolRegistrar;
+}

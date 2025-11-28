@@ -10,6 +10,21 @@ obj/
 *.exe
 *.app/
 
+# Backup files
+*.bak
+*.tmp
+*.swp
+*~
+
+# CMake build directories
+build_cmake/
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.cmake
+!CMakeLists.txt
+
 # Xcode
 *.xcodeproj/
 *.xcworkspace/
@@ -23,17 +38,47 @@ Makefile
 config.make
 addons.make
 
-# Logs
+# Logs and debug files
 logs
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 dev-debug.log
+debug_crash.*
+lldb_*.txt
 
-# Dependency directories
-node_modules/
+# Dependency directories (embedded git repos should be submodules or not tracked)
 libs/
+addons/
+!addons/.gitkeep
+
+# ImGui config files
+*.ini
+
+# Documentation and media (not source code)
+docs/
+screenshots/
+*.md
+!README.md
+*.txt
+!CMakeLists.txt
+*.prd
+*.plan
+ANALYSIS_AND_FIXES.md
+BUILD_INSTRUCTIONS.md
+DEBUGGING_EVALUATION.txt
+PERFORMANCE_*.md
+POSITION_*.md
+SHORT_TERM_PLAN.txt
+*-refactoring-plan.txt
+*-refactor-prd.txt
+*-refactoring-plan.txt
+cleanup-worktrees.sh
+test_include.cpp
+
+# Taskmaster
+.taskmaster/
 
 # Environment variables
 .env
@@ -57,27 +102,6 @@ libs/
 .Spotlight-V100
 .Trashes
 
-# Documentation/planning files (not source code)
-*.md
-!README.md
-*.txt
-*.prd
-*.plan
-ANALYSIS_AND_FIXES.md
-BUILD_INSTRUCTIONS.md
-DEBUGGING_EVALUATION.txt
-PERFORMANCE_*.md
-POSITION_*.md
-SHORT_TERM_PLAN.txt
-*-refactoring-plan.txt
-*-refactor-prd.txt
-*-refactoring-plan.txt
-cleanup-worktrees.sh
-test_include.cpp
-
-# Taskmaster
-.taskmaster/
-
 # Entitlements and plists (usually generated)
 of.entitlements
 openFrameworks-Info.plist
@@ -86,4 +110,4 @@ openFrameworks-Info.plist
 !src/
 !src/**/*.cpp
 !src/**/*.h
-!src/**/*.hpp 
+!src/**/*.hpp

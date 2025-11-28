@@ -77,6 +77,13 @@ public:
     std::string getName(const std::string& uuid) const;
     
     /**
+     * Get human-readable name for a module pointer
+     * @param module shared_ptr to module
+     * @return Human-readable name, or empty string if not found
+     */
+    std::string getName(std::shared_ptr<Module> module) const;
+    
+    /**
      * Get all registered UUIDs
      * @return Vector of UUID strings
      */
@@ -112,6 +119,17 @@ public:
     void clear();
     
     /**
+     * Initialize all registered modules
+     * This should be called after modules are registered to ensure proper initialization
+     * @param clock Pointer to Clock instance (can be nullptr)
+     * @param registry Pointer to ModuleRegistry (can be nullptr, defaults to this)
+     * @param connectionManager Pointer to ConnectionManager (can be nullptr)
+     * @param parameterRouter Pointer to ParameterRouter (can be nullptr)
+     * @param isRestored Whether modules are being restored from a session (defaults to false)
+     */
+    void setupAllModules(class Clock* clock, class ModuleRegistry* registry = nullptr, class ConnectionManager* connectionManager = nullptr, class ParameterRouter* parameterRouter = nullptr, bool isRestored = false);
+    
+    /**
      * Serialize all modules to JSON
      * @return JSON array of module data
      */
@@ -125,6 +143,48 @@ public:
      */
     bool fromJson(const ofJson& json, ModuleFactory& factory);
     
+    /**
+     * Add a module with full lifecycle management
+     * Creates, registers, initializes, and auto-connects the module
+     * @param factory ModuleFactory to create the module
+     * @param moduleType Module type name (e.g., "MediaPool", "TrackerSequencer")
+     * @param clock Clock instance for module initialization
+     * @param connectionManager ConnectionManager for connections
+     * @param parameterRouter ParameterRouter for parameter routing
+     * @param guiManager GUIManager for GUI sync (can be nullptr)
+     * @param masterAudioOutName Master audio output name for auto-routing
+     * @param masterVideoOutName Master video output name for auto-routing
+     * @return Module name if successful, empty string on failure
+     */
+    std::string addModule(
+        ModuleFactory& factory,
+        const std::string& moduleType,
+        class Clock* clock,
+        class ConnectionManager* connectionManager,
+        class ParameterRouter* parameterRouter,
+        class GUIManager* guiManager = nullptr,
+        const std::string& masterAudioOutName = "masterAudioOut",
+        const std::string& masterVideoOutName = "masterVideoOut"
+    );
+    
+    /**
+     * Remove a module with full lifecycle management
+     * Disconnects all connections, cleans up GUI, and unregisters the module
+     * @param identifier Module UUID or human-readable name
+     * @param connectionManager ConnectionManager for disconnection
+     * @param guiManager GUIManager for GUI cleanup (can be nullptr)
+     * @param masterAudioOutName Master audio output name (for validation)
+     * @param masterVideoOutName Master video output name (for validation)
+     * @return true if successful, false otherwise
+     */
+    bool removeModule(
+        const std::string& identifier,
+        class ConnectionManager* connectionManager,
+        class GUIManager* guiManager = nullptr,
+        const std::string& masterAudioOutName = "masterAudioOut",
+        const std::string& masterVideoOutName = "masterVideoOut"
+    );
+
 private:
     // Primary storage: UUID -> module
     std::map<std::string, std::shared_ptr<Module>> modules;

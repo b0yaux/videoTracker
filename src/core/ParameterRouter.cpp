@@ -1,7 +1,4 @@
 #include "ParameterRouter.h"
-#include "TrackerSequencer.h"
-#include "MediaPool.h"
-#include "MediaPlayer.h"
 #include "ofLog.h"
 #include "ofJson.h"
 #include <cmath>
@@ -83,6 +80,28 @@ bool ParameterRouter::connect(const ParameterPath& sourcePath, const ParameterPa
     ofLogNotice("ParameterRouter") << "Connected: " << sourcePath.toString() << " -> " << targetPath.toString();
     
     return true;
+}
+
+bool ParameterRouter::connectDirect(const std::string& sourceModule, const std::string& sourceParam,
+                                    const std::string& targetModule, const std::string& targetParam,
+                                    std::function<bool()> condition) {
+    // Build ParameterPath objects from module and parameter names
+    ParameterPath sourcePath;
+    sourcePath.setInstanceName(sourceModule);
+    sourcePath.setParameterName(sourceParam);
+    
+    ParameterPath targetPath;
+    targetPath.setInstanceName(targetModule);
+    targetPath.setParameterName(targetParam);
+    
+    // Validate that paths are valid (instance and parameter names are non-empty)
+    if (sourceModule.empty() || sourceParam.empty() || targetModule.empty() || targetParam.empty()) {
+        ofLogError("ParameterRouter") << "Cannot connectDirect: empty module or parameter name";
+        return false;
+    }
+    
+    // Use existing connect() method with constructed paths
+    return connect(sourcePath, targetPath, condition);
 }
 
 bool ParameterRouter::disconnect(const std::string& sourcePath) {
@@ -280,30 +299,8 @@ float ParameterRouter::getParameterValue(std::shared_ptr<Module> module, const P
         return getIndexedParameterValue(module, path);
     }
     
-    // Special case: TrackerSequencer "currentStepPosition"
-    if (path.getParameterName() == "currentStepPosition") {
-        TrackerSequencer* ts = dynamic_cast<TrackerSequencer*>(module.get());
-        if (ts) {
-            return ts->getCurrentStepPosition();
-        }
-    }
-    
-    // Special case: MediaPool "position" (get startPosition, not playhead)
-    if (path.getParameterName() == "position") {
-        MediaPool* mp = dynamic_cast<MediaPool*>(module.get());
-        if (mp) {
-            auto* player = mp->getActivePlayer();
-            if (player) {
-                return player->startPosition.get();
-            }
-        }
-    }
-    
-    // For other parameters, try to use Module interface
-    // Note: Module interface doesn't have getParameter(), so we use special cases above
-    // Future: Add getParameter() to Module interface if needed
-    
-    return 0.0f;
+    // Use generic Module interface - all modules implement getParameter()
+    return module->getParameter(path.getParameterName());
 }
 
 void ParameterRouter::setParameterValue(std::shared_ptr<Module> module, const ParameterPath& path, float value) {
@@ -317,16 +314,7 @@ void ParameterRouter::setParameterValue(std::shared_ptr<Module> module, const Pa
         return;
     }
     
-    // Special case: TrackerSequencer "currentStepPosition"
-    if (path.getParameterName() == "currentStepPosition") {
-        TrackerSequencer* ts = dynamic_cast<TrackerSequencer*>(module.get());
-        if (ts) {
-            ts->setCurrentStepPosition(value);
-            return;
-        }
-    }
-    
-    // For MediaPool and other modules, use standard Module interface
+    // Use generic Module interface - all modules implement setParameter()
     module->setParameter(path.getParameterName(), value, false);
 }
 

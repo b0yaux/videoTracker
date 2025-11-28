@@ -3,16 +3,14 @@
 #include "GUIManager.h"
 #include "Clock.h"
 #include "ClockGUI.h"
-#include "MediaPool.h"
-#include "MediaPoolGUI.h"
-#include "TrackerSequencer.h"
-#include "TrackerSequencerGUI.h"
 #include "FileBrowser.h"
 #include "Console.h"
+#include "CommandBar.h"
+#include "AssetLibraryGUI.h"
 #include "ofxSoundObjects.h"
 #include <imgui.h>
-#include "ofSoundStream.h"
 #include "ofLog.h"
+#include <map>
 
 ViewManager::ViewManager() {
 }
@@ -25,7 +23,8 @@ void ViewManager::setup(
     GUIManager* guiManager_,
     FileBrowser* fileBrowser_,
     Console* console_,
-    ofSoundStream* soundStream_
+    CommandBar* commandBar_,
+    AssetLibraryGUI* assetLibraryGUI_
 ) {
     clock = clock_;
     clockGUI = clockGUI_;
@@ -33,71 +32,28 @@ void ViewManager::setup(
     guiManager = guiManager_;
     fileBrowser = fileBrowser_;
     console = console_;
-    soundStream = soundStream_;
-    
-    // Initialize audio devices
-    if (soundStream) {
-        audioDevices = soundStream->getDeviceList();
-        
-        // Find default output device
-        for (size_t i = 0; i < audioDevices.size(); i++) {
-            if (audioDevices[i].isDefaultOutput) {
-                selectedAudioDevice = i;
-                break;
-            }
-        }
-    }
+    commandBar = commandBar_;
+    assetLibraryGUI = assetLibraryGUI_;
     
     ofLogNotice("ViewManager") << "Setup complete with GUIManager";
 }
 
-// Legacy setup method (for backward compatibility)
-void ViewManager::setup(
-    Clock* clock_,
-    ClockGUI* clockGUI_,
-    ofxSoundOutput* audioOutput_,
-    TrackerSequencer* tracker_,
-    TrackerSequencerGUI* trackerGUI_,
-    MediaPool* mediaPool_,
-    MediaPoolGUI* mediaPoolGUI_,
-    ofSoundStream* soundStream_
-) {
-    clock = clock_;
-    clockGUI = clockGUI_;
-    audioOutput = audioOutput_;
-    tracker = tracker_;
-    trackerGUI = trackerGUI_;
-    mediaPool = mediaPool_;
-    mediaPoolGUI = mediaPoolGUI_;
-    soundStream = soundStream_;
-    
-    // Initialize audio devices
-    if (soundStream) {
-        audioDevices = soundStream->getDeviceList();
-        
-        // Find default output device
-        for (size_t i = 0; i < audioDevices.size(); i++) {
-            if (audioDevices[i].isDefaultOutput) {
-                selectedAudioDevice = i;
-                break;
-            }
-        }
-        
-        // Store listener for future device changes (will be set by ofApp after setup)
-        // Initial setup will be done by ofApp after setting listener
-    }
-
-    ofLogNotice("ViewManager") << "Setup complete with " 
-                               << PANEL_NAMES.size() << " panels";
-}
-
 // setAudioDeviceState() removed - audio state is now owned by ViewManager
 
+void ViewManager::navigateToWindow(const std::string& windowName) {
+    // Generic navigation - works for ANY window by name (ALL GUI panels)
+    currentFocusedWindow = windowName;
+    ImGui::SetWindowFocus(windowName.c_str());
+    ofLogNotice("ViewManager") << "Navigated to window: " << windowName;
+}
+
 void ViewManager::navigateToPanel(Panel panel) {
+    // DEPRECATED: Use navigateToWindow() instead - kept for backward compatibility
     if (panel < Panel::COUNT) {
         currentPanel = panel;
-        ofLogNotice("ViewManager") << "Navigated to: " 
-                                   << PANEL_NAMES[static_cast<int>(panel)];
+        // Map Panel enum to window name and use new navigation system
+        std::string windowName = PANEL_NAMES[static_cast<int>(panel)];
+        navigateToWindow(windowName);
     }
 }
 
@@ -136,32 +92,49 @@ const char* ViewManager::getCurrentPanelName() const {
  * Note: This is view-only. No business logic here.
  */
 void ViewManager::draw() {
-    // Draw panels - each panel will set focus if needed (before Begin())
-    // We need to track panel changes, but update lastPanel AFTER drawing
-    // so each panel can check if it should set focus
-    Panel previousPanel = lastPanel;
+    // Track focus changes for this frame
+    lastFocusedWindow = currentFocusedWindow;
     
-    drawClockPanel(previousPanel);
-    drawAudioOutputPanel(previousPanel);
+    ofLogVerbose("ViewManager") << "draw() called";
     
-    // Use new instance-aware methods if GUIManager is available
+    drawClockPanel();
+    
+    // Draw all visible module panels (generic - handles all module types)
     if (guiManager) {
-        drawTrackerPanels(previousPanel);
-        drawMediaPoolPanels(previousPanel);
+        drawModulePanels();
     } else {
-        // Fallback to legacy single-instance methods
-        drawTrackerPanel(previousPanel);
-        drawMediaPoolPanel(previousPanel);
+        ofLogWarning("ViewManager") << "drawModulePanels() skipped - guiManager is null";
     }
     
-    // Always draw FileBrowser (even when collapsed) so ImGui can save its layout state
-    drawFileBrowserPanel(previousPanel);
+    // Draw utility panels only when visible (toggled ON in View menu)
+    if (fileBrowserVisible_) {
+        drawFileBrowserPanel();
+    }
     
-    // Always draw Console (even when collapsed) so ImGui can save its layout state
-    drawConsolePanel(previousPanel);
+    if (consoleVisible_) {
+        drawConsolePanel();
+    }
     
-    // Update lastPanel after drawing (so next frame can detect changes)
-    lastPanel = currentPanel;
+    if (assetLibraryVisible_) {
+        drawAssetLibraryPanel();
+    }
+    
+    // Draw command bar (separate from console, triggered by Cmd+'=')
+    if (commandBar && commandBar->isOpen()) {
+        // Track visibility state changes to handle focus
+        static bool lastCommandBarOpen = false;
+        bool visibilityChanged = (commandBar->isOpen() != lastCommandBarOpen);
+        
+        if (visibilityChanged && commandBar->isOpen()) {
+            // Command bar just opened - bring to front and ensure it's shown
+            // Must be called BEFORE CommandPaletteWindow() which calls ImGui::Begin()
+            ImGui::SetNextWindowFocus();
+            ImGui::SetNextWindowCollapsed(false);
+        }
+        lastCommandBarOpen = commandBar->isOpen();
+        
+        commandBar->draw();
+    }
 }
 
 void ViewManager::setFocusIfChanged() {
@@ -169,45 +142,207 @@ void ViewManager::setFocusIfChanged() {
     // Keeping it for compatibility but it does nothing
 }
 
+// Helper function to map module type names to Panel enums (DEPRECATED: kept for backward compatibility)
+static Panel getPanelForModuleType(const std::string& moduleTypeName) {
+    if (moduleTypeName == "TrackerSequencer") return Panel::TRACKER;
+    if (moduleTypeName == "MediaPool") return Panel::MEDIA_POOL;
+    // Other module types don't have specific panels, return COUNT (invalid)
+    return Panel::COUNT;
+}
+
+void ViewManager::drawModulePanels() {
+    if (!guiManager) {
+        ofLogWarning("ViewManager") << "drawModulePanels() called but guiManager is null";
+        return;
+    }
+    
+    // SAFE APPROACH: Get instance names instead of raw pointers
+    // This prevents crashes from dangling pointers when GUIs are deleted
+    auto instanceNames = guiManager->getAllInstanceNames();
+    
+    // Draw each visible GUI instance
+    for (const auto& instanceName : instanceNames) {
+        
+        // SAFE: Look up GUI by name - returns nullptr if deleted
+        auto* gui = guiManager->getGUI(instanceName);
+        if (!gui) {
+            continue;
+        }
+        
+        // Skip if GUI doesn't have registry set (not fully initialized)
+        if (!gui->getRegistry()) {
+            continue;
+        }
+        
+        // Only draw if instance is visible (visibility system handles all filtering)
+        if (!guiManager->isInstanceVisible(instanceName)) {
+            continue;
+        }
+        
+        // Create window title with instance name
+        std::string windowTitle = instanceName;
+        
+        // CRITICAL: Validate module still exists before accessing it
+        // This prevents crashes when MediaPool modules with audio/video ports are deleted
+        auto* reg = gui->getRegistry();
+        if (!reg || !reg->hasModule(instanceName)) {
+            // Module was deleted - skip this GUI
+            continue;
+        }
+        
+        // Setup window properties (applies default size if saved)
+        // Note: setupWindow() may access registry, so ensure GUI is fully initialized
+        try {
+            gui->setupWindow();
+        } catch (...) {
+            // Skip this GUI if setup fails (not fully initialized)
+            continue;
+        }
+        
+        // Check if this window should be focused (by name match - works for ALL modules)
+        bool shouldFocus = (windowTitle == currentFocusedWindow);
+        bool focusChanged = (shouldFocus && windowTitle != lastFocusedWindow);
+        
+        // Set focus when window changes
+        if (focusChanged) {
+            ImGui::SetNextWindowFocus();
+        }
+        
+        // Set border size and color based on focus state (native ImGui border system)
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);  // Enable border
+        ImGui::PushStyleColor(ImGuiCol_Border, 
+            shouldFocus ? GUIConstants::Outline::Focus : GUIConstants::Outline::Unfocused);
+        
+        // Disable scrolling on main window
+        ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoScrollbar | 
+                                      ImGuiWindowFlags_NoScrollWithMouse;
+        
+        // ImGui::Begin() returns false when window is collapsed
+        if (ImGui::Begin(windowTitle.c_str(), nullptr, windowFlags)) {
+            if (!ImGui::IsWindowCollapsed()) {
+                // Draw ON/OFF toggle button in ImGui's native title bar
+                try {
+                    gui->drawTitleBarToggle();
+                } catch (...) {
+                }
+                
+                // Handle navigation on click - navigate to this window (works for ALL modules)
+                if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
+                    navigateToWindow(windowTitle);
+                    // Clear cell focus for modules that support it (e.g., TrackerSequencer)
+                    try {
+                        gui->clearCellFocus();
+                    } catch (...) {
+                    }
+                }
+                
+                // Draw GUI content (may throw if not fully initialized)
+                try {
+                    gui->draw();
+                } catch (...) {
+                    // Continue to next GUI instead of crashing
+                }
+                
+                // Draw outline for docked windows (native borders work for undocked)
+                drawWindowOutline();
+                
+                // Save layout if window was resized
+                ImVec2 currentSize = ImGui::GetWindowSize();
+                static std::map<std::string, ImVec2> previousSizes;
+                std::string windowId = windowTitle;
+                auto it = previousSizes.find(windowId);
+                if (it == previousSizes.end() || it->second.x != currentSize.x || it->second.y != currentSize.y) {
+                    if (it != previousSizes.end()) {
+                        try {
+                            gui->saveDefaultLayout();
+                        } catch (...) {
+                        }
+                    }
+                    previousSizes[windowId] = currentSize;
+                }
+            }
+        } else {
+        }
+        ImGui::End();  // Always call End() regardless of Begin() return value
+        ImGui::PopStyleColor();  // Pop border color
+        ImGui::PopStyleVar();    // Pop border size
+    }
+    
+}
+
 void ViewManager::drawWindowOutline() {
-    // Skip drawing outline when window is collapsed to avoid accessing invalid window properties
+    // Hybrid approach: Native borders for undocked windows, manual drawing for docked windows
+    // Skip drawing outline when window is collapsed
     if (ImGui::IsWindowCollapsed()) {
         return;
     }
     
-    // Use foreground draw list to draw on top of everything (including scrollbars)
-    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+    // Check if window is docked - use multiple methods for reliability
+    bool isDocked = ImGui::IsWindowDocked();
+    ImGuiID dockId = ImGui::GetWindowDockID();
     
-    // Get window rect in screen space (includes titlebar and all decorations)
+    // Alternative check: if dockId is non-zero, window is docked
+    if (!isDocked && dockId == 0) {
+        // Window is not docked - native borders are handled by PushStyleVar/PushStyleColor
+        return;
+    }
+    
+    // DOCKED WINDOWS: Draw borders manually using foreground draw list
+    // Use foreground draw list to ensure border is visible above all content
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+    if (!drawList) {
+        // Fallback to window draw list if foreground is not available
+        drawList = ImGui::GetWindowDrawList();
+        if (!drawList) {
+            return;
+        }
+    }
+    
+    // Get window rectangle in screen space (full window including title bar and borders)
+    // This ensures we draw on the actual window outline, not the content area
     ImVec2 windowPos = ImGui::GetWindowPos();
     ImVec2 windowSize = ImGui::GetWindowSize();
     
-    // Validate window size is valid (not zero or negative)
+    // Validate window size
     if (windowSize.x <= 0 || windowSize.y <= 0) {
         return;
     }
     
-    // Calculate the full window rectangle
+    // Calculate the full window rectangle (outer edge)
     ImVec2 min = windowPos;
     ImVec2 max = ImVec2(windowPos.x + windowSize.x, windowPos.y + windowSize.y);
     
-    // Draw outline based on focus state
-    if (ImGui::IsWindowFocused()) {
-        // Draw focused outline (brighter, thicker)
-        drawList->AddRect(min, max, GUIConstants::toU32(GUIConstants::Outline::Focus), 0.0f, 0, GUIConstants::Outline::FocusThickness);
+    // Check focus state - we're inside the window context, so IsWindowFocused works correctly
+    bool isFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootWindow);
+    
+    // Draw border based on focus state - match native border appearance exactly
+    if (isFocused) {
+        // Draw focused outline (brighter, thicker) - matches native border
+        drawList->AddRect(min, max, GUIConstants::toU32(GUIConstants::Outline::Focus), 
+                         0.0f, 0, GUIConstants::Outline::FocusThickness);
     } else {
-        // Draw unfocused outline (dimmer, thinner)
-        drawList->AddRect(min, max, GUIConstants::toU32(GUIConstants::Outline::Unfocused), 0.0f, 0, GUIConstants::Outline::UnfocusedThickness);
+        // Draw unfocused outline (dimmer, thinner) - matches native border
+        drawList->AddRect(min, max, GUIConstants::toU32(GUIConstants::Outline::Unfocused), 
+                         0.0f, 0, GUIConstants::Outline::UnfocusedThickness);
     }
 }
 
-void ViewManager::drawClockPanel(Panel previousPanel) {
+void ViewManager::drawClockPanel() {
     if (clockGUI && clock) {
-        // Set focus only when panel changed and this is the current panel
-        // Must be called BEFORE Begin() for it to work
-        if (currentPanel == Panel::CLOCK && currentPanel != previousPanel) {
+        std::string windowName = "Clock ";
+        bool shouldFocus = (windowName == currentFocusedWindow);
+        bool focusChanged = (shouldFocus && windowName != lastFocusedWindow);
+        
+        // Set focus when window changes
+        if (focusChanged) {
             ImGui::SetNextWindowFocus();
         }
+        
+        // Set border size and color based on focus state (native ImGui border system)
+        bool isFocused = shouldFocus;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);  // Enable border
+        ImGui::PushStyleColor(ImGuiCol_Border, 
+            isFocused ? GUIConstants::Outline::Focus : GUIConstants::Outline::Unfocused);
         
         // ImGui::Begin() returns false when window is collapsed
         // IMPORTANT: Always call End() even if Begin() returns false
@@ -215,285 +350,47 @@ void ViewManager::drawClockPanel(Panel previousPanel) {
             // Only draw content if window is not collapsed (to avoid accessing invalid window properties)
             if (!ImGui::IsWindowCollapsed()) {
                 if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                    navigateToPanel(Panel::CLOCK);
+                    navigateToWindow(windowName);
                 }
                 
                 clockGUI->draw(*clock);
+                
+                // Draw outline for docked windows (native borders work for undocked)
                 drawWindowOutline();
             }
         }
         ImGui::End();  // Always call End() regardless of Begin() return value
+        ImGui::PopStyleColor();  // Pop border color
+        ImGui::PopStyleVar();    // Pop border size
     }
 }
 
-void ViewManager::drawAudioOutputPanel(Panel previousPanel) {
-    // Set focus only when panel changed and this is the current panel
-    // Must be called BEFORE Begin() for it to work
-    if (currentPanel == Panel::AUDIO_OUTPUT && currentPanel != previousPanel) {
+// setupAudioStream() removed - audio device management is now handled by AudioOutputGUI
+
+void ViewManager::drawAssetLibraryPanel() {
+    if (!assetLibraryGUI) return;
+    
+    std::string windowName = "Asset Library";
+    
+    // This method is only called when assetLibraryVisible_ is true
+    // Ensure window is shown (not collapsed) when visibility is true
+    if (assetLibraryVisible_) {
+        ImGui::SetNextWindowCollapsed(false);
+    }
+    
+    bool shouldFocus = (windowName == currentFocusedWindow);
+    bool focusChanged = (shouldFocus && windowName != lastFocusedWindow);
+    
+    // Set focus when window changes
+    if (focusChanged) {
         ImGui::SetNextWindowFocus();
     }
     
-    // ImGui::Begin() returns false when window is collapsed
-    // IMPORTANT: Always call End() even if Begin() returns false
-    if (ImGui::Begin("Audio Output")) {
-        if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-            navigateToPanel(Panel::AUDIO_OUTPUT);
-        }
-        
-        // Audio device selection
-        if (!audioDevices.empty()) {
-            if (ImGui::Combo("Device", &selectedAudioDevice, [](void* data, int idx, const char** out_text) {
-                auto* devices = static_cast<std::vector<ofSoundDevice>*>(data);
-                if (idx >= 0 && idx < devices->size()) {
-                    *out_text = (*devices)[idx].name.c_str();
-                    return true;
-                }
-                return false;
-            }, &audioDevices, audioDevices.size())) {
-                audioDeviceChanged = true;
-            }
-            
-            if (audioDeviceChanged && soundStream) {
-                setupAudioStream();
-                audioDeviceChanged = false;
-            }
-        }
-        
-        ImGui::SliderFloat("Volume", &globalVolume, 0.0f, 1.0f, "%.2f");
-        
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, GUIConstants::Plot::Histogram);
-        ImGui::ProgressBar(currentAudioLevel, ImVec2(-1, 0), "");
-        ImGui::PopStyleColor();
-        ImGui::Text("Level: %.3f", currentAudioLevel);
-        
-        drawWindowOutline();
-    }
-    ImGui::End();  // Always call End() regardless of Begin() return value
-}
-
-void ViewManager::drawTrackerPanel(Panel previousPanel) {
-    if (trackerGUI && tracker) {
-        // Set focus only when panel changed and this is the current panel
-        // Must be called BEFORE Begin() for it to work
-        if (currentPanel == Panel::TRACKER && currentPanel != previousPanel) {
-            ImGui::SetNextWindowFocus();
-        }
-        
-        // ImGui::Begin() returns false when window is collapsed
-        // IMPORTANT: Always call End() even if Begin() returns false
-        if (ImGui::Begin("Tracker Sequencer")) {
-            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                navigateToPanel(Panel::TRACKER);
-                trackerGUI->clearCellFocus();
-            }
-            
-            trackerGUI->draw(*tracker);
-            drawWindowOutline();
-        }
-        ImGui::End();  // Always call End() regardless of Begin() return value
-    }
-}
-
-void ViewManager::drawMediaPoolPanel(Panel previousPanel) {
-    if (mediaPoolGUI && mediaPool) {
-        // Set focus only when panel changed and this is the current panel
-        // Must be called BEFORE Begin() for it to work
-        if (currentPanel == Panel::MEDIA_POOL && currentPanel != previousPanel) {
-            ImGui::SetNextWindowFocus();
-        }
-        
-        // ImGui::Begin() returns false when window is collapsed
-        // IMPORTANT: Always call End() even if Begin() returns false
-        if (ImGui::Begin("Media Pool")) {
-            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                navigateToPanel(Panel::MEDIA_POOL);
-            }
-            
-            mediaPoolGUI->draw();
-            drawWindowOutline();
-        }
-        ImGui::End();  // Always call End() regardless of Begin() return value
-    }
-}
-
-void ViewManager::drawTrackerPanels(Panel previousPanel) {
-    if (!guiManager) return;
-    
-    // Get all visible TrackerSequencer instances
-    auto visibleInstances = guiManager->getVisibleInstances(ModuleType::SEQUENCER);
-    auto allTrackerGUIs = guiManager->getAllTrackerGUIs();
-    
-    // Draw each visible instance in its own window
-    for (auto* trackerGUI : allTrackerGUIs) {
-        if (!trackerGUI) continue;
-        
-        std::string instanceName = trackerGUI->getInstanceName();
-        if (visibleInstances.find(instanceName) == visibleInstances.end()) {
-            continue;  // Skip non-visible instances
-        }
-        
-        // Create window title with instance name
-        std::string windowTitle = instanceName;  // Use instance name as window title
-        
-        // Set focus only when panel changed and this is the current panel
-        if (currentPanel == Panel::TRACKER && currentPanel != previousPanel) {
-            // Focus first visible instance
-            if (trackerGUI == allTrackerGUIs.front()) {
-                ImGui::SetNextWindowFocus();
-            }
-        }
-        
-        // Setup window properties (applies default size if saved)
-        trackerGUI->setupWindow();
-        
-        // Disable scrolling on main window - only child regions should scroll
-        // Use native ImGui title bar - toggle button will be drawn on top of it
-        ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoScrollbar | 
-                                      ImGuiWindowFlags_NoScrollWithMouse;
-        
-        // ImGui::Begin() returns false when window is collapsed
-        // IMPORTANT: Always call End() even if Begin() returns false
-        if (ImGui::Begin(windowTitle.c_str(), nullptr, windowFlags)) {
-            // Only draw content if window is not collapsed (to avoid accessing invalid window properties)
-            if (!ImGui::IsWindowCollapsed()) {
-                // Draw ON/OFF toggle button in ImGui's native title bar
-                trackerGUI->drawTitleBarToggle();
-                
-                if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                    navigateToPanel(Panel::TRACKER);
-                    trackerGUI->clearCellFocus();
-                }
-                
-                trackerGUI->draw();
-                
-                // Save layout if window was resized (only save size, not position)
-                ImVec2 currentSize = ImGui::GetWindowSize();
-                static std::map<std::string, ImVec2> previousSizes;
-                std::string windowId = windowTitle;
-                auto it = previousSizes.find(windowId);
-                if (it == previousSizes.end() || it->second.x != currentSize.x || it->second.y != currentSize.y) {
-                    if (it != previousSizes.end()) {
-                        trackerGUI->saveDefaultLayout();
-                    }
-                    previousSizes[windowId] = currentSize;
-                }
-                
-                drawWindowOutline();
-            }
-        }
-        ImGui::End();  // Always call End() regardless of Begin() return value
-    }
-}
-
-void ViewManager::drawMediaPoolPanels(Panel previousPanel) {
-    if (!guiManager) return;
-    
-    // Get all visible MediaPool instances
-    auto visibleInstances = guiManager->getVisibleInstances(ModuleType::INSTRUMENT);
-    auto allMediaPoolGUIs = guiManager->getAllMediaPoolGUIs();
-    
-    // Draw each visible instance in its own window
-    for (auto* mediaPoolGUI : allMediaPoolGUIs) {
-        if (!mediaPoolGUI) continue;
-        
-        std::string instanceName = mediaPoolGUI->getInstanceName();
-        if (visibleInstances.find(instanceName) == visibleInstances.end()) {
-            continue;  // Skip non-visible instances
-        }
-        
-        // Create window title with instance name
-        std::string windowTitle = instanceName;  // Use instance name as window title
-        
-        // Set focus only when panel changed and this is the current panel
-        if (currentPanel == Panel::MEDIA_POOL && currentPanel != previousPanel) {
-            // Focus first visible instance
-            if (mediaPoolGUI == allMediaPoolGUIs.front()) {
-                ImGui::SetNextWindowFocus();
-            }
-        }
-        
-        // Setup window properties (applies default size if saved)
-        mediaPoolGUI->setupWindow();
-        
-        // Disable scrolling on main window - only child regions should scroll
-        // Use native ImGui title bar - toggle button will be drawn on top of it
-        ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoScrollbar | 
-                                      ImGuiWindowFlags_NoScrollWithMouse;
-        
-        // ImGui::Begin() returns false when window is collapsed
-        // IMPORTANT: Always call End() even if Begin() returns false
-        if (ImGui::Begin(windowTitle.c_str(), nullptr, windowFlags)) {
-            // Only draw content if window is not collapsed (to avoid accessing invalid window properties)
-            if (!ImGui::IsWindowCollapsed()) {
-                // Draw ON/OFF toggle button in ImGui's native title bar
-                mediaPoolGUI->drawTitleBarToggle();
-                
-                if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                    navigateToPanel(Panel::MEDIA_POOL);
-                }
-                
-                mediaPoolGUI->draw();
-                
-                // Save layout if window was resized (only save size, not position)
-                ImVec2 currentSize = ImGui::GetWindowSize();
-                static std::map<std::string, ImVec2> previousSizes;
-                std::string windowId = windowTitle;
-                auto it = previousSizes.find(windowId);
-                if (it == previousSizes.end() || it->second.x != currentSize.x || it->second.y != currentSize.y) {
-                    if (it != previousSizes.end()) {
-                        mediaPoolGUI->saveDefaultLayout();
-                    }
-                    previousSizes[windowId] = currentSize;
-                }
-                
-                drawWindowOutline();
-            }
-        }
-        ImGui::End();  // Always call End() regardless of Begin() return value
-    }
-}
-
-void ViewManager::setupAudioStream(ofBaseApp* listener) {
-    if (!soundStream || audioDevices.empty()) {
-        ofLogError("ViewManager") << "Cannot setup audio stream: no soundStream or devices";
-        return;
-    }
-    
-    // Use provided listener or stored listener
-    ofBaseApp* listenerToUse = listener ? listener : audioListener;
-    
-    // Close existing stream if open
-    soundStream->close();
-    
-    // Setup audio stream with selected device
-    ofSoundStreamSettings settings;
-    if (listenerToUse) {
-        settings.setOutListener(listenerToUse);
-    }
-    settings.sampleRate = 44100;
-    settings.numOutputChannels = 2;
-    settings.numInputChannels = 0;
-    settings.bufferSize = 512;
-    
-    if (selectedAudioDevice >= 0 && selectedAudioDevice < (int)audioDevices.size()) {
-        settings.setOutDevice(audioDevices[selectedAudioDevice]);
-    }
-    
-    soundStream->setup(settings);
-    ofLogNotice("ViewManager") << "Audio stream setup with device: " 
-                               << (selectedAudioDevice < (int)audioDevices.size() 
-                                   ? audioDevices[selectedAudioDevice].name 
-                                   : "default");
-}
-
-void ViewManager::drawFileBrowserPanel(Panel previousPanel) {
-    if (!fileBrowser) return;
-    
-    // Set focus only when panel changed and this is the current panel
-    // Must be called BEFORE Begin() for it to work
-    if (currentPanel == Panel::FILE_BROWSER && currentPanel != previousPanel) {
-        ImGui::SetNextWindowFocus();
-    }
+    // Set border size and color based on focus state (native ImGui border system)
+    bool isFocused = shouldFocus;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);  // Enable border
+    ImGui::PushStyleColor(ImGuiCol_Border, 
+        isFocused ? GUIConstants::Outline::Focus : GUIConstants::Outline::Unfocused);
     
     // Standard window flags for utility panel (no special title bar needed)
     ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoScrollbar | 
@@ -501,32 +398,87 @@ void ViewManager::drawFileBrowserPanel(Panel previousPanel) {
     
     // ImGui::Begin() returns false when window is collapsed
     // IMPORTANT: Always call End() even if Begin() returns false
-    if (ImGui::Begin("File Browser", nullptr, windowFlags)) {
+    if (ImGui::Begin("Asset Library", nullptr, windowFlags)) {
         // Window is open - safe to use window functions
         bool isCollapsed = ImGui::IsWindowCollapsed();
-        
-        // Sync visibility state
-        if (!isCollapsed && !fileBrowserVisible_) {
-            fileBrowserVisible_ = true;
-        }
         
         // Only draw content when not collapsed
         if (!isCollapsed) {
             if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                navigateToPanel(Panel::FILE_BROWSER);
+                navigateToWindow(windowName);
             }
             
-            fileBrowser->draw();
+            assetLibraryGUI->draw();
+            
+            // Draw outline for docked windows (native borders work for undocked)
             drawWindowOutline();
         }
     }
     ImGui::End();  // Always call End() regardless of Begin() return value
+    ImGui::PopStyleColor();  // Pop border color
+    ImGui::PopStyleVar();    // Pop border size
 }
 
-void ViewManager::drawConsolePanel(Panel previousPanel) {
+//--------------------------------------------------------------
+void ViewManager::drawFileBrowserPanel() {
+    if (!fileBrowser) return;
+    
+    std::string windowName = "File Browser";
+    
+    // This method is only called when fileBrowserVisible_ is true
+    // Ensure window is shown (not collapsed) when visibility is true
+    if (fileBrowserVisible_) {
+        ImGui::SetNextWindowCollapsed(false);
+    }
+    
+    bool shouldFocus = (windowName == currentFocusedWindow);
+    bool focusChanged = (shouldFocus && windowName != lastFocusedWindow);
+    
+    // Set focus when window changes
+    if (focusChanged) {
+        ImGui::SetNextWindowFocus();
+    }
+    
+    // Set border size and color based on focus state (native ImGui border system)
+    bool isFocused = shouldFocus;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);  // Enable border
+        ImGui::PushStyleColor(ImGuiCol_Border, 
+            isFocused ? GUIConstants::Outline::Focus : GUIConstants::Outline::Unfocused);
+        
+        // Standard window flags for utility panel (no special title bar needed)
+        ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoScrollbar | 
+                                      ImGuiWindowFlags_NoScrollWithMouse;
+        
+        // ImGui::Begin() returns false when window is collapsed
+        // IMPORTANT: Always call End() even if Begin() returns false
+        if (ImGui::Begin("File Browser", nullptr, windowFlags)) {
+        // Window is open - safe to use window functions
+        bool isCollapsed = ImGui::IsWindowCollapsed();
+        
+        // Only draw content when not collapsed
+        if (!isCollapsed) {
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
+                navigateToWindow(windowName);
+            }
+            
+            fileBrowser->draw();
+            
+            // Draw outline for docked windows (native borders work for undocked)
+            drawWindowOutline();
+        }
+    }
+    ImGui::End();  // Always call End() regardless of Begin() return value
+    ImGui::PopStyleColor();  // Pop border color
+    ImGui::PopStyleVar();    // Pop border size
+}
+
+void ViewManager::drawConsolePanel() {
     if (!console) return;
     
-    // Sync Console's internal isOpen state with ViewManager's visibility BEFORE Begin()
+    std::string windowName = "Console";
+    
+    // This method is only called when consoleVisible_ is true
+    // Sync Console's internal isOpen state with ViewManager's visibility
     // Handle case where Console was toggled via Cmd+':' shortcut (bidirectional sync)
     if (console->isConsoleOpen() != consoleVisible_) {
         // ViewManager's state changed (e.g., via Cmd+':') - sync Console's internal state
@@ -537,22 +489,41 @@ void ViewManager::drawConsolePanel(Panel previousPanel) {
         }
     }
     
+    // Ensure Console is open when visible
+    if (consoleVisible_ && !console->isConsoleOpen()) {
+        console->open();
+    }
+    
     // Track visibility state changes to handle Cmd+':' toggle
-    // When console becomes visible, bring it to front (but don't force expand/collapse)
+    // When console becomes visible, bring it to front
     static bool lastConsoleVisible = false;
     bool visibilityChanged = (consoleVisible_ != lastConsoleVisible);
     
     if (visibilityChanged && consoleVisible_) {
-        // Console just became visible - bring to front (user controls expand/collapse)
+        // Console just became visible - bring to front and ensure it's shown
         ImGui::SetNextWindowFocus();
+        ImGui::SetNextWindowCollapsed(false);
     }
     lastConsoleVisible = consoleVisible_;
     
-    // Set focus only when panel changed and this is the current panel
-    // Must be called BEFORE Begin() for it to work
-    if (currentPanel == Panel::CONSOLE && currentPanel != previousPanel) {
+    bool shouldFocus = (windowName == currentFocusedWindow);
+    bool focusChanged = (shouldFocus && windowName != lastFocusedWindow);
+    
+    // Set focus when window changes
+    if (focusChanged) {
         ImGui::SetNextWindowFocus();
     }
+    
+    // Ensure window is shown when visibility is true
+    if (consoleVisible_) {
+        ImGui::SetNextWindowCollapsed(false);
+    }
+    
+    // Set border size and color based on focus state (native ImGui border system)
+    bool isFocused = shouldFocus;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);  // Enable border
+    ImGui::PushStyleColor(ImGuiCol_Border, 
+        isFocused ? GUIConstants::Outline::Focus : GUIConstants::Outline::Unfocused);
     
     // No special flags needed - Console handles its own styling and scrolling
     ImGuiWindowFlags windowFlags = 0;
@@ -564,24 +535,21 @@ void ViewManager::drawConsolePanel(Panel previousPanel) {
         // Window is open and not collapsed - safe to use window functions
         bool isCollapsed = ImGui::IsWindowCollapsed();
         
-        // Sync visibility state
-        if (!isCollapsed && !consoleVisible_) {
-            consoleVisible_ = true;
-            lastConsoleVisible = true;
-            console->open();
-        }
-        
         // Only draw content when visible and not collapsed
         if (consoleVisible_ && !isCollapsed) {
             if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                navigateToPanel(Panel::CONSOLE);
+                navigateToWindow(windowName);
             }
             
             console->drawContent();
+            
+            // Draw outline for docked windows (native borders work for undocked)
             drawWindowOutline();
         }
     }
     ImGui::End();  // Always call End() regardless of Begin() return value
+    ImGui::PopStyleColor();  // Pop border color
+    ImGui::PopStyleVar();    // Pop border size
 }
 
 

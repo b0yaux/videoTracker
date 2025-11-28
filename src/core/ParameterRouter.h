@@ -12,10 +12,6 @@
 #include <memory>
 #include "ofJson.h"
 
-// Forward declarations
-class TrackerSequencer;
-class MediaPool;
-
 /**
  * ParameterRouter - Path-based parameter routing system (replaces ParameterSync)
  * 
@@ -51,6 +47,23 @@ public:
      */
     bool connect(const ParameterPath& sourcePath, const ParameterPath& targetPath,
                  std::function<bool()> condition = nullptr);
+    
+    /**
+     * Connect parameters directly without path parsing (simpler API for common cases)
+     * @param sourceModule Source module name (e.g., "tracker1")
+     * @param sourceParam Source parameter name (e.g., "currentStepPosition")
+     * @param targetModule Target module name (e.g., "pool1")
+     * @param targetParam Target parameter name (e.g., "position")
+     * @param condition Optional function that returns true when sync should be active
+     * @return true if connection succeeded, false otherwise
+     * 
+     * This is a convenience method that constructs paths internally.
+     * Use this for simple direct connections. Use connect(path, path) for advanced
+     * path-based routing with indices (e.g., "tracker1.step[4].position").
+     */
+    bool connectDirect(const std::string& sourceModule, const std::string& sourceParam,
+                       const std::string& targetModule, const std::string& targetParam,
+                       std::function<bool()> condition = nullptr);
     
     /**
      * Disconnect a binding

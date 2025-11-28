@@ -9,28 +9,28 @@
 
 class ModuleRegistry;
 class GUIManager;
+class ConnectionManager;
+class CommandExecutor;
 
 /**
- * Console - Command-line interface for programmatic module management
+ * Console - Text-based UI for command execution
+ * 
+ * RESPONSIBILITY: UI rendering for text-based command interface
  * 
  * Features:
  * - Command history with arrow key navigation
  * - Auto-scrolling output
- * - Filterable module listing
- * - Safe module removal with validation
+ * - Text input and output display
  * 
- * Commands:
- *   list, ls              - List all modules
- *   remove <name>, rm     - Remove a module by name
- *   add <type>            - Add a module (pool, tracker)
- *   clear, cls            - Clear console output
- *   help, ?               - Show help
+ * Separation of Concerns:
+ * - CommandExecutor: Command logic and execution
+ * - Console: Text-based UI rendering
+ * - CommandBar: Palette-based UI rendering
  * 
  * Shortcuts:
  *   : (colon)             - Toggle console
  *   Up/Down arrows        - Navigate command history
  *   Ctrl+C / Cmd+C        - Copy selected text to clipboard
- *   Tab                   - Auto-complete (future)
  */
 class Console {
 public:
@@ -38,6 +38,11 @@ public:
     ~Console() = default;
     
     void setup(ModuleRegistry* registry, GUIManager* guiManager);
+    
+    /**
+     * Set command executor (backend for command execution)
+     */
+    void setCommandExecutor(CommandExecutor* executor);
     
     // Draw console window (for standalone use)
     void draw();
@@ -60,9 +65,9 @@ public:
     // Check if InputText is focused (for disabling ImGui navigation)
     bool isInputTextFocused() const { return inputTextWasFocused; }
     
-    // Add callback for module operations
-    void setOnAddModule(std::function<void(const std::string&)> callback) { onAddModule = callback; }
-    void setOnRemoveModule(std::function<void(const std::string&)> callback) { onRemoveModule = callback; }
+    // Add log entry (public for CommandExecutor output callback)
+    void addLog(const std::string& text);
+    void addLog(const char* fmt, ...);
     
 private:
     bool isOpen = false;
@@ -78,29 +83,9 @@ private:
     
     ModuleRegistry* registry = nullptr;
     GUIManager* guiManager = nullptr;
+    CommandExecutor* commandExecutor = nullptr;
     
-    std::function<void(const std::string&)> onAddModule;
-    std::function<void(const std::string&)> onRemoveModule;
-    
-    // Command execution
+    // Execute command via CommandExecutor
     void executeCommand(const std::string& command);
-    void addLog(const std::string& text);
-    void addLog(const char* fmt, ...);
-    
-    // Command handlers
-    void cmdList();
-    void cmdRemove(const std::string& args);
-    void cmdAdd(const std::string& args);
-    void cmdHelp();
-    void cmdClear();
-    
-    // Helper to split command and args
-    std::pair<std::string, std::string> parseCommand(const std::string& line);
-    
-    // Helper to trim whitespace
-    static std::string trim(const std::string& str);
-    
-    // Helper to get module type string
-    static std::string getModuleTypeString(int type);
 };
 

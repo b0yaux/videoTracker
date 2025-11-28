@@ -15,7 +15,6 @@ public:
     // Composition - contains audio and video players
     ofxSoundPlayerObject audioPlayer;
     ofxVideoPlayerObject videoPlayer;
-    ofxHSV hsvAdjust;  // HSV color adjustment processor for video
     
     // Enable/disable toggles
     ofParameter<bool> audioEnabled;
@@ -35,11 +34,6 @@ public:
     // Granular-style loop control
     ofParameter<float> loopSize;  // Loop size in seconds (0.0 to duration, affects playback when in LOOP play style)
     
-    // Video-specific parameters (forwarded from videoPlayer)
-    ofParameter<float> brightness;
-    ofParameter<float> hue;
-    ofParameter<float> saturation;
-    
     // Parameter group for GUI and modulation
     ofParameterGroup parameters;
     
@@ -55,9 +49,6 @@ public:
     void resume();
     void reset();
     void setPosition(float pos);
-    
-    // Gating system for tracker-style step control
-    void playWithGate(float durationSeconds);
     
     // File path getters for display purposes
     std::string getAudioFilePath() const { return audioFilePath; }
@@ -89,6 +80,16 @@ public:
     void setup();
     
 private:
+    // Named constants for thresholds and magic numbers
+    static constexpr float POSITION_VALID_THRESHOLD = 0.001f;      // Minimum valid position (0.1%)
+    static constexpr float POSITION_SEEK_THRESHOLD = 0.01f;        // Threshold for seeking operations (1%)
+    static constexpr float POSITION_UPDATE_THRESHOLD = 0.000001f;  // Position update threshold for smooth playhead (0.0001%)
+    static constexpr float BACKWARD_WRAP_DETECT_HIGH = 0.9f;       // High threshold for backward loop wrap detection
+    static constexpr float BACKWARD_WRAP_DETECT_LOW = 0.1f;        // Low threshold for backward loop wrap detection
+    static constexpr float BACKWARD_WRAP_POSITION = 0.99f;          // Position to set when backward wrap detected
+    static constexpr float MIN_REGION_SIZE = 0.001f;                // Minimum valid region size
+    static constexpr float MS_TO_SECONDS = 0.001f;                 // Milliseconds to seconds conversion
+    
     // Parameter listeners
     void onAudioEnabledChanged(bool& enabled);
     void onVideoEnabledChanged(bool& enabled);
@@ -96,20 +97,16 @@ private:
     void onSpeedChanged(float& speed);
     void onLoopChanged(bool& loop);
     void onVolumeChanged(float& vol);
-    void onBrightnessChanged(float& value);
-    void onHueChanged(float& value);
-    void onSaturationChanged(float& value);
+    
+    // Position capture helper - single source of truth for position reading
+    // Prioritizes: playing audio > playing video > parameter > stopped audio > stopped video
+    float captureCurrentPosition() const;
     
     // Internal state
     bool isSetup;
     float lastPosition;
     float lastSpeed;
     bool lastLoop;
-    
-    // Gating system state
-    bool scheduledStopActive;
-    float stopTime;
-    float gateDuration;
     
     // File path storage for display purposes
     std::string audioFilePath;

@@ -28,11 +28,33 @@ public:
     TrackerSequencer();
     ~TrackerSequencer();
 
-    // Callback types for querying external state
-    using IndexRangeCallback = std::function<int()>;
     
     void setup(Clock* clockRef, int steps = 16);
-    void setIndexRangeCallback(IndexRangeCallback callback);
+    
+    // New unified initialization method (Phase 2.2)
+    void initialize(Clock* clock, ModuleRegistry* registry, ConnectionManager* connectionManager, 
+                    ParameterRouter* parameterRouter, bool isRestored) override;
+    
+    // React to runtime connection changes (e.g., from Console)
+    void onConnectionEstablished(const std::string& targetModuleName,
+                                 Module::ConnectionType connectionType,
+                                 ConnectionManager* connectionManager) override;
+    
+    // DEPRECATED: Use initialize() instead
+    [[deprecated("Use initialize() instead")]]
+    void postCreateSetup(Clock* clock);
+    
+    // DEPRECATED: Use initialize() instead
+    [[deprecated("Use initialize() instead")]]
+    void configureSelf(ModuleRegistry* registry, ConnectionManager* connectionManager, ParameterRouter* parameterRouter);
+    
+    // Initialize default pattern based on connected MediaPool (Phase 8.1)
+    // Called after all modules are set up and connections are established
+    void initializeDefaultPattern(class ModuleRegistry* registry, class ConnectionManager* connectionManager);
+    
+    // Get index range from connected module (replaces callback pattern)
+    // Queries connected modules directly via ConnectionManager
+    int getIndexRange() const;
     void processAudioBuffer(ofSoundBuffer& buffer);
     void onTimeEvent(TimeEvent& data); // Sample-accurate time event from Clock (filters for STEP type)
     
@@ -42,9 +64,25 @@ public:
     // Module interface implementation
     std::string getName() const override;
     ModuleType getType() const override;
-    std::vector<ParameterDescriptor> getParameters() override;
+    std::vector<ParameterDescriptor> getParameters() const override;
     void onTrigger(TriggerEvent& event) override; // Sequencers don't receive triggers, but method exists for interface
     void setParameter(const std::string& paramName, float value, bool notify = true) override;
+    float getParameter(const std::string& paramName) const override;
+    void update() override; // Update step active state (clears manually triggered steps when duration expires)
+    
+    // Capability interface implementation
+    bool hasCapability(ModuleCapability capability) const override;
+    std::vector<ModuleCapability> getCapabilities() const override;
+    
+    // Metadata interface implementation
+    ModuleMetadata getMetadata() const override;
+    
+    // Event access - expose triggerEvent for generic subscription
+    ofEvent<TriggerEvent>* getEvent(const std::string& eventName) override;
+    
+    // Port-based routing interface (Phase 1)
+    std::vector<Port> getInputPorts() const override;
+    std::vector<Port> getOutputPorts() const override;
     
     // Expose TrackerSequencer parameters (for discovery by modules)
     // Internal parameters: sequencer-specific (note, chance) - not sent to external modules
@@ -55,7 +93,8 @@ public:
     std::vector<ParameterDescriptor> getAvailableParameters(const std::vector<ParameterDescriptor>& externalParams = {}) const;
     
     // Transport listener for Clock play/stop events
-    void onClockTransportChanged(bool isPlaying);
+    void onTransportChanged(bool isPlaying) override; // Module interface
+    void onClockTransportChanged(bool isPlaying); // Internal implementation (called by Clock)
     
     // Pattern management
     void setCell(int step, const PatternCell& cell);
@@ -64,7 +103,7 @@ public:
     void clearCell(int step);
     void clearPattern();
     void randomizePattern();
-    void randomizeColumn(int columnIndex);  // Randomize a specific column (0 = index, 1 = length, 2+ = parameter columns)
+    void randomizeColumn(int columnIndex);  // Randomize a specific column (absolute index: 1 = index, 2 = length, 3+ = parameter columns)
     void applyLegato();  // Apply legato to length column (extend lengths to connect steps)
     
     // Multi-step duplication: copy a range of steps to a destination
@@ -120,7 +159,11 @@ public:
     void triggerStep(int step);
     
     // State management
+    // DEPRECATED: Use SessionManager instead for unified session saving/loading
+    // These methods are kept for backward compatibility but should not be used in new code
+    [[deprecated("Use SessionManager::saveSession() instead")]]
     bool loadState(const std::string& filename);
+    [[deprecated("Use SessionManager::saveSession() instead")]]
     bool saveState(const std::string& filename) const;
     
     // Module serialization interface
@@ -129,19 +172,21 @@ public:
     // getTypeName() uses default implementation from Module base class
     
     // UI interaction
-    // Note: GUI state (editStep, editColumn, isEditingCell, editBufferCache) is now managed by TrackerSequencerGUI
-    // These methods accept GUI state as parameters instead of using member variables
+    // Note: GUI state (editStep, editColumn, isEditingCell, editBufferCache) is managed by TrackerSequencerGUI
+    // GUIState is a temporary parameter struct for passing state to handleKeyPress() - NOT a source of truth
     struct GUIState {
         int editStep = -1;
         int editColumn = -1;
-        bool isEditingCell = false;
-        std::string editBufferCache;
-        bool editBufferInitializedCache = false;
-        bool shouldRefocusCurrentCell = false;  // For maintaining focus after exiting edit mode via Enter
+        bool isEditingCell = false;  // Temporary: passed from GUI, modified by handleKeyPress, synced back to GUI
+        std::string editBufferCache;  // Temporary: passed from GUI, modified by handleKeyPress, synced back to GUI
+        bool editBufferInitializedCache = false;  // Temporary: passed from GUI, modified by handleKeyPress, synced back to GUI
+        bool shouldRefocusCurrentCell = false;  // Temporary: passed from GUI, modified by handleKeyPress, synced back to GUI
     };
     bool handleKeyPress(int key, bool ctrlPressed, bool shiftPressed, GUIState& guiState);
     bool handleKeyPress(ofKeyEventArgs& keyEvent, GUIState& guiState); // Overload for ofKeyEventArgs
-    void handleMouseClick(int x, int y, int button);
+    
+    // Module interface - handle mouse clicks
+    void handleMouseClick(int x, int y, int button) override;
     
     // Getters
     int getStepCount() const;  // Returns current pattern's step count
@@ -195,6 +240,7 @@ private:
     bool isPatternEmpty() const;
     void notifyStepEvent(int step, float stepLength);
     void updateStepInterval();
+    
     
     // Column configuration management (delegates to current pattern)
     // Column configuration is now stored per-pattern in Pattern class
@@ -271,8 +317,8 @@ private:
     // Step event listeners
     std::vector<std::function<void(int, float, const PatternCell&)>> stepEventListeners;
     
-    // Callback for querying external state
-    IndexRangeCallback indexRangeCallback;
+    // Connection management for index range discovery
+    ConnectionManager* connectionManager_;  // Stored reference for querying connections
     
     // UI state
     bool showGUI;

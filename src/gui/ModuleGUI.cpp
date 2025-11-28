@@ -13,13 +13,27 @@ const std::string ModuleGUI::LAYOUTS_FILENAME = "module_layouts.json";
 
 ModuleGUI::ModuleGUI() {
     // Load layouts on first construction if not already loaded
+    // Note: If layouts are loaded from session, setAllDefaultLayouts()
+    // will set layoutsLoaded = true, preventing file load
     if (!layoutsLoaded) {
         loadDefaultLayouts();
         layoutsLoaded = true;
     }
 }
 
+void ModuleGUI::syncEnabledState() {
+    if (registry && !instanceName.empty()) {
+        auto module = registry->getModule(instanceName);
+        if (module) {
+            enabled_ = module->isEnabled();
+        }
+    }
+}
+
 void ModuleGUI::drawTitleBarToggle() {
+    // Don't draw toggle if subclass says not to
+    if (!shouldShowToggle()) return;
+    
     // Draw ON/OFF toggle button directly in ImGui's native title bar
     // Uses foreground draw list to draw on top of title bar decorations
     ImGuiWindow* window = ImGui::GetCurrentWindow();
@@ -67,6 +81,15 @@ void ModuleGUI::drawTitleBarToggle() {
     // Only process click if window is not collapsed (to avoid interfering with collapse behavior)
     if (clicked && !ImGui::IsWindowCollapsed()) {
         enabled_ = !enabled_;
+        
+        // Update backend module enabled state
+        if (registry && !instanceName.empty()) {
+            auto module = registry->getModule(instanceName);
+            if (module) {
+                module->setEnabled(enabled_);
+            }
+        }
+        
         ofLogVerbose("ModuleGUI") << "Module " << instanceName << " " << (enabled_ ? "enabled" : "disabled");
     }
     
@@ -255,6 +278,15 @@ void ModuleGUI::saveDefaultLayouts() {
     }
 }
 
+std::map<std::string, ImVec2> ModuleGUI::getAllDefaultLayouts() {
+    return defaultLayouts;
+}
+
+void ModuleGUI::setAllDefaultLayouts(const std::map<std::string, ImVec2>& layouts) {
+    defaultLayouts = layouts;
+    layoutsLoaded = true;  // Mark as loaded so we don't overwrite from file
+}
+
 void ModuleGUI::setupDragDropTarget() {
     if (ImGui::BeginDragDropTarget()) {
         // Check if there's any drag drop payload active (for debugging)
@@ -264,8 +296,8 @@ void ModuleGUI::setupDragDropTarget() {
                                       << ", size: " << activePayload->DataSize;
         }
         
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_BROWSER_FILES")) {
-            ofLogNotice("ModuleGUI") << "Received FILE_BROWSER_FILES payload, size: " << payload->DataSize;
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_PATHS")) {
+            ofLogNotice("ModuleGUI") << "Received FILE_PATHS payload, size: " << payload->DataSize;
             
             // Extract file paths from payload
             // Payload data is a serialized string: each path is null-terminated, final path is double-null-terminated
@@ -312,9 +344,58 @@ void ModuleGUI::setupDragDropTarget() {
                 ofLogWarning("ModuleGUI") << "Drag drop payload is empty";
             }
         } else if (activePayload) {
-            ofLogVerbose("ModuleGUI") << "Drag drop payload type mismatch. Expected FILE_BROWSER_FILES, got: " << activePayload->DataType;
+            ofLogVerbose("ModuleGUI") << "Drag drop payload type mismatch. Expected FILE_PATHS, got: " << activePayload->DataType;
         }
         ImGui::EndDragDropTarget();
     }
+}
+
+bool ModuleGUI::hasWindowState() const {
+    if (instanceName.empty()) {
+        return false;
+    }
+    
+    // Find window by instance name (window title matches instance name)
+    ImGuiWindow* window = ImGui::FindWindowByName(instanceName.c_str());
+    return window != nullptr;
+}
+
+ImVec2 ModuleGUI::getWindowPosition() const {
+    if (instanceName.empty()) {
+        return ImVec2(0, 0);
+    }
+    
+    ImGuiWindow* window = ImGui::FindWindowByName(instanceName.c_str());
+    if (window) {
+        return window->Pos;
+    }
+    
+    return ImVec2(0, 0);
+}
+
+ImVec2 ModuleGUI::getWindowSize() const {
+    if (instanceName.empty()) {
+        return ImVec2(0, 0);
+    }
+    
+    ImGuiWindow* window = ImGui::FindWindowByName(instanceName.c_str());
+    if (window) {
+        return window->Size;
+    }
+    
+    return ImVec2(0, 0);
+}
+
+bool ModuleGUI::isWindowCollapsed() const {
+    if (instanceName.empty()) {
+        return false;
+    }
+    
+    ImGuiWindow* window = ImGui::FindWindowByName(instanceName.c_str());
+    if (window) {
+        return window->Collapsed;
+    }
+    
+    return false;
 }
 

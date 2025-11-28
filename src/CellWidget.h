@@ -8,22 +8,16 @@
 typedef unsigned int ImU32;
 struct ImVec2;
 
-// Cell type enum
-enum class CellWidgetType {
-    SLIDER,    // Numeric editing (default) - supports drag, keyboard input, value editing
-    BUTTON     // Button mode - supports state cycling, action triggers, dynamic display
-};
+// CellWidget only supports SLIDER mode (numeric parameter editing)
+// Button functionality is handled directly by GUI classes using ImGui::Button()
 
-// Input context for frame-aware input processing
-// Passed from CellGrid to CellWidget to track frame state per grid instance
+// Input context for CellWidget (simplified - no frame tracking needed)
+// ImGui handles input state management internally
 struct CellWidgetInputContext {
-    int currentFrame = -1;                    // Current frame number (from ofGetFrameNum())
-    int* lastProcessedFrame = nullptr;        // Pointer to frame tracker (owned by CellGrid)
-    int* lastProcessedInputQueueFrame = nullptr;  // Pointer to input queue frame tracker (owned by CellGrid)
-    
+    // Empty struct - kept for API compatibility but no longer needed
+    // ImGui's input system (IsKeyPressed, InputQueueCharacters) already handles
+    // preventing duplicate processing within a frame
     CellWidgetInputContext() = default;
-    CellWidgetInputContext(int frame, int* lastFrame, int* lastInputQueueFrame)
-        : currentFrame(frame), lastProcessedFrame(lastFrame), lastProcessedInputQueueFrame(lastInputQueueFrame) {}
 };
 
 // Interaction result from CellWidget::draw()
@@ -33,12 +27,34 @@ struct CellWidgetInteraction {
     bool dragStarted = false;
     bool dragEnded = false;
     bool shouldExitEarly = false;
+    bool needsRefocus = false;  // Signals that cell needs refocus after edit operations (e.g., Enter exits edit mode)
     
     CellWidgetInteraction() = default;
 };
 
-// CellWidget - Reusable editing widget for parameter values
-// Supports keyboard input, drag editing, and visual feedback
+// CellWidget - Reusable editing widget for numeric parameter values
+// Core responsibilities:
+//   1. Display value (formatted text, fill bar visualization)
+//   2. Handle keyboard input (typing, Enter, Escape, arrow keys, etc.)
+//   3. Handle mouse drag for value adjustment
+//   4. Call callbacks (onValueApplied, onEditModeChanged, etc.) to notify GUI layer
+// 
+// NOTE: CellWidget is a SELF-CONTAINED, REUSABLE widget that handles all input processing internally.
+// GUI layers (TrackerSequencerGUI, MediaPoolGUI, etc.) only need to:
+//   - Set up callbacks (onValueApplied, onEditModeChanged) to sync state
+//   - Sync state TO cell before drawing (selection, edit mode, buffer cache)
+//   - Sync state FROM cell after drawing (buffer cache for persistence)
+// 
+// This architecture makes CellWidget reusable across all modules without duplicating input logic.
+// 
+// Note: Focus management is handled by the GUI layer. CellWidget signals refocus needs
+// via interaction.needsRefocus flag, but the GUI layer executes the actual refocus.
+// 
+// Supports numeric parameter editing with:
+//   - Keyboard input (direct typing, Enter to confirm, Escape to cancel)
+//   - Drag editing (mouse drag to adjust values)
+//   - Expression evaluation (e.g., "1.5 + 0.3")
+//   - Gamepad navigation (via ImGui's built-in navigation system)
 class CellWidget {
 public:
     CellWidget();
@@ -105,30 +121,20 @@ public:
     float getLastDragValue() const { return lastDragValue_; }
     
     // Callbacks - set these to connect to your data model
-    std::function<float()> getCurrentValue;              // Get current value for display (SLIDER mode)
-    std::function<void(const std::string&, float)> onValueApplied;  // Called when value is applied (SLIDER mode)
+    std::function<float()> getCurrentValue;              // Get current value for display
+    std::function<void(const std::string&, float)> onValueApplied;  // Called when value is applied
     std::function<void(const std::string&)> onValueRemoved;         // Called when parameter is removed
-    std::function<std::string(float)> formatValue;       // Optional: custom formatter (SLIDER mode)
-    std::function<float(const std::string&)> parseValue; // Optional: custom parser (SLIDER mode)
+    std::function<void(bool)> onEditModeChanged;        // Called when edit mode is entered (true) or exited (false)
+    std::function<std::string(float)> formatValue;       // Optional: custom formatter
+    std::function<float(const std::string&)> parseValue; // Optional: custom parser
     std::function<int()> getMaxIndex;                    // For index columns: max index value
     
-    // BUTTON mode callbacks
-    std::function<std::string()> getButtonLabel;         // Get button label dynamically (BUTTON mode)
-    std::function<std::string()> getButtonTooltip;       // Get button tooltip dynamically (BUTTON mode)
-    std::function<void()> onButtonClicked;               // Called when button is clicked (BUTTON mode)
-    std::function<bool()> isButtonActive;                // Check if button should show active state (BUTTON mode) - returns true for green styling
-    std::function<void()> onButtonCycleState;            // Optional: called to cycle state (for state cycling buttons)
-    
     // Configuration properties
-    CellWidgetType cellType = CellWidgetType::SLIDER;  // Cell type: SLIDER (default) or BUTTON
     std::string parameterName;  // Parameter name (e.g., "position", "speed", "volume")
     bool isRemovable = true;    // true if parameter can be removed/deleted (default: true). false for required columns like index/length
     bool isBool = false;        // True for boolean parameters
     bool isInteger = false;     // True for integer parameters (affects arrow key increments)
     float stepIncrement = 0.01f; // Step size for arrow key adjustments (0.001, 0.01, 0.1, or 1.0)
-    
-    // BUTTON mode properties
-    bool enableStateCycling = false;  // If true, clicking cycles through states (calls onButtonCycleState)
     
     // Value range
     float minVal = 0.0f;
@@ -138,8 +144,8 @@ public:
     // Selection state accessors
     void setSelected(bool selected) { selected_ = selected; }
     bool isSelected() const { return selected_; }
-    void setShouldRefocus(bool refocus) { shouldRefocus_ = refocus; }
-    bool shouldRefocus() const { return shouldRefocus_; }
+    
+    // Refocus flag removed - use CellWidgetInteraction.needsRefocus instead
     
 private:
     // Constants
@@ -173,9 +179,8 @@ private:
     bool parseAndApplyEditBuffer();
     
     // Drawing helpers (extracted from draw() for better organization)
-    CellWidgetInteraction drawButtonMode(int uniqueId, bool isFocused, bool shouldFocusFirst, bool shouldRefocusCurrentCell, const ImVec2& cellMin, const ImVec2& cellMax);
     CellWidgetInteraction drawSliderMode(int uniqueId, bool isFocused, bool shouldFocusFirst, bool shouldRefocusCurrentCell, const CellWidgetInputContext& inputContext, const ImVec2& cellMin, const ImVec2& cellMax);
-    void handleInputInDraw(bool actuallyFocused, const CellWidgetInputContext& inputContext);
+    void processInputInDraw(bool actuallyFocused);  // Process keyboard input during draw
     void drawVisualFeedback(const ImVec2& cellMin, const ImVec2& cellMax, float fillPercent);
     
     // Helper methods
@@ -193,7 +198,7 @@ private:
     void disableImGuiKeyboardNav();
     void enableImGuiKeyboardNav();
     
-    // Value removal helper
+    // Value removal helper (public so GUI can call it via callback if needed)
     void removeParameter();
     
     // Color helpers

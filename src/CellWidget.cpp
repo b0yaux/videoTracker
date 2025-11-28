@@ -1,163 +1,17 @@
 #include "CellWidget.h"
+#include "ExpressionParser.h"
 #include "gui/GUIConstants.h"
 #include <imgui.h>
 #include "ofLog.h"
 #include <cmath>
 #include <algorithm>
 #include <sstream>
-#include <stack>
 #include <cctype>
 #include <limits>
 
-// Constants for expression evaluation (used by static function)
-namespace {
-    constexpr float EPSILON_DIVISION = 1e-9f;
-}
-
 CellWidget::CellWidget() 
-    : selected_(false), shouldRefocus_(false), editing_(false), editBufferInitialized_(false), bufferModifiedByUser_(false),
+    : selected_(false), editing_(false), editBufferInitialized_(false), bufferModifiedByUser_(false),
       dragging_(false), dragStartY_(0.0f), dragStartX_(0.0f), lastDragValue_(0.0f) {
-}
-
-// Helper function to evaluate simple mathematical expressions
-// Supports: +, -, *, / with proper precedence
-// Handles negative numbers and decimal numbers
-static float evaluateExpression(const std::string& expr) {
-    if (expr.empty()) {
-        throw std::invalid_argument("Empty expression");
-    }
-    
-    // Handle starting with '.' (treat as "0.")
-    std::string processed = expr;
-    if (processed[0] == '.') {
-        processed = "0" + processed;
-    }
-    
-    // Simple expression evaluator using two stacks (shunting yard algorithm simplified)
-    std::stack<float> values;
-    std::stack<char> ops;
-    
-    auto applyOp = [&](char op) {
-        if (values.size() < 2) return;
-        float b = values.top(); values.pop();
-        float a = values.top(); values.pop();
-        switch (op) {
-            case '+': values.push(a + b); break;
-            case '-': values.push(a - b); break;
-            case '*': values.push(a * b); break;
-            case '/': 
-                if (std::abs(b) < EPSILON_DIVISION) throw std::runtime_error("Division by zero");
-                values.push(a / b); 
-                break;
-        }
-    };
-    
-    auto precedence = [](char op) -> int {
-        if (op == '+' || op == '-') return 1;
-        if (op == '*' || op == '/') return 2;
-        return 0;
-    };
-    
-    size_t i = 0;
-    bool expectNumber = true;
-    
-    while (i < processed.length()) {
-        // Skip whitespace
-        if (std::isspace(processed[i])) {
-            i++;
-            continue;
-        }
-        
-        // Handle '-' - could be negative number or subtraction
-        if (processed[i] == '-') {
-            if (expectNumber) {
-                // Check if this is a negative number (followed by digit or '.')
-                // or subtraction (not followed by digit/'.' and we have values)
-                bool isNegative = false;
-                if (i + 1 < processed.length() && (std::isdigit(processed[i + 1]) || processed[i + 1] == '.')) {
-                    isNegative = true;
-                } else if (values.empty()) {
-                    // No values yet, must be negative (even if incomplete, user is typing)
-                    isNegative = true;
-                }
-                // Otherwise, it's subtraction (handled below)
-                
-                if (isNegative) {
-                    i++; // Consume the '-'
-                    if (i >= processed.length()) {
-                        // Incomplete negative - user might be typing, allow it
-                        // Don't throw, just return 0 or let it be handled by caller
-                        throw std::invalid_argument("Incomplete negative number");
-                    }
-                    
-                    size_t start = i;
-                    bool hasDecimal = false;
-                    while (i < processed.length() && (std::isdigit(processed[i]) || processed[i] == '.')) {
-                        if (processed[i] == '.') {
-                            if (hasDecimal) throw std::invalid_argument("Multiple decimal points");
-                            hasDecimal = true;
-                        }
-                        i++;
-                    }
-                    
-                    if (i == start) throw std::invalid_argument("Invalid negative number");
-                    float val = std::stof(processed.substr(start, i - start));
-                    values.push(-val);
-                    expectNumber = false;
-                    continue;
-                }
-            }
-            // Fall through to operator handling for subtraction
-        }
-        
-        // Parse number (positive, starting with digit or '.')
-        if (std::isdigit(processed[i]) || processed[i] == '.') {
-            size_t start = i;
-            bool hasDecimal = false;
-            while (i < processed.length() && (std::isdigit(processed[i]) || processed[i] == '.')) {
-                if (processed[i] == '.') {
-                    if (hasDecimal) throw std::invalid_argument("Multiple decimal points");
-                    hasDecimal = true;
-                }
-                i++;
-            }
-            float val = std::stof(processed.substr(start, i - start));
-            values.push(val);
-            expectNumber = false;
-            continue;
-        }
-        
-        // Handle operators (binary operations: +, -, *, /)
-        if (processed[i] == '+' || processed[i] == '-' || processed[i] == '*' || processed[i] == '/') {
-            if (expectNumber) {
-                throw std::invalid_argument("Unexpected operator");
-            }
-            
-            // This is a binary operator
-            while (!ops.empty() && precedence(ops.top()) >= precedence(processed[i])) {
-                applyOp(ops.top());
-                ops.pop();
-            }
-            ops.push(processed[i]);
-            expectNumber = true;
-            i++;
-            continue;
-        }
-        
-        throw std::invalid_argument("Invalid character in expression");
-    }
-    
-    // Apply remaining operators
-    while (!ops.empty()) {
-        applyOp(ops.top());
-        ops.pop();
-    }
-    
-    if (values.size() != 1) {
-        throw std::invalid_argument("Invalid expression");
-    }
-    
-    return values.top();
 }
 
 // Helper function implementations
@@ -179,13 +33,15 @@ std::string CellWidget::trimWhitespace(const std::string& str) {
 }
 
 void CellWidget::disableImGuiKeyboardNav() {
-    ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+    // DEPRECATED: Navigation is no longer disabled to support gamepad navigation
+    // This function is kept for backward compatibility but does nothing
+    // Navigation remains enabled at all times for gamepad/keyboard support
 }
 
 void CellWidget::enableImGuiKeyboardNav() {
-    ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    // DEPRECATED: Navigation is no longer disabled, so no need to re-enable
+    // This function is kept for backward compatibility but does nothing
+    // Navigation remains enabled at all times for gamepad/keyboard support
 }
 
 void CellWidget::removeParameter() {
@@ -232,8 +88,7 @@ void CellWidget::setEditBuffer(const std::string& buffer) {
         if (!editing_) {
             editing_ = true;
             // Don't call enterEditMode() here as it would re-initialize the buffer
-            // Just disable ImGui keyboard navigation
-            disableImGuiKeyboardNav();
+            // Just set editing flag - navigation remains enabled for gamepad support
         }
         // If buffer is non-empty and being restored from cache, it means user has modified it
         // This ensures subsequent characters append rather than replace
@@ -249,8 +104,7 @@ void CellWidget::setEditBuffer(const std::string& buffer, bool initialized) {
         if (!editing_) {
             editing_ = true;
             // Don't call enterEditMode() here as it would re-initialize the buffer
-            // Just disable ImGui keyboard navigation
-            disableImGuiKeyboardNav();
+            // Just set editing flag - navigation remains enabled for gamepad support
         }
         // CRITICAL: When restoring buffer from cache, we need to determine if user has modified it
         // The `initialized` flag tells us if the buffer was initialized from current value
@@ -269,69 +123,52 @@ void CellWidget::setEditBuffer(const std::string& buffer, bool initialized) {
 }
 
 void CellWidget::enterEditMode() {
+    bool wasEditing = editing_;
     editing_ = true;
     initializeEditBuffer();
     editBufferInitialized_ = true;
     bufferModifiedByUser_ = false;  // Buffer was initialized, not modified by user yet
     
-    // Disable ImGui keyboard navigation when entering edit mode
-    disableImGuiKeyboardNav();
+    // Notify GUI layer of edit mode change
+    if (!wasEditing && onEditModeChanged) {
+        onEditModeChanged(true);
+    }
 }
 
 void CellWidget::exitEditMode() {
+    bool wasEditing = editing_;
     editing_ = false;
     editBuffer_.clear();
     editBufferInitialized_ = false;
     bufferModifiedByUser_ = false;  // Reset flag when exiting edit mode
     
-    // Re-enable ImGui keyboard navigation when exiting edit mode
-    enableImGuiKeyboardNav();
+    // Notify GUI layer of edit mode change
+    if (wasEditing && onEditModeChanged) {
+        onEditModeChanged(false);
+    }
 }
 
 bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
     // Enter key behavior
     if (key == OF_KEY_RETURN) {
-        ofLogNotice("CellWidget") << "[DEBUG] handleKeyPress: Enter key pressed"
-            << ", editing_=" << (editing_ ? "YES" : "NO") << ", isSelected=" << (isSelected() ? "YES" : "NO")
-            << ", ctrlPressed=" << (ctrlPressed ? "YES" : "NO") << ", shiftPressed=" << (shiftPressed ? "YES" : "NO");
-        
         if (ctrlPressed || shiftPressed) {
             // Ctrl+Enter or Shift+Enter: Exit edit mode
-            ofLogNotice("CellWidget") << "[DEBUG] Enter with modifier: exiting edit mode";
             exitEditMode();
             return true;
         }
         
         if (editing_) {
             // In edit mode: Confirm and exit edit mode
-            ofLogNotice("CellWidget") << "[DEBUG] Enter in edit mode: confirming and exiting, editBuffer_='" << editBuffer_ << "'";
             applyValue();
-            // CRITICAL: Set refocus flag BEFORE exiting edit mode
-            // This ensures the cell maintains focus after validation
-            setShouldRefocus(true);
             exitEditMode();
-            // Note: Refocus will happen in draw() after state is synced back to GUI
-            return true;
+            // Signal refocus needed - GUI layer will handle refocus on next frame
+            // This maintains cell focus after exiting edit mode (normal cell focus, not edit mode)
+            return true;  // Return true to indicate handled, refocus will be signaled via needsRefocus
         } else if (isSelected()) {
-            // For BUTTON mode: Enter should trigger button click, not enter edit mode
-            if (cellType == CellWidgetType::BUTTON) {
-                ofLogNotice("CellWidget") << "[DEBUG] Enter on button: triggering click";
-                // Trigger button click
-                if (enableStateCycling && onButtonCycleState) {
-                    onButtonCycleState();
-                } else if (onButtonClicked) {
-                    onButtonClicked();
-                }
-                // Maintain focus after state change
-                setShouldRefocus(true);
-                return true;
-            }
-            // For SLIDER mode: Enter edit mode
-            ofLogNotice("CellWidget") << "[DEBUG] Enter on selected cell: entering edit mode";
+            // Enter edit mode
             enterEditMode();
             return true;
         }
-        ofLogNotice("CellWidget") << "[DEBUG] Enter key not handled (not editing, not selected)";
         return false;
     }
     
@@ -362,7 +199,7 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
             } else {
                 try {
                     // Try to evaluate as expression (supports operations)
-                    float floatValue = evaluateExpression(editBuffer_);
+                    float floatValue = ExpressionParser::evaluate(editBuffer_);
                     applyEditValueFloat(floatValue);
                 } catch (...) {
                     // Expression invalid - remove parameter (set to "none")
@@ -388,16 +225,10 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
     
     // Numeric input (0-9) - Blender-style: direct typing enters edit mode and replaces value
     if (key >= '0' && key <= '9') {
-        ofLogNotice("CellWidget") << "[DEBUG] handleKeyPress: Numeric key '" << (char)key << "' pressed"
-            << ", editing_=" << (editing_ ? "YES" : "NO") << ", isSelected=" << (isSelected() ? "YES" : "NO")
-            << ", editBuffer_='" << editBuffer_ << "', bufferModifiedByUser_=" << (bufferModifiedByUser_ ? "YES" : "NO")
-            << ", editBufferInitialized_=" << (editBufferInitialized_ ? "YES" : "NO");
-        
         bool justEnteredEditMode = false;
         if (!editing_) {
             // Auto-enter edit mode if cell is selected
             if (isSelected()) {
-                ofLogNotice("CellWidget") << "[DEBUG] Entering edit mode via numeric key";
                 // CRITICAL: If buffer is already set (restored from cache), don't call enterEditMode()
                 // as it would overwrite the restored buffer. Instead, just set editing_ and preserve the buffer.
                 if (editBuffer_.empty() || !bufferModifiedByUser_) {
@@ -406,13 +237,11 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
                     justEnteredEditMode = true;
                 } else {
                     // Buffer is already set (restored from cache) - just enable edit mode without reinitializing
-                    ofLogNotice("CellWidget") << "[DEBUG] Buffer already set (restored from cache), preserving it";
                     editing_ = true;
-                    disableImGuiKeyboardNav();
+                    // Navigation remains enabled for gamepad support
                     // Don't set justEnteredEditMode - we want to preserve the buffer
                 }
             } else {
-                ofLogNotice("CellWidget") << "[DEBUG] Not selected, not handling numeric key";
                 return false;  // Not selected, don't handle
             }
         }
@@ -425,16 +254,11 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
             // Only clear if buffer hasn't been modified by user yet
             // If bufferModifiedByUser_ is true, it means we're restoring from cache, so don't clear
             if (!bufferModifiedByUser_) {
-                ofLogNotice("CellWidget") << "[DEBUG] Clearing buffer: just entered edit mode (buffer not modified yet)";
                 shouldClear = true;
-            } else {
-                ofLogNotice("CellWidget") << "[DEBUG] NOT clearing buffer: just entered edit mode but buffer was already modified (restored from cache)";
             }
         } else if (isEmpty(editBuffer_)) {
-            ofLogNotice("CellWidget") << "[DEBUG] Clearing buffer: buffer is empty/placeholder";
             shouldClear = true;
         } else if (editBufferInitialized_ && !bufferModifiedByUser_) {
-            ofLogNotice("CellWidget") << "[DEBUG] Clearing buffer: initialized but not modified by user";
             shouldClear = true;
         }
         
@@ -450,26 +274,20 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
             editBuffer_ = editBuffer_.substr(editBuffer_.length() - MAX_EDIT_BUFFER_LENGTH);
         }
         
-        ofLogNotice("CellWidget") << "[DEBUG] After appending digit, editBuffer_='" << editBuffer_ << "'";
-        
         // Apply value immediately (Blender-style reactive editing)
         // Try to evaluate as expression (supports operations like "2*3", "10/2", etc.)
         if (!editBuffer_.empty()) {
             if (isEmpty(editBuffer_)) {
                 // Only dashes (e.g., "-", "--") - remove parameter (set to "none")
-                ofLogNotice("CellWidget") << "[DEBUG] Buffer is empty/placeholder, removing parameter";
                 removeParameter();
             } else {
                 try {
-                    float floatValue = evaluateExpression(editBuffer_);
-                    ofLogNotice("CellWidget") << "[DEBUG] Evaluated expression '" << editBuffer_ << "' = " << floatValue;
+                    float floatValue = ExpressionParser::evaluate(editBuffer_);
                     applyEditValueFloat(floatValue);
                 } catch (const std::exception& e) {
-                    ofLogWarning("CellWidget") << "[DEBUG] Expression evaluation failed: " << e.what() << " - treating as invalid input (NaN/--)";
                     // Invalid input - interpret as NaN/'--' (clear parameter)
                     removeParameter();
                 } catch (...) {
-                    ofLogWarning("CellWidget") << "[DEBUG] Expression evaluation failed with unknown exception - treating as invalid input (NaN/--)";
                     // Invalid input - interpret as NaN/'--' (clear parameter)
                     removeParameter();
                 }
@@ -527,14 +345,12 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
                 removeParameter();
             } else {
                 try {
-                    float floatValue = evaluateExpression(editBuffer_);
+                    float floatValue = ExpressionParser::evaluate(editBuffer_);
                     applyEditValueFloat(floatValue);
                 } catch (const std::exception& e) {
-                    ofLogWarning("CellWidget") << "[DEBUG] Expression evaluation failed: " << e.what() << " - treating as invalid input (NaN/--)";
                     // Invalid input - interpret as NaN/'--' (clear parameter)
                     removeParameter();
                 } catch (...) {
-                    ofLogWarning("CellWidget") << "[DEBUG] Expression evaluation failed - treating as invalid input (NaN/--)";
                     // Invalid input - interpret as NaN/'--' (clear parameter)
                     removeParameter();
                 }
@@ -609,7 +425,7 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
         } else {
             try {
                 // Try to evaluate as expression (supports operations)
-                float floatValue = evaluateExpression(editBuffer_);
+                float floatValue = ExpressionParser::evaluate(editBuffer_);
                 applyEditValueFloat(floatValue);
             } catch (...) {
                 // Expression invalid - remove parameter (set to "none")
@@ -897,7 +713,7 @@ bool CellWidget::parseAndApplyEditBuffer() {
         } else {
             // Try to evaluate as expression first, fall back to simple float parse
             try {
-                floatValue = evaluateExpression(editBuffer_);
+                floatValue = ExpressionParser::evaluate(editBuffer_);
             } catch (...) {
                 // Expression invalid - try simple float parse
                 try {
@@ -940,7 +756,7 @@ std::string CellWidget::getDefaultFormatValue(float value) const {
 float CellWidget::getDefaultParseValue(const std::string& str) const {
     try {
         // Try to evaluate as expression first (supports operations)
-        return evaluateExpression(str);
+        return ExpressionParser::evaluate(str);
     } catch (...) {
         // Fall back to simple float parse
         try {
@@ -973,145 +789,21 @@ CellWidgetInteraction CellWidget::draw(int uniqueId,
                                             const CellWidgetInputContext& inputContext) {
     ImGui::PushID(uniqueId);
     
-    // Get cell rect (before drawing button)
+    // Get cell rect (before drawing)
     ImVec2 cellMin = ImGui::GetCursorScreenPos();
     float cellHeight = ImGui::GetFrameHeight();
     float cellWidth = ImGui::GetColumnWidth();
     ImVec2 cellMax = ImVec2(cellMin.x + cellWidth, cellMin.y + cellHeight);
     
-    // Handle BUTTON mode vs SLIDER mode
-    CellWidgetInteraction result;
-    if (cellType == CellWidgetType::BUTTON) {
-        result = drawButtonMode(uniqueId, isFocused, shouldFocusFirst, shouldRefocusCurrentCell, cellMin, cellMax);
-        ImGui::PopID();
-        return result;
-    } else {
-        result = drawSliderMode(uniqueId, isFocused, shouldFocusFirst, shouldRefocusCurrentCell, inputContext, cellMin, cellMax);
-        ImGui::PopID();
-        return result;
-    }
-}
-
-CellWidgetInteraction CellWidget::drawButtonMode(int uniqueId, bool isFocused, bool shouldFocusFirst, bool shouldRefocusCurrentCell, const ImVec2& cellMin, const ImVec2& cellMax) {
-    CellWidgetInteraction result;
-    
-    // BUTTON mode: use button callbacks for display and interaction
-    std::string displayText = getButtonLabel ? getButtonLabel() : "";
-    bool isActive = isButtonActive ? isButtonActive() : false;
-    
-    // Set cell background to match step number button style (like drawStepNumber does)
-    static ImU32 buttonCellBgColor = GUIConstants::toU32(GUIConstants::Background::StepNumber);
-    ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, buttonCellBgColor);
-    
-    // Apply active state styling (green when active) - only push colors when active
-    // When not active, let ImGui use default button styling (like drawStepNumber does)
-    if (isActive) {
-        ImGui::PushStyleColor(ImGuiCol_Button, GUIConstants::Active::StepButton);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, GUIConstants::Active::StepButtonHover);
-    }
-    
-    ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.5f)); // Center-aligned for buttons
-    
-    // CRITICAL: Prevent ImGui from auto-focusing cells when clicking empty space
-    ImGui::PushItemFlag(ImGuiItemFlags_NoNavDefaultFocus, true);
-    
-    // Set focus on first cell if requested
-    if (shouldFocusFirst) {
-        ImGui::SetKeyboardFocusHere(0);
-    }
-    
-    // Draw button
-    bool buttonClicked = ImGui::Button(displayText.c_str(), ImVec2(-1, 0));
-    
-    // Pop the flag after creating the button
-    ImGui::PopItemFlag();
-    
-    // Refocus current cell if requested
-    bool needsRefocus = (shouldRefocusCurrentCell || shouldRefocus()) && isSelected();
-    if (needsRefocus) {
-        ImGui::SetKeyboardFocusHere(-1);
-        ImGuiIO& io = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        setShouldRefocus(false);
-    }
-    
-    // Check actual focus state after drawing
-    bool actuallyFocused = ImGui::IsItemFocused();
-    result.focusChanged = (actuallyFocused != isFocused);
-    
-    // Sync ImGui focus to selection state (like slider mode)
-    // Only sync when item was actually clicked, keyboard-navigated, or refocusing
-    if (actuallyFocused) {
-        bool itemWasClicked = ImGui::IsItemClicked(0);
-        bool keyboardNavActive = (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
-        bool needsRefocusForSync = (shouldRefocusCurrentCell || shouldRefocus()) && isSelected();
-        
-        // Only sync if this is an intentional focus (click, keyboard nav, or refocus)
-        if (itemWasClicked || keyboardNavActive || needsRefocusForSync) {
-            result.focusChanged = true;
-            setSelected(true);
-        }
-    } else {
-        // Not focused - clear selection if it was previously selected
-        // This ensures button cells don't remain focused when navigating away (to header, outside grid, etc.)
-        // CRITICAL: Check actual focus state, not just isFocused parameter (which might be stale)
-        if (isSelected() && !actuallyFocused) {
-            setSelected(false);
-            result.focusChanged = true; // Ensure focus change is reported
-        }
-    }
-    
-    // Prevent spacebar from triggering button clicks (spacebar should be global play/pause)
-    // This matches the behavior in TrackerSequencerGUI::drawStepNumber
-    bool spacebarPressed = ImGui::IsKeyPressed(ImGuiKey_Space, false);
-    
-    // Handle button click - simplified: just check buttonClicked and spacebar
-    // ImGui::Button() already handles click detection properly
-    if (buttonClicked && !spacebarPressed) {
-        result.clicked = true;
-        setSelected(true); // Ensure selection on click
-        
-        if (enableStateCycling && onButtonCycleState) {
-            // State cycling mode: call cycle callback
-            onButtonCycleState();
-        } else if (onButtonClicked) {
-            // Action trigger mode: call click callback
-            onButtonClicked();
-        }
-    }
-    
-    // Show tooltip if available
-    if (ImGui::IsItemHovered() && getButtonTooltip) {
-        std::string tooltip = getButtonTooltip();
-        if (!tooltip.empty()) {
-            ImGui::SetTooltip("%s", tooltip.c_str());
-        }
-    }
-    
-    // Pop styling (only pop colors if we pushed them)
-    ImGui::PopStyleVar();
-    if (isActive) {
-        ImGui::PopStyleColor(2);
-    }
-    
-    // Draw outline for selected/focused buttons (like slider mode)
-    bool shouldShowOutline = isSelected() || (actuallyFocused && !editing_);
-    if (shouldShowOutline) {
-        ImDrawList* drawList = ImGui::GetWindowDrawList();
-        if (drawList) {
-            ImVec2 outlineMin = ImVec2(cellMin.x - 1, cellMin.y - 1);
-            ImVec2 outlineMax = ImVec2(cellMax.x + 1, cellMax.y + 1);
-            // Red outline for selected/focused buttons (buttons don't have edit mode, so always red)
-            ImU32 outlineColor = getRedOutlineColor();
-            drawList->AddRect(outlineMin, outlineMax, outlineColor, 0.0f, 0, 2.0f);
-        }
-    }
-    
+    // Draw slider mode (only mode supported)
+    CellWidgetInteraction result = drawSliderMode(uniqueId, isFocused, shouldFocusFirst, shouldRefocusCurrentCell, inputContext, cellMin, cellMax);
+    ImGui::PopID();
     return result;
 }
 
 CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, bool shouldFocusFirst, bool shouldRefocusCurrentCell, const CellWidgetInputContext& inputContext, const ImVec2& cellMin, const ImVec2& cellMax) {
     CellWidgetInteraction result;
+    bool wasEditingBeforeInput = editing_;  // Track if we were editing before this draw call
     
     // SLIDER mode (original implementation)
     // Get current value for display
@@ -1167,32 +859,47 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
     // Pop the flag after creating the button
     ImGui::PopItemFlag();
     
-    // Refocus current cell after exiting edit mode
-    // Use either the passed parameter OR the internal flag (set when Enter exits edit mode)
-    // This unifies refocus logic - GUI classes can pass shouldRefocusCurrentCell, or ParameterCell
-    // will automatically refocus if it set the internal shouldRefocus flag
-        bool needsRefocus = (shouldRefocusCurrentCell || shouldRefocus()) && isSelected();
-    if (needsRefocus) {
-        ImGui::SetKeyboardFocusHere(-1);
-        ImGuiIO& io = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        // Clear internal flag after using it (only clear if we actually refocused)
-        setShouldRefocus(false);
-    }
+    // Check for activation (mouse click OR gamepad/keyboard activation)
+    // IsItemActivated() works for both mouse clicks and gamepad "A" button / keyboard Enter
+    bool isActivated = ImGui::IsItemActivated();
     
-    // Prevent spacebar from triggering button clicks
+    // Prevent spacebar and Enter from triggering button clicks
     bool spacebarPressed = ImGui::IsKeyPressed(ImGuiKey_Space, false);
+    bool enterPressed = ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
     
     // Check actual focus state after drawing (ImGui::IsItemFocused() works for last item)
     bool actuallyFocused = ImGui::IsItemFocused();
     
-    // Handle keyboard input directly in draw() when item is focused
-    // CRITICAL: When in edit mode, always process input (even if not focused) to allow multi-character input
-    // When not in edit mode, process input if cell is selected (selection indicates cell should accept input)
-    // The handleInputInDraw function has its own logic to handle focus state correctly
-    // This ensures input works immediately after Enter validates, even if ImGui focus hasn't been restored yet
-    if (isSelected()) {
-        handleInputInDraw(actuallyFocused, inputContext);
+    // Handle activation (mouse click OR gamepad activation)
+    // NOTE: Mouse clicks should only focus the cell, not enter edit mode
+    // Enter key and typing will enter edit mode via processInputInDraw()
+    // CRITICAL: Ignore button activation if Enter is pressed - Enter should only enter/edit mode, not trigger button click
+    if (isActivated && !editing_ && !spacebarPressed && !enterPressed) {
+        // Mouse click or gamepad "A" button - just signal click, don't enter edit mode
+        // GUI layer will handle focus, Enter key or typing will enter edit mode
+        result.clicked = true;
+    }
+    
+    // Process keyboard input for this cell
+    // CRITICAL: Process input if cell is selected, focused, or in edit mode
+    // This handles Enter key, typing, and all other keyboard input
+    // Allow processing if selected OR focused (for direct typing on focused cell)
+    if (isSelected() || actuallyFocused || editing_) {
+        processInputInDraw(actuallyFocused);
+    }
+    
+    // Check if we just exited edit mode via Enter (was editing, now not editing)
+    // Signal refocus needed for next frame via interaction result
+    if (wasEditingBeforeInput && !editing_ && isSelected()) {
+        result.needsRefocus = true;
+    }
+    
+    // Refocus current cell after exiting edit mode
+    // This happens AFTER input processing so it works when Enter is handled during draw
+    // GUI layer passes shouldRefocusCurrentCell when refocus is needed (from previous frame's interaction.needsRefocus)
+    if (shouldRefocusCurrentCell && isSelected()) {
+        ImGui::SetKeyboardFocusHere(-1);
+        // NOTE: Navigation flags are already enabled (we don't disable them anymore)
     }
     
     // Handle drag state (Blender-style: works across entire window)
@@ -1236,8 +943,7 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
     if (actuallyFocused) {
         bool itemWasClicked = ImGui::IsItemClicked(0);
         bool keyboardNavActive = (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
-        // Use either the passed parameter OR the internal flag (unified refocus logic)
-        bool needsRefocus = (shouldRefocusCurrentCell || shouldRefocus()) && isSelected();
+        bool needsRefocus = shouldRefocusCurrentCell && isSelected();
         
         // Only sync if this is an intentional focus (click, keyboard nav, or refocus)
         if (itemWasClicked || keyboardNavActive || needsRefocus) {
@@ -1262,8 +968,9 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
     }
     
     // Handle click
+    // CRITICAL: Ignore button clicks when Enter is pressed - Enter should only enter/edit mode, not trigger button click
     bool isItemClicked = ImGui::IsItemClicked(0);
-    if (buttonClicked && !ImGui::IsMouseDragging(0) && !spacebarPressed && isItemClicked) {
+    if (buttonClicked && !ImGui::IsMouseDragging(0) && !spacebarPressed && !enterPressed && isItemClicked) {
         result.clicked = true;
         setSelected(true);
         // DON'T enter edit mode on click - just focus the cell
@@ -1323,254 +1030,134 @@ void CellWidget::drawVisualFeedback(const ImVec2& cellMin, const ImVec2& cellMax
     }
 }
 
-void CellWidget::handleInputInDraw(bool actuallyFocused, const CellWidgetInputContext& inputContext) {
-    // Handle keyboard input directly in draw() when item is focused
-    // This eliminates the need for state synchronization and makes ParameterCell self-contained
-    // CRITICAL: Process input if:
-    // - Cell is selected (selection indicates cell should accept input, even if not focused yet)
-    // - Cell is in edit mode (always process input in edit mode)
-    // - Cell is actually focused (ImGui focus)
-    // This ensures input works immediately after Enter validates, even if ImGui focus hasn't been restored yet
+void CellWidget::processInputInDraw(bool actuallyFocused) {
+    // Process keyboard input directly in draw() when cell is selected or editing
+    // This makes CellWidget self-contained and reusable across all modules
+    
+    // Early exit if not selected, not editing, and not focused
     if (!isSelected() && !editing_ && !actuallyFocused) {
-        return;  // Not selected, not editing, and not focused - don't process input
+        return;
     }
     
-        ImGuiIO& io = ImGui::GetIO();
-        
-        // Helper lambda to convert ImGui key to OF_KEY code
-        auto convertImGuiKeyToOF = [](ImGuiKey imguiKey) -> int {
-            switch (imguiKey) {
-                case ImGuiKey_Enter: return OF_KEY_RETURN;
-                case ImGuiKey_KeypadEnter: return OF_KEY_RETURN;
-                case ImGuiKey_Escape: return OF_KEY_ESC;
-                case ImGuiKey_Backspace: return OF_KEY_BACKSPACE;
-                case ImGuiKey_Delete: return OF_KEY_DEL;
-                case ImGuiKey_UpArrow: return OF_KEY_UP;
-                case ImGuiKey_DownArrow: return OF_KEY_DOWN;
-                case ImGuiKey_LeftArrow: return OF_KEY_LEFT;
-                case ImGuiKey_RightArrow: return OF_KEY_RIGHT;
-                default: return 0;
-            }
-        };
-        
-    // Use frame counter from input context to prevent processing keys multiple times
-    // Frame tracking is per-grid instance (managed by CellGrid), allowing multiple grids to work independently
-    // If no context provided (pointers are null), process keys normally (backward compatibility)
-    int currentFrame = inputContext.currentFrame >= 0 ? inputContext.currentFrame : ofGetFrameNum();
-    bool shouldProcessInputQueue = (!inputContext.lastProcessedInputQueueFrame || currentFrame != *inputContext.lastProcessedInputQueueFrame);
-    bool inputQueueProcessed = false;  // Track if we processed InputQueueCharacters this frame
-        
-        // CRITICAL: Process InputQueueCharacters FIRST (before keypad keys) to avoid double-processing
-        // Numpad keys can appear in both InputQueueCharacters AND as keypad key codes
-        // We process InputQueueCharacters first, then skip keypad key processing if we already processed input this frame
-        if (io.InputQueueCharacters.Size > 0 && shouldProcessInputQueue) {
-        ofLogNotice("CellWidget") << "[DEBUG] InputQueueCharacters.Size=" << io.InputQueueCharacters.Size << ", currentFrame=" << currentFrame;
-        if (inputContext.lastProcessedInputQueueFrame) {
-            *inputContext.lastProcessedInputQueueFrame = currentFrame;  // Mark this frame as processed for InputQueueCharacters
+    ImGuiIO& io = ImGui::GetIO();
+    
+    // Check if ImGui navigation is active (gamepad/keyboard nav)
+    bool navActive = (io.NavActive && (io.ConfigFlags & (ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad)));
+    
+    // CRITICAL: Check for Enter key BEFORE navigation check
+    // Enter should enter/edit mode even when navigation is active
+    bool enterPressed = (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
+    if (enterPressed && isSelected()) {
+        bool ctrlPressed = io.KeyCtrl;
+        bool shiftPressed = io.KeyShift;
+        if (this->handleKeyPress(OF_KEY_RETURN, ctrlPressed, shiftPressed)) {
+            return;  // Handled
         }
-        if (inputContext.lastProcessedFrame) {
-            *inputContext.lastProcessedFrame = currentFrame;  // Also mark general key processing to skip keypad keys
-        }
-        inputQueueProcessed = true;  // Mark that we processed InputQueueCharacters
+    }
+    
+    // Process InputQueueCharacters (typed characters) - this should work even when navigation is active
+    // Direct typing should auto-enter edit mode, so we process it before the navigation check
+    bool inputQueueProcessed = false;
+    if (io.InputQueueCharacters.Size > 0) {
+        inputQueueProcessed = true;
+        
+        for (int i = 0; i < io.InputQueueCharacters.Size; i++) {
+            unsigned int c = io.InputQueueCharacters[i];
+            bool handled = false;
             
-            // Process each character only once
-            for (int i = 0; i < io.InputQueueCharacters.Size; i++) {
-                unsigned int c = io.InputQueueCharacters[i];
-                ofLogNotice("CellWidget") << "[DEBUG] Processing character '" << (char)c << "' (" << (int)c << ") from InputQueueCharacters[" << i << "]";
-                bool handled = false;
-                
-                // Check for numeric keys (0-9)
-                if (c >= '0' && c <= '9') {
-                    ofLogNotice("CellWidget") << "[DEBUG] Numeric character '" << (char)c << "' detected, calling handleKeyPress";
-                    handled = handleKeyPress((int)c, false, false);
-                    ofLogNotice("CellWidget") << "[DEBUG] handleKeyPress returned " << (handled ? "true" : "false");
-                }
-                // Check for decimal point
-                else if (c == '.' || c == ',') {  // Some keyboards use comma as decimal
-                    ofLogNotice("CellWidget") << "[DEBUG] Decimal point detected, calling handleKeyPress";
-                    handled = handleKeyPress('.', false, false);
-                }
-                // Check for minus sign
-                else if (c == '-') {
-                    ofLogNotice("CellWidget") << "[DEBUG] Minus sign detected, calling handleKeyPress";
-                    handled = handleKeyPress('-', false, false);
-                }
-                // Check for operators (only in edit mode)
-                else if (editing_) {
-                    if (c == '+') {
-                        handled = handleKeyPress('+', false, false);
-                    } else if (c == '*') {
-                        handled = handleKeyPress('*', false, false);
-                    } else if (c == '/') {
-                        handled = handleKeyPress('/', false, false);
+            // Check for numeric keys (0-9) - these should auto-enter edit mode
+            if (c >= '0' && c <= '9') {
+                handled = this->handleKeyPress((int)c, false, false);
+            }
+            // Check for decimal point
+            else if (c == '.' || c == ',') {
+                handled = this->handleKeyPress('.', false, false);
+            }
+            // Check for minus sign
+            else if (c == '-') {
+                handled = this->handleKeyPress('-', false, false);
+            }
+            // Check for operators (only in edit mode)
+            else if (editing_) {
+                if (c == '+') {
+                    handled = this->handleKeyPress('+', false, false);
+                } else if (c == '*') {
+                    handled = this->handleKeyPress('*', false, false);
+                } else if (c == '/') {
+                    handled = this->handleKeyPress('/', false, false);
                 } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
-                        // Invalid character (letter) - treat as invalid input, clear parameter
-                        ofLogNotice("CellWidget") << "[DEBUG] Invalid character (letter) '" << (char)c << "' detected - treating as invalid input (NaN/--)";
-                        if (editing_) {
-                            // Clear buffer and remove parameter
-                            editBuffer_.clear();
-                            removeParameter();
-                            handled = true;
-                        }
-                    }
-            } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
-                    // Invalid character (letter) when not in edit mode - ignore
-                    ofLogNotice("CellWidget") << "[DEBUG] Invalid character (letter) '" << (char)c << "' detected but not in edit mode - ignoring";
-                    handled = true;  // Consume the event to prevent other handlers
+                    // Invalid character (letter) - clear parameter
+                    this->removeParameter();
+                    handled = true;
                 }
+            } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+                // Invalid character (letter) when not in edit mode - ignore
+                handled = true;  // Consume the event
+            }
+        }
+        
+        // Clear InputQueueCharacters after processing
+        io.InputQueueCharacters.clear();
+    }
+    
+    // If navigation is active and not editing, let ImGui handle navigation
+    // BUT: Only skip if we haven't processed typed characters (typing should work)
+    if (!editing_ && navActive && !inputQueueProcessed) {
+        return;  // Let ImGui handle navigation (gamepad/keyboard nav)
+    }
+    
+    // Process special keys (only if not already processed via InputQueueCharacters)
+        if (!inputQueueProcessed) {
+            // Escape key - only when in edit mode
+            if (editing_ && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                this->handleKeyPress(OF_KEY_ESC, false, false);
             }
             
-            // CRITICAL: Clear InputQueueCharacters after processing to prevent double-processing
-            // This ensures each character is only processed once, even if draw() is called multiple times
-            io.InputQueueCharacters.clear();
-        } else if (io.InputQueueCharacters.Size > 0) {
-        ofLogNotice("CellWidget") << "[DEBUG] Skipping InputQueueCharacters processing - already processed this frame (currentFrame=" << currentFrame << ")";
-            // Still clear it to prevent other widgets from processing it
-            io.InputQueueCharacters.clear();
-        }
-        
-        // Recalculate shouldProcessKeys after potentially processing InputQueueCharacters
-        // This ensures keypad keys are not processed if InputQueueCharacters was already processed
-        bool shouldProcessKeys = (!inputContext.lastProcessedFrame || currentFrame != *inputContext.lastProcessedFrame) && !inputQueueProcessed;
-        
-        // Check for Enter key (Enter or KeypadEnter) - only if we haven't processed InputQueueCharacters this frame
-        if (shouldProcessKeys && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))) {
-            ofLogNotice("CellWidget") << "[DEBUG] Enter key pressed in draw()";
-        if (inputContext.lastProcessedFrame) {
-            *inputContext.lastProcessedFrame = currentFrame;  // Mark this frame as processed
-        }
-            bool ctrlPressed = io.KeyCtrl;
-            bool shiftPressed = io.KeyShift;
-            int key = convertImGuiKeyToOF(ImGuiKey_Enter);
-            if (handleKeyPress(key, ctrlPressed, shiftPressed)) {
-                ofLogNotice("CellWidget") << "[DEBUG] Enter key handled";
-            } else {
-                ofLogWarning("CellWidget") << "[DEBUG] Enter key NOT handled";
+            // Backspace key
+            if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) {
+                this->handleKeyPress(OF_KEY_BACKSPACE, false, false);
             }
-        }
-        
-        // Check for Escape key - only when in edit mode
-        // IMPORTANT: Only process ESC when actually in edit mode. When NOT in edit mode, let ESC pass through
-        // to ImGui so it can use ESC to escape contained navigation contexts (like scrollable tables)
-        if (shouldProcessKeys && editing_ && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-            ofLogNotice("CellWidget") << "[DEBUG] Escape key pressed in draw() (in edit mode)";
-        if (inputContext.lastProcessedFrame) {
-            *inputContext.lastProcessedFrame = currentFrame;  // Mark this frame as processed
-        }
-            if (handleKeyPress(OF_KEY_ESC, false, false)) {
-                ofLogNotice("CellWidget") << "[DEBUG] Escape key handled";
-            }
-        }
-        // NOT in edit mode: ESC will pass through to ImGui for navigation escape
-        
-        // Check for Backspace key
-        if (shouldProcessKeys && ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) {
-            ofLogNotice("CellWidget") << "[DEBUG] Backspace key pressed in draw()";
-        if (inputContext.lastProcessedFrame) {
-            *inputContext.lastProcessedFrame = currentFrame;  // Mark this frame as processed
-        }
-            if (handleKeyPress(OF_KEY_BACKSPACE, false, false)) {
-                ofLogNotice("CellWidget") << "[DEBUG] Backspace key handled";
-            }
-        }
-        
-        // Check for Delete key
-        if (shouldProcessKeys && ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
-            ofLogNotice("CellWidget") << "[DEBUG] Delete key pressed in draw()";
-        if (inputContext.lastProcessedFrame) {
-            *inputContext.lastProcessedFrame = currentFrame;  // Mark this frame as processed
-        }
-            if (handleKeyPress(OF_KEY_DEL, false, false)) {
-                ofLogNotice("CellWidget") << "[DEBUG] Delete key handled";
-            }
-        }
-        
-        // Also check for keypad keys using key codes (for numpad support)
-        // CRITICAL: Only process keypad keys if we haven't already processed InputQueueCharacters this frame
-        // This prevents double-processing when numpad keys appear in both InputQueueCharacters AND as keypad key codes
-        if (shouldProcessKeys && (ImGui::IsKeyPressed(ImGuiKey_Keypad0, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad1, false) ||
-            ImGui::IsKeyPressed(ImGuiKey_Keypad2, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad3, false) ||
-            ImGui::IsKeyPressed(ImGuiKey_Keypad4, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad5, false) ||
-            ImGui::IsKeyPressed(ImGuiKey_Keypad6, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad7, false) ||
-            ImGui::IsKeyPressed(ImGuiKey_Keypad8, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad9, false))) {
-            // Map keypad keys to character codes
-            int keypadChar = 0;
-            if (ImGui::IsKeyPressed(ImGuiKey_Keypad0, false)) keypadChar = '0';
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad1, false)) keypadChar = '1';
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad2, false)) keypadChar = '2';
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad3, false)) keypadChar = '3';
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad4, false)) keypadChar = '4';
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad5, false)) keypadChar = '5';
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad6, false)) keypadChar = '6';
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad7, false)) keypadChar = '7';
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad8, false)) keypadChar = '8';
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad9, false)) keypadChar = '9';
             
-            if (keypadChar > 0) {
-                ofLogNotice("CellWidget") << "[DEBUG] Keypad key '" << (char)keypadChar << "' detected (not in InputQueueCharacters), calling handleKeyPress";
-                handleKeyPress(keypadChar, false, false);
-            if (inputContext.lastProcessedFrame) {
-                *inputContext.lastProcessedFrame = currentFrame;  // Mark this frame as processed
+            // Delete key
+            if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
+                this->handleKeyPress(OF_KEY_DEL, false, false);
             }
+            
+            // Keypad keys (for numpad support)
+            if (ImGui::IsKeyPressed(ImGuiKey_Keypad0, false)) this->handleKeyPress('0', false, false);
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad1, false)) this->handleKeyPress('1', false, false);
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad2, false)) this->handleKeyPress('2', false, false);
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad3, false)) this->handleKeyPress('3', false, false);
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad4, false)) this->handleKeyPress('4', false, false);
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad5, false)) this->handleKeyPress('5', false, false);
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad6, false)) this->handleKeyPress('6', false, false);
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad7, false)) this->handleKeyPress('7', false, false);
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad8, false)) this->handleKeyPress('8', false, false);
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad9, false)) this->handleKeyPress('9', false, false);
+            else if (ImGui::IsKeyPressed(ImGuiKey_KeypadDecimal, false)) this->handleKeyPress('.', false, false);
+            
+            if (editing_) {
+                if (ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false)) this->handleKeyPress('+', false, false);
+                if (ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false)) this->handleKeyPress('-', false, false);
+                if (ImGui::IsKeyPressed(ImGuiKey_KeypadMultiply, false)) this->handleKeyPress('*', false, false);
+                if (ImGui::IsKeyPressed(ImGuiKey_KeypadDivide, false)) this->handleKeyPress('/', false, false);
             }
-        }
-        
-        // Check for keypad decimal and operators - only if we haven't processed input this frame
-        if (shouldProcessKeys && ImGui::IsKeyPressed(ImGuiKey_KeypadDecimal, false)) {
-            ofLogNotice("CellWidget") << "[DEBUG] Keypad decimal detected (not in InputQueueCharacters), calling handleKeyPress";
-            handleKeyPress('.', false, false);
-        if (inputContext.lastProcessedFrame) {
-            *inputContext.lastProcessedFrame = currentFrame;  // Mark this frame as processed
-        }
-        }
-        if (shouldProcessKeys && editing_) {
-            if (ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false)) {
-                ofLogNotice("CellWidget") << "[DEBUG] Keypad add detected (not in InputQueueCharacters), calling handleKeyPress";
-                handleKeyPress('+', false, false);
-            if (inputContext.lastProcessedFrame) {
-                *inputContext.lastProcessedFrame = currentFrame;  // Mark this frame as processed
-            }
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false)) {
-                ofLogNotice("CellWidget") << "[DEBUG] Keypad subtract detected (not in InputQueueCharacters), calling handleKeyPress";
-                handleKeyPress('-', false, false);
-            if (inputContext.lastProcessedFrame) {
-                *inputContext.lastProcessedFrame = currentFrame;  // Mark this frame as processed
-            }
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_KeypadMultiply, false)) {
-                ofLogNotice("CellWidget") << "[DEBUG] Keypad multiply detected (not in InputQueueCharacters), calling handleKeyPress";
-                handleKeyPress('*', false, false);
-            if (inputContext.lastProcessedFrame) {
-                *inputContext.lastProcessedFrame = currentFrame;  // Mark this frame as processed
-            }
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_KeypadDivide, false)) {
-                ofLogNotice("CellWidget") << "[DEBUG] Keypad divide detected (not in InputQueueCharacters), calling handleKeyPress";
-                handleKeyPress('/', false, false);
-            if (inputContext.lastProcessedFrame) {
-                *inputContext.lastProcessedFrame = currentFrame;  // Mark this frame as processed
-            }
-            }
-        }
-        
-        // Check for arrow keys in edit mode (adjust values)
-        // Use IsKeyDown with repeat support for held keys (quick edits)
-        if (editing_) {
-            bool shiftPressed = io.KeyShift;
-            // Use IsKeyDown for repeat support when key is held
-            // This allows quick value adjustments by holding arrow keys
-            if (ImGui::IsKeyDown(ImGuiKey_UpArrow)) {
-                handleKeyPress(OF_KEY_UP, false, shiftPressed);
-            }
-            if (ImGui::IsKeyDown(ImGuiKey_DownArrow)) {
-                handleKeyPress(OF_KEY_DOWN, false, shiftPressed);
-            }
-            if (ImGui::IsKeyDown(ImGuiKey_LeftArrow)) {
-                handleKeyPress(OF_KEY_LEFT, false, shiftPressed);
-            }
-            if (ImGui::IsKeyDown(ImGuiKey_RightArrow)) {
-                handleKeyPress(OF_KEY_RIGHT, false, shiftPressed);
+            
+            // Arrow keys in edit mode (adjust values)
+            if (editing_) {
+                bool shiftPressed = io.KeyShift;
+                if (ImGui::IsKeyDown(ImGuiKey_UpArrow)) {
+                    this->handleKeyPress(OF_KEY_UP, false, shiftPressed);
+                }
+                if (ImGui::IsKeyDown(ImGuiKey_DownArrow)) {
+                    this->handleKeyPress(OF_KEY_DOWN, false, shiftPressed);
+                }
+                if (ImGui::IsKeyDown(ImGuiKey_LeftArrow)) {
+                    this->handleKeyPress(OF_KEY_LEFT, false, shiftPressed);
+                }
+                if (ImGui::IsKeyDown(ImGuiKey_RightArrow)) {
+                    this->handleKeyPress(OF_KEY_RIGHT, false, shiftPressed);
+                }
             }
         }
 }
@@ -1605,8 +1192,7 @@ void CellWidget::startDrag() {
         lastDragValue_ = defaultValue;
     }
     
-    // Disable keyboard navigation during drag
-    disableImGuiKeyboardNav();
+    // NOTE: Navigation remains enabled - drag is mouse-based and doesn't conflict with gamepad
 }
 
 void CellWidget::updateDrag() {
@@ -1683,8 +1269,7 @@ void CellWidget::endDrag() {
     dragStartX_ = 0.0f;
     lastDragValue_ = 0.0f;
     
-    // Re-enable keyboard navigation when drag ends
-    enableImGuiKeyboardNav();
+    // NOTE: Navigation remains enabled - no need to re-enable
 }
 
 void CellWidget::applyDragValue(float newValue) {

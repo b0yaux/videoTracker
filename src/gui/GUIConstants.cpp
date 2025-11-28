@@ -86,8 +86,9 @@ namespace GUIConstants {
         style.Colors[ImGuiCol_Text] = Text::Default;
         style.Colors[ImGuiCol_TextDisabled] = Text::Disabled;
         
-        // Borders
-        style.Colors[ImGuiCol_Border] = Border::Default;
+        // Borders - Enable native window borders
+        style.WindowBorderSize = 1.0f;  // Enable borders (works for both docked and undocked windows)
+        style.Colors[ImGuiCol_Border] = Border::Default;  // Default border color
         style.Colors[ImGuiCol_BorderShadow] = Border::Shadow;
     }
     

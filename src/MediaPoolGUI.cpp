@@ -6,6 +6,7 @@
 #include "core/ModuleRegistry.h"
 #include "gui/GUIConstants.h"
 #include "gui/MediaPreview.h"
+#include "gui/GUIManager.h"
 #include <limits>
 
 MediaPoolGUI::MediaPoolGUI() 
@@ -130,10 +131,12 @@ void MediaPoolGUI::drawContent() {
     
     drawDirectoryControls();
     
-    // Set up drag & drop target on the child window (must be called before EndChild)
-    setupDragDropTarget();
-    
     ImGui::EndChild(); // End MediaPoolContent
+    
+    // Set up drag & drop target on the main window (covers entire panel)
+    // Must be called after all content is drawn, like AssetLibraryGUI does
+    // This ensures the yellow highlight appears and drops work properly
+    setupDragDropTarget();
 }
 
 void MediaPoolGUI::drawDirectoryControls() {
@@ -254,7 +257,10 @@ CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor&
         // Map slider value back to actual seconds
         cell.onValueApplied = [this, paramDesc, MIN_LOOP_SIZE, MAX_LOOP_SIZE](const std::string&, float sliderValue) {
             MediaPool* pool = getMediaPool();
-            if (!pool) return;
+            if (!pool) {
+                ofLogWarning("MediaPoolGUI") << "[CRASH PREVENTION] MediaPool is null in setValue callback for parameter: " << paramDesc.name;
+                return;
+            }
             
             // Clamp slider value to [0.0, 1.0]
             sliderValue = std::max(0.0f, std::min(1.0f, sliderValue));
@@ -264,7 +270,7 @@ CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor&
             float actualValue = MIN_LOOP_SIZE * std::pow(MAX_LOOP_SIZE / MIN_LOOP_SIZE, sliderValue);
             
             // Clamp to actual duration if available
-            auto activePlayer = getMediaPool()->getActivePlayer();
+            auto activePlayer = pool->getActivePlayer();
             if (activePlayer) {
                 float duration = activePlayer->getDuration();
                 if (duration > 0.001f) {
@@ -272,10 +278,11 @@ CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor&
                 }
             }
             
-            getMediaPool()->setParameter(paramDesc.name, actualValue, true);
+            pool->setParameter(paramDesc.name, actualValue, true);
         };
         
         // Format display value: show actual seconds with appropriate precision
+        // NOTE: No "s" suffix - keeps parsing simple and standard (no custom parseValue needed)
         cell.formatValue = [MIN_LOOP_SIZE, MAX_LOOP_SIZE](float sliderValue) -> std::string {
             // Map slider value to actual seconds for display
             sliderValue = std::max(0.0f, std::min(1.0f, sliderValue));
@@ -286,11 +293,11 @@ CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor&
             // - 4 decimals for values < 0.1s (100ms)
             // - 3 decimals for values >= 0.1s
             if (actualValue < 0.01f) {
-                return ofToString(actualValue, 5) + "s";
+                return ofToString(actualValue, 5);
             } else if (actualValue < 0.1f) {
-                return ofToString(actualValue, 4) + "s";
+                return ofToString(actualValue, 4);
             } else {
-                return ofToString(actualValue, 3) + "s";
+                return ofToString(actualValue, 3);
             }
         };
     } else {
@@ -313,7 +320,13 @@ CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor&
 // ParameterDescriptor : Returns a vector of ParameterDescriptor objects representing editable parameters.
 // Parameters named "note" are excluded from the returned vector.
 std::vector<ParameterDescriptor> MediaPoolGUI::getEditableParameters() const {
-    auto params = getMediaPool()->getParameters();
+    MediaPool* pool = getMediaPool();
+    if (!pool) {
+        ofLogWarning("MediaPoolGUI") << "[CRASH PREVENTION] MediaPool is null in getEditableParameters()";
+        return std::vector<ParameterDescriptor>(); // Return empty vector
+    }
+    
+    auto params = pool->getParameters();
     std::vector<ParameterDescriptor> editableParams;
     for (const auto& param : params) {
         if (param.name != "note") {
@@ -376,7 +389,7 @@ void MediaPoolGUI::drawParameters() {
     anyCellFocusedThisFrame = false;
     
     // Use versioned table ID to reset column order if needed (change version number to force reset)
-    static int tableVersion = 2; // Increment this to reset all saved column settings (v2: added STYLE column)
+    static int tableVersion = 3; // Increment this to reset all saved column settings (v2: added STYLE column, v3: reordered polyphonyMode after playStyle)
     std::string tableId = "MediaPoolParameters_v" + std::to_string(tableVersion);
     
     // Configure CellGrid
@@ -389,19 +402,28 @@ void MediaPoolGUI::drawParameters() {
     cellGrid.enableReordering(true);
         
     // Convert editableParams to CellGrid column configuration
-    // Add Index and Play style as regular columns at the beginning
+    // Add Index, Play style, and Polyphony mode as regular columns at the beginning
     std::vector<CellGridColumnConfig> tableColumnConfig;
     // Add Index column (not removable, not draggable)
     tableColumnConfig.push_back(CellGridColumnConfig("mediaIndex", "Index", false, 0, false));
     // Add Play style column (not removable, not draggable)
     tableColumnConfig.push_back(CellGridColumnConfig("playStyle", "Play style", false, 1, false));
-    // Add all editable parameters (all removable)
+    // Add Polyphony mode column (not removable, not draggable)
+    tableColumnConfig.push_back(CellGridColumnConfig("polyphonyMode", "Polyphony", false, 2, false));
+    // Add all editable parameters (all removable), skipping polyphonyMode since it's already added
     for (const auto& paramDesc : editableParams) {
+        // Skip polyphonyMode since it's already added as a fixed column
+        if (paramDesc.name == "polyphonyMode") {
+            continue;
+        }
         tableColumnConfig.push_back(CellGridColumnConfig(
             paramDesc.name, paramDesc.displayName, true, 0));  // isRemovable = true for all parameters
         }
     cellGrid.setColumnConfiguration(tableColumnConfig);
     cellGrid.setAvailableParameters(editableParams);
+    
+    // Clear special column widget cache when column configuration changes
+    specialColumnWidgetCache.clear();
     
     // Setup callbacks for CellGrid
     CellGridCallbacks callbacks;
@@ -422,11 +444,9 @@ void MediaPoolGUI::drawParameters() {
         // Use parameter name directly from colConfig - no need to search through all parameters
         const std::string& paramName = colConfig.parameterName;
         
-        // Handle special button columns
-        if (paramName == "mediaIndex") {
-            return createMediaIndexButtonWidget(col);
-        } else if (paramName == "playStyle") {
-            return createPlayStyleButtonWidget(col);
+        // Skip button columns - they use drawSpecialColumn for direct ImGui::Button() calls (better performance)
+        if (paramName == "mediaIndex" || paramName == "playStyle" || paramName == "polyphonyMode") {
+            return CellWidget(); // Empty widget - won't be used
         }
         
         // Skip "note" parameter (not editable in GUI, only used internally)
@@ -444,12 +464,13 @@ void MediaPoolGUI::drawParameters() {
         }
         return CellWidget(); // Return empty cell if not found
     };
+    callbacks.drawSpecialColumn = nullptr; // Will be set after all other callbacks are defined
     callbacks.getCellValue = [this, pool](int row, int col, const CellGridColumnConfig& colConfig) -> float {
         // Use parameter name directly from colConfig - no index conversion needed
         const std::string& paramName = colConfig.parameterName;
         
         // Handle special button columns (return 0.0f as they don't have numeric values)
-        if (paramName == "mediaIndex" || paramName == "playStyle") {
+        if (paramName == "mediaIndex" || paramName == "playStyle" || paramName == "polyphonyMode") {
             return 0.0f;
         }
         
@@ -492,7 +513,7 @@ void MediaPoolGUI::drawParameters() {
         const std::string& paramName = colConfig.parameterName;
         
         // Skip button columns (they handle their own state changes)
-        if (paramName == "mediaIndex" || paramName == "playStyle") {
+        if (paramName == "mediaIndex" || paramName == "playStyle" || paramName == "polyphonyMode") {
             return;
         }
         
@@ -511,9 +532,9 @@ void MediaPoolGUI::drawParameters() {
         // col is now absolute column index
         bool isSelected = (editingColumnIndex == col);
         cell.setSelected(isSelected);
-        cell.setEditing(isEditingParameter && isSelected);
+        cell.setEditing(isEditingParameter_ && isSelected);
         
-        if (isEditingParameter && isSelected) {
+        if (isEditingParameter_ && isSelected) {
             cell.setEditBuffer(editBufferCache, editBufferInitializedCache);
         }
             
@@ -541,8 +562,8 @@ void MediaPoolGUI::drawParameters() {
                 anyCellFocusedThisFrame = true;
                 isParentWidgetFocused = false;
                 
-                if (previousColumn != col && isEditingParameter) {
-                    isEditingParameter = false;
+                if (previousColumn != col && isEditingParameter_) {
+                    isEditingParameter_ = false;
                     editBufferCache.clear();
                     editBufferInitializedCache = false;
                 }
@@ -551,7 +572,7 @@ void MediaPoolGUI::drawParameters() {
             if (interaction.clicked) {
                 editingParameter = paramName;
                 editingColumnIndex = col;  // Use absolute column index directly
-                isEditingParameter = false;
+                isEditingParameter_ = false;
                 anyCellFocusedThisFrame = true;
                 isParentWidgetFocused = false;
             }
@@ -572,16 +593,17 @@ void MediaPoolGUI::drawParameters() {
             
             // Sync edit mode state
         if (cell.isEditingMode()) {
-                isEditingParameter = true;
+                isEditingParameter_ = true;
             editBufferCache = cell.getEditBuffer();
             editBufferInitializedCache = cell.isEditBufferInitialized();
             anyCellFocusedThisFrame = true;
-        } else if (isEditingParameter && isSelected && !cell.isEditingMode()) {
-                isEditingParameter = false;
+        } else if (isEditingParameter_ && isSelected && !cell.isEditingMode()) {
+                isEditingParameter_ = false;
                 editBufferCache.clear();
                 editBufferInitializedCache = false;
             
-            if (cell.shouldRefocus() && isSelected) {
+            // Check if cell needs refocus (signaled via interaction.needsRefocus)
+            if (interaction.needsRefocus && isSelected) {
                 shouldRefocusCurrentCell = true;
                 anyCellFocusedThisFrame = true;  // ADD THIS: Prevent focus from being cleared
             }
@@ -623,7 +645,273 @@ void MediaPoolGUI::drawParameters() {
             return false; // Let CellGrid handle default rendering
         }
         };
-        cellGrid.setCallbacks(callbacks);
+    
+    // Now set drawSpecialColumn after all other callbacks are defined
+    // Capture callbacks by value to avoid dangling references
+    auto getCellValueCallback = callbacks.getCellValue;
+    auto setCellValueCallback = callbacks.setCellValue;
+    auto createCellWidgetCallback = callbacks.createCellWidget;
+    auto isCellFocusedCallback = callbacks.isCellFocused;
+    auto syncStateToCellCallback = callbacks.syncStateToCell;
+    auto syncStateFromCellCallback = callbacks.syncStateFromCell;
+    auto onCellFocusChangedCallback = callbacks.onCellFocusChanged;
+    auto onCellClickedCallback = callbacks.onCellClicked;
+    
+    callbacks.drawSpecialColumn = [this, pool, getCellValueCallback, setCellValueCallback, 
+                                    createCellWidgetCallback, isCellFocusedCallback,
+                                    syncStateToCellCallback, syncStateFromCellCallback,
+                                    onCellFocusChangedCallback, onCellClickedCallback]
+                                    (int row, int col, const CellGridColumnConfig& colConfig) {
+        const std::string& paramName = colConfig.parameterName;
+        
+        // Only handle button columns here - for other columns, we need to manually render CellWidget
+        // because when drawSpecialColumn is set, CellGrid uses it exclusively and doesn't fall back
+        if (paramName != "mediaIndex" && paramName != "playStyle" && paramName != "polyphonyMode") {
+            // Not a button column - manually render CellWidget (replicating CellGrid's default behavior)
+            // Get focus state
+            bool isFocused = (editingColumnIndex == col);
+            if (!isFocused && isCellFocusedCallback) {
+                isFocused = isCellFocusedCallback(row, col);
+            }
+            
+            // Get or create cell widget from cache
+            auto key = std::make_pair(row, col);
+            auto it = specialColumnWidgetCache.find(key);
+            if (it == specialColumnWidgetCache.end()) {
+                // Create new widget using callback
+                if (createCellWidgetCallback) {
+                    CellWidget newCell = createCellWidgetCallback(row, col, colConfig);
+                    specialColumnWidgetCache[key] = std::move(newCell);
+                    it = specialColumnWidgetCache.find(key);
+                } else {
+                    // No callback - create empty widget
+                    specialColumnWidgetCache[key] = CellWidget();
+                    it = specialColumnWidgetCache.find(key);
+                }
+            }
+            CellWidget& cell = it->second;
+            
+            // Set up callbacks on first creation
+            if (!cell.getCurrentValue && getCellValueCallback) {
+                int rowCapture = row;
+                int colCapture = col;
+                const CellGridColumnConfig colConfigCapture = colConfig;
+                cell.getCurrentValue = [rowCapture, colCapture, colConfigCapture, getCellValueCallback]() -> float {
+                    return getCellValueCallback(rowCapture, colCapture, colConfigCapture);
+                };
+            }
+            
+            if (!cell.onValueApplied && setCellValueCallback) {
+                int rowCapture = row;
+                int colCapture = col;
+                const CellGridColumnConfig colConfigCapture = colConfig;
+                cell.onValueApplied = [rowCapture, colCapture, colConfigCapture, setCellValueCallback](const std::string&, float value) {
+                    setCellValueCallback(rowCapture, colCapture, value, colConfigCapture);
+                };
+            }
+            
+            // Sync state TO cell
+            cell.setSelected(isFocused);
+            cell.setEditing(isEditingParameter_ && isFocused);
+            
+            if (isEditingParameter_ && isFocused) {
+                cell.setEditBuffer(editBufferCache, editBufferInitializedCache);
+            }
+            
+            // Allow callback to override state
+            if (syncStateToCellCallback) {
+                syncStateToCellCallback(row, col, cell);
+            }
+            
+            // Draw cell
+            int uniqueId = row * 1000 + col;
+            bool shouldRefocus = shouldRefocusCurrentCell && isFocused;
+            int currentFrame = ofGetFrameNum();
+            CellWidgetInputContext inputContext;
+            
+            CellWidgetInteraction interaction = cell.draw(uniqueId, isFocused, false, shouldRefocus, inputContext);
+            
+            // Handle interactions
+            bool actuallyFocused = ImGui::IsItemFocused();
+            
+            if (interaction.focusChanged) {
+                if (actuallyFocused) {
+                    editingColumnIndex = col;
+                    editingParameter = paramName;
+                    anyCellFocusedThisFrame = true;
+                } else if (editingColumnIndex == col) {
+                    clearCellFocus();
+                }
+                
+                if (onCellFocusChangedCallback) {
+                    onCellFocusChangedCallback(row, col);
+                }
+            }
+            
+            if (interaction.clicked) {
+                editingColumnIndex = col;
+                editingParameter = paramName;
+                if (onCellClickedCallback) {
+                    onCellClickedCallback(row, col);
+                }
+            }
+            
+            isFocused = actuallyFocused;
+            
+            // Sync state FROM cell
+            if (cell.isEditingMode()) {
+                isEditingParameter_ = true;
+                editBufferCache = cell.getEditBuffer();
+                editBufferInitializedCache = cell.isEditBufferInitialized();
+                anyCellFocusedThisFrame = true;
+            } else if (isEditingParameter_ && isFocused && !cell.isEditingMode()) {
+                isEditingParameter_ = false;
+                editBufferCache.clear();
+                editBufferInitializedCache = false;
+                
+                // Check if cell needs refocus (signaled via interaction.needsRefocus)
+                if (interaction.needsRefocus) {
+                    shouldRefocusCurrentCell = true;
+                }
+            }
+            
+            // Allow callback to handle additional state sync
+            if (syncStateFromCellCallback) {
+                syncStateFromCellCallback(row, col, cell, interaction);
+            }
+            
+            return; // Done rendering CellWidget for this column
+        }
+        
+        // Button columns: use direct ImGui::Button() calls
+        // Set cell background to match step number button style
+        static ImU32 buttonCellBgColor = GUIConstants::toU32(GUIConstants::Background::StepNumber);
+        ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, buttonCellBgColor);
+        
+        if (paramName == "mediaIndex") {
+            // Draw media index button (like step number button)
+            size_t currentIndex = pool->getCurrentIndex();
+            size_t numPlayers = pool->getNumPlayers();
+            
+            char indexBuf[8];
+            if (numPlayers > 0) {
+                snprintf(indexBuf, sizeof(indexBuf), "%02d", (int)(currentIndex + 1));
+            } else {
+                snprintf(indexBuf, sizeof(indexBuf), "--");
+            }
+            
+            // Check if active and playing
+            bool isActive = false;
+            auto activePlayer = pool->getActivePlayer();
+            if (activePlayer != nullptr && currentIndex < numPlayers) {
+                auto currentPlayer = pool->getMediaPlayer(currentIndex);
+                if (currentPlayer == activePlayer) {
+                    isActive = (pool->isManualPreview() || pool->isSequencerActive()) 
+                              && currentPlayer->isPlaying();
+                }
+            }
+            
+            // Apply active state styling
+            if (isActive) {
+                ImGui::PushStyleColor(ImGuiCol_Button, GUIConstants::Active::StepButton);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, GUIConstants::Active::StepButtonHover);
+            }
+            
+            ImGui::PushItemFlag(ImGuiItemFlags_NoNavDefaultFocus, true);
+            
+            if (ImGui::Button(indexBuf, ImVec2(-1, 0))) {
+                // Toggle playback (same logic as CellWidget version)
+                if (numPlayers == 0) return;
+                
+                auto currentPlayer = pool->getMediaPlayer(currentIndex);
+                if (!currentPlayer) return;
+                
+                // Only toggle manual preview - don't interfere with sequencer playback
+                if (pool->isManualPreview()) {
+                    currentPlayer->stop();
+                    pool->setModeIdle();
+                } else if (pool->isIdle()) {
+                    // Start manual preview - position determined automatically based on speed
+                    pool->playMediaManual(currentIndex);
+                }
+            }
+            
+            ImGui::PopItemFlag();
+            
+            if (isActive) {
+                ImGui::PopStyleColor(2);
+            }
+            
+        } else if (paramName == "playStyle") {
+            // Draw play style button (cycles ONCE/LOOP/NEXT)
+            PlayStyle currentStyle = pool->getPlayStyle();
+            const char* styleLabel;
+            switch (currentStyle) {
+                case PlayStyle::ONCE: styleLabel = "ONCE"; break;
+                case PlayStyle::LOOP: styleLabel = "LOOP"; break;
+                case PlayStyle::NEXT: styleLabel = "NEXT"; break;
+                default: styleLabel = "ONCE"; break;
+            }
+            
+            ImGui::PushItemFlag(ImGuiItemFlags_NoNavDefaultFocus, true);
+            
+            if (ImGui::Button(styleLabel, ImVec2(-1, 0))) {
+                // Cycle play style
+                PlayStyle nextStyle;
+                switch (currentStyle) {
+                    case PlayStyle::ONCE: nextStyle = PlayStyle::LOOP; break;
+                    case PlayStyle::LOOP: nextStyle = PlayStyle::NEXT; break;
+                    case PlayStyle::NEXT: nextStyle = PlayStyle::ONCE; break;
+                }
+                pool->setPlayStyle(nextStyle);
+            }
+            
+            ImGui::PopItemFlag();
+            
+            if (ImGui::IsItemHovered()) {
+                const char* tooltip;
+                switch (currentStyle) {
+                    case PlayStyle::ONCE:
+                        tooltip = "Play Style: ONCE\nClick to cycle: ONCE → LOOP → NEXT";
+                        break;
+                    case PlayStyle::LOOP:
+                        tooltip = "Play Style: LOOP\nClick to cycle: LOOP → NEXT → ONCE";
+                        break;
+                    case PlayStyle::NEXT:
+                        tooltip = "Play Style: NEXT\nClick to cycle: NEXT → ONCE → LOOP";
+                        break;
+                    default:
+                        tooltip = "Play Style: ONCE\nClick to cycle: ONCE → LOOP → NEXT";
+                        break;
+                }
+                ImGui::SetTooltip("%s", tooltip);
+            }
+            
+        } else if (paramName == "polyphonyMode") {
+            // Draw polyphony mode button (toggles MONO/POLY)
+            PolyphonyMode currentMode = pool->getPolyphonyMode();
+            const char* modeLabel = (currentMode == PolyphonyMode::POLYPHONIC) ? "POLY" : "MONO";
+            const char* tooltipText = (currentMode == PolyphonyMode::POLYPHONIC) 
+                ? "POLYPHONIC\nswitch to MONOPHONIC ?"
+                : "MONOPHONIC\nswitch to POLYPHONIC ?";
+            
+            ImGui::PushItemFlag(ImGuiItemFlags_NoNavDefaultFocus, true);
+            
+            if (ImGui::Button(modeLabel, ImVec2(-1, 0))) {
+                // Toggle polyphony mode
+                float newValue = (currentMode == PolyphonyMode::MONOPHONIC) ? 1.0f : 0.0f;
+                pool->setParameter("polyphonyMode", newValue, true);
+            }
+            
+            ImGui::PopItemFlag();
+            
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", tooltipText);
+            }
+        }
+    };
+    
+    cellGrid.setCallbacks(callbacks);
     
     // Begin table (single row, no fixed columns)
     cellGrid.beginTable(1, 0); // 1 row, 0 fixed columns
@@ -645,7 +933,7 @@ void MediaPoolGUI::drawParameters() {
         // 2. No cell was focused this frame AND we had a column focused (clicked outside grid)
         // 3. CRITICAL: Don't clear focus if we're dragging - this prevents focus loss during smooth dragging
         if (headerClickedThisFrame || 
-            (editingColumnIndex >= 0 && !anyCellFocusedThisFrame && !isEditingParameter && !shouldRefocusCurrentCell && draggingParameter.empty())) {
+            (editingColumnIndex >= 0 && !anyCellFocusedThisFrame && !isEditingParameter_ && !shouldRefocusCurrentCell && draggingParameter.empty())) {
             clearCellFocus();
         }
         
@@ -662,7 +950,7 @@ void MediaPoolGUI::drawParameters() {
 void MediaPoolGUI::clearCellFocus() {
     editingColumnIndex = -1;
     editingParameter.clear();
-    isEditingParameter = false;
+    isEditingParameter_ = false;
     editBufferCache.clear();
     editBufferInitializedCache = false;
     draggingParameter.clear();
@@ -689,164 +977,8 @@ void MediaPoolGUI::syncEditStateFromImGuiFocus(MediaPoolGUI& gui) {
 
 
 
-/// MARK: - Button Widget Creation
-/// @brief Create CellWidget for PlayStyle button (cycles ONCE/LOOP/NEXT)
-CellWidget MediaPoolGUI::createPlayStyleButtonWidget(int columnIndex) {
-    CellWidget widget;
-    widget.cellType = CellWidgetType::BUTTON;
-    widget.parameterName = "playStyle";
-    widget.enableStateCycling = true;
-    
-    MediaPool* pool = getMediaPool();
-    
-    // Get button label dynamically based on current style
-    widget.getButtonLabel = [pool]() -> std::string {
-        if (!pool) return "ONCE";
-        PlayStyle currentStyle = pool->getPlayStyle();
-        switch (currentStyle) {
-            case PlayStyle::ONCE: return "ONCE";
-            case PlayStyle::LOOP: return "LOOP";
-            case PlayStyle::NEXT: return "NEXT";
-            default: return "ONCE";
-        }
-    };
-    
-    // Get tooltip dynamically
-    widget.getButtonTooltip = [pool]() -> std::string {
-        if (!pool) return "Play Style: ONCE\nClick to cycle: ONCE → LOOP → NEXT";
-        PlayStyle currentStyle = pool->getPlayStyle();
-        switch (currentStyle) {
-            case PlayStyle::ONCE:
-                return "Play Style: ONCE\nClick to cycle: ONCE → LOOP → NEXT";
-            case PlayStyle::LOOP:
-                return "Play Style: LOOP\nClick to cycle: LOOP → NEXT → ONCE";
-            case PlayStyle::NEXT:
-                return "Play Style: NEXT\nClick to cycle: NEXT → ONCE → LOOP";
-            default:
-                return "Play Style: ONCE\nClick to cycle: ONCE → LOOP → NEXT";
-        }
-    };
-    
-    // Cycle state on click
-    widget.onButtonCycleState = [pool]() {
-        if (!pool) return;
-        PlayStyle currentStyle = pool->getPlayStyle();
-        PlayStyle nextStyle;
-        switch (currentStyle) {
-            case PlayStyle::ONCE:
-                nextStyle = PlayStyle::LOOP;
-                break;
-            case PlayStyle::LOOP:
-                nextStyle = PlayStyle::NEXT;
-                break;
-            case PlayStyle::NEXT:
-                nextStyle = PlayStyle::ONCE;
-                break;
-        }
-        pool->setPlayStyle(nextStyle);
-    };
-    
-    // Button is never "active" (green) - always shows normal state
-    widget.isButtonActive = []() -> bool {
-        return false;
-    };
-    
-    return widget;
-}
-
-/// @brief Create CellWidget for MediaIndex button (shows index and toggles playback)
-CellWidget MediaPoolGUI::createMediaIndexButtonWidget(int columnIndex) {
-    CellWidget widget;
-    widget.cellType = CellWidgetType::BUTTON;
-    widget.parameterName = "mediaIndex";
-    widget.enableStateCycling = false; // Not a cycling button, it's a toggle
-    
-    MediaPool* pool = getMediaPool();
-    
-    // Get button label dynamically (shows current index or "--")
-    widget.getButtonLabel = [pool]() -> std::string {
-        if (!pool) return "--";
-        size_t currentIndex = pool->getCurrentIndex();
-        size_t numPlayers = pool->getNumPlayers();
-        
-        if (numPlayers > 0) {
-            int displayIndex = (int)(currentIndex + 1);
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%02d", displayIndex);
-            return std::string(buf);
-        }
-        return "--";
-    };
-    
-    // Button is active (green) when current media is playing
-    widget.isButtonActive = [pool]() -> bool {
-        if (!pool) return false;
-        
-        size_t currentIndex = pool->getCurrentIndex();
-        size_t numPlayers = pool->getNumPlayers();
-        auto activePlayer = pool->getActivePlayer();
-        
-        if (activePlayer != nullptr && currentIndex < numPlayers) {
-            auto currentPlayer = pool->getMediaPlayer(currentIndex);
-            if (currentPlayer == activePlayer) {
-                // Button is green if mode is MANUAL_PREVIEW OR SEQUENCER_ACTIVE
-                // This syncs with both manual clicks and external sequencer triggers
-                return (pool->isManualPreview() || pool->isSequencerActive()) 
-                       && currentPlayer->isPlaying();
-            }
-        }
-        return false;
-    };
-    
-    // Handle button click - toggle playback
-    widget.onButtonClicked = [pool]() {
-        if (!pool) return;
-        
-        size_t currentIndex = pool->getCurrentIndex();
-        size_t numPlayers = pool->getNumPlayers();
-        
-        if (numPlayers == 0) return;
-        
-        auto currentPlayer = pool->getMediaPlayer(currentIndex);
-        if (!currentPlayer) return;
-        
-        // Only toggle manual preview - don't interfere with sequencer playback
-        // If sequencer is active, button click does nothing (sequencer controls playback)
-        if (pool->isManualPreview()) {
-            // Currently in MANUAL_PREVIEW mode - stop it
-            currentPlayer->stop();
-            pool->setModeIdle();  // Transition to IDLE immediately
-        } else if (pool->isIdle()) {
-            // Not playing (IDLE) - start manual preview
-            // Note: If SEQUENCER_ACTIVE, we don't do anything (sequencer is in control)
-            // CRITICAL FIX: Convert relative startPosition to absolute position for playMediaManual
-            // playMediaManual expects absolute position (0.0-1.0), but startPosition is relative within region
-            float relativeStartPos = currentPlayer->startPosition.get();
-            float regionStartVal = currentPlayer->regionStart.get();
-            float regionEndVal = currentPlayer->regionEnd.get();
-            float regionSize = regionEndVal - regionStartVal;
-            
-            float absoluteStartPosition;
-            if (regionSize > 0.001f) {
-                // Convert relative position to absolute within region
-                absoluteStartPosition = regionStartVal + relativeStartPos * regionSize;
-            } else {
-                // If region is invalid, use relative position directly
-                absoluteStartPosition = relativeStartPos;
-            }
-            
-            // Clamp to valid range
-            absoluteStartPosition = std::max(0.0f, std::min(1.0f, absoluteStartPosition));
-            
-            pool->playMediaManual(currentIndex, absoluteStartPosition);
-        }
-        // If isSequencerActive(), do nothing - sequencer controls playback
-    };
-    
-    return widget;
-}
-
-
+// Button widget creation functions removed - buttons are drawn directly via drawSpecialColumn
+// using ImGui::Button() for better performance (see drawSpecialColumn callback)
 
 /// MARK: - MEDIA LIST
 /// @brief draw the media list
@@ -899,11 +1031,24 @@ void MediaPoolGUI::drawMediaList() {
     bool shouldSyncScroll = (currentIndex != previousMediaIndex);
     
     // Show indexed media list with actual file names
-    if (pool->getNumPlayers() > 0) {
+    size_t numPlayers = pool->getNumPlayers();
+    if (numPlayers > 0) {
         auto playerNames = pool->getPlayerNames();
         auto playerFileNames = pool->getPlayerFileNames();
         
+        // Log list iteration for troubleshooting
+        ofLogVerbose("MediaPoolGUI") << "[drawMediaList] Iterating " << numPlayers << " players "
+                                     << "(playerNames.size()=" << playerNames.size() 
+                                     << ", playerFileNames.size()=" << playerFileNames.size() << ")";
+        
         for (size_t i = 0; i < playerNames.size(); i++) {
+            // Validate index before accessing player
+            if (i >= numPlayers) {
+                ofLogWarning("MediaPoolGUI") << "[drawMediaList] Index " << i << " >= numPlayers " << numPlayers 
+                                            << " - skipping invalid index";
+                continue;
+            }
+            
             auto player = pool->getMediaPlayer(i);
             if (player) {
                 // Check if this is the currently active player
@@ -965,10 +1110,40 @@ void MediaPoolGUI::drawMediaList() {
                 
                 // Make items selectable and clickable
                 if (ImGui::Selectable(displayName.c_str(), isActive)) {
-                    // Use playMediaManual to set MANUAL_PREVIEW mode and play from start
-                    bool success = getMediaPool()->playMediaManual(i, 0.0f);  // Always play from start (position 0.0)
-                    if (!success) {
-                        ofLogWarning("MediaPoolGUI") << "Failed to play media at index " << i;
+                    // CRITICAL: Re-check pool and validate index before calling playMediaManual
+                    // The pool could become null or players list could change between iteration and click
+                    MediaPool* clickedPool = getMediaPool();
+                    if (!clickedPool) {
+                        ofLogError("MediaPoolGUI") << "[CRASH PREVENTION] MediaPool became null when clicking asset at index " << i;
+                        // Cannot proceed - skip playback attempt
+                    } else {
+                        // Validate index is still within bounds
+                        size_t numPlayers = clickedPool->getNumPlayers();
+                        if (i >= numPlayers) {
+                            ofLogError("MediaPoolGUI") << "[CRASH PREVENTION] Index " << i << " out of bounds (numPlayers: " << numPlayers << ") when clicking asset";
+                            // Index invalid - skip playback attempt
+                        } else {
+                            // Validate player still exists at this index
+                            auto clickedPlayer = clickedPool->getMediaPlayer(i);
+                            if (!clickedPlayer) {
+                                ofLogError("MediaPoolGUI") << "[CRASH PREVENTION] Player at index " << i << " is null when clicking asset";
+                                // Player invalid - skip playback attempt
+                            } else {
+                                // Log click attempt for troubleshooting
+                                ofLogNotice("MediaPoolGUI") << "[ASSET_CLICK] Clicked asset at index " << i 
+                                                            << " (displayName: " << displayName 
+                                                            << ", numPlayers: " << numPlayers 
+                                                            << ", player valid: " << (clickedPlayer != nullptr) << ")";
+                                
+                                // Use playMediaManual - automatically determines start position based on speed
+                                bool success = clickedPool->playMediaManual(i);
+                                if (!success) {
+                                    ofLogWarning("MediaPoolGUI") << "[ASSET_CLICK] Failed to play media at index " << i;
+                                } else {
+                                    ofLogNotice("MediaPoolGUI") << "[ASSET_CLICK] Successfully started playback for index " << i;
+                                }
+                            }
+                        }
                     }
                 }
                 
@@ -994,29 +1169,17 @@ void MediaPoolGUI::drawMediaList() {
                     ImGui::Text("Media %zu", i);
                     ImGui::Separator();
                     
-                    if (ImGui::MenuItem("Play/Preview", "Click")) {
-                        // Stop all other players first
-                        for (size_t j = 0; j < getMediaPool()->getNumPlayers(); j++) {
-                            auto otherPlayer = getMediaPool()->getMediaPlayer(j);
-                            if (otherPlayer && otherPlayer != player) {
-                                otherPlayer->stop();
-                            }
-                        }
-                        getMediaPool()->setActivePlayer(i);
-                        player->play();
-                    }
                     
-                    if (ImGui::MenuItem("Stop", "")) {
-                        player->stop();
-                    }
+
+
                     
                     ImGui::Separator();
                     
-                    if (ImGui::MenuItem("Set Position 0%")) {
-                        player->setPosition(0.0f);
-                    }
-                    if (ImGui::MenuItem("Set Position 50%")) {
-                        player->setPosition(0.5f);
+                    if (ImGui::MenuItem("Unload Media")) {
+                        MediaPool* pool = getMediaPool();
+                        if (pool) {
+                            pool->removePlayer(i);
+                        }
                     }
                     
                     ImGui::EndPopup();
@@ -1400,13 +1563,43 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                 draggingMarker = hoveredMarker;
                 waveformDragStartX = mouseX;
             } else {
-                // Click on empty area: seek playhead to position
-                // CRITICAL: Only update playheadPosition, not startPosition (decoupled)
-                // startPosition should only change when explicitly set (e.g., dragging position marker)
+                // Click on empty area: behavior depends on MediaPool mode
                 auto player = getMediaPool()->getActivePlayer();
-                if (player) {
-                    if (player->isPlaying()) {
-                        // During playback: seek playhead only (scrubbing)
+                MediaPool* pool = getMediaPool();
+                if (player && pool) {
+                    // CRITICAL: Check transport FIRST, before checking isIdle()
+                    // This ensures transport playing always updates startPosition, even if MediaPool is IDLE between triggers
+                    if (pool->isTransportPlaying()) {
+                        // Transport is playing: Update startPosition (not playheadPosition)
+                        // Do NOT seek playhead even if player is playing - sequencer/transport controls playback
+                        float regionStartVal = player->regionStart.get();
+                        float regionEndVal = player->regionEnd.get();
+                        float regionSize = regionEndVal - regionStartVal;
+                        
+                        float relativePos = 0.0f;
+                        if (regionSize > 0.001f) {
+                            float clampedAbsolute = std::max(regionStartVal, std::min(regionEndVal, relativeX));
+                            relativePos = (clampedAbsolute - regionStartVal) / regionSize;
+                            relativePos = std::max(0.0f, std::min(1.0f, relativePos));
+                        } else {
+                            relativePos = std::max(0.0f, std::min(1.0f, relativeX));
+                        }
+                        
+                        player->startPosition.set(relativePos);
+                        pool->setParameter("position", relativePos, true);
+                    } else if (pool->isIdle()) {
+                        // IDLE mode: Just set playhead position (no playback)
+                        // Scrubbing playback will start when dragging begins (handled in drag section)
+                        if (player->isAudioLoaded()) {
+                            player->getAudioPlayer().setPosition(relativeX);
+                        }
+                        if (player->isVideoLoaded()) {
+                            player->getVideoPlayer().getVideoFile().setPosition(relativeX);
+                            player->getVideoPlayer().getVideoFile().update();
+                        }
+                        player->playheadPosition.set(relativeX);
+                    } else if (player->isPlaying()) {
+                        // MANUAL_PREVIEW mode during playback: seek playhead only (scrubbing)
                         if (player->isAudioLoaded()) {
                             player->getAudioPlayer().setPosition(relativeX);
                         }
@@ -1416,8 +1609,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                         }
                         player->playheadPosition.set(relativeX);
                     } else {
-                        // Not playing: only update playheadPosition for visual feedback (scrubbing)
-                        // Do NOT update startPosition or trigger playback - just move the playhead indicator
+                        // Not playing: only update playheadPosition for visual feedback
                         player->playheadPosition.set(relativeX);
                     }
                 }
@@ -1480,28 +1672,92 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
         // Stop dragging
         if (ImGui::IsMouseReleased(0)) {
             draggingMarker = WaveformMarker::NONE;
+            
+            // When scrubbing ends in IDLE mode, stop temporary playback but keep playhead position
+            if (isScrubbing) {
+                isScrubbing = false;
+                MediaPool* pool = getMediaPool();
+                if (pool && pool->isIdle()) {
+                    // Stop temporary playback (doesn't change mode)
+                    pool->stopTemporaryPlayback();
+                    // playheadPosition is already set to the scrub position, so it stays
+                }
+            }
         }
         
-        // Handle scrubbing during playback (when dragging playhead area)
-        // CRITICAL: Scrubbing only affects playheadPosition, not startPosition (decoupled)
-        // startPosition should remain unchanged during scrubbing
-        // Also skip if dragging a CellWidget to prevent interference
+        // Handle scrubbing (dragging without marker)
+        // CRITICAL: Scrubbing behavior depends on MediaPool mode
         if (draggingMarker == WaveformMarker::NONE && ImGui::IsMouseDragging(0) && !isDraggingParameter) {
             auto player = getMediaPool()->getActivePlayer();
-            if (player && player->isPlaying()) {
-                // Scrubbing: only update playheadPosition (absolute position)
-                // Don't change startPosition - it should remain as set
-                if (player->isAudioLoaded()) {
-                    player->getAudioPlayer().setPosition(relativeX);
-                }
-                if (player->isVideoLoaded()) {
-                    player->getVideoPlayer().getVideoFile().setPosition(relativeX);
-                    player->getVideoPlayer().getVideoFile().update();
+            MediaPool* pool = getMediaPool();
+            if (!player || !pool) return;
+            
+            bool wasScrubbing = isScrubbing;
+            isScrubbing = true;
+            
+            // CRITICAL: Check transport FIRST, before checking isIdle()
+            // This handles the case where MediaPool is IDLE between triggers but transport is still playing
+            if (pool->isTransportPlaying()) {
+                // Transport is playing (sequencer active or between triggers): Update startPosition only
+                // CRITICAL: Check transport FIRST, before checking isSequencerActive()
+                // This handles the case where MediaPool is IDLE between triggers but transport is still playing
+                float regionStartVal = player->regionStart.get();
+                float regionEndVal = player->regionEnd.get();
+                float regionSize = regionEndVal - regionStartVal;
+                
+                float relativePos = 0.0f;
+                if (regionSize > 0.001f) {
+                    float clampedAbsolute = std::max(regionStartVal, std::min(regionEndVal, relativeX));
+                    relativePos = (clampedAbsolute - regionStartVal) / regionSize;
+                    relativePos = std::max(0.0f, std::min(1.0f, relativePos));
+                } else {
+                    relativePos = std::max(0.0f, std::min(1.0f, relativeX));
                 }
                 
-                player->playheadPosition.set(relativeX);
-                // NOTE: Don't call setParameter("position") here - that would change startPosition
-                // Scrubbing should only affect playheadPosition
+                player->startPosition.set(relativePos);
+                pool->setParameter("position", relativePos, true);
+            } else if (pool->isIdle()) {
+                // IDLE mode: Start scrubbing playback for AV feedback (doesn't change mode or startPosition)
+                if (!wasScrubbing) {
+                    // First frame of scrubbing: start scrubbing playback
+                    size_t currentIndex = pool->getCurrentIndex();
+                    pool->startScrubbingPlayback(currentIndex, relativeX);
+                } else {
+                    // Continue scrubbing: seek to new position
+                    if (player->isPlaying()) {
+                        if (player->isAudioLoaded()) {
+                            player->getAudioPlayer().setPosition(relativeX);
+                        }
+                        if (player->isVideoLoaded()) {
+                            player->getVideoPlayer().getVideoFile().setPosition(relativeX);
+                            player->getVideoPlayer().getVideoFile().update();
+                        }
+                        player->playheadPosition.set(relativeX);
+                    }
+                }
+            } else {
+                // MANUAL_PREVIEW mode: Normal scrubbing (seek playhead, allow past loop end)
+                if (player->isPlaying()) {
+                    // Temporarily disable loop to allow scrubbing past loop end
+                    bool wasLooping = player->loop.get();
+                    if (wasLooping) {
+                        player->loop.set(false);
+                    }
+                    
+                    if (player->isAudioLoaded()) {
+                        player->getAudioPlayer().setPosition(relativeX);
+                    }
+                    if (player->isVideoLoaded()) {
+                        player->getVideoPlayer().getVideoFile().setPosition(relativeX);
+                        player->getVideoPlayer().getVideoFile().update();
+                    }
+                    player->playheadPosition.set(relativeX);
+                    
+                    // Restore loop state after seeking
+                    if (wasLooping) {
+                        player->loop.set(true);
+                    }
+                }
             }
         }
     }
@@ -1608,9 +1864,6 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
         if (loopSizeSeconds > 0.001f) {
             float duration = currentPlayer->getDuration();
             if (duration > 0.001f) {
-                // Convert loopSize (seconds) to normalized position (0-1)
-                float loopSizeNormalized = loopSizeSeconds / duration;
-                
                 // Calculate loop start position (absolute) - same logic as in MediaPool::update()
                 float relativeStartPos = currentPlayer->startPosition.get();
                 float regionSize = regionEnd - regionStart;
@@ -1622,9 +1875,20 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                     loopStartAbsolute = std::max(0.0f, std::min(1.0f, relativeStartPos));
                 }
                 
-                // Calculate loop end (clamped to region end and media duration)
-                float calculatedLoopEnd = loopStartAbsolute + loopSizeNormalized;
-                float loopEndAbsolute = std::min(regionEnd, std::min(1.0f, calculatedLoopEnd));
+                // CRITICAL FIX: Work in absolute time (seconds) first to preserve precision
+                // Converting small time values to normalized positions loses precision for long samples
+                // Convert normalized positions to absolute time
+                float loopStartSeconds = loopStartAbsolute * duration;
+                float regionEndSeconds = regionEnd * duration;
+                
+                // Calculate loop end in absolute time
+                float calculatedLoopEndSeconds = loopStartSeconds + loopSizeSeconds;
+                
+                // Clamp to region end and media duration
+                float clampedLoopEndSeconds = std::min(regionEndSeconds, std::min(duration, calculatedLoopEndSeconds));
+                
+                // Convert back to normalized position (0-1)
+                float loopEndAbsolute = clampedLoopEndSeconds / duration;
                 
                 // Map to screen coordinates
                 float loopStartX = mapToScreenX(loopStartAbsolute);
@@ -1718,7 +1982,7 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
     // will process the actual key input during draw(). We just need to set the edit mode state here.
     if ((key >= '0' && key <= '9') || key == '.' || key == '-' || key == '+' || key == '*' || key == '/') {
         // Check if we have a valid parameter column focused (not Index or Play style button)
-        if (!isEditingParameter && isEditableColumn()) {
+        if (!isEditingParameter_ && isEditableColumn()) {
             // Ensure editingParameter is set
             if (editingParameter.empty()) {
                 auto columnConfig = cellGrid.getColumnConfiguration();
@@ -1729,7 +1993,7 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
             
             if (!editingParameter.empty()) {
                 // Enter edit mode - CellGrid will handle the actual key input during draw()
-                isEditingParameter = true;
+                isEditingParameter_ = true;
                 
                 // Disable ImGui keyboard navigation when entering edit mode
                 ImGuiIO& io = ImGui::GetIO();
@@ -1744,7 +2008,7 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
     
     // CRITICAL: When NOT in edit mode, let ImGui handle arrow keys for native navigation
     // We'll sync our state from ImGui focus after it processes the keys
-    if (!isEditingParameter && editingColumnIndex >= 0) {
+    if (!isEditingParameter_ && editingColumnIndex >= 0) {
         // Not in edit mode: Let ImGui handle arrow keys for native navigation
         // This allows smooth navigation between parameter cells
         // Our state will be synced from ImGui focus in the next frame during draw()
@@ -1761,7 +2025,7 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
     
     // In edit mode: Let CellGrid handle arrow keys and other input internally
     // CellGrid's CellWidget::handleInputInDraw() will process them during draw()
-    if (isEditingParameter && editingColumnIndex >= 0) {
+    if (isEditingParameter_ && editingColumnIndex >= 0) {
         // Let ImGui pass the key through so CellGrid can handle it
         // This includes arrow keys (for value adjustment) and all other keys
         return false;
@@ -1772,8 +2036,8 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
         case OF_KEY_RETURN:
             if (ctrlPressed || shiftPressed) {
                 // Ctrl+Enter or Shift+Enter: Exit parameter editing
-                if (isEditingParameter) {
-                    isEditingParameter = false;
+                if (isEditingParameter_) {
+                    isEditingParameter_ = false;
                     editBufferCache.clear();
                     editBufferInitializedCache = false;
                     ImGuiIO& io = ImGui::GetIO();
@@ -1782,35 +2046,26 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
                     return true;
                 }
             }
-            if (isEditableColumn() && !isEditingParameter) {
-                // Enter on selected parameter column: Enter edit mode
-                // (Index and Play style buttons don't support editing)
-                
-                // Ensure editingParameter is set
-                if (editingParameter.empty()) {
-                    auto columnConfig = cellGrid.getColumnConfiguration();
-                    if (editingColumnIndex >= 0 && (size_t)editingColumnIndex < columnConfig.size()) {
-                        editingParameter = columnConfig[editingColumnIndex].parameterName;
-                    }
-                }
-                
-                if (!editingParameter.empty()) {
-                    isEditingParameter = true;
-                    ImGuiIO& io = ImGui::GetIO();
-                    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-                    // Don't consume Enter - let CellGrid handle it so it can enter edit mode properly
-                    return false;
-                }
+            // For Enter key: Let CellWidget handle it completely via processInputInDraw()
+            // CellWidget will:
+            // - Enter edit mode if not editing
+            // - Apply value and exit edit mode if already editing
+            // We just need to ensure navigation is disabled when entering edit mode
+            if (isEditableColumn() && !isEditingParameter_) {
+                // Pre-emptively disable navigation so CellWidget can enter edit mode cleanly
+                ImGuiIO& io = ImGui::GetIO();
+                io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
             }
-            break;
+            // Don't consume Enter - let CellWidget handle it via processInputInDraw()
+            return false;
             
         case OF_KEY_ESC:
             // IMPORTANT: Only handle ESC when in edit mode. When NOT in edit mode, let ESC pass through
             // to ImGui so it can use ESC to escape contained navigation contexts (like scrollable tables)
-            if (isEditingParameter) {
+            if (isEditingParameter_) {
                 // Exit edit mode - CellGrid will handle the actual ESC key processing
                 // We just set the state here so it's ready when CellGrid processes it
-                isEditingParameter = false;
+                isEditingParameter_ = false;
                 editBufferCache.clear();
                 editBufferInitializedCache = false;
                 ImGuiIO& io = ImGui::GetIO();
@@ -1875,7 +2130,6 @@ void MediaPoolGUI::drawPositionScanModeButton(const ImVec2& cellStartPos, float 
     ImGui::PushID("PositionScanMode");
     
     // Calculate button size and position (right-aligned in header)
-    // NOTE: We push style var AFTER calculating button width to avoid affecting the calculation
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
     float buttonWidth = ImGui::CalcTextSize(MODE_LABELS[currentModeIndex]).x + 
                         ImGui::GetStyle().FramePadding.x * 2.0f;
@@ -1913,4 +2167,23 @@ bool MediaPoolGUI::handleFileDrop(const std::vector<std::string>& filePaths) {
     return true;
 }
 
+// Note: setupDragDropTarget() is inherited from ModuleGUI base class
+// It handles FILE_PATHS payload (unified for all sources: FileBrowser, AssetLibrary, OS)
+// and calls handleFileDrop() which adds files to MediaPool
 
+//--------------------------------------------------------------
+// GUI Factory Registration
+//--------------------------------------------------------------
+// Auto-register MediaPoolGUI with GUIManager on static initialization
+// This enables true modularity - no hardcoded dependencies in GUIManager
+namespace {
+    struct MediaPoolGUIRegistrar {
+        MediaPoolGUIRegistrar() {
+            GUIManager::registerGUIType("MediaPool", 
+                []() -> std::unique_ptr<ModuleGUI> {
+                    return std::make_unique<MediaPoolGUI>();
+                });
+        }
+    };
+    static MediaPoolGUIRegistrar g_mediaPoolGUIRegistrar;
+}

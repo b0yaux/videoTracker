@@ -1,25 +1,32 @@
 #include "TrackerSequencer.h"
 #include "Clock.h"
 #include "Module.h"
+#include "core/ModuleRegistry.h"
+#include "core/ConnectionManager.h"
+#include "core/ParameterRouter.h"
+#include "core/ModuleFactory.h"
 #include "ofLog.h"
 #include "ofJson.h"
 #include <imgui.h>
 #include <cmath>  // For std::round
 #include <limits>  // For std::numeric_limits
 #include <set>
+#include <atomic>  // For diagnostic event counter
 
 // TrackerSequencer implementation
 //--------------------------------------------------------------
 TrackerSequencer::TrackerSequencer() 
-    : clock(nullptr), stepsPerBeat(4), gatingEnabled(true), playbackStep(0), lastTriggeredStep(-1), 
-      playing(false), currentMediaStartStep(-1), 
-      currentMediaStepLength(0.0f), 
-      sampleAccumulator(0.0), lastBpm(120.0f),
+    : clock(nullptr), stepsPerBeat(4), gatingEnabled(true),
+      currentPatternIndex(0), currentChainIndex(0), currentChainRepeat(0), usePatternChain(true),
+      playbackStep(0),
       draggingStep(-1), draggingColumn(-1), lastDragValue(0.0f), dragStartY(0.0f), dragStartX(0.0f),
+      lastTriggeredStep(-1), playing(false),
+      currentMediaStartStep(-1), currentMediaStepLength(0.0f),
+      sampleAccumulator(0.0), lastBpm(120.0f),
       stepStartTime(0.0f), stepEndTime(0.0f),
+      connectionManager_(nullptr),
       showGUI(true),
-      currentPlayingStep(-1),
-      currentPatternIndex(0), currentChainIndex(0), currentChainRepeat(0), usePatternChain(true) {
+      currentPlayingStep(-1) {
     // Initialize with one empty pattern (default 16 steps)
     patterns.push_back(Pattern(16));
     // Initialize pattern chain with first pattern
@@ -61,11 +68,178 @@ void TrackerSequencer::setup(Clock* clockRef, int steps) {
     ofLogNotice("TrackerSequencer") << "Setup complete with " << getCurrentPattern().getStepCount() << " steps";
 }
 
-void TrackerSequencer::setIndexRangeCallback(IndexRangeCallback callback) {
-    indexRangeCallback = callback;
+
+//--------------------------------------------------------------
+//--------------------------------------------------------------
+void TrackerSequencer::initialize(Clock* clock, ModuleRegistry* registry, ConnectionManager* connectionManager, 
+                                  ParameterRouter* parameterRouter, bool isRestored) {
+    // Phase 2.2: Unified initialization - combines postCreateSetup and configureSelf
+    
+    // 1. Basic setup (from postCreateSetup)
+    if (clock) {
+        // Use default step count of 16 (matches setup() default)
+        setup(clock, 16);
+    }
+    
+    // 2. Self-configuration (from configureSelf) - only if we have all required dependencies
+    if (!registry || !connectionManager || !parameterRouter) {
+        return;
+    }
+    
+    // Store ConnectionManager reference for querying connections
+    connectionManager_ = connectionManager;
+    
+    // 2.1. Index range is now queried directly via getIndexRange() when needed
+    // No setup required - ConnectionManager reference is stored for queries
+    
+    // 2.2. Set up parameter change callback for parameter routing
+    auto metadata = getMetadata();
+    setParameterChangeCallback([parameterRouter, this](const std::string& paramName, float value) {
+        // Check if this parameter is in module's metadata
+        auto modMetadata = getMetadata();
+        for (const auto& param : modMetadata.parameterNames) {
+            if (param == paramName) {
+                parameterRouter->notifyParameterChange(this, paramName, value);
+                break;
+            }
+        }
+    });
+    
+    // 2.3. Initialize default pattern (if needed) - only for new modules, not restored ones
+    if (!isRestored) {
+        initializeDefaultPattern(registry, connectionManager);
+    }
+    
+    // Note: Step event listeners for ofApp state tracking (lastTriggeredStep) are set up in ofApp
+    // since they're tied to ofApp's internal state, not module state
 }
 
 //--------------------------------------------------------------
+// Get index range from connected module (queries directly, no caching)
+int TrackerSequencer::getIndexRange() const {
+    if (!connectionManager_) {
+        return 127;  // Default MIDI range
+    }
+    
+    auto* registry = connectionManager_->getRegistry();
+    if (!registry) {
+        return 127;  // Default MIDI range
+    }
+    
+    // Query directly from connected modules via ConnectionManager
+    auto connections = connectionManager_->getConnectionsFrom(getName());
+    for (const auto& conn : connections) {
+        if (conn.type == ConnectionManager::ConnectionType::EVENT) {
+            auto targetModule = registry->getModule(conn.targetModule);
+            if (targetModule) {
+                // Check if target has "index" parameter
+                auto params = targetModule->getParameters();
+                for (const auto& param : params) {
+                    if (param.name == "index" || param.name == "note") {
+                        // Found connected module with index parameter - return range
+                        return static_cast<int>(param.maxValue) + 1;  // maxValue is inclusive, range is count
+                    }
+                }
+            }
+        }
+    }
+    
+    // No connected module found - return default
+    return 127;  // Default MIDI range
+}
+
+//--------------------------------------------------------------
+void TrackerSequencer::onConnectionEstablished(const std::string& targetModuleName,
+                                                Module::ConnectionType connectionType,
+                                                ConnectionManager* connectionManager) {
+    // Only react to EVENT connections (tracker -> pool connections)
+    if (connectionType != Module::ConnectionType::EVENT) {
+        return;
+    }
+    
+    // Store ConnectionManager reference if not already set
+    // Index range is now queried directly via getIndexRange() when needed
+    if (!connectionManager_) {
+        connectionManager_ = connectionManager;
+    }
+}
+
+//--------------------------------------------------------------
+// DEPRECATED: Use initialize() instead
+void TrackerSequencer::postCreateSetup(Clock* clock) {
+    // Legacy implementation - delegates to initialize()
+    initialize(clock, nullptr, nullptr, nullptr, false);
+}
+
+//--------------------------------------------------------------
+// DEPRECATED: Use initialize() instead
+void TrackerSequencer::configureSelf(ModuleRegistry* registry, ConnectionManager* connectionManager, ParameterRouter* parameterRouter) {
+    // Legacy implementation - delegates to initialize()
+    // Note: clock is nullptr here since configureSelf doesn't have it
+    initialize(nullptr, registry, connectionManager, parameterRouter, false);
+}
+
+//--------------------------------------------------------------
+void TrackerSequencer::initializeDefaultPattern(ModuleRegistry* registry, ConnectionManager* connectionManager) {
+    if (!registry || !connectionManager) {
+        return;
+    }
+    
+    // Use ConnectionManager to find event connections (simplified approach)
+    std::shared_ptr<Module> connectedProvider;
+    auto connections = connectionManager->getConnectionsFrom(getName());
+    
+    for (const auto& conn : connections) {
+        if (conn.type == ConnectionManager::ConnectionType::EVENT) {
+            // Found event connection - check if target has "index" parameter
+            auto targetModule = registry->getModule(conn.targetModule);
+            if (targetModule) {
+                auto params = targetModule->getParameters();
+                for (const auto& param : params) {
+                    if (param.name == "index" || param.name == "note") {
+                        connectedProvider = targetModule;
+                        break;
+                    }
+                }
+                if (connectedProvider) break;
+            }
+        }
+    }
+    
+    // Initialize default pattern cells if provider is available and has items
+    if (connectedProvider) {
+        // Query "index" parameter from getParameters() to get dynamic range
+        auto params = connectedProvider->getParameters();
+        int indexRange = 127;  // Default MIDI range
+        for (const auto& param : params) {
+            if (param.name == "index" || param.name == "note") {
+                indexRange = static_cast<int>(param.maxValue) + 1;  // maxValue is inclusive, range is count
+                break;
+            }
+        }
+        if (indexRange > 0) {
+            PatternCell cell0(0, 0.0f, 1.0f, 1.0f, 1.0f);
+            setCell(0, cell0);
+            
+            if (indexRange > 1) {
+                PatternCell cell4(1, 0.0f, 1.2f, 1.0f, 1.0f);
+                setCell(4, cell4);
+                
+                PatternCell cell8(0, 0.5f, 1.0f, 1.0f, 1.0f);
+                setCell(8, cell8);
+            }
+            ofLogNotice("TrackerSequencer") << "Initialized default pattern for " << getName() 
+                                            << " (index range: 0-" << (indexRange - 1) << ")";
+        }
+    }
+}
+
+//--------------------------------------------------------------
+void TrackerSequencer::onTransportChanged(bool isPlaying) {
+    // Module interface implementation - delegate to internal method
+    onClockTransportChanged(isPlaying);
+}
+
 void TrackerSequencer::onClockTransportChanged(bool isPlaying) {
     if (isPlaying) {
         // Clock started - start the sequencer from step 1
@@ -163,12 +337,7 @@ void TrackerSequencer::clearPattern() {
 }
 
 void TrackerSequencer::randomizePattern() {
-    if (!indexRangeCallback) {
-        ofLogWarning("TrackerSequencer") << "Cannot randomize pattern: IndexRangeCallback not set";
-        return;
-    }
-    
-    int numMedia = indexRangeCallback();
+    int numMedia = getIndexRange();
     if (numMedia == 0) {
         ofLogWarning("TrackerSequencer") << "Cannot randomize pattern: No media available";
         return;
@@ -207,22 +376,25 @@ void TrackerSequencer::randomizePattern() {
 }
 
 void TrackerSequencer::randomizeColumn(int columnIndex) {
-    const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
-    if (columnIndex < 0 || columnIndex >= (int)columnConfig.size()) {
+    // columnIndex is absolute column index (1 = index, 2 = length, 3+ = parameter columns)
+    // Convert to parameter-relative index for columnConfig access
+    if (columnIndex <= 0) {
         ofLogWarning("TrackerSequencer") << "Invalid column index for randomization: " << columnIndex;
         return;
     }
     
-    const auto& colConfig = columnConfig[columnIndex];
+    const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
+    int paramColIdx = columnIndex - 1;  // Convert absolute to parameter-relative
+    if (paramColIdx < 0 || paramColIdx >= (int)columnConfig.size()) {
+        ofLogWarning("TrackerSequencer") << "Invalid column index for randomization: " << columnIndex;
+        return;
+    }
+    
+    const auto& colConfig = columnConfig[paramColIdx];
     
     if (colConfig.parameterName == "index") {
         // Randomize index column
-        if (!indexRangeCallback) {
-            ofLogWarning("TrackerSequencer") << "Cannot randomize index column: IndexRangeCallback not set";
-            return;
-        }
-        
-        int numMedia = indexRangeCallback();
+        int numMedia = getIndexRange();
         if (numMedia == 0) {
             ofLogWarning("TrackerSequencer") << "Cannot randomize index column: No media available";
             return;
@@ -703,6 +875,9 @@ void TrackerSequencer::triggerStep(int step) {
     if (!isValidStep(step)) return;
     if (!clock) return;
     
+    // Don't send triggers if module is disabled
+    if (!isEnabled()) return;
+    
     // Apply any pending edit for this step before triggering
     if (pendingEdit.step == step && pendingEdit.step >= 0) {
         applyPendingEdit();
@@ -836,10 +1011,26 @@ void TrackerSequencer::handleMouseClick(int x, int y, int button) {
 }
 
 bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed, GUIState& guiState) {
-    // If a cell is selected (editStep/editColumn are valid), delegate to CellWidget
-    // This handles both editing cells and selected cells (for auto-entering edit mode)
+    // NOTE: guiState is a temporary parameter - actual state lives in TrackerSequencerGUI
+    // This method modifies guiState and returns it, which gets synced back to TrackerSequencerGUI
+    
+    // If a cell is selected (editStep/editColumn are valid), handle special keys only
+    // NOTE: Typed characters (0-9, ., -, +, *, /) are NOT processed here.
+    // They are handled by TrackerSequencerGUI::processCellInput() via InputQueueCharacters during draw().
+    // This prevents double-processing: InputRouter calls handleKeyPress() AND processCellInput() processes InputQueueCharacters.
     if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-        // Create CellWidget for current cell and delegate keyboard handling
+        // Skip typed characters - let processCellInput() handle them via InputQueueCharacters
+        if ((key >= '0' && key <= '9') || key == '.' || key == '-' || key == '+' || key == '*' || key == '/') {
+            // Just enter edit mode if not already editing, then let processCellInput() handle the input
+            if (!guiState.isEditingCell) {
+                guiState.isEditingCell = true;
+                // NOTE: Navigation remains enabled for gamepad support
+            }
+            // Return false to let the key pass through to ImGui so processCellInput() can process it
+            return false;
+        }
+        
+        // For special keys (Enter, Escape, Arrow keys, etc.), delegate to CellWidget
         CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
         
         // Sync state from GUI state to CellWidget
@@ -873,25 +1064,15 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 guiState.editBufferInitializedCache = false;
             }
             
-            // If CellWidget exited edit mode via Enter, check if it needs refocus
+            // If CellWidget exited edit mode via Enter, signal refocus needed
             // This maintains focus after saving with Enter (unified refocus system)
-            if (!nowEditing && wasEditing && cell.shouldRefocus()) {
+            // Note: Refocus is signaled via GUI state, GUI layer will handle it on next frame
+            if (!nowEditing && wasEditing) {
                 guiState.shouldRefocusCurrentCell = true;
             }
             
-            // If CellWidget entered edit mode, sync that
-            if (nowEditing && !wasEditing) {
-                // Disable ImGui keyboard navigation when entering edit mode
-                ImGuiIO& io = ImGui::GetIO();
-                io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-            }
-            
-            // If ParameterCell exited edit mode, sync that too
-            if (!nowEditing && wasEditing) {
-                // Re-enable ImGui keyboard navigation when exiting edit mode
-                ImGuiIO& io = ImGui::GetIO();
-                io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-            }
+            // NOTE: Navigation remains enabled at all times for gamepad support
+            // No need to disable/enable navigation when entering/exiting edit mode
             return true;
         }
         // If ParameterCell didn't handle it, fall through to grid navigation logic
@@ -905,7 +1086,6 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
         case OF_KEY_RETURN:
             if (ctrlPressed || shiftPressed) {
                 // Ctrl+Enter or Shift+Enter: Exit grid navigation
-                ofLogNotice("TrackerSequencer") << "[DEBUG] [SET editStep] Ctrl/Shift+Enter - clearing editStep to -1";
                 // If we were in edit mode, restore ImGui keyboard navigation
                 if (guiState.isEditingCell) {
                     ImGuiIO& io = ImGui::GetIO();
@@ -919,47 +1099,16 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 return true;
             }
             
-            if (guiState.isEditingCell) {
-                // Should have been handled by ParameterCell above, but handle fallback
-                if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.setSelected(true);
-                    cell.setEditing(true);
-                    cell.applyValue(); // Confirm edit
-                }
-                guiState.isEditingCell = false;
-                guiState.editBufferCache.clear();
-                guiState.editBufferInitializedCache = false;
-                
-                // Re-enable ImGui keyboard navigation when exiting edit mode
-                ImGuiIO& io = ImGui::GetIO();
-                io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-                
+            // Enter key for data columns (editColumn > 0) is handled by CellWidget delegation above
+            // Only handle Enter for step number column (editColumn == 0) or when no cell is selected
+            if (isValidStep(guiState.editStep) && guiState.editColumn == 0) {
+                // Step number column: Trigger step
+                triggerStep(guiState.editStep);
                 return true;
-            } else if (isValidStep(guiState.editStep) && guiState.editColumn >= 0) {
-                if (guiState.editColumn == 0) {
-                    // Step number column: Trigger step
-                    triggerStep(guiState.editStep);
-                    return true;
-                }
-                // Data column: Enter edit mode
-                const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
-                if (guiState.editColumn > 0 && guiState.editColumn <= (int)columnConfig.size()) {
-                    guiState.isEditingCell = true;
-                    // Initialize via ParameterCell (ParameterCell manages its own edit buffer)
-                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.setSelected(true);
-                    cell.enterEditMode();
-                    // Cache edit buffer after entering edit mode
-                    guiState.editBufferCache = cell.getEditBuffer();
-                    guiState.editBufferInitializedCache = cell.isEditBufferInitialized();
-                    
-                    // CRITICAL: Disable ImGui keyboard navigation when entering edit mode
-                    ImGuiIO& io = ImGui::GetIO();
-                    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-                    
-                    return true;
-                }
+            } else if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
+                // Data column: Should have been handled by CellWidget delegation above
+                // If we reach here, it means CellWidget didn't handle it (cell not selected?)
+                // Don't handle it here - let it fall through or return false
                 return false;
             } else {
                 // No cell selected - check if we're on header row
@@ -971,7 +1120,6 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
                 int stepCount = getCurrentPattern().getStepCount();
                 const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
                 if (stepCount > 0 && !columnConfig.empty()) {
-                    ofLogNotice("TrackerSequencer") << "[DEBUG] [SET editStep] Enter key - setting editStep to 0, editColumn to 1 (Enter grid)";
                     guiState.editStep = 0;
                     guiState.editColumn = 1;
                     guiState.isEditingCell = false;
@@ -1193,95 +1341,36 @@ bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPress
             }
             break;
             
-        // Numeric input (0-9) - Blender-style: direct typing enters edit mode and starts editing
-        // This should be handled by ParameterCell if in edit mode, but handle auto-enter and media selection
+        // Numeric input (0-9) - Blender-style: direct typing enters edit mode
+        // NOTE: Don't process the key here - let TrackerSequencerGUI::processCellInput() process it from InputQueueCharacters
+        // This prevents double-processing: InputRouter calls handleKeyPress() AND CellWidget processes InputQueueCharacters
         case '0': case '1': case '2': case '3': case '4': case '5': 
         case '6': case '7': case '8': case '9': {
-            // If not in edit mode, check if we should auto-enter edit mode or handle media selection
-            if (!guiState.isEditingCell) {
-                // Check if we have a valid cell focused
-                const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
-                if (isValidStep(guiState.editStep) && guiState.editColumn > 0 && guiState.editColumn <= (int)columnConfig.size()) {
-                    // We have a valid cell: enter edit mode and delegate to ParameterCell
-                    // Use the general handler approach to ensure proper state management
-                    guiState.isEditingCell = true;
-                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.setSelected(true);
-                    // Enter edit mode (this initializes buffer with current value)
-                    cell.enterEditMode();
-                    // For direct typing, clear the buffer so the digit replaces the current value
-                    // ParameterCell's handleKeyPress will handle clearing on first digit
-                    // But we need to ensure the buffer is cleared for direct typing
-                    cell.setEditBuffer("", false);
-                    
-                    // Disable ImGui keyboard navigation when entering edit mode
-                    ImGuiIO& io = ImGui::GetIO();
-                    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-                    
-                    // Now handle the digit key via ParameterCell
-                    cell.handleKeyPress(key, ctrlPressed, shiftPressed);
-                    // Cache edit buffer after handling key
-                    guiState.editBufferCache = cell.getEditBuffer();
-                    guiState.editBufferInitializedCache = cell.isEditBufferInitialized();
+            // Special case: index column (column 1) uses numeric keys for quick media selection
+            if (isValidStep(guiState.editStep) && guiState.editColumn == 1 && !guiState.isEditingCell) {
+                if (key == '0') {
+                    // Clear media index (rest)
+                    getCurrentPattern()[guiState.editStep].index = -1;
                     return true;
-                } else if (isValidStep(guiState.editStep) && guiState.editColumn == 1) {
-                    // Not in edit mode and on index column: media selection (1-9, 0) for quick selection
-                    if (key == '0') {
-                        // Clear media index (rest)
-                        getCurrentPattern()[guiState.editStep].index = -1;
-                        return true;
-                    } else {
-                        int mediaIndex = key - '1';
-                        if (indexRangeCallback && mediaIndex < indexRangeCallback()) {
-                            getCurrentPattern()[guiState.editStep].index = mediaIndex;
-                            return true;
-                        }
-                    }
                 } else {
-                    // No valid cell focused - don't auto-enter edit mode
-                    ofLogNotice("TrackerSequencer") << "[DEBUG] Digit key ignored - no cell focused (editStep=" << guiState.editStep << ", editColumn=" << guiState.editColumn << ")";
-                    return false;
+                    int mediaIndex = key - '1';
+                    if (mediaIndex < getIndexRange()) {
+                        getCurrentPattern()[guiState.editStep].index = mediaIndex;
+                        return true;
+                    }
                 }
             }
-            // If already in edit mode, should have been handled by ParameterCell delegation above
+            // For parameter columns: just enter edit mode, let CellWidget handle the input
+            // This is handled by the early return in the cell delegation section above
             break;
         }
         
         // Decimal point and minus sign for numeric input
-        // This should be handled by ParameterCell if in edit mode, but handle auto-enter
+        // NOTE: Don't process the key here - let TrackerSequencerGUI::processCellInput() process it from InputQueueCharacters
         case '.':
         case '-': {
-            // If not in edit mode, auto-enter edit mode if we have a valid cell focused
-            if (!guiState.isEditingCell) {
-                // Check if we have a valid cell focused
-                const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
-                if (isValidStep(guiState.editStep) && guiState.editColumn > 0 && guiState.editColumn <= (int)columnConfig.size()) {
-                    // We have a valid cell: enter edit mode and delegate to ParameterCell
-                    guiState.isEditingCell = true;
-                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.setSelected(true);
-                    // Enter edit mode (this initializes buffer with current value)
-                    cell.enterEditMode();
-                    // For direct typing, clear the buffer so the decimal/minus replaces the current value
-                    cell.setEditBuffer("", false);
-                    
-                    // Disable ImGui keyboard navigation when entering edit mode
-                    ImGuiIO& io = ImGui::GetIO();
-                    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-                    
-                    // Now handle the decimal/minus key via ParameterCell
-                    cell.handleKeyPress(key, ctrlPressed, shiftPressed);
-                    // Cache edit buffer after handling key
-                    guiState.editBufferCache = cell.getEditBuffer();
-                    guiState.editBufferInitializedCache = cell.isEditBufferInitialized();
-                    return true;
-                } else {
-                    // No valid cell focused - don't auto-enter edit mode
-                    ofLogNotice("TrackerSequencer") << "[DEBUG] Decimal/minus key ignored - no cell focused (editStep=" << guiState.editStep << ", editColumn=" << guiState.editColumn << ")";
-                    return false;
-                }
-            }
-            // If already in edit mode, should have been handled by ParameterCell delegation above
+            // Just enter edit mode if needed, let CellWidget handle the input
+            // This is handled by the early return in the cell delegation section above
             break;
         }
         
@@ -1374,9 +1463,43 @@ ModuleType TrackerSequencer::getType() const {
     return ModuleType::SEQUENCER;
 }
 
-std::vector<ParameterDescriptor> TrackerSequencer::getParameters() {
+//--------------------------------------------------------------
+bool TrackerSequencer::hasCapability(ModuleCapability capability) const {
+    switch (capability) {
+        case ModuleCapability::EMITS_TRIGGER_EVENTS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+//--------------------------------------------------------------
+std::vector<ModuleCapability> TrackerSequencer::getCapabilities() const {
+    return {
+        ModuleCapability::EMITS_TRIGGER_EVENTS
+    };
+}
+
+//--------------------------------------------------------------
+Module::ModuleMetadata TrackerSequencer::getMetadata() const {
+    Module::ModuleMetadata metadata;
+    metadata.typeName = "TrackerSequencer";
+    metadata.eventNames = {"triggerEvent"};
+    metadata.parameterNames = {"currentStepPosition"};
+    metadata.parameterDisplayNames["currentStepPosition"] = "Step Position";
+    return metadata;
+}
+
+std::vector<ParameterDescriptor> TrackerSequencer::getParameters() const {
     // Module interface - return available parameters (without external params for backward compatibility)
     return getAvailableParameters({});
+}
+
+ofEvent<TriggerEvent>* TrackerSequencer::getEvent(const std::string& eventName) {
+    if (eventName == "triggerEvent") {
+        return &triggerEvent;
+    }
+    return nullptr;
 }
 
 void TrackerSequencer::onTrigger(TriggerEvent& event) {
@@ -1385,12 +1508,29 @@ void TrackerSequencer::onTrigger(TriggerEvent& event) {
 }
 
 void TrackerSequencer::setParameter(const std::string& paramName, float value, bool notify) {
-    // Sequencers don't have settable parameters in the traditional sense
+    // Handle "currentStepPosition" parameter (for ParameterRouter synchronization)
+    if (paramName == "currentStepPosition") {
+        setCurrentStepPosition(value);
+        if (notify && parameterChangeCallback) {
+            parameterChangeCallback(paramName, value);
+        }
+        return;
+    }
+    
+    // Sequencers don't have other settable parameters in the traditional sense
     // Parameters are set per-step via pattern cells
-    // This method exists for Module interface compliance but does nothing
+    // This method exists for Module interface compliance but does nothing for other parameters
     if (notify && parameterChangeCallback) {
         parameterChangeCallback(paramName, value);
     }
+}
+
+float TrackerSequencer::getParameter(const std::string& paramName) const {
+    if (paramName == "currentStepPosition") {
+        return getCurrentStepPosition();
+    }
+    // For other parameters that might be added in the future
+    return Module::getParameter(paramName); // Default
 }
 
 bool TrackerSequencer::handleKeyPress(ofKeyEventArgs& keyEvent, GUIState& guiState) {
@@ -1580,6 +1720,11 @@ std::string TrackerSequencer::formatParameterValue(const std::string& paramName,
     }
     
     return std::string(buf);
+}
+
+void TrackerSequencer::update() {
+    // Update step active state (clears manually triggered steps when duration expires)
+    updateStepActiveState();
 }
 
 void TrackerSequencer::updateStepActiveState() {
@@ -1845,18 +1990,18 @@ void TrackerSequencer::setPatternChainEntryDisabled(int chainIndex, bool disable
 //--------------------------------------------------------------
 CellWidget TrackerSequencer::createParameterCellForColumn(int step, int column) {
     // column is absolute column index (0=step number, 1+=parameter columns)
-    // For parameter columns, convert to 0-based index: colIdx = column - 1
+    // For parameter columns, convert to parameter-relative index: paramColIdx = column - 1
     if (!isValidStep(step) || column <= 0) {
         return CellWidget(); // Return empty cell for invalid step or step number column (column=0)
     }
     
     const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
-    int colIdx = column - 1;  // Convert absolute column index to parameter column index
-    if (colIdx < 0 || colIdx >= (int)columnConfig.size()) {
+    int paramColIdx = column - 1;  // Convert absolute column index to parameter-relative index
+    if (paramColIdx < 0 || paramColIdx >= (int)columnConfig.size()) {
         return CellWidget();
     }
     
-    const auto& col = columnConfig[colIdx];
+    const auto& col = columnConfig[paramColIdx];
     CellWidget cell;
     
     // Configure basic properties
@@ -1871,9 +2016,9 @@ CellWidget TrackerSequencer::createParameterCellForColumn(int step, int column) 
     // Set value range based on column type
     if (!col.isRemovable && col.parameterName == "index") {
         // Index column: 0 = rest, 1+ = media index (1-based display)
-        int maxIndex = indexRangeCallback ? indexRangeCallback() : 127;
+        int maxIndex = getIndexRange();
         cell.setValueRange(0.0f, (float)maxIndex, 0.0f);
-        cell.getMaxIndex = [this]() { return indexRangeCallback ? indexRangeCallback() : 127; };
+        cell.getMaxIndex = [this]() { return getIndexRange(); };
     } else if (!col.isRemovable && col.parameterName == "length") {
         // Length column: 1-16 range
         cell.setValueRange(1.0f, 16.0f, 1.0f);
@@ -1899,18 +2044,18 @@ CellWidget TrackerSequencer::createParameterCellForColumn(int step, int column) 
 
 void TrackerSequencer::configureParameterCellCallbacks(CellWidget& cell, int step, int column) {
     // column is absolute column index (0=step number, 1+=parameter columns)
-    // For parameter columns, convert to 0-based index: colIdx = column - 1
+    // For parameter columns, convert to parameter-relative index: paramColIdx = column - 1
     if (!isValidStep(step) || column <= 0) {
         return;  // Invalid step or step number column (column=0)
     }
     
     const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
-    int colIdx = column - 1;  // Convert absolute column index to parameter column index
-    if (colIdx < 0 || colIdx >= (int)columnConfig.size()) {
+    int paramColIdx = column - 1;  // Convert absolute column index to parameter-relative index
+    if (paramColIdx < 0 || paramColIdx >= (int)columnConfig.size()) {
         return;
     }
     
-    const auto& col = columnConfig[colIdx];
+    const auto& col = columnConfig[paramColIdx];
     std::string paramName = col.parameterName; // Capture by value for lambda
     bool isRequiredCol = !col.isRemovable; // Capture by value
     std::string requiredTypeCol = !col.isRemovable ? col.parameterName : ""; // Capture by value
@@ -1948,18 +2093,18 @@ void TrackerSequencer::configureParameterCellCallbacks(CellWidget& cell, int ste
     };
     
     // onValueApplied callback - applies value to PatternCell
-    cell.onValueApplied = [this, step, colIdx, paramName, isRequiredCol, requiredTypeCol](const std::string&, float value) {
+    cell.onValueApplied = [this, step, column, paramName, isRequiredCol, requiredTypeCol](const std::string&, float value) {
         if (!isValidStep(step)) return;
         
         // Check if we should queue this edit (playback editing)
         // Note: GUI state (editStep, editColumn) is now managed by TrackerSequencerGUI
         // Since this callback is only called for the cell being edited, we just check if it's the playback step
-        bool shouldQueue = playing && isValidStep(step) && step == playbackStep && (colIdx + 1) > 0;
+        bool shouldQueue = playing && isValidStep(step) && step == playbackStep && column > 0;
         
         if (shouldQueue) {
             // Queue edit for next trigger
             pendingEdit.step = step;
-            pendingEdit.column = colIdx + 1;
+            pendingEdit.column = column;
             pendingEdit.parameterName = paramName;
             
             if (isRequiredCol && requiredTypeCol == "index") {
@@ -1997,18 +2142,18 @@ void TrackerSequencer::configureParameterCellCallbacks(CellWidget& cell, int ste
     };
     
     // onValueRemoved callback - removes parameter from PatternCell
-    cell.onValueRemoved = [this, step, colIdx, paramName, isRequiredCol, requiredTypeCol](const std::string&) {
+    cell.onValueRemoved = [this, step, column, paramName, isRequiredCol, requiredTypeCol](const std::string&) {
         if (!isValidStep(step)) return;
         
         // Check if we should queue this edit (playback editing)
         // Note: GUI state (editStep, editColumn) is now managed by TrackerSequencerGUI
         // Since this callback is only called for the cell being edited, we just check if it's the playback step
-        bool shouldQueue = playing && isValidStep(step) && step == playbackStep && (colIdx + 1) > 0;
+        bool shouldQueue = playing && isValidStep(step) && step == playbackStep && column > 0;
         
         if (shouldQueue) {
             // Queue removal for next trigger
             pendingEdit.step = step;
-            pendingEdit.column = colIdx + 1;
+            pendingEdit.column = column;
             pendingEdit.parameterName = paramName;
             pendingEdit.shouldRemove = true;
         } else {
@@ -2097,5 +2242,34 @@ void TrackerSequencer::configureParameterCellCallbacks(CellWidget& cell, int ste
     // Dynamic parameters use ParameterCell's default parsing (expression evaluation)
 }
 
+//--------------------------------------------------------------
+//--------------------------------------------------------------
+// Port-based routing interface (Phase 1)
+std::vector<Port> TrackerSequencer::getInputPorts() const {
+    // TrackerSequencer doesn't accept inputs (it's a source)
+    return {};
+}
 
+std::vector<Port> TrackerSequencer::getOutputPorts() const {
+    return {
+        Port("trigger_out", PortType::EVENT_OUT, false, "Trigger Event Output",
+             const_cast<void*>(static_cast<const void*>(&triggerEvent)))
+    };
+}
 
+//--------------------------------------------------------------
+// Module Factory Registration
+//--------------------------------------------------------------
+// Auto-register TrackerSequencer with ModuleFactory on static initialization
+// This enables true modularity - no hardcoded dependencies in ModuleFactory
+namespace {
+    struct TrackerSequencerRegistrar {
+        TrackerSequencerRegistrar() {
+            ModuleFactory::registerModuleType("TrackerSequencer", 
+                []() -> std::shared_ptr<Module> {
+                    return std::make_shared<TrackerSequencer>();
+                });
+        }
+    };
+    static TrackerSequencerRegistrar g_trackerSequencerRegistrar;
+}

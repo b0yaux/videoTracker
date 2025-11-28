@@ -1,16 +1,16 @@
 #pragma once
 
 #include "core/ModuleRegistry.h"
-#include "MediaPoolGUI.h"
-#include "TrackerSequencerGUI.h"
+#include "gui/ModuleGUI.h"
 #include "Module.h"
 #include <memory>
 #include <map>
 #include <set>
 #include <string>
 #include <vector>
+#include <functional>
 
-// Forward declaration
+// Forward declarations
 class ParameterRouter;
 
 /**
@@ -43,8 +43,36 @@ class ParameterRouter;
  * Note: Instance visibility (which instances to show) is managed here.
  *       Panel visibility (FileBrowser, Console) is managed by ViewManager.
  */
+/**
+ * GUIManager - Manages GUI object lifecycle, one per module instance
+ * 
+ * Uses registration-based factory pattern (like ModuleFactory) for true modularity.
+ * GUI classes register themselves via static registration, eliminating hardcoded dependencies.
+ */
 class GUIManager {
 public:
+    /**
+     * GUI creator function type
+     * Simply creates a GUI instance - no parameters needed
+     * @return unique_ptr to created GUI
+     */
+    using GUICreator = std::function<std::unique_ptr<ModuleGUI>()>;
+    
+    /**
+     * Register a GUI type with the factory
+     * Called automatically by GUI classes during static initialization
+     * @param typeName Module type name (e.g., "TrackerSequencer", "MediaPool")
+     * @param creator Factory function that creates instances of this GUI type
+     */
+    static void registerGUIType(const std::string& typeName, GUICreator creator);
+    
+    /**
+     * Check if a GUI type is registered
+     * @param typeName Module type name
+     * @return true if type is registered
+     */
+    static bool isGUITypeRegistered(const std::string& typeName);
+    
     GUIManager();
     ~GUIManager();
     
@@ -69,31 +97,36 @@ public:
      */
     void syncWithRegistry();
     
-    /**
-     * Get GUI for specific MediaPool instance
-     * @param instanceName Instance name (e.g., "pool1")
-     * @return Pointer to GUI object, or nullptr if not found
-     */
-    MediaPoolGUI* getMediaPoolGUI(const std::string& instanceName);
+    // ========================================================================
+    // GENERIC GUI ACCESS (Phase 12.5) - Use getGUI() and getAllGUIs() instead of module-specific getters
+    // ========================================================================
     
     /**
-     * Get GUI for specific TrackerSequencer instance
-     * @param instanceName Instance name (e.g., "tracker1")
-     * @return Pointer to GUI object, or nullptr if not found
+     * Get GUI for any module instance by name (generic)
+     * @param instanceName Instance name (e.g., "pool1", "tracker1")
+     * @return Pointer to ModuleGUI, or nullptr if not found
      */
-    TrackerSequencerGUI* getTrackerGUI(const std::string& instanceName);
+    ModuleGUI* getGUI(const std::string& instanceName);
     
     /**
-     * Get all MediaPool GUI objects
-     * @return Vector of pointers to all MediaPool GUIs
+     * Get all GUI objects (generic - Phase 12.5)
+     * @return Vector of pointers to all ModuleGUIs
+     * @deprecated Use getAllInstanceNames() and getGUI() for safer access
      */
-    std::vector<MediaPoolGUI*> getAllMediaPoolGUIs();
+    std::vector<ModuleGUI*> getAllGUIs();
     
     /**
-     * Get all TrackerSequencer GUI objects
-     * @return Vector of pointers to all TrackerSequencer GUIs
+     * Get all instance names that have GUIs (safer than getAllGUIs)
+     * @return Vector of instance names
      */
-    std::vector<TrackerSequencerGUI*> getAllTrackerGUIs();
+    std::vector<std::string> getAllInstanceNames() const;
+    
+    /**
+     * Check if a GUI exists for an instance (for safe access validation)
+     * @param instanceName Instance name
+     * @return True if GUI exists and is valid
+     */
+    bool hasGUI(const std::string& instanceName) const;
     
     /**
      * Set visibility for a specific instance
@@ -115,28 +148,45 @@ public:
      * @return Set of visible instance names
      */
     std::set<std::string> getVisibleInstances(ModuleType type) const;
+    
+    /**
+     * Validate window state after session restoration
+     * Checks if all visible module instances have corresponding ImGui windows
+     * @return true if all visible instances have windows, false otherwise
+     */
+    bool validateWindowStates() const;
+    
+    /**
+     * Remove GUI for a specific instance (for safe deletion)
+     * This directly removes the GUI without iterating through all modules
+     * @param instanceName Instance name to remove
+     */
+    void removeGUI(const std::string& instanceName);
 
 private:
     ModuleRegistry* registry = nullptr;
     ParameterRouter* parameterRouter = nullptr;
     
-    // One GUI object per instance
-    std::map<std::string, std::unique_ptr<MediaPoolGUI>> mediaPoolGUIs;
-    std::map<std::string, std::unique_ptr<TrackerSequencerGUI>> trackerGUIs;
+    // Static registration map: typeName -> GUI creator function
+    // Note: Implementation uses function-local static for initialization order safety
+    // No public static member needed - accessed via getGUICreators() internally
     
-    // Visibility state (which instances should be shown)
-    std::set<std::string> visibleMediaPoolInstances;
-    std::set<std::string> visibleTrackerInstances;
+    // ========================================================================
+    // UNIFIED GUI STORAGE (Phase 12.8) - Replaces separate maps per type
+    // ========================================================================
+    // One GUI object per instance, stored generically
+    std::map<std::string, std::unique_ptr<ModuleGUI>> allGUIs;
+    
+    // Visibility state (which instances should be shown) - unified by instance name
+    std::set<std::string> visibleInstances;
     
     /**
-     * Sync MediaPool GUIs with registry
+     * Create a GUI object for a module based on its type (factory pattern)
+     * @param module Module to create GUI for
+     * @param instanceName Instance name for the GUI
+     * @return Unique pointer to created GUI, or nullptr if module type not supported
      */
-    void syncMediaPoolGUIs();
-    
-    /**
-     * Sync TrackerSequencer GUIs with registry
-     */
-    void syncTrackerGUIs();
+    std::unique_ptr<ModuleGUI> createGUIForModule(std::shared_ptr<Module> module, const std::string& instanceName);
     
     /**
      * Get instance name for a module (helper)
@@ -144,5 +194,10 @@ private:
      * @return Instance name, or empty string if not found
      */
     std::string getInstanceNameForModule(std::shared_ptr<Module> module) const;
+    
+    // Legacy visibility helpers (for backward compatibility during migration)
+    // These map to the unified visibleInstances set
+    std::set<std::string> getVisibleInstancesForType(ModuleType type) const;
+    void setVisibleInstancesForType(ModuleType type, const std::set<std::string>& instances);
 };
 

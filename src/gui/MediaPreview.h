@@ -23,6 +23,9 @@ namespace MediaPreview {
      * @param height Height of waveform preview
      */
     void drawWaveformPreview(MediaPlayer* player, float width, float height);
+
+    // Add new function that uses cached waveform data
+    void drawWaveformPreview(const std::vector<float>& waveformData, float width, float height);
     
     /**
      * Draw video thumbnail preview
@@ -31,6 +34,14 @@ namespace MediaPreview {
      * @return Height of thumbnail
      */
     float drawVideoThumbnail(MediaPlayer* player, float width);
+    
+    /**
+     * Draw cached video thumbnail from image file
+     * @param thumbnailPath Path to cached thumbnail image
+     * @param width Width of thumbnail (height calculated from aspect ratio)
+     * @return Height of thumbnail
+     */
+    float drawCachedVideoThumbnail(const std::string& thumbnailPath, float width);
     
     /**
      * Draw hover tooltip with media preview (video thumbnail + waveform)

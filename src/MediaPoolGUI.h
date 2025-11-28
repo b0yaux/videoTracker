@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <utility>  // For std::pair
 
 class MediaPool;  // Forward declaration
 class MediaPlayer;  // Forward declaration
@@ -28,14 +29,15 @@ public:
     void requestFocusMoveToParent() { requestFocusMoveToParentWidget = true; }
     
     // Keyboard input handling (for InputRouter)
-    bool handleKeyPress(int key, bool ctrlPressed = false, bool shiftPressed = false);
-    bool isKeyboardFocused() const { return editingColumnIndex >= 0; }
+    bool handleKeyPress(int key, bool ctrlPressed = false, bool shiftPressed = false) override;
     
     // Static sync method (similar to TrackerSequencerGUI)
     static void syncEditStateFromImGuiFocus(MediaPoolGUI& gui);
     
-    // Clear cell focus (for focus restoration when window regains focus)
-    void clearCellFocus();
+    // Override ModuleGUI generic interface (Phase 7.3/7.4)
+    bool isEditingCell() const override { return isEditingParameter_; }
+    bool isKeyboardFocused() const override { return isCellFocused(); }
+    void clearCellFocus() override;
     
 protected:
     // Implement ModuleGUI::drawContent() - draws panel-specific content
@@ -72,6 +74,7 @@ private:
     };
     WaveformMarker draggingMarker = WaveformMarker::NONE;
     float waveformDragStartX = 0.0f;
+    bool isScrubbing = false;  // Track if user is currently scrubbing (for temporary playback during IDLE)
     
     // Navigation state (parent widget pattern, similar to TrackerSequencerGUI)
     ImGuiID parentWidgetId = 0;
@@ -81,7 +84,7 @@ private:
     // Parameter editing state (similar to TrackerSequencer)
     std::string editingParameter;  // Currently editing parameter name (empty if none)
     int editingColumnIndex;        // Currently editing column index (0 = media index button, 1+ = parameter columns, -1 = none)
-    bool isEditingParameter = false;
+    bool isEditingParameter_ = false;  // True when in edit mode (typing numeric value) - standardized naming
     std::string editBufferCache;
     bool editBufferInitializedCache = false;
     
@@ -109,10 +112,6 @@ private:
     void drawWaveformControls(const ImVec2& canvasPos, const ImVec2& canvasMax, float canvasWidth, float canvasHeight);  // Draw markers and controls on top of waveform
     void drawWaveformPreview(MediaPlayer* player, float width, float height);  // Draw waveform preview in tooltip
     void drawParameters();  // New: Draw parameter editing section as one-row table
-    
-    // Helper methods to create CellWidget instances for fixed column buttons
-    CellWidget createPlayStyleButtonWidget(int columnIndex);
-    CellWidget createMediaIndexButtonWidget(int columnIndex);
     
     // Helper method to create and configure CellWidget for a parameter
     // Renamed from createParameterCellForParameter (ParameterCell abstraction removed)
@@ -142,5 +141,9 @@ private:
     
     // CellGrid instance for reusable table rendering
     CellGrid cellGrid;
+    
+    // Cache for CellWidgets used in drawSpecialColumn (for non-button columns)
+    // Key: (row, col) pair, Value: CellWidget instance
+    std::map<std::pair<int, int>, CellWidget> specialColumnWidgetCache;
 };
 
