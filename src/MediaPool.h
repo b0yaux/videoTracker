@@ -17,17 +17,11 @@ class MediaPlayer;
 class Clock;
 
 // Playback state machine enum
-// NOTE: This represents MediaPool's LOCAL playback mode, NOT global transport state.
-// MediaPool can be in different modes regardless of Clock transport state:
-// - IDLE: No media playing (can occur while Clock is playing or stopped)
-// - MANUAL_PREVIEW: User-triggered preview (can occur while Clock is stopped)
-// - SEQUENCER_ACTIVE: Sequencer-triggered playback (requires Clock to be playing)
-// This is a different concern than transport state - it answers "What is MediaPool doing?"
-// rather than "Is the global transport playing?" (which comes from Clock).
+// Simplified to 2 modes: IDLE (no playback) and PLAYING (any playback active)
+// MediaPool doesn't need to distinguish between trigger sources - it just needs to know if it's playing
 enum class PlaybackMode {
-    IDLE,              // No playback active
-    MANUAL_PREVIEW,    // GUI-triggered preview playback
-    SEQUENCER_ACTIVE   // Sequencer-triggered playback
+    IDLE,     // No playback active
+    PLAYING   // Playback active (from user trigger, sequencer, or any source)
 };
 
 enum class PlayStyle {
@@ -37,14 +31,6 @@ enum class PlayStyle {
 };
 
 // Position scan mode: how scan position is stored and restored
-// Scan position tracks where playback left off, so next trigger (without explicit position) continues from there
-enum class ScanMode {
-    NONE,        // No scanning - always start from set position (or 0.0)
-    PER_STEP,    // Each step remembers its own scan position (key: step + mediaIndex)
-    PER_MEDIA,   // Each media remembers its scan position across all steps (key: mediaIndex)
-    GLOBAL       // All media share one scan position (key: ignored)
-};
-
 // Polyphony mode: how multiple triggers are handled
 enum class PolyphonyMode {
     MONOPHONIC = 0,  // Only one player active at a time (stops previous player on new trigger)
@@ -57,7 +43,7 @@ class MediaPool : public Module {
 public:
     // Constructor with optional directory
     MediaPool(const std::string& dataDir = "data");
-    virtual ~MediaPool();
+    virtual ~MediaPool() noexcept;
     
     // Scan directory for media files
     void scanDirectory(const std::string& path);
@@ -157,14 +143,11 @@ public:
     // Manual media playback (for GUI preview)
     // Automatically determines start position based on speed (end for backward, start for forward)
     bool playMediaManual(size_t index);
-    // stopManualPreview() removed - update() automatically transitions MANUAL_PREVIEW → IDLE when player stops
+    // stopManualPreview() removed - update() automatically transitions PLAYING → IDLE when player stops
     
     // Query methods for state checking
     PlaybackMode getCurrentMode() const;
-    bool isSequencerActive() const;
-    bool isManualPreview() const;
-    bool isIdle() const;
-    bool isTransportPlaying() const;  // Check if global transport is playing
+    bool isPlaying() const;  // Returns true if any player is playing (PLAYING mode)
     
     // Helper to transition to IDLE mode immediately (for button handlers)
     void setModeIdle();
@@ -183,12 +166,6 @@ public:
     
     // Update method for end-of-media detection
     void update() override;
-    
-    // Transport listener system for Clock play/stop events
-    typedef std::function<void(bool isPlaying)> TransportCallback;
-    void addTransportListener(TransportCallback listener);
-    void removeTransportListener();
-    void onTransportChanged(bool isPlaying) override; // Module interface
     
     // Connection management (internal)
     void setActivePlayer(size_t index);
@@ -222,107 +199,10 @@ public:
     std::function<void(const std::string&)> onDirectoryChanged;
     void setDirectoryChangeCallback(std::function<void(const std::string&)> callback) { onDirectoryChanged = callback; }
     
-    // Position scan mode control
-    void setScanMode(ScanMode mode);
-    ScanMode getScanMode() const;
-    
     // Polyphony mode control
     PolyphonyMode getPolyphonyMode() const;
     
 private:
-    // Position scan system: tracks where playback left off for scanning through media
-    // SIMPLIFIED: PER_MEDIA mode now uses MediaPlayer::playheadPosition directly (no storage needed)
-    // Only PER_STEP and GLOBAL modes use this storage
-    class PositionScan {
-    private:
-        ScanMode mode;
-        
-        // For PER_STEP: key = (step, mediaIndex) pair (simplified from bit-shifting)
-        // For GLOBAL: single value, key ignored
-        // NOTE: PER_MEDIA mode no longer uses storage - reads directly from MediaPlayer::playheadPosition
-        std::map<std::pair<int, int>, float> stepPositions;  // (step, mediaIndex) -> position
-        float globalScanPosition = 0.0f;
-        
-        static constexpr float SCAN_THRESHOLD = 0.01f;      // Don't store near-zero positions
-        static constexpr float SCAN_END_THRESHOLD = 0.99f;  // Positions >= this mean "media ended" (reset to start)
-        
-    public:
-        PositionScan(ScanMode m = ScanMode::PER_MEDIA) : mode(m) {}
-        
-        void setMode(ScanMode m) { mode = m; }
-        ScanMode getMode() const { return mode; }
-        
-        // Capture scan position during active playback
-        // NOTE: Only called for PER_STEP and GLOBAL modes
-        // PER_MEDIA mode uses MediaPlayer::playheadPosition directly (no capture needed)
-        void capture(int step, int mediaIndex, float position) {
-            if (mode == ScanMode::NONE || mode == ScanMode::PER_MEDIA) return;
-            if (position < SCAN_THRESHOLD) return;  // Don't store near-zero positions
-            
-            // CRITICAL: If media reached the end, reset scan position (start fresh next time)
-            if (position >= SCAN_END_THRESHOLD) {
-                clear(step, mediaIndex);
-                return;
-            }
-            
-            // Store scan position
-            if (mode == ScanMode::GLOBAL) {
-                globalScanPosition = position;
-            } else if (mode == ScanMode::PER_STEP) {
-                // For PER_STEP mode, step must be valid (>= 0)
-                if (step >= 0) {
-                    stepPositions[{step, mediaIndex}] = position;
-                }
-            }
-        }
-        
-        // Restore scan position (returns 0.0 if not found or at end)
-        // NOTE: For PER_MEDIA mode, caller should read directly from MediaPlayer::playheadPosition
-        float restore(int step, int mediaIndex) const {
-            if (mode == ScanMode::NONE || mode == ScanMode::PER_MEDIA) return 0.0f;
-            
-            if (mode == ScanMode::GLOBAL) {
-                return (globalScanPosition >= SCAN_END_THRESHOLD) ? 0.0f : globalScanPosition;
-            } else if (mode == ScanMode::PER_STEP) {
-                if (step < 0) return 0.0f;
-                auto it = stepPositions.find({step, mediaIndex});
-                if (it != stepPositions.end()) {
-                    // If stored position is at end, return 0.0 (start fresh)
-                    return (it->second >= SCAN_END_THRESHOLD) ? 0.0f : it->second;
-                }
-            }
-            return 0.0f;
-        }
-        
-        // Clear all scan positions (called when transport starts)
-        void clear() {
-            stepPositions.clear();
-            globalScanPosition = 0.0f;
-        }
-        
-        // Clear scan position for specific step/index
-        void clear(int step, int mediaIndex) {
-            if (mode == ScanMode::NONE || mode == ScanMode::PER_MEDIA) return;
-            
-            if (mode == ScanMode::GLOBAL) {
-                globalScanPosition = 0.0f;
-            } else if (mode == ScanMode::PER_STEP) {
-                if (step >= 0) {
-                    stepPositions.erase({step, mediaIndex});
-                }
-            }
-        }
-        
-        // Get number of stored scan positions
-        size_t size() const {
-            if (mode == ScanMode::NONE || mode == ScanMode::PER_MEDIA) return 0;
-            if (mode == ScanMode::GLOBAL) {
-                return (globalScanPosition > SCAN_THRESHOLD) ? 1 : 0;
-            }
-            return stepPositions.size();
-        }
-    };
-    
 private:
     Clock* clock;
     std::vector<std::unique_ptr<MediaPlayer>> players;
@@ -371,24 +251,19 @@ private:
     std::map<MediaPlayer*, bool> playerVideoConnected;  // Track video connection state per player
     std::map<MediaPlayer*, bool> playerAudioConnected;  // Track audio connection state per player
     
-    // Transport listener system
-    TransportCallback transportListener;
-    bool lastTransportState;
-    
-    // Position scan system (tracks where playback left off for scanning through media)
-    PositionScan positionScan;
-    
-    // Track last triggered step for position capture (used in update())
+    // Track last triggered step (used by ofApp/InputRouter for state tracking)
     int lastTriggeredStep = -1;
     
-    // Active step context for accurate position capture timing
-    // Updated in processEventQueue() before position capture happens in update()
+    // Active step context (kept for potential future use, currently not used in simplified logic)
     struct ActiveStepContext {
         int step = -1;
         int mediaIndex = -1;
         float triggerTime = 0.0f;
     };
     ActiveStepContext activeStepContext;
+    
+    // Track last trigger time (kept for potential future use, not needed for simplified queue-based logic)
+    float lastTriggerTime = 0.0f;
     
     // Polyphony mode: controls whether multiple players can play simultaneously
     PolyphonyMode polyphonyMode_;
@@ -446,9 +321,6 @@ private:
     // Parameter processing helper
     void applyEventParameters(MediaPlayer* player, const TriggerEvent& event, 
                              const std::vector<ParameterDescriptor>& descriptors);
-    
-    // State transition helper - simplifies mode/transport state checks
-    bool shouldTransitionToIdle(PlaybackMode mode, bool transportIsPlaying) const;
     
     // Position validation helper - clamps position for playback with play style awareness
     float clampPositionForPlayback(float position, PlayStyle playStyle) const;

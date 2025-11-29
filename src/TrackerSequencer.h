@@ -5,6 +5,7 @@
 #include "Module.h"
 #include "Pattern.h"
 #include "CellWidget.h"
+#include "PatternChain.h"
 #include "ofJson.h"
 #include <string>
 #include <vector>
@@ -15,6 +16,13 @@
 class Clock;
 struct TimeEvent;
 
+// TrackerSequencer: Pattern-based step sequencer for triggering media playback
+//
+// STEP INDEXING CONVENTION:
+// - All internal step indices are 0-based (0, 1, 2, ...)
+// - Display conversions to 1-based (1, 2, 3, ...) happen only at GUI/log boundaries
+// - Methods accepting step parameters expect 0-based indices
+// - Log messages and user-facing displays show 1-based step numbers
 class TrackerSequencer : public Module {
     friend class TrackerSequencerGUI;  // Allow GUI to access private members for rendering
     
@@ -29,7 +37,7 @@ public:
     ~TrackerSequencer();
 
     
-    void setup(Clock* clockRef, int steps = 16);
+    void setup(Clock* clockRef);
     
     // New unified initialization method (Phase 2.2)
     void initialize(Clock* clock, ModuleRegistry* registry, ConnectionManager* connectionManager, 
@@ -39,14 +47,6 @@ public:
     void onConnectionEstablished(const std::string& targetModuleName,
                                  Module::ConnectionType connectionType,
                                  ConnectionManager* connectionManager) override;
-    
-    // DEPRECATED: Use initialize() instead
-    [[deprecated("Use initialize() instead")]]
-    void postCreateSetup(Clock* clock);
-    
-    // DEPRECATED: Use initialize() instead
-    [[deprecated("Use initialize() instead")]]
-    void configureSelf(ModuleRegistry* registry, ConnectionManager* connectionManager, ParameterRouter* parameterRouter);
     
     // Initialize default pattern based on connected MediaPool (Phase 8.1)
     // Called after all modules are set up and connections are established
@@ -59,7 +59,7 @@ public:
     void onTimeEvent(TimeEvent& data); // Sample-accurate time event from Clock (filters for STEP type)
     
     // Event listener system
-    void addStepEventListener(std::function<void(int, float, const PatternCell&)> listener);
+    void addStepEventListener(std::function<void(int, float, const Step&)> listener);
     
     // Module interface implementation
     std::string getName() const override;
@@ -85,22 +85,27 @@ public:
     std::vector<Port> getOutputPorts() const override;
     
     // Expose TrackerSequencer parameters (for discovery by modules)
-    // Internal parameters: sequencer-specific (note, chance) - not sent to external modules
-    std::vector<ParameterDescriptor> getInternalParameters() const;
     // Combined: internal + external parameters
     // externalParams: optional list of external parameters from connected modules (provided by GUI layer)
     // If not provided, returns internal parameters + hardcoded defaults for backward compatibility
     std::vector<ParameterDescriptor> getAvailableParameters(const std::vector<ParameterDescriptor>& externalParams = {}) const;
+    
+    // Static helper to get default parameters (for backward compatibility when no external params)
+    static std::vector<ParameterDescriptor> getDefaultParameters();
+    
+    // Static helper to get internal parameters (doesn't depend on instance state)
+    // Internal parameters: sequencer-specific (note, chance) - not sent to external modules
+    static std::vector<ParameterDescriptor> getInternalParameters();
     
     // Transport listener for Clock play/stop events
     void onTransportChanged(bool isPlaying) override; // Module interface
     void onClockTransportChanged(bool isPlaying); // Internal implementation (called by Clock)
     
     // Pattern management
-    void setCell(int step, const PatternCell& cell);
-    PatternCell getCell(int step) const;
-    void setStepCount(int steps);  // Set step count for current pattern only
-    void clearCell(int step);
+    void setStep(int stepIndex, const Step& step);
+    Step getStep(int stepIndex) const;
+    void setStepCount(int stepCount);  // Set step count for current pattern only
+    void clearStep(int stepIndex);
     void clearPattern();
     void randomizePattern();
     void randomizeColumn(int columnIndex);  // Randomize a specific column (absolute index: 1 = index, 2 = length, 3+ = parameter columns)
@@ -123,27 +128,27 @@ public:
     void duplicatePattern(int index);  // Duplicate a pattern (adds new pattern)
     
     // Pattern chain (pattern chaining) support
-    int getPatternChainSize() const { return (int)patternChain.size(); }
-    int getCurrentChainIndex() const { return currentChainIndex; }
+    int getPatternChainSize() const { return patternChain.getSize(); }
+    int getCurrentChainIndex() const { return patternChain.getCurrentIndex(); }
     void setCurrentChainIndex(int index);
-    void addToPatternChain(int patternIndex);  // Add pattern to chain
-    void removeFromPatternChain(int chainIndex);  // Remove entry from chain
-    void clearPatternChain();  // Clear pattern chain
-    int getPatternChainEntry(int chainIndex) const;  // Get pattern index at chain position
-    void setPatternChainEntry(int chainIndex, int patternIndex);  // Set pattern at chain position
-    const std::vector<int>& getPatternChain() const { return patternChain; }
+    void addToPatternChain(int patternIndex);
+    void removeFromPatternChain(int chainIndex);
+    void clearPatternChain() { patternChain.clear(); }
+    int getPatternChainEntry(int chainIndex) const { return patternChain.getEntry(chainIndex); }
+    void setPatternChainEntry(int chainIndex, int patternIndex);
+    const std::vector<int>& getPatternChain() const { return patternChain.getChain(); }
     
     // Pattern chain repeat counts
-    int getPatternChainRepeatCount(int chainIndex) const;  // Get repeat count for chain entry (1-99)
-    void setPatternChainRepeatCount(int chainIndex, int repeatCount);  // Set repeat count (1-99)
+    int getPatternChainRepeatCount(int chainIndex) const { return patternChain.getRepeatCount(chainIndex); }
+    void setPatternChainRepeatCount(int chainIndex, int repeatCount) { patternChain.setRepeatCount(chainIndex, repeatCount); }
     
     // Pattern chain toggle
-    bool getUsePatternChain() const { return usePatternChain; }
-    void setUsePatternChain(bool use) { usePatternChain = use; }
+    bool getUsePatternChain() const { return patternChain.isEnabled(); }
+    void setUsePatternChain(bool use) { patternChain.setEnabled(use); }
     
     // Pattern chain disable (temporary disable during playback for performance)
-    bool isPatternChainEntryDisabled(int chainIndex) const;
-    void setPatternChainEntryDisabled(int chainIndex, bool disabled);
+    bool isPatternChainEntryDisabled(int chainIndex) const { return patternChain.isEntryDisabled(chainIndex); }
+    void setPatternChainEntryDisabled(int chainIndex, bool disabled) { patternChain.setEntryDisabled(chainIndex, disabled); }
     
     // Helper to get current pattern (for internal use)
     Pattern& getCurrentPattern();
@@ -173,40 +178,28 @@ public:
     
     // UI interaction
     // Note: GUI state (editStep, editColumn, isEditingCell, editBufferCache) is managed by TrackerSequencerGUI
-    // GUIState is a temporary parameter struct for passing state to handleKeyPress() - NOT a source of truth
-    struct GUIState {
-        int editStep = -1;
-        int editColumn = -1;
-        bool isEditingCell = false;  // Temporary: passed from GUI, modified by handleKeyPress, synced back to GUI
-        std::string editBufferCache;  // Temporary: passed from GUI, modified by handleKeyPress, synced back to GUI
-        bool editBufferInitializedCache = false;  // Temporary: passed from GUI, modified by handleKeyPress, synced back to GUI
-        bool shouldRefocusCurrentCell = false;  // Temporary: passed from GUI, modified by handleKeyPress, synced back to GUI
-    };
-    bool handleKeyPress(int key, bool ctrlPressed, bool shiftPressed, GUIState& guiState);
-    bool handleKeyPress(ofKeyEventArgs& keyEvent, GUIState& guiState); // Overload for ofKeyEventArgs
-    
-    // Module interface - handle mouse clicks
-    void handleMouseClick(int x, int y, int button) override;
+    // Keyboard input handling has been moved to TrackerSequencerGUI::handleKeyPress()
+    // Mouse click handling is managed by TrackerSequencerGUI (Module::handleMouseClick uses default empty implementation)
     
     // Getters
     int getStepCount() const;  // Returns current pattern's step count
-    int getCurrentStep() const { return playbackStep; }  // Backward compatibility: returns playback step
-    int getPlaybackStep() const { return playbackStep; }
-    int getPlaybackStepIndex() const { return playbackStep; }  // GUI compatibility alias
+    int getCurrentStep() const { return playbackState.playbackStep; }  // Backward compatibility: returns playback step
+    int getPlaybackStep() const { return playbackState.playbackStep; }
+    int getPlaybackStepIndex() const { return playbackState.playbackStep; }  // GUI compatibility alias
     // Sequencer playback state - derived from Clock transport state
     // This represents whether the sequencer is actively advancing steps.
     // It's synchronized with Clock via onClockTransportChanged() listener.
     // NOTE: This is sequencer-specific state, not global transport state.
     // For global transport state, query clock->isPlaying() instead.
-    bool isPlaying() const { return playing; }
-    int getCurrentPlayingStep() const { return currentPlayingStep; }
+    bool isPlaying() const { return playbackState.isPlaying; }
+    int getCurrentPlayingStep() const { return playbackState.currentPlayingStep; }
     
     // Note: GUI state accessors (editStep, editColumn, isEditingCell, editBufferCache) removed
     // Use TrackerSequencerGUI::getEditStep(), etc. instead
     
     // Pattern cell accessor for GUI
-    PatternCell& getPatternCell(int step) { return getCurrentPattern()[step]; }
-    const PatternCell& getPatternCell(int step) const { return getCurrentPattern()[step]; }
+    Step& getPatternStep(int stepIndex) { return getCurrentPattern()[stepIndex]; }
+    const Step& getPatternStep(int stepIndex) const { return getCurrentPattern()[stepIndex]; }
     
     // Drag state accessors for GUI (still needed for CellWidget interaction)
     float getDragStartY() const { return dragStartY; }
@@ -264,8 +257,7 @@ private:
     const std::vector<ColumnConfig>& getColumnConfiguration() const { return getCurrentPattern().getColumnConfiguration(); }
     
     // Pattern interaction methods
-    bool handlePatternGridClick(int x, int y);
-    bool handlePatternRowClick(int step, int column); // Unused - kept for API compatibility
+    // Mouse click handling has been moved to TrackerSequencerGUI
     
     // Parameter range conversion helpers (use actual parameter ranges, not 0-127)
     static std::pair<float, float> getParameterRange(const std::string& paramName);
@@ -282,15 +274,41 @@ private:
     // Multi-pattern support
     std::vector<Pattern> patterns;  // Pattern bank
     int currentPatternIndex = 0;  // Currently active pattern
-    std::vector<int> patternChain;  // Pattern chain for pattern chaining (sequence of pattern indices)
-    std::map<int, int> patternChainRepeatCounts;  // Repeat counts for each chain entry (default: 1)
-    std::map<int, bool> patternChainDisabled;  // Disabled state for each chain entry (temporary disable during playback)
-    int currentChainIndex = 0;  // Current position in pattern chain
-    int currentChainRepeat = 0;  // Current repeat count for current chain entry
-    bool usePatternChain = true;  // If true, use pattern chain for playback; if false, use currentPatternIndex
+    PatternChain patternChain;     // Pattern chain for pattern chaining (sequence of pattern indices)
     
-    // Note: numSteps removed - step count is now per-pattern (use getCurrentPattern().getStepCount())
-    int playbackStep;  // Currently playing step (for visual indicator)
+    // Note: stepCount is now per-pattern (use getCurrentPattern().getStepCount())
+    
+    // Consolidated playback state
+    struct PlaybackState {
+        int playbackStep = 0;           // Sequencer position in pattern (advances every step, wraps around)
+        int currentPlayingStep = -1;    // Step currently playing audio/media (-1 if none, set when media triggers)
+        bool isPlaying = false;         // Whether sequencer is actively playing
+        
+        // Timing state for current playing step
+        float stepStartTime = 0.0f;    // When current step started (unified for manual and playback)
+        float stepEndTime = 0.0f;       // When current step should end (calculated from duration)
+        
+        // Audio-rate timing system
+        double sampleAccumulator = 0.0; // Sample accumulator for step timing
+        float lastBpm = 120.0f;         // Last known BPM for timing calculations
+        
+        void reset() {
+            playbackStep = 0;
+            currentPlayingStep = -1;
+            isPlaying = false;
+            stepStartTime = 0.0f;
+            stepEndTime = 0.0f;
+            sampleAccumulator = 0.0;
+        }
+        
+        void clearPlayingStep() {
+            currentPlayingStep = -1;
+            stepStartTime = 0.0f;
+            stepEndTime = 0.0f;
+        }
+    };
+    PlaybackState playbackState;
+    
     // Note: GUI state (editStep, editColumn, isEditingCell, editBufferCache) moved to TrackerSequencerGUI
     
     // Drag state for parameter cell editing (moved from static variables to avoid loop issues)
@@ -299,52 +317,38 @@ private:
     float lastDragValue;   // Last drag value (float for precision with float parameters)
     float dragStartY;      // Y position when drag started
     float dragStartX;      // X position when drag started (for horizontal dragging)
-    int lastTriggeredStep;
-    bool playing;  // Renamed from isPlaying to avoid conflict
-    
-    // Track current media playback
-    int currentMediaStartStep;
-    float currentMediaStepLength;
-    
-    // Audio-rate timing system
-    double sampleAccumulator; // Sample accumulator for step timing
-    float lastBpm; // Last known BPM for timing calculations
-    
-    // Unified timing system for step duration (works for both manual and playback triggers)
-    float stepStartTime;      // When current step started (unified for manual and playback)
-    float stepEndTime;        // When current step should end (calculated from duration)
     
     // Step event listeners
-    std::vector<std::function<void(int, float, const PatternCell&)>> stepEventListeners;
+    std::vector<std::function<void(int, float, const Step&)>> stepEventListeners;
     
     // Connection management for index range discovery
     ConnectionManager* connectionManager_;  // Stored reference for querying connections
     
-    // UI state
-    bool showGUI;
-    
-    // Step playback tracking
-    int currentPlayingStep;  // Current step that's playing (for GUI visualization)
-    
-    // Note: Cell focus management flags removed - these are GUI concerns managed by TrackerSequencerGUI
+    // Note: GUI state (showGUI, cell focus, etc.) is managed by TrackerSequencerGUI
     
     // Parameter change callback (for ParameterRouter system)
     std::function<void(const std::string&, float)> parameterChangeCallback;
     
     // Pending edit system for playback editing
+    // Pending edit system - queues edits during playback to apply on next trigger
     struct PendingEdit {
-        int step;
-        int column;
-        std::string parameterName;
-        float value;
-        bool isIndex;
-        int indexValue;
-        bool isLength;
-        int lengthValue;
-        bool shouldRemove;
+        enum class EditType {
+            NONE,
+            PARAMETER,  // Set parameter value
+            INDEX,      // Set index value
+            LENGTH,     // Set length value
+            REMOVE      // Remove parameter
+        };
         
-        PendingEdit() : step(-1), column(-1), value(0.0f), isIndex(false), indexValue(-1), 
-                       isLength(false), lengthValue(1), shouldRemove(false) {}
+        int step = -1;
+        int column = -1;
+        EditType type = EditType::NONE;
+        std::string parameterName;
+        float value = 0.0f;
+        int intValue = -1;  // Used for index and length
+        
+        bool isValid() const { return step >= 0 && type != EditType::NONE; }
+        void clear() { *this = PendingEdit(); }
     };
     PendingEdit pendingEdit;  // Stores edit queued for next trigger
     
@@ -352,15 +356,10 @@ private:
     void applyPendingEdit();
     
     // Helper to determine if edit should be queued (during playback on current step)
-    // Note: GUI state parameters added - editStep and editColumn are now passed in
     bool shouldQueueEdit(int editStep, int editColumn) const;
     
-    // CellWidget adapter methods - bridge PatternCell to CellWidget
-    // Creates and configures a CellWidget for a specific step/column
-    CellWidget createParameterCellForColumn(int step, int column);
-    
-    // Configures callbacks for a CellWidget to connect to PatternCell operations
-    void configureParameterCellCallbacks(CellWidget& cell, int step, int column);
+    // CellWidget adapter methods removed - moved to TrackerSequencerGUI
+    // Use TrackerSequencerGUI::createParameterCellForColumn() instead
 };
 
 

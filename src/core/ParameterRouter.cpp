@@ -333,7 +333,7 @@ float ParameterRouter::getIndexedParameterValue(std::shared_ptr<Module> module, 
     //       TrackerSequencer* ts = dynamic_cast<TrackerSequencer*>(module.get());
     //       if (ts) {
     //           int step = path.getIndex();
-    //           return ts->getCell(step).getParameterValue("position", 0.0f);
+    //           return ts->getStep(step).getParameterValue("position", 0.0f);
     //       }
     //   }
     

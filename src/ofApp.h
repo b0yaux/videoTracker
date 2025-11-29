@@ -111,7 +111,7 @@ private:
     bool showGUI = true;
     bool showDemoWindow = false;
     // Note: isPlaying removed - use clock.isPlaying() directly (Clock is single source of truth for transport)
-    int numSteps = 16;
+    // Note: stepCount is now per-pattern (use getCurrentPattern().getStepCount() on TrackerSequencer)
     
     // Note: Audio state (devices, volume, level) is now managed by ViewManager
     

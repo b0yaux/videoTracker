@@ -1,4 +1,5 @@
 #include "TrackerSequencer.h"
+#include "TrackerSequencerGUI.h"  // For GUIState definition
 #include "Clock.h"
 #include "Module.h"
 #include "core/ModuleRegistry.h"
@@ -17,47 +18,49 @@
 //--------------------------------------------------------------
 TrackerSequencer::TrackerSequencer() 
     : clock(nullptr), stepsPerBeat(4), gatingEnabled(true),
-      currentPatternIndex(0), currentChainIndex(0), currentChainRepeat(0), usePatternChain(true),
-      playbackStep(0),
+      currentPatternIndex(0),
       draggingStep(-1), draggingColumn(-1), lastDragValue(0.0f), dragStartY(0.0f), dragStartX(0.0f),
-      lastTriggeredStep(-1), playing(false),
-      currentMediaStartStep(-1), currentMediaStepLength(0.0f),
-      sampleAccumulator(0.0), lastBpm(120.0f),
-      stepStartTime(0.0f), stepEndTime(0.0f),
-      connectionManager_(nullptr),
-      showGUI(true),
-      currentPlayingStep(-1) {
+      connectionManager_(nullptr) {
+    // PlaybackState is initialized with default values in struct definition
     // Initialize with one empty pattern (default 16 steps)
     patterns.push_back(Pattern(16));
     // Initialize pattern chain with first pattern
-    patternChain.push_back(0);
-    patternChainRepeatCounts[0] = 1;
+    patternChain.addEntry(0);
+    patternChain.setEnabled(true);
 }
 
 TrackerSequencer::~TrackerSequencer() {
 }
 
-void TrackerSequencer::setup(Clock* clockRef, int steps) {
+void TrackerSequencer::setup(Clock* clockRef) {
     clock = clockRef;
-    playbackStep = 0; // Initialize playback step
+    playbackState.playbackStep = 0; // Initialize playback step
     // Note: GUI state initialization removed - managed by TrackerSequencerGUI
     
     // Initialize patterns (ensure at least one pattern exists)
+    // Note: Constructor already creates Pattern(16), so this is just a safety check
     if (patterns.empty()) {
-        patterns.push_back(Pattern(steps));
+        patterns.push_back(Pattern(16));
         currentPatternIndex = 0;
     } else {
-        // Set step count for current pattern only (per-pattern step count)
-        getCurrentPattern().setStepCount(steps);
+        // Only set step count if pattern is empty (newly created)
+        // Don't overwrite existing pattern stepCounts (they may have been loaded from JSON)
+        if (getCurrentPattern().isEmpty()) {
+            getCurrentPattern().setStepCount(16);
+        }
+        // Otherwise preserve existing stepCount
     }
     
     // Column configuration is now per-pattern (initialized in Pattern constructor)
             
-            // Connect to Clock's time events for sample-accurate timing
+            // Connect to Clock's time events for beat synchronization
     if (clock) {
         ofAddListener(clock->timeEvent, this, &TrackerSequencer::onTimeEvent);
-        // Sync Clock's SPB with TrackerSequencer's SPB
-        clock->setStepsPerBeat(stepsPerBeat);
+        
+        // Register audio listener for sample-accurate step timing
+        clock->addAudioListener([this](ofSoundBuffer& buffer) {
+            this->processAudioBuffer(buffer);
+        });
         
         // Subscribe to Clock transport changes
         clock->addTransportListener([this](bool isPlaying) {
@@ -77,8 +80,35 @@ void TrackerSequencer::initialize(Clock* clock, ModuleRegistry* registry, Connec
     
     // 1. Basic setup (from postCreateSetup)
     if (clock) {
-        // Use default step count of 16 (matches setup() default)
-        setup(clock, 16);
+        if (isRestored) {
+            // For restored modules, only set up clock connection without resetting pattern stepCount
+            // Pattern stepCounts were already loaded from JSON in fromJson()
+            this->clock = clock;
+            playbackState.playbackStep = 0;
+            
+            // Connect to Clock's time events for beat synchronization
+            ofAddListener(clock->timeEvent, this, &TrackerSequencer::onTimeEvent);
+            
+            // Register audio listener for sample-accurate step timing
+            clock->addAudioListener([this](ofSoundBuffer& buffer) {
+                this->processAudioBuffer(buffer);
+            });
+            
+            // Subscribe to Clock transport changes
+            clock->addTransportListener([this](bool isPlaying) {
+                this->onClockTransportChanged(isPlaying);
+            });
+            
+            // Ensure at least one pattern exists (should already exist from fromJson, but safety check)
+            if (patterns.empty()) {
+                patterns.push_back(Pattern(16));
+                currentPatternIndex = 0;
+            }
+        } else {
+            // For new modules, setup clock connection
+            // Pattern already exists from constructor (Pattern(16))
+            setup(clock);
+        }
     }
     
     // 2. Self-configuration (from configureSelf) - only if we have all required dependencies
@@ -165,21 +195,6 @@ void TrackerSequencer::onConnectionEstablished(const std::string& targetModuleNa
 }
 
 //--------------------------------------------------------------
-// DEPRECATED: Use initialize() instead
-void TrackerSequencer::postCreateSetup(Clock* clock) {
-    // Legacy implementation - delegates to initialize()
-    initialize(clock, nullptr, nullptr, nullptr, false);
-}
-
-//--------------------------------------------------------------
-// DEPRECATED: Use initialize() instead
-void TrackerSequencer::configureSelf(ModuleRegistry* registry, ConnectionManager* connectionManager, ParameterRouter* parameterRouter) {
-    // Legacy implementation - delegates to initialize()
-    // Note: clock is nullptr here since configureSelf doesn't have it
-    initialize(nullptr, registry, connectionManager, parameterRouter, false);
-}
-
-//--------------------------------------------------------------
 void TrackerSequencer::initializeDefaultPattern(ModuleRegistry* registry, ConnectionManager* connectionManager) {
     if (!registry || !connectionManager) {
         return;
@@ -218,15 +233,15 @@ void TrackerSequencer::initializeDefaultPattern(ModuleRegistry* registry, Connec
             }
         }
         if (indexRange > 0) {
-            PatternCell cell0(0, 0.0f, 1.0f, 1.0f, 1.0f);
-            setCell(0, cell0);
+            Step step0(0, 0.0f, 1.0f, 1.0f, 1.0f);
+            setStep(0, step0);
             
             if (indexRange > 1) {
-                PatternCell cell4(1, 0.0f, 1.2f, 1.0f, 1.0f);
-                setCell(4, cell4);
+                Step step4(1, 0.0f, 1.2f, 1.0f, 1.0f);
+                setStep(4, step4);
                 
-                PatternCell cell8(0, 0.5f, 1.0f, 1.0f, 1.0f);
-                setCell(8, cell8);
+                Step step8(0, 0.5f, 1.0f, 1.0f, 1.0f);
+                setStep(8, step8);
             }
             ofLogNotice("TrackerSequencer") << "Initialized default pattern for " << getName() 
                                             << " (index range: 0-" << (indexRange - 1) << ")";
@@ -245,16 +260,14 @@ void TrackerSequencer::onClockTransportChanged(bool isPlaying) {
         // Clock started - start the sequencer from step 1
         play();
         // Reset to step 1 and trigger it
-        playbackStep = 0; // Start playback at step 0 (0-based internally, so step 1 is index 0)
-        currentPlayingStep = -1;  // Reset current playing step
-        stepStartTime = 0.0f;
-        stepEndTime = 0.0f;
+        playbackState.playbackStep = 0; // Start playback at step 0 (0-based internally, so step 1 is index 0)
+        playbackState.clearPlayingStep();
         triggerStep(0);  // Trigger step 1 (0-based)
         ofLogNotice("TrackerSequencer") << "Clock transport started - sequencer playing from step 1";
     } else {
         // Clock stopped - pause the sequencer (don't reset step)
         pause();
-        ofLogNotice("TrackerSequencer") << "Clock transport stopped - sequencer paused at step " << (playbackStep + 1);
+        ofLogNotice("TrackerSequencer") << "Clock transport stopped - sequencer paused at step " << (playbackState.playbackStep + 1);
     }
 }
 
@@ -294,22 +307,22 @@ const Pattern& TrackerSequencer::getCurrentPattern() const {
     return patterns[currentPatternIndex];
 }
 
-void TrackerSequencer::setCell(int step, const PatternCell& cell) {
-    if (!isValidStep(step)) return;
+void TrackerSequencer::setStep(int stepIndex, const Step& step) {
+    if (!isValidStep(stepIndex)) return;
     
     // Check if position parameter changed and notify if it's the current playback step
-    const PatternCell& oldCell = getCurrentPattern().getCell(step);
-    float oldPosition = oldCell.getParameterValue("position", 0.0f);
-    float newPosition = cell.getParameterValue("position", 0.0f);
+    const Step& oldStep = getCurrentPattern().getStep(stepIndex);
+    float oldPosition = oldStep.getParameterValue("position", 0.0f);
+    float newPosition = step.getParameterValue("position", 0.0f);
     
     // Update the pattern
-    getCurrentPattern().setCell(step, cell);
+    getCurrentPattern().setStep(stepIndex, step);
     
     // Notify if position changed and this is the current playback step
     // Note: Edit step checking removed - GUI state is managed by TrackerSequencerGUI
     // The GUI will handle edit step notifications separately if needed
     if (parameterChangeCallback && std::abs(oldPosition - newPosition) > 0.0001f) {
-        if (step == playbackStep) {
+        if (stepIndex == playbackState.playbackStep) {
             parameterChangeCallback("currentStepPosition", newPosition);
         }
     }
@@ -317,15 +330,15 @@ void TrackerSequencer::setCell(int step, const PatternCell& cell) {
     // Removed verbose logging for performance
 }
 
-PatternCell TrackerSequencer::getCell(int step) const {
-    if (!isValidStep(step)) return PatternCell();
-    return getCurrentPattern().getCell(step);
+Step TrackerSequencer::getStep(int stepIndex) const {
+    if (!isValidStep(stepIndex)) return Step();
+    return getCurrentPattern().getStep(stepIndex);
 }
 
-void TrackerSequencer::clearCell(int step) {
-    if (!isValidStep(step)) return;
+void TrackerSequencer::clearStep(int stepIndex) {
+    if (!isValidStep(stepIndex)) return;
     
-    getCurrentPattern().clearCell(step);
+    getCurrentPattern().clearStep(stepIndex);
     
     // Removed verbose logging for performance
 }
@@ -345,31 +358,31 @@ void TrackerSequencer::randomizePattern() {
     
     int stepCount = getCurrentPattern().getStepCount();
     for (int i = 0; i < stepCount; i++) {
-        PatternCell cell;
+        Step step;
         
         // 70% chance of having a media item, 30% chance of being empty (rest)
         if (ofRandom(1.0f) < 0.7f) {
-            cell.index = ofRandom(0, numMedia);
+            step.index = ofRandom(0, numMedia);
             
             // Use parameter ranges dynamically instead of hardcoded values
             auto posRange = getParameterRange("position");
             auto speedRange = getParameterRange("speed");
             auto volumeRange = getParameterRange("volume");
             
-            cell.setParameterValue("position", ofRandom(posRange.first, posRange.second));
-            cell.setParameterValue("speed", ofRandom(speedRange.first, speedRange.second));
+            step.setParameterValue("position", ofRandom(posRange.first, posRange.second));
+            step.setParameterValue("speed", ofRandom(speedRange.first, speedRange.second));
             // Use 25% to 75% of volume range for randomization (avoiding extremes)
             float volumeRangeSize = volumeRange.second - volumeRange.first;
-            cell.setParameterValue("volume", ofRandom(
+            step.setParameterValue("volume", ofRandom(
                 volumeRange.first + volumeRangeSize * 0.25f,
                 volumeRange.first + volumeRangeSize * 0.75f
             ));
-            cell.length = ofRandom(1, stepCount);
+            step.length = ofRandom(1, stepCount);
         } else {
-            cell.clear(); // Empty/rest step
+            step.clear(); // Empty/rest step
         }
         
-        getCurrentPattern().setCell(i, cell);
+            getCurrentPattern().setStep(i, step);
     }
     
     ofLogNotice("TrackerSequencer") << "Pattern randomized with " << numMedia << " media items";
@@ -480,28 +493,44 @@ bool TrackerSequencer::duplicateRange(int fromStep, int toStep, int destinationS
 
 // Timing and playback control
 void TrackerSequencer::processAudioBuffer(ofSoundBuffer& buffer) {
-    // This method is now deprecated - timing is handled by Clock's beat events
-    // Keep for compatibility but do nothing
+    // Sample-accurate step timing based on this TrackerSequencer's own stepsPerBeat
+    if (!playbackState.isPlaying || !clock) return;
+    
+    // Calculate samples per step from our own stepsPerBeat
+    float bpm = clock->getBPM();
+    float sampleRate = buffer.getSampleRate();
+    if (sampleRate <= 0.0f || bpm <= 0.0f) return;
+    
+    float beatsPerSecond = bpm / 60.0f;
+    float samplesPerBeat = sampleRate / beatsPerSecond;
+    float samplesPerStep = samplesPerBeat / stepsPerBeat;
+    
+    // Sample-accurate step detection
+    int numFrames = buffer.getNumFrames();
+    for (int i = 0; i < numFrames; i++) {
+        playbackState.sampleAccumulator += 1.0;
+        
+        if (playbackState.sampleAccumulator >= samplesPerStep) {
+            playbackState.sampleAccumulator -= samplesPerStep;
+            advanceStep();  // Advance to next step
+        }
+    }
 }
 
 void TrackerSequencer::onTimeEvent(TimeEvent& data) {
-    if (!playing) return;
+    if (!playbackState.isPlaying) return;
     
-    // Only process STEP events (ignore BEAT events)
-    if (data.type != TimeEventType::STEP) return;
-
-    // Advance to next step (sample-accurate timing from Clock!)
-    advanceStep();
+    // Reset step accumulator on each beat to keep steps synchronized to beats
+    // Step timing is handled by processAudioBuffer() for sample accuracy
+    playbackState.sampleAccumulator = 0.0;
+    playbackState.lastBpm = data.bpm;
 }
 
 //--------------------------------------------------------------
 void TrackerSequencer::setStepsPerBeat(int steps) {
     stepsPerBeat = std::max(1, std::min(96, steps));
     updateStepInterval();
-    // Sync with Clock's SPB
-    if (clock) {
-        clock->setStepsPerBeat(stepsPerBeat);
-    }
+    // Note: stepsPerBeat is now per-instance, no Clock coupling needed
 }
 
 void TrackerSequencer::updateStepInterval() {
@@ -522,61 +551,50 @@ void TrackerSequencer::updateStepInterval() {
 }
 
 void TrackerSequencer::play() {
-    playing = true;
-    // Reset timing state
-    currentPlayingStep = -1;
-    stepStartTime = 0.0f;
-    stepEndTime = 0.0f;
+    playbackState.isPlaying = true;
+    playbackState.clearPlayingStep();
     // Reset audio-rate timing for fresh start
-    sampleAccumulator = 0.0;
+    playbackState.sampleAccumulator = 0.0;
+    playbackState.lastBpm = clock ? clock->getBPM() : 120.0f;
 }
 
 void TrackerSequencer::pause() {
-    playing = false;
+    playbackState.isPlaying = false;
     // Clear current playing step so GUI shows inactive state when paused
     // This ensures visual feedback matches the paused state
-    currentPlayingStep = -1;
+    playbackState.clearPlayingStep();
     // Keep playbackStep and timing state for resume (if needed)
 }
 
 void TrackerSequencer::stop() {
-    playing = false;
-    playbackStep = 0; // Reset playback step indicator
-    currentPlayingStep = -1;
-    stepStartTime = 0.0f;
-    stepEndTime = 0.0f;
-    // Reset audio-rate timing
-    sampleAccumulator = 0.0;
+    playbackState.isPlaying = false;
+    playbackState.reset();
 }
 
 void TrackerSequencer::reset() {
-    playbackStep = 0; // Reset playback step indicator
-    playing = false;
-    currentPlayingStep = -1;
-    stepStartTime = 0.0f;
-    stepEndTime = 0.0f;
-    // Reset audio-rate timing
-    sampleAccumulator = 0.0;
+    playbackState.reset();
 }
 
 void TrackerSequencer::setCurrentStep(int step) {
     if (isValidStep(step)) {
-        playbackStep = step; // Update playback step indicator
+        playbackState.playbackStep = step; // Update playback step indicator
     }
 }
 
 ofJson TrackerSequencer::toJson() const {
     ofJson json;
-    json["currentStep"] = playbackStep;  // Save playback step for backward compatibility
+    json["currentStep"] = playbackState.playbackStep;  // Save playback step for backward compatibility
     // Note: GUI state (editStep, etc.) no longer saved here - managed by TrackerSequencerGUI
+    
+    // Save stepsPerBeat (per-instance step timing)
+    json["stepsPerBeat"] = stepsPerBeat;
     
     // Column configuration is now saved per-pattern (in Pattern::toJson)
     // No need to save it here - each pattern saves its own columnConfig
     
     // Save multi-pattern support
     json["currentPatternIndex"] = currentPatternIndex;
-    json["usePatternChain"] = usePatternChain;
-    json["currentChainIndex"] = currentChainIndex;
+    patternChain.toJson(json);
     
     // Save all patterns
     ofJson patternsArray = ofJson::array();
@@ -585,16 +603,7 @@ ofJson TrackerSequencer::toJson() const {
     }
     json["patterns"] = patternsArray;
     
-    // Save pattern chain with repeat counts
-    ofJson chainArray = ofJson::array();
-    for (size_t i = 0; i < patternChain.size(); i++) {
-        ofJson entryJson;
-        entryJson["patternIndex"] = patternChain[i];
-        entryJson["repeatCount"] = getPatternChainRepeatCount((int)i);
-        chainArray.push_back(entryJson);
-    }
-    json["patternChain"] = chainArray;
-    json["currentChainRepeat"] = currentChainRepeat;
+    // Pattern chain serialization is handled by PatternChain::toJson()
     
     // Legacy: Save single pattern for backward compatibility
     json["pattern"] = getCurrentPattern().toJson();
@@ -622,9 +631,17 @@ bool TrackerSequencer::saveState(const std::string& filename) const {
 void TrackerSequencer::fromJson(const ofJson& json) {
     // Load basic properties
     if (json.contains("currentStep")) {
-        playbackStep = json["currentStep"];
+        playbackState.playbackStep = json["currentStep"];
     }
     // Note: GUI state (editStep, etc.) no longer loaded here - managed by TrackerSequencerGUI
+    
+    // Load stepsPerBeat (default to 4 if not present)
+    if (json.contains("stepsPerBeat")) {
+        int spb = json["stepsPerBeat"];
+        stepsPerBeat = std::max(1, std::min(96, spb));  // Clamp to valid range
+    } else {
+        stepsPerBeat = 4;  // Default fallback
+    }
     
     // Column configuration is now per-pattern (loaded in Pattern::fromJson)
     
@@ -633,10 +650,10 @@ void TrackerSequencer::fromJson(const ofJson& json) {
         patterns.clear();
         auto patternsArray = json["patterns"];
         for (const auto& patternJson : patternsArray) {
-            Pattern p(16);  // Default step count - actual count comes from JSON array size
+            // Create pattern with default step count - fromJson will set correct count from JSON
+            Pattern p(16);  // Default step count - actual count comes from JSON stepCount field or array size
             p.fromJson(patternJson);
-            // Pattern size is now per-pattern, so we don't force it to match
-            // Each pattern keeps its own step count from JSON
+            // Pattern size is now per-pattern, preserved from JSON stepCount field
             patterns.push_back(p);
         }
         
@@ -650,110 +667,22 @@ void TrackerSequencer::fromJson(const ofJson& json) {
             }
         }
         
-        // Load pattern chain with repeat counts (support both new and legacy keys)
-        ofJson chainArray;
-        if (json.contains("patternChain") && json["patternChain"].is_array()) {
-            chainArray = json["patternChain"];
-        } else if (json.contains("orderList") && json["orderList"].is_array()) {
-            // Legacy: support old "orderList" key
-            chainArray = json["orderList"];
-        }
-        
-        if (!chainArray.is_null() && chainArray.is_array()) {
-            patternChain.clear();
-            patternChainRepeatCounts.clear();
-            for (size_t i = 0; i < chainArray.size(); i++) {
-                const auto& chainEntry = chainArray[i];
-                int patternIdx = -1;
-                int repeatCount = 1;
-                
-                // Support both old format (int) and new format (object)
-                if (chainEntry.is_number()) {
-                    // Legacy format: just pattern index
-                    patternIdx = chainEntry;
-                } else if (chainEntry.is_object()) {
-                    // New format: object with patternIndex and repeatCount
-                    if (chainEntry.contains("patternIndex")) {
-                        patternIdx = chainEntry["patternIndex"];
-                    }
-                    if (chainEntry.contains("repeatCount")) {
-                        repeatCount = chainEntry["repeatCount"];
-                        repeatCount = std::max(1, std::min(99, repeatCount));
-                    }
-                }
-                
-                if (patternIdx >= 0 && patternIdx < (int)patterns.size()) {
-                    patternChain.push_back(patternIdx);
-                    patternChainRepeatCounts[(int)i] = repeatCount;
-                    patternChainDisabled[(int)i] = false;  // Default to enabled when loading
-                }
-            }
-        }
-        
-        // Load pattern chain settings (support both new and legacy keys)
-        if (json.contains("usePatternChain")) {
-            usePatternChain = json["usePatternChain"];
-        } else if (json.contains("useOrderList")) {
-            // Legacy: support old "useOrderList" key
-            usePatternChain = json["useOrderList"];
-        } else {
-            // Default to enabled for new files
-            usePatternChain = true;
-        }
-        
-        if (json.contains("currentChainIndex")) {
-            int loadedChainIndex = json["currentChainIndex"];
-            if (loadedChainIndex >= 0 && loadedChainIndex < (int)patternChain.size()) {
-                currentChainIndex = loadedChainIndex;
-            } else {
-                currentChainIndex = 0;
-            }
-        } else if (json.contains("currentOrderIndex")) {
-            // Legacy: support old "currentOrderIndex" key
-            int loadedChainIndex = json["currentOrderIndex"];
-            if (loadedChainIndex >= 0 && loadedChainIndex < (int)patternChain.size()) {
-                currentChainIndex = loadedChainIndex;
-            } else {
-                currentChainIndex = 0;
-            }
-        }
-        
-        if (json.contains("currentChainRepeat")) {
-            currentChainRepeat = json["currentChainRepeat"];
-        } else if (json.contains("currentOrderRepeat")) {
-            // Legacy: support old "currentOrderRepeat" key
-            currentChainRepeat = json["currentOrderRepeat"];
-        } else {
-            currentChainRepeat = 0;
-        }
-        
-        // If pattern chain is empty but enabled, initialize with all patterns
-        if (usePatternChain && patternChain.empty() && !patterns.empty()) {
-            for (size_t i = 0; i < patterns.size(); i++) {
-                patternChain.push_back((int)i);
-                patternChainRepeatCounts[(int)i] = 1;
-            }
-            currentChainIndex = 0;
-            currentChainRepeat = 0;
-        }
+        // Load pattern chain (handles both new and legacy formats)
+        patternChain.fromJson(json, (int)patterns.size());
         
         ofLogNotice("TrackerSequencer") << "Loaded " << patterns.size() << " patterns, current pattern: " << currentPatternIndex;
     } else if (json.contains("pattern") && json["pattern"].is_array()) {
         // Legacy: Load single pattern (backward compatibility)
         patterns.clear();
-        Pattern p(16);  // Default step count - actual count comes from JSON array size
+        Pattern p(16);  // Default step count - actual count comes from JSON stepCount field or array size
         p.fromJson(json["pattern"]);
-        // Pattern size is now per-pattern, so we don't force it to match
+        // Pattern size is now per-pattern, preserved from JSON stepCount field
         patterns.push_back(p);
         currentPatternIndex = 0;
         patternChain.clear();
-        patternChainRepeatCounts.clear();
         // Initialize pattern chain with the single pattern for legacy files
-        patternChain.push_back(0);
-        patternChainRepeatCounts[0] = 1;
-        usePatternChain = true;  // Enable by default
-        currentChainIndex = 0;
-        currentChainRepeat = 0;
+        patternChain.addEntry(0);
+        patternChain.setEnabled(true);
         ofLogNotice("TrackerSequencer") << "Loaded legacy single pattern format";
     } else {
         // No pattern data - ensure we have at least one empty pattern
@@ -762,12 +691,9 @@ void TrackerSequencer::fromJson(const ofJson& json) {
             currentPatternIndex = 0;
         }
         // Initialize pattern chain with the first pattern
-        if (patternChain.empty() && !patterns.empty()) {
-            patternChain.push_back(0);
-            patternChainRepeatCounts[0] = 1;
-            usePatternChain = true;  // Enable by default
-            currentChainIndex = 0;
-            currentChainRepeat = 0;
+        if (patternChain.getSize() == 0 && !patterns.empty()) {
+            patternChain.addEntry(0);
+            patternChain.setEnabled(true);
         }
     }
 }
@@ -796,77 +722,47 @@ bool TrackerSequencer::loadState(const std::string& filename) {
     return true;
 }
 
-void TrackerSequencer::addStepEventListener(std::function<void(int, float, const PatternCell&)> listener) {
+void TrackerSequencer::addStepEventListener(std::function<void(int, float, const Step&)> listener) {
     stepEventListeners.push_back(listener);
 }
 
 void TrackerSequencer::advanceStep() {
-    if (!playing) return;
+    if (!playbackState.isPlaying) return;
     
     float currentTime = ofGetElapsedTimef();
     
     // Check if current step duration has expired
-    bool currentStepExpired = (currentPlayingStep >= 0 && stepEndTime > 0.0f && currentTime >= stepEndTime);
+    bool currentStepExpired = (playbackState.currentPlayingStep >= 0 && playbackState.stepEndTime > 0.0f && currentTime >= playbackState.stepEndTime);
     
     if (currentStepExpired) {
         // Current step finished - clear playing state
-        currentPlayingStep = -1;
-        stepStartTime = 0.0f;
-        stepEndTime = 0.0f;
+        playbackState.clearPlayingStep();
     }
     
     // Always advance playback step (for visual indicator)
     int stepCount = getCurrentPattern().getStepCount();
-    int previousStep = playbackStep;
-    playbackStep = (playbackStep + 1) % stepCount;
+    int previousStep = playbackState.playbackStep;
+    playbackState.playbackStep = (playbackState.playbackStep + 1) % stepCount;
     
     // Check if we wrapped around (pattern finished)
-    bool patternFinished = (playbackStep == 0 && previousStep == stepCount - 1);
+    bool patternFinished = (playbackState.playbackStep == 0 && previousStep == stepCount - 1);
     
     // If pattern finished and using pattern chain, handle repeat counts
-    if (patternFinished && usePatternChain && !patternChain.empty()) {
-        // Increment repeat counter
-        currentChainRepeat++;
-        
-        // Get repeat count for current chain entry (default to 1 if not set)
-        int repeatCount = 1;
-        auto it = patternChainRepeatCounts.find(currentChainIndex);
-        if (it != patternChainRepeatCounts.end()) {
-            repeatCount = it->second;
-        }
-        
-        // Check if we've finished all repeats for current chain entry
-        if (currentChainRepeat >= repeatCount) {
-            // Move to next chain entry (skip disabled entries)
-            currentChainRepeat = 0;
-            int startIndex = currentChainIndex;
-            do {
-                currentChainIndex = (currentChainIndex + 1) % (int)patternChain.size();
-                // If we've looped back to start and all are disabled, break to avoid infinite loop
-                if (currentChainIndex == startIndex) break;
-            } while (isPatternChainEntryDisabled(currentChainIndex) && currentChainIndex != startIndex);
-        }
-        
-        // Update current pattern index (only if not disabled)
-        if (!isPatternChainEntryDisabled(currentChainIndex)) {
-            int nextPatternIdx = patternChain[currentChainIndex];
-            if (nextPatternIdx >= 0 && nextPatternIdx < (int)patterns.size()) {
-                currentPatternIndex = nextPatternIdx;
-                ofLogVerbose("TrackerSequencer") << "Pattern finished, advancing to pattern " << nextPatternIdx 
-                                                 << " (chain position " << currentChainIndex 
-                                                 << ", repeat " << (currentChainRepeat + 1) << "/" << repeatCount << ")";
-            }
+    if (patternFinished) {
+        int nextPatternIdx = patternChain.advanceOnPatternFinish((int)patterns.size());
+        if (nextPatternIdx >= 0) {
+            currentPatternIndex = nextPatternIdx;
         }
     }
     
     // Check if we should trigger the new step
-    const PatternCell& newCell = getCell(playbackStep);
+    const Step& newStep = getStep(playbackState.playbackStep);
     
     // Trigger new step if:
     // 1. No step is currently playing (currentPlayingStep < 0), OR
     // 2. New step has media (index >= 0) - this overrides current playing step
-    if (currentPlayingStep < 0 || newCell.index >= 0) {
-        triggerStep(playbackStep);
+    if (playbackState.currentPlayingStep < 0 || newStep.index >= 0) {
+        triggerStep(playbackState.playbackStep);
     }
 }
 
@@ -879,32 +775,29 @@ void TrackerSequencer::triggerStep(int step) {
     if (!isEnabled()) return;
     
     // Apply any pending edit for this step before triggering
-    if (pendingEdit.step == step && pendingEdit.step >= 0) {
+    if (pendingEdit.step == step && pendingEdit.isValid()) {
         applyPendingEdit();
-        // Clear pending edit after applying
-        pendingEdit = PendingEdit();
+        pendingEdit.clear();
     }
 
-    const PatternCell& cell = getCell(step); // Direct 0-based array access
+    const Step& stepData = getStep(step); // Direct 0-based array access
     float bpm = clock->getBPM();
     
-    playbackStep = step;
+    playbackState.playbackStep = step;
     
     // Calculate duration in seconds (same for both manual and playback)
-    float stepLength = cell.index >= 0 ? (float)cell.length : 1.0f;
+    float stepLength = stepData.index >= 0 ? (float)stepData.length : 1.0f;
     float duration = (stepLength * 60.0f) / (bpm * stepsPerBeat);
     
     // Set timing for ALL triggers (unified for manual and playback)
-    if (cell.index >= 0) {
+    if (stepData.index >= 0) {
         float currentTime = ofGetElapsedTimef();
-        stepStartTime = currentTime;
-        stepEndTime = currentTime + duration;
-        currentPlayingStep = step;
+        playbackState.stepStartTime = currentTime;
+        playbackState.stepEndTime = currentTime + duration;
+        playbackState.currentPlayingStep = step;
     } else {
         // Empty step - clear playing state
-        currentPlayingStep = -1;
-        stepStartTime = 0.0f;
-        stepEndTime = 0.0f;
+        playbackState.clearPlayingStep();
     }
     
     // Create TriggerEvent with TrackerSequencer parameters
@@ -917,8 +810,8 @@ void TrackerSequencer::triggerStep(int step) {
     // Check chance parameter (internal) - only trigger if random roll succeeds
     // Chance is 0-100, default 100 (always trigger)
     int chance = 100;
-    if (cell.hasParameter("chance")) {
-        chance = (int)std::round(cell.getParameterValue("chance", 100.0f));
+    if (stepData.hasParameter("chance")) {
+        chance = (int)std::round(stepData.getParameterValue("chance", 100.0f));
         chance = std::max(0, std::min(100, chance)); // Clamp to 0-100
     }
     
@@ -931,10 +824,10 @@ void TrackerSequencer::triggerStep(int step) {
         }
     }
     
-    // Map PatternCell parameters to TrackerSequencer parameters
-    // "note" is the sequencer's parameter name (maps to cell.index for MediaPool)
-    if (cell.index >= 0) {
-        triggerEvt.parameters["note"] = (float)cell.index;
+    // Map Step parameters to TrackerSequencer parameters
+    // "note" is the sequencer's parameter name (maps to stepData.index for MediaPool)
+    if (stepData.index >= 0) {
+        triggerEvt.parameters["note"] = (float)stepData.index;
     } else {
         triggerEvt.parameters["note"] = -1.0f; // Rest/empty step
     }
@@ -960,10 +853,10 @@ void TrackerSequencer::triggerStep(int step) {
     }
     
     // Only send parameters that are both:
-    // 1. In the cell's parameterValues (explicitly set)
+    // 1. In the step's parameterValues (explicitly set)
     // 2. In the current pattern's column configuration (actually displayed in grid)
     // 3. Not internal parameters (note, chance)
-    for (const auto& paramPair : cell.parameterValues) {
+    for (const auto& paramPair : stepData.parameterValues) {
         const std::string& paramName = paramPair.first;
         float paramValue = paramPair.second;
         
@@ -987,465 +880,60 @@ void TrackerSequencer::triggerStep(int step) {
     ofNotifyEvent(triggerEvent, triggerEvt);
     
     // Legacy: Also notify old event system for backward compatibility
-    // Optimized: Pass cell and duration directly to avoid redundant lookups
+    // Optimized: Pass step and duration directly to avoid redundant lookups
     if (!stepEventListeners.empty()) {
         float noteDuration = duration; // Already calculated above
         int step1Based = step + 1; // Convert to 1-based for display
         for (auto& callback : stepEventListeners) {
-            callback(step1Based, noteDuration, cell);
+            callback(step1Based, noteDuration, stepData);
         }
     }
-    
-    // NO LOGGING IN AUDIO THREAD - removed ofLogVerbose calls
 }
 
-///MARK: - DRAW
-// GUI drawing methods have been moved to TrackerSequencerGUI class
-// All ImGui drawing code is now in TrackerSequencerGUI::draw() and related methods
-
-void TrackerSequencer::handleMouseClick(int x, int y, int button) {
-    // Handle pattern grid clicks
-    if (showGUI) {
-        handlePatternGridClick(x, y);
-    }
-}
-
-bool TrackerSequencer::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed, GUIState& guiState) {
-    // NOTE: guiState is a temporary parameter - actual state lives in TrackerSequencerGUI
-    // This method modifies guiState and returns it, which gets synced back to TrackerSequencerGUI
-    
-    // If a cell is selected (editStep/editColumn are valid), handle special keys only
-    // NOTE: Typed characters (0-9, ., -, +, *, /) are NOT processed here.
-    // They are handled by TrackerSequencerGUI::processCellInput() via InputQueueCharacters during draw().
-    // This prevents double-processing: InputRouter calls handleKeyPress() AND processCellInput() processes InputQueueCharacters.
-    if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-        // Skip typed characters - let processCellInput() handle them via InputQueueCharacters
-        if ((key >= '0' && key <= '9') || key == '.' || key == '-' || key == '+' || key == '*' || key == '/') {
-            // Just enter edit mode if not already editing, then let processCellInput() handle the input
-            if (!guiState.isEditingCell) {
-                guiState.isEditingCell = true;
-                // NOTE: Navigation remains enabled for gamepad support
-            }
-            // Return false to let the key pass through to ImGui so processCellInput() can process it
-            return false;
-        }
-        
-        // For special keys (Enter, Escape, Arrow keys, etc.), delegate to CellWidget
-        CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-        
-        // Sync state from GUI state to CellWidget
-        cell.setSelected(true);
-        if (guiState.isEditingCell) {
-            // Set editing state first (this will initialize buffer with current value)
-            cell.setEditing(true);
-            // Then restore the cached buffer to preserve state across frames
-            // This overwrites the initialized buffer with the cached one
-            cell.setEditBuffer(guiState.editBufferCache, guiState.editBufferInitializedCache);
-        } else {
-            cell.setEditing(false);
-        }
-        
-        // Delegate keyboard handling to ParameterCell
-        bool handled = cell.handleKeyPress(key, ctrlPressed, shiftPressed);
-        
-        if (handled) {
-            // Check state changes BEFORE syncing
-            bool wasEditing = guiState.isEditingCell;
-            bool nowEditing = cell.isEditingMode();
-            
-            // Sync edit mode state back from ParameterCell to GUI state
-            guiState.isEditingCell = nowEditing;
-            // Cache edit buffer for persistence across frames (ParameterCell owns the logic)
-            if (nowEditing) {
-                guiState.editBufferCache = cell.getEditBuffer();
-                guiState.editBufferInitializedCache = cell.isEditBufferInitialized();
-            } else {
-                guiState.editBufferCache.clear();
-                guiState.editBufferInitializedCache = false;
-            }
-            
-            // If CellWidget exited edit mode via Enter, signal refocus needed
-            // This maintains focus after saving with Enter (unified refocus system)
-            // Note: Refocus is signaled via GUI state, GUI layer will handle it on next frame
-            if (!nowEditing && wasEditing) {
-                guiState.shouldRefocusCurrentCell = true;
-            }
-            
-            // NOTE: Navigation remains enabled at all times for gamepad support
-            // No need to disable/enable navigation when entering/exiting edit mode
-            return true;
-        }
-        // If ParameterCell didn't handle it, fall through to grid navigation logic
-    }
-    
-    // Handle keyboard shortcuts for pattern editing (grid navigation)
-    switch (key) {
-        // Enter key behavior:
-        // - Enter on step number column (editColumn == 0): Trigger step
-        // - Enter on data column: Enter/exit edit mode
-        case OF_KEY_RETURN:
-            if (ctrlPressed || shiftPressed) {
-                // Ctrl+Enter or Shift+Enter: Exit grid navigation
-                // If we were in edit mode, restore ImGui keyboard navigation
-                if (guiState.isEditingCell) {
-                    ImGuiIO& io = ImGui::GetIO();
-                    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-                }
-                guiState.editStep = -1;
-                guiState.editColumn = -1;
-                guiState.isEditingCell = false;
-                guiState.editBufferCache.clear();
-                guiState.editBufferInitializedCache = false;
-                return true;
-            }
-            
-            // Enter key for data columns (editColumn > 0) is handled by CellWidget delegation above
-            // Only handle Enter for step number column (editColumn == 0) or when no cell is selected
-            if (isValidStep(guiState.editStep) && guiState.editColumn == 0) {
-                // Step number column: Trigger step
-                triggerStep(guiState.editStep);
-                return true;
-            } else if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-                // Data column: Should have been handled by CellWidget delegation above
-                // If we reach here, it means CellWidget didn't handle it (cell not selected?)
-                // Don't handle it here - let it fall through or return false
-                return false;
-            } else {
-                // No cell selected - check if we're on header row
-                if (guiState.editStep == -1 && !guiState.isEditingCell) {
-                    // On header row - don't select first cell, let ImGui handle it
-                    return false;
-                }
-                // No cell selected: Enter grid and select first data cell
-                int stepCount = getCurrentPattern().getStepCount();
-                const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
-                if (stepCount > 0 && !columnConfig.empty()) {
-                    guiState.editStep = 0;
-                    guiState.editColumn = 1;
-                    guiState.isEditingCell = false;
-                    guiState.editBufferCache.clear();
-                    guiState.editBufferInitializedCache = false;
-                    return true;
-                }
-            }
-            return false;
-            
-        // Escape: Exit edit mode (should be handled by ParameterCell, but handle fallback)
-        // IMPORTANT: Only handle ESC when in edit mode. When NOT in edit mode, let ESC pass through
-        // to ImGui so it can use ESC to escape contained navigation contexts (like scrollable tables)
-        case OF_KEY_ESC:
-            if (guiState.isEditingCell) {
-                guiState.isEditingCell = false;
-                guiState.editBufferCache.clear();
-                guiState.editBufferInitializedCache = false;
-                
-                // CRITICAL: Re-enable ImGui keyboard navigation when exiting edit mode
-                ImGuiIO& io = ImGui::GetIO();
-                io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-                
-                return true;
-            }
-            // NOT in edit mode: Let ESC pass through to ImGui for navigation escape
-            return false;
-            
-        // Backspace and Delete: Should be handled by ParameterCell above
-        case OF_KEY_BACKSPACE:
-        case OF_KEY_DEL:
-            // These should have been handled by ParameterCell if in edit mode
-            return false;
-            
-        // Tab: Always let ImGui handle for panel navigation
-        // (Exit edit mode is handled by clicking away or pressing Escape)
-        case OF_KEY_TAB:
-            return false; // Always let ImGui handle Tab for panel/window navigation
-            
-        // Arrow keys: 
-        // - Cmd+Arrow Up/Down: Move playback step (walk through steps)
-        // - In edit mode: Adjust values ONLY (no navigation) - handled by ParameterCell
-        // - Not in edit mode: Let ImGui handle navigation between cells
-        case OF_KEY_UP:
-            if (ctrlPressed && !guiState.isEditingCell) {
-                // Cmd+Up: Move playback step up
-                if (isValidStep(guiState.editStep)) {
-                    int stepCount = getCurrentPattern().getStepCount();
-                    playbackStep = (playbackStep - 1 + stepCount) % stepCount;
-                    triggerStep(playbackStep);
-                    return true;
-                }
-                return false;
-            }
-            if (guiState.isEditingCell) {
-                // In edit mode: Should be handled by ParameterCell above
-                // Fallback: adjust value directly
-                if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.setSelected(true);
-                    cell.setEditing(true);
-                    cell.adjustValue(1);
-                    return true;
-                }
-                return false;
-            }
-            // Not in edit mode: Navigate to cell above
-            if (isValidStep(guiState.editStep) && guiState.editColumn >= 0) {
-                if (guiState.editStep > 0) {
-                    // Move to cell above (same column)
-                    guiState.editStep--;
-                    return true;
-                } else {
-                    // At top of grid - exit grid focus to allow navigation to other widgets
-                    guiState.editStep = -1;
-                    guiState.editColumn = -1;
-                    guiState.isEditingCell = false;
-                    guiState.editBufferCache.clear();
-                    guiState.editBufferInitializedCache = false;
-                    return false; // Let ImGui handle navigation to other widgets
-                }
-            }
-            // Not in edit mode: Check if on header row (editStep == -1 means no cell focused, likely on header)
-            if (guiState.editStep == -1 && !guiState.isEditingCell) {
-                // On header row - clear cell focus and let ImGui handle navigation naturally
-                guiState.editStep = -1;
-                guiState.editColumn = -1;
-                guiState.isEditingCell = false;
-                guiState.editBufferCache.clear();
-                guiState.editBufferInitializedCache = false;
-                return false; // Let ImGui handle the UP key to navigate to other widgets
-            }
-            // Not in edit mode: Let ImGui handle navigation
-            return false;
-            
-        case OF_KEY_DOWN: {
-            if (ctrlPressed && !guiState.isEditingCell) {
-                // Cmd+Down: Move playback step down
-                if (isValidStep(guiState.editStep)) {
-                    int stepCount = getCurrentPattern().getStepCount();
-                    playbackStep = (playbackStep + 1) % stepCount;
-                    triggerStep(playbackStep);
-                    return true;
-                }
-                return false;
-            }
-            if (guiState.isEditingCell) {
-                // In edit mode: Should be handled by ParameterCell above
-                // Fallback: adjust value directly
-                if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.setSelected(true);
-                    cell.setEditing(true);
-                    cell.adjustValue(-1);
-                    return true;
-                }
-                return false;
-            }
-            // Not in edit mode: Navigate to cell below
-            if (isValidStep(guiState.editStep) && guiState.editColumn >= 0) {
-                int stepCount = getCurrentPattern().getStepCount();
-                if (guiState.editStep < stepCount - 1) {
-                    // Move to cell below (same column)
-                    guiState.editStep++;
-                    return true;
-                } else {
-                    // At bottom of grid - exit grid focus to allow navigation to other widgets
-                    guiState.editStep = -1;
-                    guiState.editColumn = -1;
-                    guiState.isEditingCell = false;
-                    guiState.editBufferCache.clear();
-                    guiState.editBufferInitializedCache = false;
-                    return false; // Let ImGui handle navigation to other widgets
-                }
-            }
-            // Not in edit mode: Let ImGui handle navigation
-            return false;
-        }
-            
-        case OF_KEY_LEFT:
-            if (guiState.isEditingCell) {
-                // In edit mode: Should be handled by ParameterCell above
-                // Fallback: adjust value directly
-                if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.setSelected(true);
-                    cell.setEditing(true);
-                    cell.adjustValue(-1);
-                    return true;
-                }
-                return false;
-            }
-            // Not in edit mode: Navigate to cell to the left
-            if (isValidStep(guiState.editStep) && guiState.editColumn >= 0) {
-                if (guiState.editColumn > 1) {
-                    // Move to cell to the left (decrement column)
-                    guiState.editColumn--;
-                    return true;
-                } else if (guiState.editColumn == 1) {
-                    // At first data column - move to step number column (column 0)
-                    guiState.editColumn = 0;
-                    return true;
-                } else {
-                    // At step number column (column 0) - exit grid focus
-                    return false;
-                }
-            }
-            // Not in edit mode: Let ImGui handle navigation
-            return false;
-            
-        case OF_KEY_RIGHT:
-            if (guiState.isEditingCell) {
-                // In edit mode: Should be handled by ParameterCell above
-                // Fallback: adjust value directly
-                if (isValidStep(guiState.editStep) && guiState.editColumn > 0) {
-                    CellWidget cell = createParameterCellForColumn(guiState.editStep, guiState.editColumn);
-                    cell.setSelected(true);
-                    cell.setEditing(true);
-                    cell.adjustValue(1);
-                    return true;
-                }
-                return false;
-            }
-            // Not in edit mode: Navigate to cell to the right
-            if (isValidStep(guiState.editStep) && guiState.editColumn >= 0) {
-                const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
-                int maxColumn = (int)columnConfig.size();
-                if (guiState.editColumn == 0) {
-                    // At step number column - move to first data column (column 1)
-                    guiState.editColumn = 1;
-                    return true;
-                } else if (guiState.editColumn < maxColumn) {
-                    // Move to cell to the right (increment column)
-                    guiState.editColumn++;
-                    return true;
-                } else {
-                    // At rightmost column - exit grid focus
-                    return false;
-                }
-            }
-            // Not in edit mode: Let ImGui handle navigation
-            return false;
-            
-        // Pattern editing - all operations use editStep
-        case 'c':
-        case 'C':
-            if (isValidStep(guiState.editStep)) {
-                clearCell(guiState.editStep);
-                return true;
-            }
-            break;
-            
-        case 'x':
-        case 'X':
-            // Copy from previous step
-            if (isValidStep(guiState.editStep) && guiState.editStep > 0) {
-                        getCurrentPattern().setCell(guiState.editStep, getCurrentPattern().getCell(guiState.editStep - 1));
-                return true;
-            }
-            break;
-            
-        // Numeric input (0-9) - Blender-style: direct typing enters edit mode
-        // NOTE: Don't process the key here - let TrackerSequencerGUI::processCellInput() process it from InputQueueCharacters
-        // This prevents double-processing: InputRouter calls handleKeyPress() AND CellWidget processes InputQueueCharacters
-        case '0': case '1': case '2': case '3': case '4': case '5': 
-        case '6': case '7': case '8': case '9': {
-            // Special case: index column (column 1) uses numeric keys for quick media selection
-            if (isValidStep(guiState.editStep) && guiState.editColumn == 1 && !guiState.isEditingCell) {
-                if (key == '0') {
-                    // Clear media index (rest)
-                    getCurrentPattern()[guiState.editStep].index = -1;
-                    return true;
-                } else {
-                    int mediaIndex = key - '1';
-                    if (mediaIndex < getIndexRange()) {
-                        getCurrentPattern()[guiState.editStep].index = mediaIndex;
-                        return true;
-                    }
-                }
-            }
-            // For parameter columns: just enter edit mode, let CellWidget handle the input
-            // This is handled by the early return in the cell delegation section above
-            break;
-        }
-        
-        // Decimal point and minus sign for numeric input
-        // NOTE: Don't process the key here - let TrackerSequencerGUI::processCellInput() process it from InputQueueCharacters
-        case '.':
-        case '-': {
-            // Just enter edit mode if needed, let CellWidget handle the input
-            // This is handled by the early return in the cell delegation section above
-            break;
-        }
-        
-        // Note: Numpad keys are already handled above - openFrameworks converts
-        // numpad 0-9 to regular '0'-'9' characters and numpad Enter to OF_KEY_RETURN
-        // So numpad support works automatically!
-        
-    }
-    return false;
-}
-
-// Private methods
-//--------------------------------------------------------------
-
-// GUI drawing methods (drawPatternRow, drawStepNumber, drawParameterCell) 
-// have been moved to TrackerSequencerGUI class
-
-// drawAudioEnabled and drawVideoEnabled removed - A/V toggles no longer used
-
-bool TrackerSequencer::handlePatternGridClick(int x, int y) {
-    // Calculate grid position (simplified - would need proper coordinate mapping)
-    // This is a placeholder implementation
-    return false;
-}
-
-bool TrackerSequencer::handlePatternRowClick(int step, int column) {
-    // Unused - cycling functionality removed
-    return false;
-}
-
-// toggleAudio and toggleVideo removed - A/V toggles no longer used
-// Audio/video always enabled when available
-
-// Additional missing method implementations
 //--------------------------------------------------------------
 bool TrackerSequencer::isValidStep(int step) const {
     return step >= 0 && step < getCurrentPattern().getStepCount();
 }
-
-// Column configuration methods are now in Pattern class
-// TrackerSequencer methods delegate to current pattern (see TrackerSequencer.h)
-
-// Dynamic column drawing - drawParameterCell() has been moved to TrackerSequencerGUI class
-
-// Edit mode helpers
 //--------------------------------------------------------------
-// Legacy edit methods removed - use ParameterCell methods instead
-// The pending edit queue is handled via ParameterCell callbacks
-
 bool TrackerSequencer::shouldQueueEdit(int editStep, int editColumn) const {
-    return playing && isValidStep(editStep) && editStep == playbackStep && editColumn > 0;
+    return playbackState.isPlaying && isValidStep(editStep) && editStep == playbackState.playbackStep && editColumn > 0;
 }
 
 void TrackerSequencer::applyPendingEdit() {
-    if (!isValidStep(pendingEdit.step)) {
+    if (!pendingEdit.isValid() || !isValidStep(pendingEdit.step)) {
         return;
     }
     
-    auto& cell = getCurrentPattern()[pendingEdit.step];
+    Step step = getStep(pendingEdit.step);
     
-    if (pendingEdit.shouldRemove) {
-        cell.removeParameter(pendingEdit.parameterName);
-        setCell(pendingEdit.step, cell);
-    } else if (pendingEdit.isLength) {
-        cell.length = pendingEdit.lengthValue;
-        setCell(pendingEdit.step, cell);
-    } else if (pendingEdit.isIndex) {
-        cell.index = pendingEdit.indexValue;
-        setCell(pendingEdit.step, cell);
-    } else if (!pendingEdit.parameterName.empty()) {
-        auto range = getParameterRange(pendingEdit.parameterName);
-        float clampedValue = std::max(range.first, std::min(range.second, pendingEdit.value));
-        cell.setParameterValue(pendingEdit.parameterName, clampedValue);
-        setCell(pendingEdit.step, cell);
+    // Apply edit based on type
+    switch (pendingEdit.type) {
+        case PendingEdit::EditType::REMOVE:
+            step.removeParameter(pendingEdit.parameterName);
+            break;
+            
+        case PendingEdit::EditType::LENGTH:
+            step.length = pendingEdit.intValue;
+            break;
+            
+        case PendingEdit::EditType::INDEX:
+            step.index = pendingEdit.intValue;
+            break;
+            
+        case PendingEdit::EditType::PARAMETER:
+            if (!pendingEdit.parameterName.empty()) {
+                auto range = getParameterRange(pendingEdit.parameterName);
+                float clampedValue = std::max(range.first, std::min(range.second, pendingEdit.value));
+                step.setParameterValue(pendingEdit.parameterName, clampedValue);
+            }
+            break;
+            
+        case PendingEdit::EditType::NONE:
+            return;  // No edit to apply
     }
+    
+    // Update the pattern with modified step
+    setStep(pendingEdit.step, step);
 }
 
 // initializeEditBuffer() removed - use ParameterCell::enterEditMode() instead
@@ -1533,15 +1021,10 @@ float TrackerSequencer::getParameter(const std::string& paramName) const {
     return Module::getParameter(paramName); // Default
 }
 
-bool TrackerSequencer::handleKeyPress(ofKeyEventArgs& keyEvent, GUIState& guiState) {
-    // Convert ofKeyEventArgs to existing handleKeyPress signature
-    int key = keyEvent.key;
-    bool ctrlPressed = keyEvent.hasModifier(OF_KEY_CONTROL);
-    bool shiftPressed = keyEvent.hasModifier(OF_KEY_SHIFT);
-    return handleKeyPress(key, ctrlPressed, shiftPressed, guiState);
-}
+// Keyboard input handling has been moved to TrackerSequencerGUI::handleKeyPress()
 
-std::vector<ParameterDescriptor> TrackerSequencer::getInternalParameters() const {
+// Static helper to get internal parameters (doesn't depend on instance state)
+std::vector<ParameterDescriptor> TrackerSequencer::getInternalParameters() {
     std::vector<ParameterDescriptor> params;
     
     // Internal parameters: sequencer-specific, not sent to external modules
@@ -1553,11 +1036,23 @@ std::vector<ParameterDescriptor> TrackerSequencer::getInternalParameters() const
     return params;
 }
 
+// Static helper to get default parameters (for backward compatibility when no external params)
+std::vector<ParameterDescriptor> TrackerSequencer::getDefaultParameters() {
+    std::vector<ParameterDescriptor> params;
+    
+    // Hardcoded defaults for backward compatibility when external params are not available
+    params.push_back(ParameterDescriptor("position", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Position"));
+    params.push_back(ParameterDescriptor("speed", ParameterType::FLOAT, -10.0f, 10.0f, 1.0f, "Speed"));
+    params.push_back(ParameterDescriptor("volume", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Volume"));
+    
+    return params;
+}
+
 std::vector<ParameterDescriptor> TrackerSequencer::getAvailableParameters(const std::vector<ParameterDescriptor>& externalParams) const {
     std::vector<ParameterDescriptor> params;
     
-    // Start with internal parameters
-    auto internalParams = getInternalParameters();
+    // Start with internal parameters (now static, but called from instance method)
+    auto internalParams = TrackerSequencer::getInternalParameters();
     params.insert(params.end(), internalParams.begin(), internalParams.end());
     
     // Add external parameters if provided
@@ -1605,7 +1100,7 @@ bool TrackerSequencer::isPatternEmpty() const {
 
 void TrackerSequencer::notifyStepEvent(int step, float stepLength) {
     // step is 1-based from PatternSequencer, convert to 0-based for internal access
-    const PatternCell& cell = getCell(step - 1);
+    const Step& stepData = getStep(step - 1);
     float bpm = clock ? clock->getBPM() : 120.0f;
     
     // Calculate duration in seconds using patternSequencer's stepsPerBeat
@@ -1614,7 +1109,7 @@ void TrackerSequencer::notifyStepEvent(int step, float stepLength) {
     float noteDuration = stepDuration * stepLength;     // Duration for THIS note
     
     for (auto& callback : stepEventListeners) {
-        callback(step, noteDuration, cell);  // Pass 1-based step number for display
+        callback(step, noteDuration, stepData);  // Pass 1-based step number for display
     }
 }
 
@@ -1622,12 +1117,12 @@ float TrackerSequencer::getCurrentStepPosition() const {
     // Note: GUI state (editStep, editColumn) is now managed by TrackerSequencerGUI
     // This method now only returns position for the playback step
     // The GUI should handle edit step position separately if needed
-    if (!isValidStep(playbackStep)) {
+    if (!isValidStep(playbackState.playbackStep)) {
         return 0.0f;
     }
     
-    const PatternCell& cell = getCurrentPattern()[playbackStep];
-    return cell.getParameterValue("position", 0.0f);
+    const Step& step = getCurrentPattern()[playbackState.playbackStep];
+    return step.getParameterValue("position", 0.0f);
 }
 
 void TrackerSequencer::setCurrentStepPosition(float position) {
@@ -1638,18 +1133,18 @@ void TrackerSequencer::setCurrentStepPosition(float position) {
     // Clamp position to valid range
     position = std::max(0.0f, std::min(1.0f, position));
     
-    if (!isValidStep(playbackStep)) {
+    if (!isValidStep(playbackState.playbackStep)) {
         return;
     }
     
-    PatternCell& cell = getCurrentPattern()[playbackStep];
-    float oldValue = cell.getParameterValue("position", 0.0f);
+    Step& step = getCurrentPattern()[playbackState.playbackStep];
+    float oldValue = step.getParameterValue("position", 0.0f);
     
     // Only update if value actually changed to avoid unnecessary notifications
     if (std::abs(oldValue - position) > 0.0001f) {
-        cell.setParameterValue("position", position);
-        // Use setCell to properly update the pattern and trigger notifications
-        setCell(playbackStep, cell);
+        step.setParameterValue("position", position);
+        // Use setStep to properly update the pattern and trigger notifications
+        setStep(playbackState.playbackStep, step);
     }
 }
 
@@ -1661,47 +1156,72 @@ float TrackerSequencer::getCurrentBpm() const {
 // These use actual parameter ranges from getAvailableParameters() dynamically
 //--------------------------------------------------------------
 std::pair<float, float> TrackerSequencer::getParameterRange(const std::string& paramName) {
-    // MODULAR: Use getAvailableParameters() to get ranges dynamically
-    // Create temporary instance to call getAvailableParameters() (it's non-static but doesn't depend on instance state)
-    // Note: Static helper uses empty external params (backward compatibility - returns hardcoded defaults)
-    static TrackerSequencer tempInstance;
-    auto params = tempInstance.getAvailableParameters({});
-    for (const auto& param : params) {
+    // Get parameters from static helpers (no temporary instance needed)
+    auto internalParams = getInternalParameters();
+    auto defaultParams = getDefaultParameters();
+    
+    // Check internal parameters first
+    for (const auto& param : internalParams) {
         if (param.name == paramName) {
             return std::make_pair(param.minValue, param.maxValue);
         }
     }
+    
+    // Check default parameters
+    for (const auto& param : defaultParams) {
+        if (param.name == paramName) {
+            return std::make_pair(param.minValue, param.maxValue);
+        }
+    }
+    
     // Default range for unknown parameters
     return std::make_pair(0.0f, 1.0f);
 }
 
 // Static helper to get default value
-// MODULAR: Uses getAvailableParameters() dynamically instead of hardcoding
 float TrackerSequencer::getParameterDefault(const std::string& paramName) {
-    // MODULAR: Use getAvailableParameters() to get defaults dynamically
-    // Create temporary instance to call getAvailableParameters() (it's non-static but doesn't depend on instance state)
-    // Note: Static helper uses empty external params (backward compatibility - returns hardcoded defaults)
-    static TrackerSequencer tempInstance;
-    auto params = tempInstance.getAvailableParameters({});
-    for (const auto& param : params) {
+    // Get parameters from static helpers (no temporary instance needed)
+    auto internalParams = getInternalParameters();
+    auto defaultParams = getDefaultParameters();
+    
+    // Check internal parameters first
+    for (const auto& param : internalParams) {
         if (param.name == paramName) {
             return param.defaultValue;
         }
     }
+    
+    // Check default parameters
+    for (const auto& param : defaultParams) {
+        if (param.name == paramName) {
+            return param.defaultValue;
+        }
+    }
+    
     // Fallback default
     return 0.0f;
 }
 
-// MODULAR: Get parameter type dynamically from getAvailableParameters()
+// Get parameter type dynamically from static helpers
 ParameterType TrackerSequencer::getParameterType(const std::string& paramName) {
-    // Note: Static helper uses empty external params (backward compatibility - returns hardcoded defaults)
-    static TrackerSequencer tempInstance;
-    auto params = tempInstance.getAvailableParameters({});
-    for (const auto& param : params) {
+    // Get parameters from static helpers (no temporary instance needed)
+    auto internalParams = getInternalParameters();
+    auto defaultParams = getDefaultParameters();
+    
+    // Check internal parameters first
+    for (const auto& param : internalParams) {
         if (param.name == paramName) {
             return param.type;
         }
     }
+    
+    // Check default parameters
+    for (const auto& param : defaultParams) {
+        if (param.name == paramName) {
+            return param.type;
+        }
+    }
+    
     // Default to FLOAT for unknown parameters
     return ParameterType::FLOAT;
 }
@@ -1730,13 +1250,11 @@ void TrackerSequencer::update() {
 void TrackerSequencer::updateStepActiveState() {
     // Check if current step duration has expired (works for both manual and playback)
     // PERFORMANCE: Early return checks BEFORE expensive system call
-    if (currentPlayingStep >= 0 && stepEndTime > 0.0f) {
+    if (playbackState.currentPlayingStep >= 0 && playbackState.stepEndTime > 0.0f) {
         float currentTime = ofGetElapsedTimef();
-        if (currentTime >= stepEndTime) {
+        if (currentTime >= playbackState.stepEndTime) {
             // Step duration expired - clear playing state
-            currentPlayingStep = -1;
-            stepStartTime = 0.0f;
-            stepEndTime = 0.0f;
+            playbackState.clearPlayingStep();
         }
     }
 }
@@ -1781,20 +1299,20 @@ void TrackerSequencer::removePattern(int index) {
     }
     
     // Adjust pattern chain indices
-    for (size_t i = 0; i < patternChain.size(); i++) {
-        if (patternChain[i] == index) {
+    const auto& chain = patternChain.getChain();
+    for (int i = (int)chain.size() - 1; i >= 0; i--) {
+        if (chain[i] == index) {
             // Remove entry from pattern chain
-            patternChain.erase(patternChain.begin() + i);
-            i--; // Adjust index after removal
-        } else if (patternChain[i] > index) {
+            patternChain.removeEntry(i);
+        } else if (chain[i] > index) {
             // Decrement indices greater than removed index
-            patternChain[i]--;
+            patternChain.setEntry(i, chain[i] - 1);
         }
     }
     
     // Adjust current chain index if necessary
-    if (currentChainIndex >= (int)patternChain.size()) {
-        currentChainIndex = std::max(0, (int)patternChain.size() - 1);
+    if (patternChain.getCurrentIndex() >= patternChain.getSize()) {
+        patternChain.setCurrentIndex(std::max(0, patternChain.getSize() - 1));
     }
     
     ofLogNotice("TrackerSequencer") << "Removed pattern at index " << index;
@@ -1831,19 +1349,13 @@ void TrackerSequencer::duplicatePattern(int index) {
 // Pattern chain (pattern chaining) implementation
 //--------------------------------------------------------------
 void TrackerSequencer::setCurrentChainIndex(int index) {
-    if (index >= 0 && index < (int)patternChain.size()) {
-        currentChainIndex = index;
-        currentChainRepeat = 0;  // Reset repeat counter
-        // Update current pattern index based on pattern chain
-        if (usePatternChain) {
-            int patternIdx = patternChain[currentChainIndex];
-            if (patternIdx >= 0 && patternIdx < (int)patterns.size()) {
-                currentPatternIndex = patternIdx;
-            }
+    patternChain.setCurrentIndex(index);
+    // Update current pattern index based on pattern chain
+    if (patternChain.isEnabled()) {
+        int patternIdx = patternChain.getEntry(index);
+        if (patternIdx >= 0 && patternIdx < (int)patterns.size()) {
+            currentPatternIndex = patternIdx;
         }
-        ofLogNotice("TrackerSequencer") << "Set chain index to " << index;
-    } else {
-        ofLogWarning("TrackerSequencer") << "Invalid chain index: " << index;
     }
 }
 
@@ -1852,401 +1364,38 @@ void TrackerSequencer::addToPatternChain(int patternIndex) {
         ofLogWarning("TrackerSequencer") << "Invalid pattern index for chain: " << patternIndex;
         return;
     }
-    
-    int newIndex = (int)patternChain.size();
-    patternChain.push_back(patternIndex);
-    patternChainRepeatCounts[newIndex] = 1;  // Default repeat count
-    ofLogNotice("TrackerSequencer") << "Added pattern " << patternIndex << " to chain";
+    patternChain.addEntry(patternIndex);
 }
 
 void TrackerSequencer::removeFromPatternChain(int chainIndex) {
-    if (chainIndex < 0 || chainIndex >= (int)patternChain.size()) {
-        ofLogWarning("TrackerSequencer") << "Invalid chain index for removal: " << chainIndex;
-        return;
-    }
-    
-    patternChain.erase(patternChain.begin() + chainIndex);
-    
-    // Remove repeat count and adjust indices
-    patternChainRepeatCounts.erase(chainIndex);
-    std::map<int, int> newRepeatCounts;
-    for (const auto& pair : patternChainRepeatCounts) {
-        if (pair.first < chainIndex) {
-            newRepeatCounts[pair.first] = pair.second;
-        } else if (pair.first > chainIndex) {
-            newRepeatCounts[pair.first - 1] = pair.second;
-        }
-    }
-    patternChainRepeatCounts = newRepeatCounts;
-    
-    // Adjust current chain index if necessary
-    bool wasCurrentIndex = (currentChainIndex == chainIndex);
-    if (currentChainIndex > chainIndex) {
-        // If current index is after the removed one, decrement it
-        // (the pattern that was at currentChainIndex is now at currentChainIndex - 1)
-        currentChainIndex--;
-    }
-    // If we removed the current index, currentChainIndex stays the same
-    // (it now points to the pattern that was at chainIndex+1, which shifted down)
-    // If current index is out of bounds, clamp to last valid index
-    if (currentChainIndex >= (int)patternChain.size()) {
-        currentChainIndex = std::max(0, (int)patternChain.size() - 1);
-    }
-    if (wasCurrentIndex) {
-        // If we removed the current index, reset repeat counter
-        currentChainRepeat = 0;
-    }
+    patternChain.removeEntry(chainIndex);
     
     // Switch to the pattern at the new current chain index
-    if (!patternChain.empty() && currentChainIndex >= 0 && currentChainIndex < (int)patternChain.size()) {
-        int newPatternIndex = patternChain[currentChainIndex];
-        setCurrentPatternIndex(newPatternIndex);
+    int newCurrentIndex = patternChain.getCurrentIndex();
+    if (newCurrentIndex >= 0 && newCurrentIndex < patternChain.getSize()) {
+        int newPatternIndex = patternChain.getEntry(newCurrentIndex);
+        if (newPatternIndex >= 0 && newPatternIndex < (int)patterns.size()) {
+            setCurrentPatternIndex(newPatternIndex);
+        }
     }
-    
-    ofLogNotice("TrackerSequencer") << "Removed chain entry at index " << chainIndex;
-}
-
-void TrackerSequencer::clearPatternChain() {
-    patternChain.clear();
-    patternChainRepeatCounts.clear();
-    patternChainDisabled.clear();
-    currentChainIndex = 0;
-    currentChainRepeat = 0;
-    usePatternChain = false;
-    ofLogNotice("TrackerSequencer") << "Pattern chain cleared";
-}
-
-int TrackerSequencer::getPatternChainEntry(int chainIndex) const {
-    if (chainIndex >= 0 && chainIndex < (int)patternChain.size()) {
-        return patternChain[chainIndex];
-    }
-    return -1;
 }
 
 void TrackerSequencer::setPatternChainEntry(int chainIndex, int patternIndex) {
-    if (chainIndex < 0) {
-        ofLogWarning("TrackerSequencer") << "Invalid chain index: " << chainIndex;
-        return;
-    }
-    
     if (patternIndex < 0 || patternIndex >= (int)patterns.size()) {
         ofLogWarning("TrackerSequencer") << "Invalid pattern index: " << patternIndex;
         return;
     }
-    
-    // Resize pattern chain if necessary
-    if (chainIndex >= (int)patternChain.size()) {
-        patternChain.resize(chainIndex + 1, 0);
-        // Set default repeat count for new entries
-        if (patternChainRepeatCounts.find(chainIndex) == patternChainRepeatCounts.end()) {
-            patternChainRepeatCounts[chainIndex] = 1;
-        }
-    }
-    
-    patternChain[chainIndex] = patternIndex;
-    ofLogNotice("TrackerSequencer") << "Set chain entry " << chainIndex << " to pattern " << patternIndex;
+    patternChain.setEntry(chainIndex, patternIndex);
 }
 
-int TrackerSequencer::getPatternChainRepeatCount(int chainIndex) const {
-    if (chainIndex < 0 || chainIndex >= (int)patternChain.size()) {
-        return 1;  // Default repeat count
-    }
-    auto it = patternChainRepeatCounts.find(chainIndex);
-    if (it != patternChainRepeatCounts.end()) {
-        return it->second;
-    }
-    return 1;  // Default repeat count
-}
-
-void TrackerSequencer::setPatternChainRepeatCount(int chainIndex, int repeatCount) {
-    if (chainIndex < 0 || chainIndex >= (int)patternChain.size()) {
-        ofLogWarning("TrackerSequencer") << "Invalid chain index: " << chainIndex;
-        return;
-    }
-    
-    repeatCount = std::max(1, std::min(99, repeatCount));  // Clamp to 1-99
-    patternChainRepeatCounts[chainIndex] = repeatCount;
-    ofLogNotice("TrackerSequencer") << "Set chain entry " << chainIndex << " repeat count to " << repeatCount;
-}
-
-bool TrackerSequencer::isPatternChainEntryDisabled(int chainIndex) const {
-    if (chainIndex < 0 || chainIndex >= (int)patternChain.size()) {
-        return false;
-    }
-    auto it = patternChainDisabled.find(chainIndex);
-    return (it != patternChainDisabled.end() && it->second);
-}
-
-void TrackerSequencer::setPatternChainEntryDisabled(int chainIndex, bool disabled) {
-    if (chainIndex < 0 || chainIndex >= (int)patternChain.size()) {
-        ofLogWarning("TrackerSequencer") << "Invalid chain index: " << chainIndex;
-        return;
-    }
-    patternChainDisabled[chainIndex] = disabled;
-    ofLogVerbose("TrackerSequencer") << "Set chain entry " << chainIndex << " disabled: " << (disabled ? "true" : "false");
-}
-
-// CellWidget adapter methods - bridge PatternCell to CellWidget
-//--------------------------------------------------------------
-CellWidget TrackerSequencer::createParameterCellForColumn(int step, int column) {
-    // column is absolute column index (0=step number, 1+=parameter columns)
-    // For parameter columns, convert to parameter-relative index: paramColIdx = column - 1
-    if (!isValidStep(step) || column <= 0) {
-        return CellWidget(); // Return empty cell for invalid step or step number column (column=0)
-    }
-    
-    const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
-    int paramColIdx = column - 1;  // Convert absolute column index to parameter-relative index
-    if (paramColIdx < 0 || paramColIdx >= (int)columnConfig.size()) {
-        return CellWidget();
-    }
-    
-    const auto& col = columnConfig[paramColIdx];
-    CellWidget cell;
-    
-    // Configure basic properties
-    cell.parameterName = col.parameterName;
-    cell.isRemovable = col.isRemovable; // Columns (index, length) cannot be removed
-    if (!col.isRemovable) {
-        // Required columns (index, length) are always integers
-        cell.isInteger = true;
-        cell.stepIncrement = 1.0f;
-    }
-    
-    // Set value range based on column type
-    if (!col.isRemovable && col.parameterName == "index") {
-        // Index column: 0 = rest, 1+ = media index (1-based display)
-        int maxIndex = getIndexRange();
-        cell.setValueRange(0.0f, (float)maxIndex, 0.0f);
-        cell.getMaxIndex = [this]() { return getIndexRange(); };
-    } else if (!col.isRemovable && col.parameterName == "length") {
-        // Length column: 1-16 range
-        cell.setValueRange(1.0f, 16.0f, 1.0f);
-    } else {
-        // Dynamic parameter column - use parameter ranges
-        auto range = getParameterRange(col.parameterName);
-        float defaultValue = getParameterDefault(col.parameterName);
-        cell.setValueRange(range.first, range.second, defaultValue);
-        
-        // Determine if parameter is integer or float
-        ParameterType paramType = getParameterType(col.parameterName);
-        cell.isInteger = (paramType == ParameterType::INT);
-        
-        // Calculate optimal step increment based on range and type
-        cell.calculateStepIncrement();
-    }
-    
-    // Configure callbacks
-    configureParameterCellCallbacks(cell, step, column);
-    
-    return cell;
-}
-
-void TrackerSequencer::configureParameterCellCallbacks(CellWidget& cell, int step, int column) {
-    // column is absolute column index (0=step number, 1+=parameter columns)
-    // For parameter columns, convert to parameter-relative index: paramColIdx = column - 1
-    if (!isValidStep(step) || column <= 0) {
-        return;  // Invalid step or step number column (column=0)
-    }
-    
-    const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
-    int paramColIdx = column - 1;  // Convert absolute column index to parameter-relative index
-    if (paramColIdx < 0 || paramColIdx >= (int)columnConfig.size()) {
-        return;
-    }
-    
-    const auto& col = columnConfig[paramColIdx];
-    std::string paramName = col.parameterName; // Capture by value for lambda
-    bool isRequiredCol = !col.isRemovable; // Capture by value
-    std::string requiredTypeCol = !col.isRemovable ? col.parameterName : ""; // Capture by value
-    
-    // getCurrentValue callback - returns current value from PatternCell
-    // Returns NaN to indicate empty/not set (will display as "--")
-    // Unified system: all empty values (Index, Length, dynamic parameters) use NaN
-    cell.getCurrentValue = [this, step, paramName, isRequiredCol, requiredTypeCol]() -> float {
-        if (!isValidStep(step)) {
-            // Return NaN for invalid step (will display as "--")
-            return std::numeric_limits<float>::quiet_NaN();
-        }
-        
-        auto& patternCell = getCurrentPattern()[step];
-        
-        if (isRequiredCol && requiredTypeCol == "index") {
-            // Index: return NaN when empty (index <= 0), otherwise return 1-based display value
-            int idx = patternCell.index;
-            return (idx < 0) ? std::numeric_limits<float>::quiet_NaN() : (float)(idx + 1);
-        } else if (isRequiredCol && requiredTypeCol == "length") {
-            // Length: return NaN when index < 0 (rest), otherwise return length
-            if (patternCell.index < 0) {
-                return std::numeric_limits<float>::quiet_NaN(); // Use NaN instead of -1.0f
-            }
-            return (float)patternCell.length;
-        } else {
-            // Dynamic parameter: return NaN if parameter doesn't exist (will display as "--")
-            // This allows parameters with negative ranges (like speed -10 to 10) to distinguish
-            // between "not set" (NaN/--) and explicit values like 1.0 or -1.0
-            if (!patternCell.hasParameter(paramName)) {
-                return std::numeric_limits<float>::quiet_NaN();
-            }
-            return patternCell.getParameterValue(paramName, 0.0f);
-        }
-    };
-    
-    // onValueApplied callback - applies value to PatternCell
-    cell.onValueApplied = [this, step, column, paramName, isRequiredCol, requiredTypeCol](const std::string&, float value) {
-        if (!isValidStep(step)) return;
-        
-        // Check if we should queue this edit (playback editing)
-        // Note: GUI state (editStep, editColumn) is now managed by TrackerSequencerGUI
-        // Since this callback is only called for the cell being edited, we just check if it's the playback step
-        bool shouldQueue = playing && isValidStep(step) && step == playbackStep && column > 0;
-        
-        if (shouldQueue) {
-            // Queue edit for next trigger
-            pendingEdit.step = step;
-            pendingEdit.column = column;
-            pendingEdit.parameterName = paramName;
-            
-            if (isRequiredCol && requiredTypeCol == "index") {
-                // Index: value is 1-based display, convert to 0-based storage
-                // 0 = rest (-1), 1+ = media index (0-based)
-                int indexValue = (int)std::round(value);
-                pendingEdit.isIndex = true;
-                pendingEdit.indexValue = (indexValue == 0) ? -1 : (indexValue - 1);
-            } else if (isRequiredCol && requiredTypeCol == "length") {
-                // Length: clamp to 1-16
-                int lengthValue = std::max(1, std::min(16, (int)std::round(value)));
-                pendingEdit.isLength = true;
-                pendingEdit.lengthValue = lengthValue;
-            } else {
-                // Dynamic parameter
-                pendingEdit.value = value;
-            }
-            pendingEdit.shouldRemove = false;
-        } else {
-            // Apply immediately
-            auto& patternCell = getCurrentPattern()[step];
-            if (isRequiredCol && requiredTypeCol == "index") {
-                // Index: value is 1-based display, convert to 0-based storage
-                int indexValue = (int)std::round(value);
-                patternCell.index = (indexValue == 0) ? -1 : (indexValue - 1);
-            } else if (isRequiredCol && requiredTypeCol == "length") {
-                // Length: clamp to 1-16
-                patternCell.length = std::max(1, std::min(16, (int)std::round(value)));
-            } else {
-                // Dynamic parameter
-                patternCell.setParameterValue(paramName, value);
-            }
-            setCell(step, patternCell);
-        }
-    };
-    
-    // onValueRemoved callback - removes parameter from PatternCell
-    cell.onValueRemoved = [this, step, column, paramName, isRequiredCol, requiredTypeCol](const std::string&) {
-        if (!isValidStep(step)) return;
-        
-        // Check if we should queue this edit (playback editing)
-        // Note: GUI state (editStep, editColumn) is now managed by TrackerSequencerGUI
-        // Since this callback is only called for the cell being edited, we just check if it's the playback step
-        bool shouldQueue = playing && isValidStep(step) && step == playbackStep && column > 0;
-        
-        if (shouldQueue) {
-            // Queue removal for next trigger
-            pendingEdit.step = step;
-            pendingEdit.column = column;
-            pendingEdit.parameterName = paramName;
-            pendingEdit.shouldRemove = true;
-        } else {
-            // Remove immediately (only for removable parameters)
-            if (isRequiredCol) {
-                // Required columns (index, length) cannot be removed - reset to default
-                auto& patternCell = getCurrentPattern()[step];
-                if (requiredTypeCol == "index") {
-                    patternCell.index = -1; // Rest
-                } else if (requiredTypeCol == "length") {
-                    patternCell.length = 1; // Default length
-                }
-                setCell(step, patternCell);
-            } else {
-                // Removable parameter - remove it
-                auto& patternCell = getCurrentPattern()[step];
-                patternCell.removeParameter(paramName);
-                setCell(step, patternCell);
-            }
-        }
-    };
-    
-    // formatValue callback - tracker-specific formatting for all columns
-    if (isRequiredCol && requiredTypeCol == "index") {
-        // Index column: 1-based display (01-99), NaN = rest
-        cell.formatValue = [](float value) -> std::string {
-            if (std::isnan(value)) {
-                return "--"; // Show "--" for NaN (empty/rest)
-            }
-            int indexVal = (int)std::round(value);
-            if (indexVal <= 0) {
-                return "--"; // Also handle edge case
-            }
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%02d", indexVal);
-            return std::string(buf);
-        };
-    } else if (isRequiredCol && requiredTypeCol == "length") {
-        // Length column: 1-16 range, formatted as "02", NaN = not set
-        cell.formatValue = [](float value) -> std::string {
-            if (std::isnan(value)) {
-                return "--"; // Show "--" for NaN (empty/not set)
-            }
-            int lengthVal = (int)std::round(value);
-            lengthVal = std::max(1, std::min(16, lengthVal)); // Clamp to 1-16
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%02d", lengthVal); // Zero-padded to 2 digits
-            return std::string(buf);
-        };
-    } else {
-        // Dynamic parameter: use TrackerSequencer's formatting
-        cell.formatValue = [paramName](float value) -> std::string {
-            return formatParameterValue(paramName, value);
-        };
-    }
-    
-    // parseValue callback - tracker-specific parsing for index/length
-    if (isRequiredCol && requiredTypeCol == "index") {
-        // Index: parse as integer, handle "--" as NaN
-        cell.parseValue = [](const std::string& str) -> float {
-            if (str == "--" || str.empty()) {
-                return std::numeric_limits<float>::quiet_NaN();
-            }
-            try {
-                int val = std::stoi(str);
-                return (float)val;
-            } catch (...) {
-                return std::numeric_limits<float>::quiet_NaN();
-            }
-        };
-    } else if (isRequiredCol && requiredTypeCol == "length") {
-        // Length: parse as integer (1-16), handle "--" as NaN
-        cell.parseValue = [](const std::string& str) -> float {
-            if (str == "--" || str.empty()) {
-                return std::numeric_limits<float>::quiet_NaN();
-            }
-            try {
-                int val = std::stoi(str);
-                val = std::max(1, std::min(16, val)); // Clamp to 1-16
-                return (float)val;
-            } catch (...) {
-                return std::numeric_limits<float>::quiet_NaN();
-            }
-        };
-    }
-    // Dynamic parameters use ParameterCell's default parsing (expression evaluation)
-}
+// CellWidget adapter methods removed - moved to TrackerSequencerGUI
+// Use TrackerSequencerGUI::createParameterCellForColumn() instead
 
 //--------------------------------------------------------------
-//--------------------------------------------------------------
-// Port-based routing interface (Phase 1)
+/// MARK: - Ports 
+/// Port-based routing interface 
 std::vector<Port> TrackerSequencer::getInputPorts() const {
-    // TrackerSequencer doesn't accept inputs (it's a source)
+    // TrackerSequencer doesn't have inputs ports (for now)
     return {};
 }
 

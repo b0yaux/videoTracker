@@ -14,23 +14,15 @@
 struct ClockConfig {
     float minBPM = 20.0f;
     float maxBPM = 480.0f;
-    int minStepsPerBeat = 1;
-    int maxStepsPerBeat = 96;
     float bpmSmoothFactor = 0.05f;
     float pulseFadeFactor = 0.75f;
     float pulseThreshold = 0.05f;
 };
 
-// Unified time event structure (replaces BeatEventData and StepEventData)
-enum class TimeEventType {
-    BEAT,   // Beat event (once per beat)
-    STEP    // Step event (multiple per beat)
-};
-
+// Time event structure - Clock emits beat events
+// Step timing is handled independently by each TrackerSequencer instance
 struct TimeEvent {
-    TimeEventType type;      // BEAT or STEP
-    int beatNumber;          // Beat number (valid for both types)
-    int stepNumber;          // Step number (valid only for STEP type, -1 for BEAT)
+    int beat;                // Beat number
     double timestamp;        // Timestamp when event occurred
     float bpm;              // Current BPM at time of event
 };
@@ -56,10 +48,6 @@ public:
     void reset();
     bool isPlaying() const;  // Master transport state - single source of truth
     
-    // Steps per beat control
-    void setStepsPerBeat(int spb);
-    int getStepsPerBeat() const;
-    
     // Audio-rate listener system
     void addAudioListener(std::function<void(ofSoundBuffer&)> listener);
     void removeAudioListener();
@@ -69,8 +57,8 @@ public:
     void addTransportListener(TransportCallback listener);
     void removeTransportListener();
     
-    // Unified time event system for sample-accurate timing
-    ofEvent<TimeEvent> timeEvent;  // Fires for both beats and steps (use type field to distinguish)
+    // Time event system for sample-accurate beat timing
+    ofEvent<TimeEvent> timeEvent;  // Fires BEAT events only (step timing is handled by TrackerSequencer instances)
     
     // Configuration
     void setConfig(const ClockConfig& cfg);
@@ -102,7 +90,6 @@ private:
     ClockConfig config;
     float sampleRate = 44100.0f;
     int beatCounter = 0;
-    int stepCounter = 0;
     
     // BPM visualizer
     float beatPulse;
@@ -110,11 +97,8 @@ private:
     float beatInterval;
     
     // Sample-accurate timing
-    double sampleAccumulator;
     double beatAccumulator;
-    float samplesPerStep;
     float samplesPerBeat;
-    int stepsPerBeat;
     
     // Audio listeners
     std::vector<std::function<void(ofSoundBuffer&)>> audioListeners;

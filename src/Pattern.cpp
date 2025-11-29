@@ -2,9 +2,9 @@
 #include "ofLog.h"
 #include "ofUtils.h"
 
-// PatternCell implementation
+// Step implementation
 //--------------------------------------------------------------
-void PatternCell::clear() {
+void Step::clear() {
     index = -1;
     length = 1;  // Changed to int
     parameterValues.clear();
@@ -13,7 +13,7 @@ void PatternCell::clear() {
     // Empty parameterValues means "use defaults/position memory" when triggering
 }
 
-float PatternCell::getParameterValue(const std::string& paramName, float defaultValue) const {
+float Step::getParameterValue(const std::string& paramName, float defaultValue) const {
     auto it = parameterValues.find(paramName);
     if (it != parameterValues.end()) {
         return it->second;
@@ -21,19 +21,19 @@ float PatternCell::getParameterValue(const std::string& paramName, float default
     return defaultValue;
 }
 
-void PatternCell::setParameterValue(const std::string& paramName, float value) {
+void Step::setParameterValue(const std::string& paramName, float value) {
     parameterValues[paramName] = value;
 }
 
-bool PatternCell::hasParameter(const std::string& paramName) const {
+bool Step::hasParameter(const std::string& paramName) const {
     return parameterValues.find(paramName) != parameterValues.end();
 }
 
-void PatternCell::removeParameter(const std::string& paramName) {
+void Step::removeParameter(const std::string& paramName) {
     parameterValues.erase(paramName);
 }
 
-bool PatternCell::operator==(const PatternCell& other) const {
+bool Step::operator==(const Step& other) const {
     if (index != other.index || length != other.length) {
         return false;
     }
@@ -49,11 +49,11 @@ bool PatternCell::operator==(const PatternCell& other) const {
     return true;
 }
 
-bool PatternCell::operator!=(const PatternCell& other) const {
+bool Step::operator!=(const Step& other) const {
     return !(*this == other);
 }
 
-std::string PatternCell::toString() const {
+std::string Step::toString() const {
     if (isEmpty()) {
         return "---";
     }
@@ -71,53 +71,53 @@ std::string PatternCell::toString() const {
 
 // Pattern implementation
 //--------------------------------------------------------------
-Pattern::Pattern(int numSteps) {
-    setStepCount(numSteps);
+Pattern::Pattern(int stepCount) {
+    setStepCount(stepCount);
     initializeDefaultColumns();
 }
 
-PatternCell& Pattern::getCell(int step) {
-    if (!isValidStep(step)) {
-        static PatternCell emptyCell;
-        ofLogWarning("Pattern") << "Invalid step index: " << step;
-        return emptyCell;
+Step& Pattern::getStep(int stepIndex) {
+    if (!isValidStep(stepIndex)) {
+        static Step emptyStep;
+        ofLogWarning("Pattern") << "Invalid step index: " << stepIndex;
+        return emptyStep;
     }
-    return cells[step];
+    return steps[stepIndex];
 }
 
-const PatternCell& Pattern::getCell(int step) const {
-    if (!isValidStep(step)) {
-        static PatternCell emptyCell;
-        ofLogWarning("Pattern") << "Invalid step index: " << step;
-        return emptyCell;
+const Step& Pattern::getStep(int stepIndex) const {
+    if (!isValidStep(stepIndex)) {
+        static Step emptyStep;
+        ofLogWarning("Pattern") << "Invalid step index: " << stepIndex;
+        return emptyStep;
     }
-    return cells[step];
+    return steps[stepIndex];
 }
 
-void Pattern::setCell(int step, const PatternCell& cell) {
-    if (!isValidStep(step)) {
-        ofLogWarning("Pattern") << "Invalid step index: " << step;
+void Pattern::setStep(int stepIndex, const Step& step) {
+    if (!isValidStep(stepIndex)) {
+        ofLogWarning("Pattern") << "Invalid step index: " << stepIndex;
         return;
     }
-    cells[step] = cell;
+    steps[stepIndex] = step;
 }
 
-void Pattern::clearCell(int step) {
-    if (!isValidStep(step)) {
+void Pattern::clearStep(int stepIndex) {
+    if (!isValidStep(stepIndex)) {
         return;
     }
-    cells[step].clear();
+    steps[stepIndex].clear();
 }
 
 void Pattern::clear() {
-    for (auto& cell : cells) {
-        cell.clear();
+    for (auto& step : steps) {
+        step.clear();
     }
 }
 
 bool Pattern::isEmpty() const {
-    for (const auto& cell : cells) {
-        if (!cell.isEmpty()) {
+    for (const auto& step : steps) {
+        if (!step.isEmpty()) {
             return false;
         }
     }
@@ -141,16 +141,16 @@ bool Pattern::duplicateRange(int fromStep, int toStep, int destinationStep) {
     int rangeSize = toStep - fromStep + 1;
     
     // Validate that source range is within bounds
-    if (toStep >= (int)cells.size()) {
+    if (toStep >= (int)steps.size()) {
         ofLogError("Pattern") << "Source range exceeds pattern size: toStep=" << toStep 
-                              << ", pattern size=" << cells.size();
+                              << ", pattern size=" << steps.size();
         return false;
     }
     
     // Validate that destination range is within bounds
-    if (destinationStep + rangeSize - 1 >= (int)cells.size()) {
+    if (destinationStep + rangeSize - 1 >= (int)steps.size()) {
         ofLogError("Pattern") << "Destination range exceeds pattern size: dest=" << destinationStep 
-                              << ", range size=" << rangeSize << ", pattern size=" << cells.size();
+                              << ", range size=" << rangeSize << ", pattern size=" << steps.size();
         return false;
     }
     
@@ -160,20 +160,20 @@ bool Pattern::duplicateRange(int fromStep, int toStep, int destinationStep) {
     
     if (hasOverlap) {
         // Copy to temporary buffer first to handle overlapping ranges
-        std::vector<PatternCell> tempBuffer;
+        std::vector<Step> tempBuffer;
         tempBuffer.reserve(rangeSize);
         for (int i = fromStep; i <= toStep; i++) {
-            tempBuffer.push_back(cells[i]);
+            tempBuffer.push_back(steps[i]);
         }
         
         // Now copy from temp buffer to destination
         for (size_t i = 0; i < tempBuffer.size(); i++) {
-            cells[destinationStep + i] = tempBuffer[i];
+            steps[destinationStep + i] = tempBuffer[i];
         }
     } else {
         // No overlap, direct copy
         for (int i = 0; i < rangeSize; i++) {
-            cells[destinationStep + i] = cells[fromStep + i];
+            steps[destinationStep + i] = steps[fromStep + i];
         }
     }
     
@@ -182,34 +182,34 @@ bool Pattern::duplicateRange(int fromStep, int toStep, int destinationStep) {
     return true;
 }
 
-void Pattern::setStepCount(int steps) {
-    if (steps <= 0) {
-        ofLogWarning("Pattern") << "Invalid number of steps: " << steps;
+void Pattern::setStepCount(int stepCount) {
+    if (stepCount <= 0) {
+        ofLogWarning("Pattern") << "Invalid number of steps: " << stepCount;
         return;
     }
     
-    size_t oldSize = cells.size();
-    cells.resize(steps);
+    size_t oldSize = steps.size();
+    steps.resize(stepCount);
     
-    // Initialize new cells
-    for (size_t i = oldSize; i < cells.size(); i++) {
-        cells[i] = PatternCell();
+    // Initialize new steps
+    for (size_t i = oldSize; i < steps.size(); i++) {
+        steps[i] = Step();
     }
 }
 
 void Pattern::doubleSteps() {
-    int currentSize = (int)cells.size();
+    int currentSize = (int)steps.size();
     if (currentSize <= 0) {
         ofLogWarning("Pattern") << "Cannot double steps: pattern is empty";
         return;
     }
     
     // Resize to double the current size
-    cells.resize(currentSize * 2);
+    steps.resize(currentSize * 2);
     
-    // Duplicate existing cells
+    // Duplicate existing steps
     for (int i = 0; i < currentSize; i++) {
-        cells[currentSize + i] = cells[i];
+        steps[currentSize + i] = steps[i];
     }
     
     ofLogNotice("Pattern") << "Doubled pattern steps from " << currentSize << " to " << (currentSize * 2);
@@ -218,23 +218,26 @@ void Pattern::doubleSteps() {
 ofJson Pattern::toJson() const {
     ofJson json;
     
-    // Save cells
+    // Save stepCount explicitly to preserve pattern length
+    json["stepCount"] = (int)steps.size();
+    
+    // Save steps (JSON key "cells" kept for backward compatibility)
     ofJson patternArray = ofJson::array();
-    for (size_t i = 0; i < cells.size(); i++) {
-        ofJson cellJson;
-        const auto& cell = cells[i];
-        cellJson["index"] = cell.index;
-        cellJson["length"] = cell.length;
+    for (size_t i = 0; i < steps.size(); i++) {
+        ofJson stepJson;
+        const auto& step = steps[i];
+        stepJson["index"] = step.index;
+        stepJson["length"] = step.length;
         
         // Save parameter values
         ofJson paramJson = ofJson::object();
-        for (const auto& pair : cell.parameterValues) {
+        for (const auto& pair : step.parameterValues) {
             paramJson[pair.first] = pair.second;
         }
-        cellJson["parameters"] = paramJson;
-        patternArray.push_back(cellJson);
+        stepJson["parameters"] = paramJson;
+        patternArray.push_back(stepJson);
     }
-    json["cells"] = patternArray;
+    json["cells"] = patternArray;  // Keep "cells" key for backward compatibility
     
     // Save column configuration
     ofJson columnArray = ofJson::array();
@@ -252,20 +255,33 @@ ofJson Pattern::toJson() const {
 }
 
 void Pattern::fromJson(const ofJson& json) {
-    // Handle both old format (array of cells) and new format (object with cells and columnConfig)
-    ofJson cellsJson;
+    // Handle both old format (array of steps) and new format (object with steps and columnConfig)
+    // JSON key "cells" kept for backward compatibility
+    ofJson stepsJson;
+    int stepCount = 16;  // Default step count (fallback only)
+    
     if (json.is_array()) {
-        // Old format: just array of cells
-        cellsJson = json;
+        // Old format: just array of steps
+        stepsJson = json;
+        stepCount = (int)stepsJson.size();  // Infer from array size
         // Initialize default columns for old format
         initializeDefaultColumns();
     } else if (json.is_object()) {
-        // New format: object with cells and columnConfig
+        // New format: object with steps and columnConfig
         if (json.contains("cells") && json["cells"].is_array()) {
-            cellsJson = json["cells"];
+            stepsJson = json["cells"];  // JSON key "cells" for backward compatibility
         } else {
             ofLogError("Pattern") << "Invalid JSON format: expected 'cells' array";
             return;
+        }
+        
+        // Load stepCount if present (new format) - this is the authoritative value
+        // Only fall back to array size if stepCount is not explicitly saved
+        if (json.contains("stepCount") && json["stepCount"].is_number()) {
+            stepCount = json["stepCount"];  // Direct conversion (ofJson supports this)
+        } else {
+            // No stepCount in JSON - infer from array size (backward compatibility)
+            stepCount = (int)stepsJson.size();
         }
         
         // Load column configuration if present
@@ -288,52 +304,58 @@ void Pattern::fromJson(const ofJson& json) {
         return;
     }
     
-    cells.clear();
-    cells.resize(cellsJson.size());
+    // Resize to stepCount (preserves user-set pattern length)
+    // This overwrites any previous size set by Pattern constructor
+    steps.clear();
+    steps.resize(stepCount);
     
-    for (size_t i = 0; i < cellsJson.size(); i++) {
-        auto cellJson = cellsJson[i];
-        PatternCell cell;
+    ofLogNotice("Pattern") << "Loading pattern with stepCount=" << stepCount 
+                           << " (cells in JSON: " << stepsJson.size() << ")";
+    
+    // Load step data (may be fewer items than stepCount if pattern was extended)
+    for (size_t i = 0; i < stepsJson.size() && i < (size_t)stepCount; i++) {
+        auto stepJson = stepsJson[i];
+        Step step;
         
         // Load fixed fields - handle null values gracefully
-        if (cellJson.contains("index") && !cellJson["index"].is_null()) {
-            cell.index = cellJson["index"];
-        } else if (cellJson.contains("mediaIndex") && !cellJson["mediaIndex"].is_null()) {
-            cell.index = cellJson["mediaIndex"]; // Legacy support
+        if (stepJson.contains("index") && !stepJson["index"].is_null()) {
+            step.index = stepJson["index"];
+        } else if (stepJson.contains("mediaIndex") && !stepJson["mediaIndex"].is_null()) {
+            step.index = stepJson["mediaIndex"]; // Legacy support
         }
-        // else: use default value (-1) from PatternCell constructor
+        // else: use default value (-1) from Step constructor
         
-        if (cellJson.contains("length") && !cellJson["length"].is_null()) {
-            cell.length = cellJson["length"];
-        } else if (cellJson.contains("stepLength") && !cellJson["stepLength"].is_null()) {
-            cell.length = cellJson["stepLength"]; // Legacy support
+        if (stepJson.contains("length") && !stepJson["length"].is_null()) {
+            step.length = stepJson["length"];
+        } else if (stepJson.contains("stepLength") && !stepJson["stepLength"].is_null()) {
+            step.length = stepJson["stepLength"]; // Legacy support
         }
-        // else: use default value (1) from PatternCell constructor
+        // else: use default value (1) from Step constructor
         
         // Load parameter values (new format)
-        if (cellJson.contains("parameters") && cellJson["parameters"].is_object()) {
-            auto paramJson = cellJson["parameters"];
+        if (stepJson.contains("parameters") && stepJson["parameters"].is_object()) {
+            auto paramJson = stepJson["parameters"];
             for (auto it = paramJson.begin(); it != paramJson.end(); ++it) {
                 // Skip null parameter values
                 if (!it.value().is_null() && it.value().is_number()) {
-                    cell.setParameterValue(it.key(), it.value());
+                    step.setParameterValue(it.key(), it.value());
                 }
             }
         } else {
             // Legacy: migrate old format to new parameter map
-            if (cellJson.contains("position") && !cellJson["position"].is_null()) {
-                cell.setParameterValue("position", cellJson["position"]);
+            if (stepJson.contains("position") && !stepJson["position"].is_null()) {
+                step.setParameterValue("position", stepJson["position"]);
             }
-            if (cellJson.contains("speed") && !cellJson["speed"].is_null()) {
-                cell.setParameterValue("speed", cellJson["speed"]);
+            if (stepJson.contains("speed") && !stepJson["speed"].is_null()) {
+                step.setParameterValue("speed", stepJson["speed"]);
             }
-            if (cellJson.contains("volume") && !cellJson["volume"].is_null()) {
-                cell.setParameterValue("volume", cellJson["volume"]);
+            if (stepJson.contains("volume") && !stepJson["volume"].is_null()) {
+                step.setParameterValue("volume", stepJson["volume"]);
             }
         }
         // Legacy: audioEnabled/videoEnabled fields are ignored (backward compatibility)
         
-        cells[i] = cell;
+        steps[i] = step;
     }
 }
 
@@ -382,7 +404,7 @@ void Pattern::removeColumn(int columnIndex) {
         return;
     }
     
-    // NOTE: We do NOT remove parameter values from cells when removing a column
+    // NOTE: We do NOT remove parameter values from steps when removing a column
     // This preserves the values so they can be restored if the column is added back
     // Parameter values are saved in Pattern::toJson() and will persist across saves/loads
     // The column configuration only controls what's displayed in the grid, not what's stored
@@ -428,7 +450,7 @@ void Pattern::swapColumnParameter(int columnIndex, const std::string& newParamet
     // NOTE: We do NOT migrate or remove old parameter values when swapping
     // This preserves all parameter values so they can be restored if the user swaps back
     // The column configuration only controls what's displayed in the grid, not what's stored
-    // Old parameter values remain in cells and are saved/loaded with the pattern
+    // Old parameter values remain in steps and are saved/loaded with the pattern
     
     // Update parameter name (this only changes what the column displays)
     columnConfig[columnIndex].parameterName = newParameterName;

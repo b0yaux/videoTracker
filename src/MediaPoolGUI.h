@@ -126,9 +126,6 @@ private:
     //          if false, truncates from end (shows start with ellipsis suffix)
     std::string truncateTextToWidth(const std::string& text, float maxWidth, bool showEnd = false, const std::string& ellipsis = "...");
     
-    // Helper method to draw position scan mode selector button in header
-    void drawPositionScanModeButton(const ImVec2& cellStartPos, float columnWidth, float cellMinY);
-    
     // Helper method to get editable parameters (filters out "note" parameter)
     std::vector<ParameterDescriptor> getEditableParameters() const;
     

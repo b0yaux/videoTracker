@@ -16,11 +16,8 @@ Clock::Clock()
     , beatPulse(0.0f)
     , lastBeatTime(0.0f)
     , beatInterval(0.0f)
-    , sampleAccumulator(0.0)
     , beatAccumulator(0.0)
-    , samplesPerStep(0.0f)
-    , samplesPerBeat(0.0f)
-    , stepsPerBeat(4) {
+    , samplesPerBeat(0.0f) {
 }
 
 //--------------------------------------------------------------
@@ -55,8 +52,7 @@ float Clock::getBPM() const {
 void Clock::start() {
     if (!playing) {
         playing = true;
-        // Reset accumulators
-        sampleAccumulator = 0.0;
+        // Reset accumulator
         beatAccumulator = 0.0;
         // Don't calculate samplesPerBeat here - wait for first audioOut() call
         // to get accurate sample rate from the actual audio stream
@@ -75,7 +71,6 @@ void Clock::stop() {
     if (playing) {
         playing = false;
         beatPulse = 0.0f; // Reset visualizer
-        sampleAccumulator = 0.0; // Reset sample timing
         beatAccumulator = 0.0; // Reset beat timing
         ofLogNotice("Clock") << "Audio-rate clock stopped";
         
@@ -103,22 +98,8 @@ void Clock::pause() {
 void Clock::reset() {
     playing = false;
     beatPulse = 0.0f; // Reset visualizer
-    sampleAccumulator = 0.0; // Reset sample timing
     beatAccumulator = 0.0; // Reset beat timing
     ofLogNotice("Clock") << "Audio-rate clock reset";
-}
-
-//--------------------------------------------------------------
-void Clock::setStepsPerBeat(int spb) {
-    // Silent clamping using config
-    int clampedSpb = ofClamp(spb, config.minStepsPerBeat, config.maxStepsPerBeat);
-    stepsPerBeat = clampedSpb;
-    ofLogNotice("Clock") << "Steps per beat set to: " << stepsPerBeat;
-}
-
-//--------------------------------------------------------------
-int Clock::getStepsPerBeat() const {
-    return stepsPerBeat;
 }
 
 //--------------------------------------------------------------
@@ -176,7 +157,6 @@ void Clock::audioOut(ofSoundBuffer& buffer) {
         float current = currentBpm.load();
         float beatsPerSecond = current / 60.0f;
         samplesPerBeat = sampleRate / beatsPerSecond;
-        samplesPerStep = samplesPerBeat / stepsPerBeat;
     }
     
     // Smooth BPM changes for audio-rate transitions using config
@@ -187,40 +167,21 @@ void Clock::audioOut(ofSoundBuffer& buffer) {
         currentBpm.store(current);
     }
     
-    // Update samples per beat and step for sample-accurate timing
+    // Update samples per beat for sample-accurate timing
     float beatsPerSecond = current / 60.0f;
     samplesPerBeat = sampleRate / beatsPerSecond;
-    samplesPerStep = samplesPerBeat / stepsPerBeat;
     
-    // Sample-accurate beat and step detection
+    // Sample-accurate beat detection
     for (int i = 0; i < buffer.getNumFrames(); i++) {
-        sampleAccumulator += 1.0;
         beatAccumulator += 1.0;
         
-        // Check for step event (for TrackerSequencer)
-        if (sampleAccumulator >= samplesPerStep) {
-            sampleAccumulator -= samplesPerStep;
-            stepCounter++;
-            
-            TimeEvent stepEvent;
-            stepEvent.type = TimeEventType::STEP;
-            stepEvent.stepNumber = stepCounter;
-            stepEvent.beatNumber = beatCounter;
-            stepEvent.timestamp = ofGetElapsedTimef();
-            stepEvent.bpm = current;
-            
-            ofNotifyEvent(timeEvent, stepEvent);
-        }
-        
-        // Check for beat event (for visualizer) - independent timing
+        // Check for beat event
         if (beatAccumulator >= samplesPerBeat) {
             beatAccumulator -= samplesPerBeat;
             beatCounter++;
             
             TimeEvent beatEvent;
-            beatEvent.type = TimeEventType::BEAT;
-            beatEvent.stepNumber = -1;  // Not applicable for beat events
-            beatEvent.beatNumber = beatCounter;
+            beatEvent.beat = beatCounter;
             beatEvent.timestamp = ofGetElapsedTimef();
             beatEvent.bpm = current;
             
@@ -257,7 +218,6 @@ void Clock::setSampleRate(float rate) {
             float current = currentBpm.load();
             float beatsPerSecond = current / 60.0f;
             samplesPerBeat = sampleRate / beatsPerSecond;
-            samplesPerStep = samplesPerBeat / stepsPerBeat;
         }
     }
 }
@@ -292,7 +252,7 @@ void Clock::onBPMChanged() {
 ofJson Clock::toJson() const {
     ofJson json;
     json["bpm"] = currentBpm.load();
-    json["stepsPerBeat"] = stepsPerBeat;
+    // Note: stepsPerBeat removed - step timing is now per-TrackerSequencer instance
     // Note: isPlaying is intentionally not saved (transient state)
     return json;
 }
@@ -303,9 +263,7 @@ void Clock::fromJson(const ofJson& json) {
         float bpm = json["bpm"];
         setBPM(bpm);
     }
-    if (json.contains("stepsPerBeat")) {
-        int spb = json["stepsPerBeat"];
-        setStepsPerBeat(spb);
-    }
+    // Note: stepsPerBeat removed - step timing is now per-TrackerSequencer instance
+    // Old JSON files with stepsPerBeat will be ignored (backward compatible)
     // Note: isPlaying is intentionally not loaded (transient state)
 }

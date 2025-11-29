@@ -623,7 +623,7 @@ void MediaPoolGUI::drawParameters() {
         headerClickedThisFrame = true;
     };
     
-    // Setup custom header rendering callback for Position parameter (scan mode button only, no popup)
+    // Setup custom header rendering callback for Position parameter
     callbacks.drawCustomHeader = [this, pool, &headerClickedThisFrame](int col, const CellGridColumnConfig& colConfig, ImVec2 cellStartPos, float columnWidth, float cellMinY) -> bool {
         if (colConfig.parameterName == "position") {
             // Draw column name first (standard header)
@@ -634,10 +634,6 @@ void MediaPoolGUI::drawParameters() {
                 headerClickedThisFrame = true;
             }
             
-            // Draw scan mode selector button (right-aligned in header)
-            if (pool) {
-                drawPositionScanModeButton(cellStartPos, columnWidth, cellMinY);
-            }
             return true; // Header was drawn by custom callback
         } else {
             // Default header for other parameters (use CellGrid's default rendering)
@@ -806,8 +802,7 @@ void MediaPoolGUI::drawParameters() {
             if (activePlayer != nullptr && currentIndex < numPlayers) {
                 auto currentPlayer = pool->getMediaPlayer(currentIndex);
                 if (currentPlayer == activePlayer) {
-                    isActive = (pool->isManualPreview() || pool->isSequencerActive()) 
-                              && currentPlayer->isPlaying();
+                    isActive = pool->isPlaying() && currentPlayer->isPlaying();
                 }
             }
             
@@ -826,11 +821,11 @@ void MediaPoolGUI::drawParameters() {
                 auto currentPlayer = pool->getMediaPlayer(currentIndex);
                 if (!currentPlayer) return;
                 
-                // Only toggle manual preview - don't interfere with sequencer playback
-                if (pool->isManualPreview()) {
+                // Only toggle if currently playing - don't interfere with sequencer playback
+                if (pool->isPlaying()) {
                     currentPlayer->stop();
                     pool->setModeIdle();
-                } else if (pool->isIdle()) {
+                } else if (!pool->isPlaying()) {
                     // Start manual preview - position determined automatically based on speed
                     pool->playMediaManual(currentIndex);
                 }
@@ -1567,11 +1562,11 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                 auto player = getMediaPool()->getActivePlayer();
                 MediaPool* pool = getMediaPool();
                 if (player && pool) {
-                    // CRITICAL: Check transport FIRST, before checking isIdle()
-                    // This ensures transport playing always updates startPosition, even if MediaPool is IDLE between triggers
-                    if (pool->isTransportPlaying()) {
-                        // Transport is playing: Update startPosition (not playheadPosition)
-                        // Do NOT seek playhead even if player is playing - sequencer/transport controls playback
+                    // If player is playing (sequencer active), update startPosition for next trigger
+                    // If player is not playing, allow scrubbing (update playheadPosition)
+                    if (player->isPlaying()) {
+                        // Player is playing: Update startPosition (not playheadPosition)
+                        // Do NOT seek playhead - sequencer controls playback
                         float regionStartVal = player->regionStart.get();
                         float regionEndVal = player->regionEnd.get();
                         float regionSize = regionEndVal - regionStartVal;
@@ -1587,7 +1582,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                         
                         player->startPosition.set(relativePos);
                         pool->setParameter("position", relativePos, true);
-                    } else if (pool->isIdle()) {
+                    } else if (!pool->isPlaying()) {
                         // IDLE mode: Just set playhead position (no playback)
                         // Scrubbing playback will start when dragging begins (handled in drag section)
                         if (player->isAudioLoaded()) {
@@ -1599,7 +1594,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                         }
                         player->playheadPosition.set(relativeX);
                     } else if (player->isPlaying()) {
-                        // MANUAL_PREVIEW mode during playback: seek playhead only (scrubbing)
+                        // PLAYING mode during playback: seek playhead only (scrubbing)
                         if (player->isAudioLoaded()) {
                             player->getAudioPlayer().setPosition(relativeX);
                         }
@@ -1677,7 +1672,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
             if (isScrubbing) {
                 isScrubbing = false;
                 MediaPool* pool = getMediaPool();
-                if (pool && pool->isIdle()) {
+                if (pool && !pool->isPlaying()) {
                     // Stop temporary playback (doesn't change mode)
                     pool->stopTemporaryPlayback();
                     // playheadPosition is already set to the scrub position, so it stays
@@ -1695,12 +1690,11 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
             bool wasScrubbing = isScrubbing;
             isScrubbing = true;
             
-            // CRITICAL: Check transport FIRST, before checking isIdle()
-            // This handles the case where MediaPool is IDLE between triggers but transport is still playing
-            if (pool->isTransportPlaying()) {
-                // Transport is playing (sequencer active or between triggers): Update startPosition only
-                // CRITICAL: Check transport FIRST, before checking isSequencerActive()
-                // This handles the case where MediaPool is IDLE between triggers but transport is still playing
+            // If player is playing (sequencer active), update startPosition for next trigger
+            // If player is not playing, allow scrubbing (update playheadPosition)
+            if (player->isPlaying()) {
+                // Player is playing: Update startPosition (not playheadPosition)
+                // Do NOT seek playhead - sequencer controls playback
                 float regionStartVal = player->regionStart.get();
                 float regionEndVal = player->regionEnd.get();
                 float regionSize = regionEndVal - regionStartVal;
@@ -1716,7 +1710,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                 
                 player->startPosition.set(relativePos);
                 pool->setParameter("position", relativePos, true);
-            } else if (pool->isIdle()) {
+            } else if (!pool->isPlaying()) {
                 // IDLE mode: Start scrubbing playback for AV feedback (doesn't change mode or startPosition)
                 if (!wasScrubbing) {
                     // First frame of scrubbing: start scrubbing playback
@@ -1736,7 +1730,7 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
                     }
                 }
             } else {
-                // MANUAL_PREVIEW mode: Normal scrubbing (seek playhead, allow past loop end)
+                // IDLE mode: Normal scrubbing (seek playhead, allow past loop end)
                 if (player->isPlaying()) {
                     // Temporarily disable loop to allow scrubbing past loop end
                     bool wasLooping = player->loop.get();
@@ -2080,80 +2074,6 @@ bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) 
     
     // All other keys: Let CellGrid handle them internally via CellWidget::handleInputInDraw()
     return false;
-}
-
-/// MARK: - SCAN MODE
-/// @brief draw button for position scan mode
-void MediaPoolGUI::drawPositionScanModeButton(const ImVec2& cellStartPos, float columnWidth, float cellMinY) {
-    MediaPool* pool = getMediaPool();
-    if (!pool) return;
-    
-    // Mode cycling button with all 4 modes properly mapped
-    static const char* const MODE_LABELS[] = { "N", "S", "M", "G" }; // None, Step, Media, Global
-    static const char* const MODE_TOOLTIPS[] = { 
-        "None: No scanning - always start from set position (or 0.0)",
-        "Step: Each step remembers its scan position separately",
-        "Media: Each media remembers its scan position across all steps", 
-        "Global: All media share one scan position"
-    };
-    static constexpr int NUM_MODES = 4;
-    
-    // Helper functions to map between enum and GUI index
-    auto modeToGuiIndex = [](ScanMode mode) -> int {
-        switch (mode) {
-            case ScanMode::NONE: return 0;
-            case ScanMode::PER_STEP: return 1;
-            case ScanMode::PER_MEDIA: return 2;
-            case ScanMode::GLOBAL: return 3;
-            default: return 2; // Default to PER_MEDIA
-        }
-    };
-    
-    auto guiIndexToMode = [](int guiIndex) -> ScanMode {
-        switch (guiIndex) {
-            case 0: return ScanMode::NONE;
-            case 1: return ScanMode::PER_STEP;
-            case 2: return ScanMode::PER_MEDIA;
-            case 3: return ScanMode::GLOBAL;
-            default: return ScanMode::PER_MEDIA;
-        }
-    };
-    
-    ScanMode currentMode = getMediaPool()->getScanMode();
-    int currentModeIndex = modeToGuiIndex(currentMode);
-    
-    // Validate mode index
-    if (currentModeIndex < 0 || currentModeIndex >= NUM_MODES) {
-        currentModeIndex = 2; // Default to PER_MEDIA if invalid
-    }
-    
-    ImGui::PushID("PositionScanMode");
-    
-    // Calculate button size and position (right-aligned in header)
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
-    float buttonWidth = ImGui::CalcTextSize(MODE_LABELS[currentModeIndex]).x + 
-                        ImGui::GetStyle().FramePadding.x * 2.0f;
-    float padding = ImGui::GetStyle().CellPadding.x;
-    
-    // Position button to the right edge of the cell
-    float cellMaxX = cellStartPos.x + columnWidth;
-    float buttonStartX = cellMaxX - buttonWidth - padding;
-    ImGui::SetCursorScreenPos(ImVec2(buttonStartX, cellMinY));
-    
-    // Single click cycles to next mode
-    if (ImGui::SmallButton(MODE_LABELS[currentModeIndex])) {
-        int nextModeIndex = (currentModeIndex + 1) % NUM_MODES;
-        getMediaPool()->setScanMode(guiIndexToMode(nextModeIndex));
-    }
-    
-    // Simple tooltip on hover
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("%s", MODE_TOOLTIPS[currentModeIndex]);
-    }
-    
-    ImGui::PopStyleVar();
-    
-    ImGui::PopID();
 }
 
 bool MediaPoolGUI::handleFileDrop(const std::vector<std::string>& filePaths) {

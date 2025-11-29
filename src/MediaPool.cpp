@@ -12,13 +12,12 @@
 MediaPool::MediaPool(const std::string& dataDir) 
     : currentIndex(0), dataDirectory(dataDir), isSetup(false), currentMode(PlaybackMode::IDLE), 
       currentPlayStyle(PlayStyle::ONCE), clock(nullptr), activePlayer(nullptr), 
-      lastTransportState(false),
-      positionScan(ScanMode::PER_MEDIA), lastTriggeredStep(-1), activeStepContext(),
+      lastTriggeredStep(-1), activeStepContext(),
       polyphonyMode_(PolyphonyMode::MONOPHONIC) {  // Default to monophonic for backward compatibility
     // setup() will be called later with clock reference
 }
 
-MediaPool::~MediaPool() {
+MediaPool::~MediaPool() noexcept {
     isDestroying_ = true;  // Prevent update() from running after destruction starts
     clear();
 }
@@ -595,7 +594,6 @@ void MediaPool::clear() {
     audioFiles.clear();
     videoFiles.clear();
     currentIndex = 0;
-    positionScan.clear();
     scheduledStops_.clear();  // Clear scheduled stops when clearing pool
     
     // Note: Mixers are member objects - their destructors will safely clear
@@ -1015,7 +1013,7 @@ bool MediaPool::playMediaManual(size_t index) {
     // Set active player and mode
     activePlayer = player;
     currentIndex = index;
-    currentMode.store(PlaybackMode::MANUAL_PREVIEW, std::memory_order_relaxed);
+    currentMode.store(PlaybackMode::PLAYING, std::memory_order_relaxed);
     
     // Stop current player if playing (to reset state)
     if (player->isPlaying()) {
@@ -1042,7 +1040,7 @@ bool MediaPool::playMediaManual(size_t index) {
     return true;
 }
 // Note: Old onStepTrigger methods removed - now using onTrigger() which receives TriggerEvent directly
-// stopManualPreview() removed - update() now automatically transitions MANUAL_PREVIEW → IDLE when player stops
+// stopManualPreview() removed - update() now automatically transitions PLAYING → IDLE when player stops
 
 //--------------------------------------------------------------
 // Temporary playback for scrubbing (doesn't change MediaPool mode)
@@ -1292,24 +1290,10 @@ PlaybackMode MediaPool::getCurrentMode() const {
     return currentMode.load(std::memory_order_relaxed);
 }
 
-bool MediaPool::isSequencerActive() const {
+bool MediaPool::isPlaying() const {
     // Lock-free read (atomic)
-    return currentMode.load(std::memory_order_relaxed) == PlaybackMode::SEQUENCER_ACTIVE;
-}
-
-bool MediaPool::isManualPreview() const {
-    // Lock-free read (atomic)
-    return currentMode.load(std::memory_order_relaxed) == PlaybackMode::MANUAL_PREVIEW;
-}
-
-bool MediaPool::isIdle() const {
-    // Lock-free read (atomic)
-    return currentMode.load(std::memory_order_relaxed) == PlaybackMode::IDLE;
-}
-
-bool MediaPool::isTransportPlaying() const {
-    std::lock_guard<std::mutex> lock(stateMutex);
-    return lastTransportState;
+    // Returns true if mode is PLAYING (any playback active)
+    return currentMode.load(std::memory_order_relaxed) == PlaybackMode::PLAYING;
 }
 
 void MediaPool::setModeIdle() {
@@ -1332,7 +1316,7 @@ void MediaPool::setPlayStyle(PlayStyle style) {
     // (loopStart to loopEnd based on loopSize). We handle looping manually in update().
     if (activePlayer) {
         PlaybackMode mode = currentMode.load(std::memory_order_relaxed);
-        if (mode == PlaybackMode::MANUAL_PREVIEW || mode == PlaybackMode::SEQUENCER_ACTIVE) {
+        if (mode == PlaybackMode::PLAYING) {
             // Always disable underlying loop - looping is handled manually at region level
             activePlayer->loop.set(false);
             ofLogNotice("MediaPool") << "Applied play style to active player - looping handled manually at region level";
@@ -1437,45 +1421,35 @@ void MediaPool::update() {
         }
     }
     
-    // Check if we should transition from SEQUENCER_ACTIVE to IDLE
-    // This handles cases where sequencer stops (module disabled, disconnected, or transport stopped)
+    // Check if we should transition from PLAYING to IDLE
+    // Simple logic: if player stopped AND no events in queue, transition to IDLE
+    // If events arrive later, processEventQueue() will set mode back to PLAYING
     mode = currentMode.load(std::memory_order_relaxed);
-    if (mode == PlaybackMode::SEQUENCER_ACTIVE) {
-        bool transportIsPlaying = false;
-        {
-            std::lock_guard<std::mutex> lock(stateMutex);
-            transportIsPlaying = lastTransportState;
-        }
-        
-        // Transition to IDLE if:
-        // 1. Transport is stopped (sequencer won't send more triggers)
-        // 2. No active player is playing (all playback has stopped)
-        bool shouldTransitionToIdle = false;
-        
-        if (!transportIsPlaying) {
-            // Transport stopped - sequencer won't send more triggers
-            shouldTransitionToIdle = true;
-            ofLogNotice("MediaPool") << "[SEQUENCER_STOP] Transport stopped - transitioning to IDLE";
-        } else if (!activePlayerIsValid) {
-            // No active player - this can happen if sequencer module was disabled or disconnected
-            // Only transition if transport is still playing (if transport stopped, we already handled it above)
-            shouldTransitionToIdle = true;
-            ofLogNotice("MediaPool") << "[SEQUENCER_STOP] No active player - transitioning to IDLE";
-        } else if (!isPlayerPlaying) {
-            // Player stopped but transport is still playing - this is normal between triggers
-            // Keep SEQUENCER_ACTIVE mode - don't transition to IDLE
-            // The sequencer will send more triggers while transport is playing
-            // Only log occasionally to avoid spam
-            static int stopFrameCount = 0;
-            if (++stopFrameCount % 60 == 0) { // Log every second at 60fps
-                ofLogVerbose("MediaPool") << "[SEQUENCER] Player stopped between triggers (transport still playing) - staying in SEQUENCER_ACTIVE";
-            }
-        }
-        
-        if (shouldTransitionToIdle) {
+    if (mode == PlaybackMode::PLAYING) {
+        if (!activePlayerIsValid) {
+            // No active player - module was disabled or disconnected
             currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
-            // Also reload mode for rest of update() function
             mode = PlaybackMode::IDLE;
+            ofLogNotice("MediaPool") << "[STOP] No active player - transitioning to IDLE";
+        } else if (!isPlayerPlaying) {
+            // Player stopped - check if more triggers are coming
+            size_t queuedEvents = eventQueue.size_approx();
+            
+            if (queuedEvents == 0) {
+                // No events in queue - transition to IDLE
+                // If triggers arrive later, processEventQueue() will set mode back to PLAYING
+                currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+                mode = PlaybackMode::IDLE;
+                ofLogVerbose("MediaPool") << "[STOP] Player stopped and no events queued - transitioning to IDLE";
+            } else {
+                // Events in queue - more triggers coming, stay in PLAYING
+                // Only log occasionally to avoid spam
+                static int stopFrameCount = 0;
+                if (++stopFrameCount % 60 == 0) { // Log every second at 60fps
+                    ofLogVerbose("MediaPool") << "[PLAYING] Player stopped between triggers (" 
+                                              << queuedEvents << " events queued) - staying in PLAYING";
+                }
+            }
         }
     }
     
@@ -1545,40 +1519,11 @@ void MediaPool::update() {
                 }
             }
             
-            // Position capture (separate concern - only when appropriate)
-            // Get transport state and step context for position capture
-            bool transportIsPlaying = false;
-            int captureStep = -1;
-            {
-                std::lock_guard<std::mutex> lock(stateMutex);
-                transportIsPlaying = lastTransportState;
-                if (mode == PlaybackMode::SEQUENCER_ACTIVE) {
-                    captureStep = activeStepContext.step;
-                }
-            }
-            
-            // Only capture position when transport is playing (sequencer) or in manual preview
-            // This prevents position from being saved after transport stops and memory is cleared
-            if (transportIsPlaying || mode == PlaybackMode::MANUAL_PREVIEW) {
-                captureScanPosition(captureStep, currentIndex, currentPosition, mode);
-            }
+            // Position memory is now handled automatically by MediaPlayer::playheadPosition
+            // No explicit capture needed - MediaPlayer preserves position on stop()
         } else if (!isCurrentlyPlaying) {
-            // Player stopped - handle transitions
-            bool transportIsPlaying = false;
-            {
-                std::lock_guard<std::mutex> lock(stateMutex);
-                transportIsPlaying = lastTransportState;
-            }
-            
-            // Transition MANUAL_PREVIEW to IDLE when playback stops
-            // NOTE: SEQUENCER_ACTIVE is already handled by the early check above
-            mode = currentMode.load(std::memory_order_relaxed);
-            if (shouldTransitionToIdle(mode, transportIsPlaying)) {
-                currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
-                if (mode == PlaybackMode::MANUAL_PREVIEW) {
-                    ofLogNotice("MediaPool") << "[MANUAL_STOP] Manual preview stopped - transitioning to IDLE mode";
-                }
-            }
+            // Player stopped - transitions are handled by the early check above
+            // No additional action needed here
         }
     } else if (activePlayer && !activePlayerIsValid) {
         // activePlayer is no longer valid - reset it
@@ -1586,9 +1531,9 @@ void MediaPool::update() {
         currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
     }
     
-    // Check for end-of-playback (applies to both manual preview and sequencer)
+    // Check for end-of-playback
     mode = currentMode.load(std::memory_order_relaxed);
-    if ((mode == PlaybackMode::MANUAL_PREVIEW || mode == PlaybackMode::SEQUENCER_ACTIVE) && activePlayerIsValid && activePlayer) {
+    if (mode == PlaybackMode::PLAYING && activePlayerIsValid && activePlayer) {
         if (!activePlayer->isPlaying() && !activePlayer->loop.get()) {
             onPlaybackEnd();
         }
@@ -1671,7 +1616,7 @@ void MediaPool::processEventQueue() {
             continue;  // Process next event
         }
         
-        // Update activeStepContext and apply position scan (GUI thread - safe to access positionScan)
+        // Update activeStepContext and apply position memory (GUI thread)
         {
             std::lock_guard<std::mutex> lock(stateMutex);
             if (event.step >= 0) {
@@ -1679,18 +1624,33 @@ void MediaPool::processEventQueue() {
                 activeStepContext.step = event.step;
                 activeStepContext.mediaIndex = mediaIndex;
                 activeStepContext.triggerTime = ofGetElapsedTimef();
+                // Track last trigger time (kept for potential future use, but not needed for simplified logic)
+                lastTriggerTime = ofGetElapsedTimef();
             }
             
-            // Apply position scan: restore stored scan position if position not explicitly set
-            // PER_MEDIA mode reads directly from MediaPlayer::playheadPosition
-            // (no need for PositionScan storage - MediaPlayer already preserves position on stop())
+            // Position memory: For NEXT mode, use playheadPosition if position not explicitly set
+            // This allows NEXT mode to continue from where it left off
             if (event.parameters.find("position") == event.parameters.end()) {
-                float scanPosition = restoreScanPosition(event.step, mediaIndex, player);
-                
-                // Always set position parameter if we got a valid scan position
-                // This ensures playback starts from the correct position
-                if (scanPosition > POSITION_THRESHOLD) {
-                    event.parameters["position"] = scanPosition;
+                // For NEXT mode, use position memory from playheadPosition
+                // For ONCE/LOOP modes, use startPosition (GUI-set value)
+                if (currentPlayStyle == PlayStyle::NEXT) {
+                    float rememberedPosition = player->playheadPosition.get();
+                    if (rememberedPosition > POSITION_THRESHOLD) {
+                        // Convert absolute position to relative position for startPosition
+                        float regionStart = player->regionStart.get();
+                        float regionEnd = player->regionEnd.get();
+                        float relativePos = mapAbsoluteToRelative(rememberedPosition, regionStart, regionEnd);
+                        
+                        // Reset to 0.0 if position is at the end or too small
+                        if (relativePos >= END_POSITION_THRESHOLD || relativePos < POSITION_THRESHOLD) {
+                            relativePos = 0.0f;
+                            player->playheadPosition.set(0.0f);
+                        }
+                        
+                        event.parameters["position"] = relativePos;
+                        ofLogNotice("MediaPool") << "[TRIGGER] NEXT mode: Using position memory " 
+                                                 << rememberedPosition << " -> relative " << relativePos;
+                    }
                 }
             }
         }
@@ -1743,6 +1703,19 @@ void MediaPool::processEventQueue() {
         // Apply all parameters from event using helper method
         applyEventParameters(player, event, paramDescriptors);
         
+        // CRITICAL FIX: Cancel any existing scheduled stop for this player
+        // This prevents scheduled stops from interfering with retriggers when
+        // step length equals pattern stepCount (e.g., both = 16).
+        // When a pattern loops back to the same step, the new trigger should
+        // take precedence over the old scheduled stop.
+        scheduledStops_.erase(
+            std::remove_if(scheduledStops_.begin(), scheduledStops_.end(),
+                [player](const ScheduledStop& stop) {
+                    return stop.player == player;
+                }),
+            scheduledStops_.end()
+        );
+        
         // Use duration directly from TriggerEvent
         float stepDurationSeconds = event.duration;
         
@@ -1759,9 +1732,14 @@ void MediaPool::processEventQueue() {
         ensurePlayerAudioConnected(player);
         ensurePlayerVideoConnected(player);
         
-        // Transition to SEQUENCER_ACTIVE if playback started
+        // Transition to PLAYING if playback started
         if (player->isPlaying()) {
-            currentMode.store(PlaybackMode::SEQUENCER_ACTIVE, std::memory_order_relaxed);
+            currentMode.store(PlaybackMode::PLAYING, std::memory_order_relaxed);
+            // (in case step was -1 and we didn't update it above)
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                lastTriggerTime = ofGetElapsedTimef();
+            }
         } else {
             ofLogWarning("MediaPool") << "play() called but player is not playing - staying in IDLE mode";
         }
@@ -1798,26 +1776,17 @@ void MediaPool::onPlaybackEnd() {
     // No lock needed - caller (update()) already holds stateMutex
     
     PlaybackMode mode = currentMode.load(std::memory_order_relaxed);
-    if (mode != PlaybackMode::MANUAL_PREVIEW && mode != PlaybackMode::SEQUENCER_ACTIVE) return;
+    if (mode != PlaybackMode::PLAYING) return;
     
-    // Get transport state - CRITICAL: Keep SEQUENCER_ACTIVE when transport is playing
-    bool transportIsPlaying = false;
-    {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        transportIsPlaying = lastTransportState;
-    }
+    // Transitions to IDLE are handled by update() when player stops and queue is empty
+    // This function only handles play style behavior (ONCE, LOOP, NEXT)
     
     switch (currentPlayStyle) {
         case PlayStyle::ONCE:
-            // Stop the current player
+            // Stop the current player - update() will transition to IDLE when it detects player stopped
             if (activePlayer) {
                 activePlayer->stop();
             }
-            // Transition to IDLE using helper method
-            if (shouldTransitionToIdle(mode, transportIsPlaying)) {
-                currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
-            }
-            // If SEQUENCER_ACTIVE and transport is playing, keep SEQUENCER_ACTIVE mode
             break;
         case PlayStyle::LOOP:
             // Already handled by loop=true
@@ -1851,123 +1820,25 @@ void MediaPool::onPlaybackEnd() {
                     // Start playback
                     nextPlayer->play();
                     
-                    ofLogNotice("MediaPool") << "Started next media " << nextIndex << " (state: " << (mode == PlaybackMode::MANUAL_PREVIEW ? "MANUAL_PREVIEW" : "SEQUENCER_ACTIVE") << ")";
+                    ofLogNotice("MediaPool") << "Started next media " << nextIndex << " (PLAYING mode)";
                 } else {
-                    // No next player available - only transition to IDLE if:
-                    // - MANUAL_PREVIEW mode (always transition)
-                    // - SEQUENCER_ACTIVE mode AND transport is stopped
-                    if (mode == PlaybackMode::MANUAL_PREVIEW || !transportIsPlaying) {
-                        currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+                    // No next player available - stop current player
+                    // update() will transition to IDLE when it detects player stopped
+                    if (activePlayer) {
+                        activePlayer->stop();
                     }
                 }
             } else {
                 // Only one player (no next player) - stop current player
+                // update() will transition to IDLE when it detects player stopped
                 if (activePlayer) {
                     activePlayer->stop();
-                }
-                // Only transition to IDLE if:
-                // - MANUAL_PREVIEW mode (always transition)
-                // - SEQUENCER_ACTIVE mode AND transport is stopped
-                if (mode == PlaybackMode::MANUAL_PREVIEW || !transportIsPlaying) {
-                    currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
                 }
             }
             break;
     }
 }
 
-
-//--------------------------------------------------------------
-// Transport listener system for Clock play/stop events
-void MediaPool::addTransportListener(TransportCallback listener) {
-    std::lock_guard<std::mutex> lock(stateMutex);
-    transportListener = listener;
-    ofLogNotice("MediaPool") << "Transport listener added";
-}
-
-void MediaPool::removeTransportListener() {
-    std::lock_guard<std::mutex> lock(stateMutex);
-    transportListener = nullptr;
-    ofLogNotice("MediaPool") << "Transport listener removed";
-}
-
-void MediaPool::onTransportChanged(bool isPlaying) {
-    std::lock_guard<std::mutex> lock(stateMutex);
-    
-    if (isPlaying != lastTransportState) {
-        // CRITICAL: Update lastTransportState FIRST to prevent update() from capturing position
-        // after we clear memory. This ensures update() sees transport as stopped immediately.
-        lastTransportState = isPlaying;
-        
-        if (isPlaying) {
-            // Transport started - clear all positions and reset step context (fresh start)
-            // PHASE 2: Clear positions based on scan mode
-            ScanMode scanMode = positionScan.getMode();
-            if (scanMode == ScanMode::PER_STEP || scanMode == ScanMode::GLOBAL) {
-                // Clear PositionScan storage for PER_STEP/GLOBAL modes
-                positionScan.clear();
-            }
-            // For PER_MEDIA mode, clear playheadPosition on all players (PositionScan not used)
-            // For all modes, reset playheadPosition to ensure fresh start
-            for (auto& player : players) {
-                if (player) {
-                    player->playheadPosition.set(0.0f);
-                }
-            }
-            
-            activeStepContext.step = -1;
-            activeStepContext.mediaIndex = -1;
-            activeStepContext.triggerTime = 0.0f;
-            
-            ofLogNotice("MediaPool") << "[TRANSPORT_START] ===== TRANSPORT STARTED ===== ScanMode: " 
-                                     << (int)scanMode << ", ScanSize: " << positionScan.size() << " =====";
-        } else {
-            // Transport stopped - CRITICAL: Clear positions FIRST before stopping players
-            // This prevents update() from capturing position after we clear
-            // (update() checks lastTransportState, which we've already set to false above)
-            ScanMode scanMode = positionScan.getMode();
-            if (scanMode == ScanMode::PER_STEP || scanMode == ScanMode::GLOBAL) {
-                // Clear PositionScan storage for PER_STEP/GLOBAL modes
-                positionScan.clear();
-            }
-            // For PER_MEDIA mode, clear playheadPosition on all players
-            // For all modes, reset playheadPosition to prevent position leakage
-            for (auto& player : players) {
-                if (player) {
-                    player->playheadPosition.set(0.0f);
-                }
-            }
-            
-            // Reset step context BEFORE stopping players
-            activeStepContext.step = -1;
-            activeStepContext.mediaIndex = -1;
-            activeStepContext.triggerTime = 0.0f;
-            
-            // Now stop ALL players (monophonic behavior: only one should be playing, but stop all to be safe)
-            // NOTE: We stop players AFTER clearing positions to prevent any position capture
-            // in update() from repopulating scan
-                currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
-                
-            // Stop all players to ensure clean state (prevents players continuing after transport stops)
-            for (size_t i = 0; i < players.size(); i++) {
-                auto& player = players[i];
-                if (player && player->isPlaying()) {
-                    player->stop();
-                    // Disconnect stopped player from mixer
-                    ensurePlayerVideoDisconnected(player.get());
-                    ofLogVerbose("MediaPool") << "[TRANSPORT_STOP] Stopped player at index " << i;
-                }
-            }
-            
-            ofLogNotice("MediaPool") << "[TRANSPORT_STOP] ===== TRANSPORT STOPPED ===== Positions CLEARED (ScanMode: " 
-                                     << (int)scanMode << ", ScanSize: " << positionScan.size() << ") =====";
-        }
-        
-        if (transportListener) {
-            transportListener(isPlaying);
-        }
-    }
-}
 
 //--------------------------------------------------------------
 // Module interface implementation
@@ -1992,9 +1863,6 @@ ofJson MediaPool::toJson() const {
     
     // Save active player index
     json["activePlayerIndex"] = currentIndex;
-    
-    // Save scan mode
-    json["scanMode"] = static_cast<int>(getScanMode());
     
     // Save play style
     json["playStyle"] = static_cast<int>(currentPlayStyle);
@@ -2057,14 +1925,7 @@ ofJson MediaPool::toJson() const {
 }
 
 void MediaPool::fromJson(const ofJson& json) {
-    // Load scan mode and play style first (before loading players)
-    if (json.contains("scanMode")) {
-        int modeInt = json["scanMode"];
-        if (modeInt >= 0 && modeInt <= 3) {
-            setScanMode(static_cast<ScanMode>(modeInt));
-        }
-    }
-    
+    // Load play style first (before loading players)
     if (json.contains("playStyle")) {
         int styleInt = json["playStyle"];
         if (styleInt >= 0 && styleInt <= 2) {
@@ -2473,20 +2334,9 @@ void MediaPool::onTrigger(TriggerEvent& event) {
 
 //--------------------------------------------------------------
 // Position scan mode control
-void MediaPool::setScanMode(ScanMode mode) {
-    std::lock_guard<std::mutex> lock(stateMutex);
-    positionScan.setMode(mode);
-    ofLogNotice("MediaPool") << "Position scan mode set to: " << (int)mode;
-}
-
 PolyphonyMode MediaPool::getPolyphonyMode() const {
     std::lock_guard<std::mutex> lock(stateMutex);
     return polyphonyMode_;
-}
-
-ScanMode MediaPool::getScanMode() const {
-    std::lock_guard<std::mutex> lock(stateMutex);
-    return positionScan.getMode();
 }
 
 //--------------------------------------------------------------
@@ -2788,102 +2638,8 @@ void MediaPool::handleRegionEnd(MediaPlayer* player, float currentPosition,
     }
 }
 
-void MediaPool::captureScanPosition(int step, int mediaIndex, float position, PlaybackMode mode) {
-    ScanMode scanMode = positionScan.getMode();
-    
-    // PER_MEDIA mode uses MediaPlayer::playheadPosition directly (no capture needed)
-    if (scanMode == ScanMode::PER_MEDIA || scanMode == ScanMode::NONE) {
-        return;
-    }
-    
-    // PER_STEP mode: only capture if step is valid and in SEQUENCER_ACTIVE mode
-    if (scanMode == ScanMode::PER_STEP) {
-        if (mode == PlaybackMode::SEQUENCER_ACTIVE && step >= 0) {
-            // Only capture if position is valid (optimization: skip near-zero positions)
-            if (position > POSITION_THRESHOLD) {
-                size_t sizeBefore = positionScan.size();
-                positionScan.capture(step, mediaIndex, position);
-                // Only log when scan size changes (new position stored) to avoid spam
-                if (positionScan.size() != sizeBefore) {
-                    ofLogVerbose("MediaPool") << "[SCAN_CAPTURE] PER_STEP: Step " << step 
-                                              << ", Media " << mediaIndex << ", Position " << position;
-                }
-            }
-        }
-        return;
-    }
-    
-    // GLOBAL mode: capture every frame (single shared position)
-    if (scanMode == ScanMode::GLOBAL) {
-        // Only capture if position is valid (optimization: skip near-zero positions)
-        if (position > POSITION_THRESHOLD) {
-            size_t sizeBefore = positionScan.size();
-            positionScan.capture(step, mediaIndex, position);
-            // Only log when scan size changes to reduce overhead
-            if (positionScan.size() != sizeBefore) {
-                ofLogVerbose("MediaPool") << "[SCAN_CAPTURE] GLOBAL: Media " << mediaIndex 
-                                          << ", Position " << position;
-            }
-        }
-    }
-}
+// Position scan functions removed - position memory now handled directly via MediaPlayer::playheadPosition
 
-float MediaPool::restoreScanPosition(int step, int mediaIndex, MediaPlayer* player) {
-    if (!player) return 0.0f;
-    
-    ScanMode scanMode = positionScan.getMode();
-    float scanPosition = 0.0f;
-    
-    if (scanMode == ScanMode::PER_MEDIA) {
-        // Read directly from MediaPlayer (single source of truth)
-        // MediaPlayer::stop() already preserves position in playheadPosition parameter
-        scanPosition = player->playheadPosition.get();
-        
-        // CRITICAL: If position is at the end (>= END_POSITION_THRESHOLD), reset to 0.0f for fresh start
-        // This allows scanning to work (resume from where it left off), but when media
-        // reaches the end, the next trigger starts from the beginning
-        if (scanPosition >= END_POSITION_THRESHOLD) {
-            float originalPos = scanPosition;  // Save for logging
-            scanPosition = 0.0f;
-            player->playheadPosition.set(0.0f);  // Reset in player too
-            ofLogNotice("MediaPool") << "[SCAN_RESTORE] PER_MEDIA: Position at end (" 
-                                     << originalPos << "), resetting to 0.0f for media " << mediaIndex;
-        }
-        
-        // Log restoration
-        if (scanPosition > POSITION_THRESHOLD) {
-            ofLogNotice("MediaPool") << "[SCAN_RESTORE] PER_MEDIA: Using playheadPosition for media " 
-                                     << mediaIndex << ": " << scanPosition;
-        } else {
-            ofLogVerbose("MediaPool") << "[SCAN_RESTORE] PER_MEDIA: Starting from beginning (position: " 
-                                      << scanPosition << ") for media " << mediaIndex;
-        }
-    } else {
-        // PER_STEP or GLOBAL mode: use PositionScan storage
-        size_t scanSizeBefore = positionScan.size();
-        scanPosition = positionScan.restore(step, mediaIndex);
-        
-        if (scanPosition > POSITION_THRESHOLD) {
-            ofLogNotice("MediaPool") << "[SCAN_RESTORE] " << (scanMode == ScanMode::PER_STEP ? "PER_STEP" : "GLOBAL")
-                                     << ": Using scan position for step " << step 
-                                     << ", media " << mediaIndex << ": " << scanPosition
-                                     << " (scan size: " << scanSizeBefore << ")";
-        } else {
-            ofLogVerbose("MediaPool") << "[SCAN_SKIP] " << (scanMode == ScanMode::PER_STEP ? "PER_STEP" : "GLOBAL")
-                                      << ": No scan position available for step " << step 
-                                      << ", media " << mediaIndex << " (scan size: " << scanSizeBefore << ")";
-        }
-    }
-    
-    return scanPosition;
-}
-
-bool MediaPool::shouldTransitionToIdle(PlaybackMode mode, bool transportIsPlaying) const {
-    // Transition to IDLE if:
-    // - MANUAL_PREVIEW mode (always transition when playback ends)
-    // - SEQUENCER_ACTIVE mode AND transport is stopped (transport still playing = stay in SEQUENCER_ACTIVE)
-    return (mode == PlaybackMode::MANUAL_PREVIEW || !transportIsPlaying);
-}
 
 float MediaPool::clampPositionForPlayback(float position, PlayStyle playStyle) const {
     // First clamp to valid range (0.0-1.0)
