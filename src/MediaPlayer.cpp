@@ -473,29 +473,39 @@ void MediaPlayer::update() {
     // are visible even when paused or when adjusting sliders
     if (isVideoLoaded()) {
         // CRITICAL: Frame gating logic - must check videoEnabled FIRST
-        // If videoEnabled=false, always gate out (enabled=false) regardless of position/playing state
-        // This prevents stopped videos from showing stale frames
+        // Check if video is actually playing (not just stopped at end)
+        bool actuallyPlaying = videoPlayer.isPlaying();
+        
+        // CRITICAL FIX: Detect when video naturally reached end
+        // When video ends naturally, isPlaying() becomes false but position might be at end (1.0)
+        // We should gate out in this case to prevent expensive update() calls on stopped players
+        float videoPos = videoPlayer.getVideoFile().getPosition();
+        bool atEnd = videoPos >= 0.99f; // Near end of video (account for floating point precision)
+        
         bool shouldBeEnabled = false;
         if (videoEnabled.get()) {
-            // Video is enabled - allow frames if playing OR paused for scrubbing
-            // Only check position when video is enabled to allow scrubbing preview
-            shouldBeEnabled = isPlaying() || (videoPlayer.getVideoFile().getPosition() > POSITION_VALID_THRESHOLD);
+            // Only enable if actually playing AND not at end (unless looping)
+            // This prevents expensive processing when video naturally ends before sequencer trigger ends
+            if (actuallyPlaying && (!atEnd || loop.get())) {
+                shouldBeEnabled = true;
+            }
+            // Allow scrubbing when paused (not stopped) - position > threshold but not playing
+            else if (!actuallyPlaying && videoPos > POSITION_VALID_THRESHOLD && videoPos < 0.99f) {
+                shouldBeEnabled = true; // Paused for scrubbing
+            }
+            // else: shouldBeEnabled stays false (video stopped at end or not playing)
         }
-        // else: shouldBeEnabled stays false (gate out when disabled/stopped)
         
         if (videoPlayer.enabled.get() != shouldBeEnabled) {
             videoPlayer.enabled.set(shouldBeEnabled);
         }
         
         // Only update video player when actually playing (performance optimization)
-        // videoPlayer.update() can be expensive (texture updates, buffer operations)
-        if (videoEnabled.get() && isPlaying()) {
+        if (videoEnabled.get() && actuallyPlaying && (!atEnd || loop.get())) {
             videoPlayer.update();
         }
         
-        // Process video player to update output buffer (needed for pull-based video chain)
-        // This ensures the video output buffer is updated for downstream modules (VideoMixer, etc.)
-        // Only process if video is enabled to avoid unnecessary work when gated out
+        // Process video player only if enabled
         if (videoEnabled.get() && shouldBeEnabled) {
             ofFbo emptyInput;
             videoPlayer.process(emptyInput, videoPlayer.getOutputBuffer());
