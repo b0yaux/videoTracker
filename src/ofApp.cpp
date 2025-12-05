@@ -262,6 +262,9 @@ void ofApp::update() {
     // Update input router
     inputRouter.update();
     
+    // Update asset library (processes conversion status updates)
+    assetLibrary.update();
+    
     // Update all modules (MediaPool, TrackerSequencer, etc.)
     // This is critical for MediaPool to process its event queue
     moduleRegistry.forEachModule([this](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {

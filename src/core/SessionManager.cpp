@@ -94,7 +94,7 @@ ofJson SessionManager::serializeAll() const {
         json["gui"]["viewState"]["fileBrowserVisible"] = viewManager_->isFileBrowserVisible();
         json["gui"]["viewState"]["consoleVisible"] = viewManager_->isConsoleVisible();
         json["gui"]["viewState"]["assetLibraryVisible"] = viewManager_->isAssetLibraryVisible();
-        json["gui"]["viewState"]["currentPanel"] = static_cast<int>(viewManager_->getCurrentPanel());
+        json["gui"]["viewState"]["currentFocusedWindow"] = viewManager_->getCurrentFocusedWindow();
     }
     
     // Module instance visibility state
@@ -291,10 +291,24 @@ bool SessionManager::deserializeAll(const ofJson& json) {
                 }
                 if (viewState.contains("currentPanel")) {
                     int panelIndex = viewState["currentPanel"].get<int>();
-                    if (panelIndex >= 0 && panelIndex < static_cast<int>(Panel::COUNT)) {
-                        viewManager_->navigateToPanel(static_cast<Panel>(panelIndex));
+                    // Legacy panel index - convert to window name (deprecated, will be removed)
+                    std::vector<std::string> legacyPanelNames = {
+                        "Clock ", "Audio Output", "Tracker Sequencer", "Media Pool", 
+                        "File Browser", "Console", "Asset Library"
+                    };
+                    if (panelIndex >= 0 && panelIndex < static_cast<int>(legacyPanelNames.size())) {
+                        viewManager_->navigateToWindow(legacyPanelNames[panelIndex]);
                     }
                 }
+                
+                // New window name format (preferred)
+                if (viewState.contains("currentFocusedWindow")) {
+                    std::string windowName = viewState["currentFocusedWindow"].get<std::string>();
+                    if (!windowName.empty()) {
+                        viewManager_->navigateToWindow(windowName);
+                    }
+                }
+                
                 ofLogNotice("SessionManager") << "Loaded view state";
             } catch (const std::exception& e) {
                 ofLogError("SessionManager") << "Failed to load view state: " << e.what();

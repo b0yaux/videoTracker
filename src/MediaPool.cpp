@@ -615,28 +615,57 @@ bool MediaPool::removePlayer(size_t index) {
         return false;
     }
     
-    // If this is the active player, disconnect and reset it
-    if (activePlayer == players[index].get()) {
-        disconnectActivePlayer();
-        activePlayer = nullptr;
+    // Get player pointer before any operations
+    MediaPlayer* playerToRemove = players[index].get();
+    if (!playerToRemove) {
+        ofLogWarning("MediaPool") << "Cannot remove player: player at index " << index << " is null";
+        return false;
     }
     
-    // Disconnect player before removing
-    MediaPlayer* playerToRemove = players[index].get();
-    if (playerToRemove) {
-        ensurePlayerAudioDisconnected(playerToRemove);
-        ensurePlayerVideoDisconnected(playerToRemove);
-        playerAudioConnected.erase(playerToRemove);
-        playerVideoConnected.erase(playerToRemove);
-        
-        // Remove any scheduled stops for this player
-        scheduledStops_.erase(
-            std::remove_if(scheduledStops_.begin(), scheduledStops_.end(),
-                [playerToRemove](const ScheduledStop& stop) {
-                    return stop.player == playerToRemove;
-                }),
-            scheduledStops_.end()
-        );
+    // CRITICAL: Stop the player if it's playing BEFORE removing it
+    // This prevents crashes from update() or audio thread accessing deleted player
+    if (playerToRemove->isPlaying()) {
+        playerToRemove->stop();
+        ofLogNotice("MediaPool") << "Stopped playing player before removal";
+    }
+    
+    // If this is the active player, disconnect and reset it, and transition to IDLE
+    bool wasActivePlayer = (activePlayer == playerToRemove);
+    if (wasActivePlayer) {
+        disconnectActivePlayer();
+        activePlayer = nullptr;
+        // Transition to IDLE mode if this was the active player
+        currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+        ofLogNotice("MediaPool") << "Removed active player - transitioning to IDLE mode";
+    }
+    
+    // Disconnect player from mixers before removing
+    ensurePlayerAudioDisconnected(playerToRemove);
+    ensurePlayerVideoDisconnected(playerToRemove);
+    playerAudioConnected.erase(playerToRemove);
+    playerVideoConnected.erase(playerToRemove);
+    
+    // Remove any scheduled stops for this player
+    scheduledStops_.erase(
+        std::remove_if(scheduledStops_.begin(), scheduledStops_.end(),
+            [playerToRemove](const ScheduledStop& stop) {
+                return stop.player == playerToRemove;
+            }),
+        scheduledStops_.end()
+    );
+    
+    // CRITICAL: Clear event queue of any pending events for this player
+    // This prevents processEventQueue() from trying to access the deleted player
+    // Note: We can't safely filter and re-enqueue with lock-free queue, so we drain all events
+    // If this was the active player, we want to clear all events anyway
+    // If it wasn't active, clearing is still safe - sequencer will retrigger if needed
+    TriggerEvent dummy;
+    size_t eventsDrained = 0;
+    while (eventQueue.try_dequeue(dummy)) {
+        eventsDrained++;
+    }
+    if (eventsDrained > 0) {
+        ofLogNotice("MediaPool") << "Drained " << eventsDrained << " events from queue when removing player";
     }
     
     // Remove the player

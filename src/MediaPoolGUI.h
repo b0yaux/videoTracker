@@ -35,7 +35,7 @@ public:
     static void syncEditStateFromImGuiFocus(MediaPoolGUI& gui);
     
     // Override ModuleGUI generic interface (Phase 7.3/7.4)
-    bool isEditingCell() const override { return isEditingParameter_; }
+    bool isEditingCell() const override { return cellFocusState.isEditing; }
     bool isKeyboardFocused() const override { return isCellFocused(); }
     void clearCellFocus() override;
     
@@ -64,6 +64,10 @@ private:
     // Per-index zoom and pan state (index -> {zoom, offset})
     std::map<size_t, std::pair<float, float>> waveformZoomState;  // Stores {zoom, offset} per media index
     
+    // Waveform data buffers (instance-specific, not static - fixes performance issue with multiple MediaPool instances)
+    std::vector<float> waveformTimeData;
+    std::vector<std::vector<float>> waveformChannelData;
+    
     // Waveform marker dragging state
     enum class WaveformMarker {
         NONE,
@@ -81,32 +85,24 @@ private:
     bool isParentWidgetFocused = false;
     bool requestFocusMoveToParentWidget = false;
     
-    // Parameter editing state (similar to TrackerSequencer)
-    std::string editingParameter;  // Currently editing parameter name (empty if none)
-    int editingColumnIndex;        // Currently editing column index (0 = media index button, 1+ = parameter columns, -1 = none)
-    bool isEditingParameter_ = false;  // True when in edit mode (typing numeric value) - standardized naming
-    std::string editBufferCache;
-    bool editBufferInitializedCache = false;
+    // Unified cell focus state (replaces editingColumnIndex, isEditingParameter_, editingParameter)
+    CellFocusState cellFocusState;
     
-    // Focus management (similar to TrackerSequencer)
+    // Unified callback state tracking
+    CellGridCallbacksState callbacksState;
+    
+    // Focus management
     bool shouldFocusFirstCell = false;      // Flag to request focus on first cell when entering table
-    bool shouldRefocusCurrentCell = false;  // Flag to request focus on current cell after exiting edit mode
-    bool anyCellFocusedThisFrame = false;   // Track if any cell was focused this frame
     
-    // Drag state for parameter editing
-    std::string draggingParameter;  // Parameter being dragged (empty if none)
-    float dragStartY = 0.0f;
-    float dragStartX = 0.0f;
-    float lastDragValue = 0.0f;
+    // Note: Edit buffer and drag state are now managed by CellWidget internally
     
     // Scroll sync state - track previous index to only sync when it changes
     size_t previousMediaIndex = SIZE_MAX;  // Initialize to invalid value
     
-    // Helper methods for focus management
-    bool isCellFocused() const { return editingColumnIndex >= 0; }
+    // Helper methods for focus management (using unified state)
+    bool isCellFocused() const { return cellFocusState.hasFocus(); }
     
     // GUI section methods
-    void drawDirectoryControls();
     void drawMediaList();
     void drawWaveform();
     void drawWaveformControls(const ImVec2& canvasPos, const ImVec2& canvasMax, float canvasWidth, float canvasHeight);  // Draw markers and controls on top of waveform
@@ -142,5 +138,8 @@ private:
     // Cache for CellWidgets used in drawSpecialColumn (for non-button columns)
     // Key: (row, col) pair, Value: CellWidget instance
     std::map<std::pair<int, int>, CellWidget> specialColumnWidgetCache;
+    
+    // Track last column configuration to avoid clearing cache unnecessarily
+    std::vector<CellGridColumnConfig> lastColumnConfig;
 };
 

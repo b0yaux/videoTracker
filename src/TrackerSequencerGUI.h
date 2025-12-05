@@ -21,7 +21,6 @@ struct GUIState {
     bool isEditingCell = false;  // Temporary: passed from GUI, modified by handleKeyPress, synced back to GUI
     std::string editBufferCache;  // Temporary: passed from GUI, modified by handleKeyPress, synced back to GUI
     bool editBufferInitializedCache = false;  // Temporary: passed from GUI, modified by handleKeyPress, synced back to GUI
-    bool shouldRefocusCurrentCell = false;  // Temporary: passed from GUI, modified by handleKeyPress, synced back to GUI
 };
 
 class TrackerSequencerGUI : public ModuleGUI {
@@ -35,26 +34,40 @@ public:
     void draw();
     
     // GUI state accessors (moved from TrackerSequencer)
-    int getEditStep() const { return focusState.step; }
-    int getEditColumn() const { return focusState.column; }
-    bool getIsEditingCell() const { return focusState.isEditing; }
-    const std::string& getEditBufferCache() const { return focusState.editBuffer; }
-    std::string& getEditBufferCache() { return focusState.editBuffer; }
-    bool getEditBufferInitializedCache() const { return focusState.editBufferInitialized; }
-    bool getShouldRefocusCurrentCell() const { return focusState.shouldRefocus; }
-    
+    int getEditStep() const { return cellFocusState.row; }
+    int getEditColumn() const { return cellFocusState.column; }
+    bool getIsEditingCell() const { return cellFocusState.isEditing; }
+    // Note: editBuffer and editBufferInitialized are managed internally by CellWidget
+    // These accessors are kept for backward compatibility but may not be used
+    const std::string& getEditBufferCache() const { 
+        static std::string empty; 
+        return empty; // CellWidget manages edit buffer internally
+    }
+    std::string& getEditBufferCache() { 
+        static std::string empty; 
+        return empty; // CellWidget manages edit buffer internally
+    }
+    bool getEditBufferInitializedCache() const { 
+        return false; // CellWidget manages this internally
+    }
     // GUI state setters
     void setEditCell(int step, int column) { 
-        focusState.step = step; 
-        focusState.column = column; 
+        setCellFocus(cellFocusState, step, column);
     }
-    void setInEditMode(bool editing) { focusState.isEditing = editing; }
-    void setEditBufferInitializedCache(bool init) { focusState.editBufferInitialized = init; }
-    void setShouldRefocusCurrentCell(bool refocus) { focusState.shouldRefocus = refocus; }
+    void setInEditMode(bool editing) { cellFocusState.isEditing = editing; }
+    void setEditBufferInitializedCache(bool init) { 
+        // CellWidget manages this internally - no-op for backward compatibility
+        (void)init;
+    }
     
     // Override ModuleGUI generic interface (Phase 7.3/7.4)
-    bool isEditingCell() const override { return getIsEditingCell(); }
-    bool isKeyboardFocused() const override { return (focusState.step >= 0 && focusState.column >= 0); }
+    bool isEditingCell() const override { 
+        return getIsEditingCell() || patternParamsFocusState.isEditing; 
+    }
+    bool isKeyboardFocused() const override { 
+        return (cellFocusState.row >= 0 && cellFocusState.column >= 0) ||
+               (patternParamsFocusState.row >= 0 && patternParamsFocusState.column >= 0);
+    }
     void clearCellFocus() override;
     
     // Override ModuleGUI input handling (InputRouter refactoring)
@@ -69,31 +82,18 @@ private:
     TrackerSequencer* getTrackerSequencer() const;
     
     // GUI state (moved from TrackerSequencer)
-    // Consolidated focus state for better organization
-    struct FocusState {
-        int step = -1;      // Currently selected row for editing (-1 = none)
-        int column = -1;    // Currently selected column for editing (-1 = none, 0 = step number, 1+ = column index)
-        bool isEditing = false; // True when in edit mode (typing numeric value)
-        std::string editBuffer; // Cache for edit buffer to persist across frames
-        bool editBufferInitialized = false; // Cache for edit buffer initialized state
-        bool shouldRefocus = false; // For maintaining focus after exiting edit mode via Enter
-        
-        void clear() {
-            step = -1;
-            column = -1;
-            isEditing = false;
-            editBuffer.clear();
-            editBufferInitialized = false;
-            shouldRefocus = false;
-        }
-    };
-    FocusState focusState;
+    // Unified cell focus state (replaces FocusState struct)
+    // Note: editBuffer and editBufferInitialized are now managed by CellWidget internally
+    CellFocusState cellFocusState;
+    
+    // Unified callback state tracking
+    CellGridCallbacksState callbacksState;
     
     // Track pattern index to detect pattern switches
     int lastPatternIndex;
     
-    // Track if any cell is focused during drawing (to detect header row focus)
-    bool anyCellFocusedThisFrame;
+    // Track last step triggered when paused (to prevent repeated triggers)
+    int lastTriggeredStepWhenPaused;
     
     // Row outline tracking for step number hover
     struct RowOutlineState {
@@ -107,12 +107,24 @@ private:
     };
     RowOutlineState pendingRowOutline;
     
-    // CellGrid instance for reusable table rendering
+    // CellGrid instance for reusable table rendering (pattern grid)
     CellGrid cellGrid;
+    
+    // CellGrid instance for pattern parameters (Steps, SPB)
+    CellGrid patternParametersGrid;
+    
+    // Focus state for pattern parameters grid
+    CellFocusState patternParamsFocusState;
+    
+    // Callback state for pattern parameters grid
+    CellGridCallbacksState patternParamsCallbacksState;
+    
+    // Track last column configuration for pattern parameters grid
+    std::vector<CellGridColumnConfig> lastPatternParamsColumnConfig;
     
     // Drawing methods
     void drawPatternChain(TrackerSequencer& sequencer);
-    void drawTrackerStatus(TrackerSequencer& sequencer);
+    void drawPatternControls(TrackerSequencer& sequencer);
     void drawPatternGrid(TrackerSequencer& sequencer);
     void drawStepNumber(TrackerSequencer& sequencer, int step, bool isPlaybackStep,
                        bool isPlaying, int currentPlayingStep);
@@ -137,6 +149,9 @@ private:
     void setupCellValueCallbacks(CellGridCallbacks& callbacks, TrackerSequencer& sequencer);
     void setupStateSyncCallbacks(CellGridCallbacks& callbacks, TrackerSequencer& sequencer);
     void setupRowCallbacks(CellGridCallbacks& callbacks, TrackerSequencer& sequencer, int currentPlayingStep);
+    
+    // Track last column configuration to avoid clearing cache unnecessarily
+    std::vector<CellGridColumnConfig> lastColumnConfig;
     
     // Constants for UI dimensions and limits
     static constexpr float PATTERN_CELL_HEIGHT = 22.0f;

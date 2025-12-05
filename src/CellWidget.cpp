@@ -10,8 +10,8 @@
 #include <limits>
 
 CellWidget::CellWidget() 
-    : selected_(false), editing_(false), editBufferInitialized_(false), bufferModifiedByUser_(false),
-      dragging_(false), dragStartY_(0.0f), dragStartX_(0.0f), lastDragValue_(0.0f) {
+    : editing_(false), bufferState_(EditBufferState::None),
+      originalValue_(NAN), shouldRefocus_(false), dragging_(false), dragStartY_(0.0f), dragStartX_(0.0f), lastDragValue_(0.0f) {
 }
 
 // Helper function implementations
@@ -45,6 +45,22 @@ void CellWidget::enableImGuiKeyboardNav() {
 }
 
 void CellWidget::removeParameter() {
+    if (onValueRemoved) {
+        onValueRemoved(parameterName);
+    }
+}
+
+void CellWidget::clearCell() {
+    // Exit edit mode if active
+    if (editing_) {
+        exitEditMode();
+    }
+    
+    // Set refocus flag to maintain focus after clearing
+    shouldRefocus_ = true;
+    
+    // Remove parameter to restore natural empty state
+    // In tracker context, empty state (not in parameterValues map) IS the default
     if (onValueRemoved) {
         onValueRemoved(parameterName);
     }
@@ -92,13 +108,14 @@ void CellWidget::setEditBuffer(const std::string& buffer) {
         }
         // If buffer is non-empty and being restored from cache, it means user has modified it
         // This ensures subsequent characters append rather than replace
-        bufferModifiedByUser_ = true;
+        bufferState_ = EditBufferState::Restored;
+    } else {
+        bufferState_ = EditBufferState::None;
     }
 }
 
 void CellWidget::setEditBuffer(const std::string& buffer, bool initialized) {
     editBuffer_ = buffer;
-    editBufferInitialized_ = initialized;
     if (!editBuffer_.empty()) {
         // If setting a non-empty buffer, ensure we're in edit mode
         if (!editing_) {
@@ -106,28 +123,34 @@ void CellWidget::setEditBuffer(const std::string& buffer, bool initialized) {
             // Don't call enterEditMode() here as it would re-initialize the buffer
             // Just set editing flag - navigation remains enabled for gamepad support
         }
-        // CRITICAL: When restoring buffer from cache, we need to determine if user has modified it
-        // The `initialized` flag tells us if the buffer was initialized from current value
-        // But if we're restoring from cache, the buffer has already been modified by user input
-        // So: if buffer is non-empty and we're restoring (not just initializing), user has modified it
-        // We can't distinguish "just initialized" from "restored from cache" with just the initialized flag
-        // Solution: If buffer is non-empty when restoring, assume user has modified it
-        // This ensures subsequent characters append rather than replace
-        // The only time bufferModifiedByUser_ should be false is when we just entered edit mode
-        // and the buffer matches the formatted current value (handled by enterEditMode())
-        bufferModifiedByUser_ = true;  // Assume modified when restoring non-empty buffer
+        // Set buffer state based on initialization flag
+        // If initialized=true, buffer was just set from current value
+        // If initialized=false, buffer is being restored from cache (user had typed something)
+        bufferState_ = initialized ? EditBufferState::Initialized : EditBufferState::Restored;
     } else {
-        // Empty buffer: reset flags
-        bufferModifiedByUser_ = false;
+        bufferState_ = EditBufferState::None;
     }
 }
 
 void CellWidget::enterEditMode() {
     bool wasEditing = editing_;
     editing_ = true;
+    
+    // Store original value for fallback
+    if (!wasEditing && getCurrentValue) {
+        originalValue_ = getCurrentValue();
+        // Keep NaN as-is to preserve empty cell state
+    }
+    
     initializeEditBuffer();
-    editBufferInitialized_ = true;
-    bufferModifiedByUser_ = false;  // Buffer was initialized, not modified by user yet
+    bufferState_ = EditBufferState::Initialized;  // Buffer was initialized from current value
+    
+    // Disable ImGui navigation when entering edit mode
+    if (!wasEditing) {
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+        ofLogNotice("CellWidget") << "[ENTER_EDIT] Disabled navigation for edit mode";
+    }
     
     // Notify GUI layer of edit mode change
     if (!wasEditing && onEditModeChanged) {
@@ -137,15 +160,29 @@ void CellWidget::enterEditMode() {
 
 void CellWidget::exitEditMode() {
     bool wasEditing = editing_;
+    if (!wasEditing) {
+        // Not in edit mode - nothing to do
+        return;
+    }
+    
     editing_ = false;
     editBuffer_.clear();
-    editBufferInitialized_ = false;
-    bufferModifiedByUser_ = false;  // Reset flag when exiting edit mode
+    bufferState_ = EditBufferState::None;  // Reset buffer state when exiting edit mode
+    originalValue_ = NAN;  // Clear original value
+    
+    // Re-enable ImGui navigation when exiting edit mode
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ofLogNotice("CellWidget") << "[EXIT_EDIT] Re-enabled navigation after edit mode";
     
     // Notify GUI layer of edit mode change
-    if (wasEditing && onEditModeChanged) {
+    if (onEditModeChanged) {
+        ofLogNotice("CellWidget") << "[EXIT_EDIT] Calling onEditModeChanged(false)";
         onEditModeChanged(false);
     }
+    
+    // Note: Immediate refocus is handled in drawSliderMode() when cell is still focused
+    // This ensures refocus happens in the same frame without delay
 }
 
 bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
@@ -159,13 +196,13 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
         
         if (editing_) {
             // In edit mode: Confirm and exit edit mode
+            shouldRefocus_ = true;  // Flag to maintain focus after exit
             applyValue();
             exitEditMode();
-            // Signal refocus needed - GUI layer will handle refocus on next frame
-            // This maintains cell focus after exiting edit mode (normal cell focus, not edit mode)
-            return true;  // Return true to indicate handled, refocus will be signaled via needsRefocus
-        } else if (isSelected()) {
-            // Enter edit mode
+            // Refocus will be handled in draw() based on shouldRefocus_ flag
+            return true;
+        } else {
+            // Enter edit mode if cell is focused (checked by caller via processInputInDraw)
             enterEditMode();
             return true;
         }
@@ -188,25 +225,10 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
     if (key == OF_KEY_BACKSPACE) {
         if (editing_ && !editBuffer_.empty()) {
             editBuffer_.pop_back();
-            editBufferInitialized_ = false;
-            bufferModifiedByUser_ = true;  // User modified the buffer
+            bufferState_ = EditBufferState::UserModified;  // User modified the buffer
             
-            // Re-apply value after backspace (Blender-style reactive editing)
-            // This allows the value to update as the user corrects their input
-            if (editBuffer_.empty() || isEmpty(editBuffer_)) {
-                // Buffer is empty or only dashes - remove parameter (set to "none")
-                removeParameter();
-            } else {
-                try {
-                    // Try to evaluate as expression (supports operations)
-                    float floatValue = ExpressionParser::evaluate(editBuffer_);
-                    applyEditValueFloat(floatValue);
-                } catch (...) {
-                    // Expression invalid - remove parameter (set to "none")
-                    // This handles invalid expressions
-                    removeParameter();
-                }
-            }
+            // Apply buffer with fallback after backspace
+            applyBufferWithFallback();
             return true;
         }
         return false;
@@ -216,224 +238,15 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
     if (key == OF_KEY_DEL) {
         if (editing_) {
             editBuffer_.clear();
-            editBufferInitialized_ = false;
-            bufferModifiedByUser_ = true;  // User modified the buffer (cleared it)
+            bufferState_ = EditBufferState::UserModified;  // User modified the buffer (cleared it)
             return true;
         }
         return false;
     }
     
-    // Numeric input (0-9) - Blender-style: direct typing enters edit mode and replaces value
-    if (key >= '0' && key <= '9') {
-        bool justEnteredEditMode = false;
-        if (!editing_) {
-            // Auto-enter edit mode if cell is selected
-            if (isSelected()) {
-                // CRITICAL: If buffer is already set (restored from cache), don't call enterEditMode()
-                // as it would overwrite the restored buffer. Instead, just set editing_ and preserve the buffer.
-                if (editBuffer_.empty() || !bufferModifiedByUser_) {
-                    // Buffer is empty or not modified yet - safe to call enterEditMode()
-                    enterEditMode();
-                    justEnteredEditMode = true;
-                } else {
-                    // Buffer is already set (restored from cache) - just enable edit mode without reinitializing
-                    editing_ = true;
-                    // Navigation remains enabled for gamepad support
-                    // Don't set justEnteredEditMode - we want to preserve the buffer
-                }
-            } else {
-                return false;  // Not selected, don't handle
-            }
-        }
-        
-        // Clear buffer if we just entered edit mode or buffer is empty/placeholder
-        // This ensures typing REPLACES the initialized value when starting to type
-        // CRITICAL: Don't clear if buffer was already modified by user (restored from cache)
-        bool shouldClear = false;
-        if (justEnteredEditMode) {
-            // Only clear if buffer hasn't been modified by user yet
-            // If bufferModifiedByUser_ is true, it means we're restoring from cache, so don't clear
-            if (!bufferModifiedByUser_) {
-                shouldClear = true;
-            }
-        } else if (isEmpty(editBuffer_)) {
-            shouldClear = true;
-        } else if (editBufferInitialized_ && !bufferModifiedByUser_) {
-            shouldClear = true;
-        }
-        
-        if (shouldClear) {
-            editBuffer_.clear();
-            editBufferInitialized_ = false;
-        }
-        
-        // Append digit to buffer
-        editBuffer_ += (char)key;
-        bufferModifiedByUser_ = true;  // Mark that user has modified the buffer
-        if (editBuffer_.length() > MAX_EDIT_BUFFER_LENGTH) {
-            editBuffer_ = editBuffer_.substr(editBuffer_.length() - MAX_EDIT_BUFFER_LENGTH);
-        }
-        
-        // Apply value immediately (Blender-style reactive editing)
-        // Try to evaluate as expression (supports operations like "2*3", "10/2", etc.)
-        if (!editBuffer_.empty()) {
-            if (isEmpty(editBuffer_)) {
-                // Only dashes (e.g., "-", "--") - remove parameter (set to "none")
-                removeParameter();
-            } else {
-                try {
-                    float floatValue = ExpressionParser::evaluate(editBuffer_);
-                    applyEditValueFloat(floatValue);
-                } catch (const std::exception& e) {
-                    // Invalid input - interpret as NaN/'--' (clear parameter)
-                    removeParameter();
-                } catch (...) {
-                    // Invalid input - interpret as NaN/'--' (clear parameter)
-                    removeParameter();
-                }
-            }
-        }
-        return true;
-    }
-    
-    // Mathematical operators: +, *, /
-    if (key == '+' || key == '*' || key == '/') {
-        if (!editing_) {
-            // Auto-enter edit mode if cell is selected
-            if (isSelected()) {
-                enterEditMode();
-                // Clear buffer if it's "--" (placeholder) - typing should replace it
-                if (isEmpty(editBuffer_)) {
-                    editBuffer_.clear();
-                    editBufferInitialized_ = false;
-                }
-                // Otherwise, don't clear buffer - allow appending operator to existing value
-                // This allows operations like "5*2" or "10/2"
-            } else {
-                return false;  // Not selected, don't handle
-            }
-        } else {
-            // Already in edit mode - clear buffer if it's "--" (placeholder)
-            if (isEmpty(editBuffer_)) {
-                editBuffer_.clear();
-                editBufferInitialized_ = false;
-            }
-        }
-        
-        // Append operator to buffer
-        editBuffer_ += (char)key;
-        bufferModifiedByUser_ = true;  // User modified the buffer
-        if (editBuffer_.length() > MAX_EDIT_BUFFER_LENGTH) {
-            editBuffer_ = editBuffer_.substr(editBuffer_.length() - MAX_EDIT_BUFFER_LENGTH);
-        }
-        
-        // Try to evaluate expression if it's complete
-        // For operators, we wait for the next number before evaluating
-        // But we can try to evaluate if the expression is already valid
-        if (!editBuffer_.empty()) {
-            // Check if buffer contains only operators/dashes
-            bool onlyOpsOrDashes = true;
-            for (char c : editBuffer_) {
-                if (c != '-' && c != '+' && c != '*' && c != '/') {
-                    onlyOpsOrDashes = false;
-                    break;
-                }
-            }
-            
-            if (onlyOpsOrDashes) {
-                // Only operators/dashes - remove parameter (set to "none")
-                removeParameter();
-            } else {
-                try {
-                    float floatValue = ExpressionParser::evaluate(editBuffer_);
-                    applyEditValueFloat(floatValue);
-                } catch (const std::exception& e) {
-                    // Invalid input - interpret as NaN/'--' (clear parameter)
-                    removeParameter();
-                } catch (...) {
-                    // Invalid input - interpret as NaN/'--' (clear parameter)
-                    removeParameter();
-                }
-            }
-        }
-        return true;
-    }
-    
-    // Decimal point and minus sign (can be negative number or subtraction)
-    if (key == '.' || key == '-') {
-        // For integer columns, don't allow decimal point input
-        if (key == '.' && isInteger) {
-            // Ignore decimal point for integer columns - they should only accept whole numbers
-            return true;  // Consume the event but don't add decimal point
-        }
-        
-        if (!editing_) {
-            // Auto-enter edit mode if cell is selected
-            if (isSelected()) {
-                enterEditMode();
-                // Clear buffer when entering edit mode via decimal/minus (replaces current value)
-                editBuffer_.clear();
-                editBufferInitialized_ = false;
-            } else {
-                return false;  // Not selected, don't handle
-            }
-        }
-        
-        // Clear buffer if it's "--" (placeholder) - typing should replace it
-        // This ensures typing replaces "--" even if we entered edit mode via Enter key
-        if (isEmpty(editBuffer_)) {
-            editBuffer_.clear();
-            editBufferInitialized_ = false;
-        }
-        // NOTE: We do NOT clear the buffer if already in edit mode with actual content - this allows:
-        // - Typing decimals after numbers (e.g., "1.5")
-        // - Using backspace to correct input
-        
-        // Allow decimal point and minus sign in edit buffer
-        // For minus: allow at start (negative number) or as subtraction operator
-        // The expression evaluator will handle distinguishing between negative and subtraction
-        if (key == '-') {
-            // Always allow minus - expression evaluator will handle it correctly
-            // (negative at start/after operator, subtraction otherwise)
-        }
-        
-        // Only allow one decimal point per number (but allow multiple in expression like "1.5*2.3")
-        if (key == '.') {
-            // Find the last number in the buffer (after last operator)
-            size_t lastOp = editBuffer_.find_last_of("+-*/");
-            std::string lastNumber = (lastOp == std::string::npos) ? editBuffer_ : editBuffer_.substr(lastOp + 1);
-            if (lastNumber.find('.') != std::string::npos) {
-                return true;  // This number already has a decimal point
-            }
-        }
-        
-        editBuffer_ += (char)key;
-        bufferModifiedByUser_ = true;  // User modified the buffer
-        if (editBuffer_.length() > MAX_EDIT_BUFFER_LENGTH) {
-            editBuffer_ = editBuffer_.substr(editBuffer_.length() - MAX_EDIT_BUFFER_LENGTH);
-        }
-        
-        // Apply value immediately (Blender-style)
-        // Check if buffer is empty, single '.', or contains only dashes
-        // CRITICAL: Handle '--' explicitly as clear/reset command
-        if (editBuffer_ == "--") {
-            // User typed '--' explicitly - remove parameter (set to "none"/rest)
-            removeParameter();
-        } else if (editBuffer_.empty() || editBuffer_ == "." || isEmpty(editBuffer_)) {
-            // Buffer is only dashes, empty, or single '.' - remove parameter (set to "none")
-            removeParameter();
-        } else {
-            try {
-                // Try to evaluate as expression (supports operations)
-                float floatValue = ExpressionParser::evaluate(editBuffer_);
-                applyEditValueFloat(floatValue);
-            } catch (...) {
-                // Expression invalid - remove parameter (set to "none")
-                // This handles invalid expressions like "abc", "2**3", etc.
-                removeParameter();
-            }
-        }
-        return true;
+    // Character input (numeric, operators, decimal, minus) - use unified handler
+    if ((key >= '0' && key <= '9') || key == '+' || key == '*' || key == '/' || key == '.' || key == '-') {
+        return handleCharacterInput((char)key);
     }
     
     // Arrow keys in edit mode: Adjust values ONLY (no navigation)
@@ -483,12 +296,128 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
     return false;
 }
 
+bool CellWidget::handleCharacterInput(char c) {
+    // Unified character input handler for direct typing
+    // Handles: numeric (0-9), operators (+, *, /), decimal (.), minus (-)
+    
+    // Special validation for integer columns
+    if (c == '.' && isInteger) {
+        // Ignore decimal point for integer columns
+        return true;  // Consume the event but don't add decimal point
+    }
+    
+    // Enter edit mode if not already editing
+    bool justEnteredEditMode = false;
+    if (!editing_) {
+        // Auto-enter edit mode
+        // CRITICAL: If buffer is already set (restored from cache), don't call enterEditMode()
+        // as it would overwrite the restored buffer. Instead, just set editing_ and preserve the buffer.
+        if (editBuffer_.empty() || bufferState_ == EditBufferState::None || bufferState_ == EditBufferState::Initialized) {
+            // Buffer is empty or just initialized - safe to call enterEditMode()
+            enterEditMode();
+            justEnteredEditMode = true;
+        } else {
+            // Buffer is already set (restored from cache) - just enable edit mode without reinitializing
+            editing_ = true;
+            // Still need to disable navigation and notify callbacks for proper edit mode
+            ImGuiIO& io = ImGui::GetIO();
+            io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+            if (onEditModeChanged) {
+                onEditModeChanged(true);
+            }
+        }
+    }
+    
+    // Determine if we should clear the buffer before appending
+    // Clear if:
+    // 1. We just entered edit mode and buffer was initialized (not restored) - typing should REPLACE the value
+    // 2. Buffer is empty or placeholder ("--")
+    // 3. Buffer was just initialized (user hasn't typed yet) - typing should REPLACE the value
+    // Don't clear if buffer was restored from cache (user had typed something) - typing should APPEND
+    bool shouldClear = false;
+    if (justEnteredEditMode) {
+        // We just entered edit mode - clear buffer so typing REPLACES the initialized value
+        // This gives Blender-style behavior: typing immediately replaces the displayed value
+        shouldClear = true;
+    } else if (isEmpty(editBuffer_)) {
+        // Buffer is placeholder ("--") - clear it
+        shouldClear = true;
+    } else if (bufferState_ == EditBufferState::Initialized) {
+        // Buffer was initialized but user hasn't typed yet - clear so typing replaces it
+        shouldClear = true;
+    }
+    // If bufferState_ == Restored, don't clear - user had typed something, so append
+    
+    // Special handling for operators: don't clear if buffer has content (allow "5*2")
+    if ((c == '+' || c == '*' || c == '/') && !editBuffer_.empty() && !isEmpty(editBuffer_) && bufferState_ != EditBufferState::Initialized) {
+        shouldClear = false;
+    }
+    
+    if (shouldClear) {
+        editBuffer_.clear();
+    }
+    
+    // Special validation for decimal point: only allow one per number
+    if (c == '.') {
+        // Find the last number in the buffer (after last operator)
+        size_t lastOp = editBuffer_.find_last_of("+-*/");
+        std::string lastNumber = (lastOp == std::string::npos) ? editBuffer_ : editBuffer_.substr(lastOp + 1);
+        if (lastNumber.find('.') != std::string::npos) {
+            return true;  // This number already has a decimal point
+        }
+    }
+    
+    // Append character to buffer
+    editBuffer_ += c;
+    bufferState_ = EditBufferState::UserModified;  // Mark that user has modified the buffer
+    if (editBuffer_.length() > MAX_EDIT_BUFFER_LENGTH) {
+        editBuffer_ = editBuffer_.substr(editBuffer_.length() - MAX_EDIT_BUFFER_LENGTH);
+    }
+    
+    // Apply value immediately (Blender-style reactive editing)
+    if (!editBuffer_.empty()) {
+        // Check for special cases
+        if (editBuffer_ == "--") {
+            // User typed '--' explicitly - remove parameter (set to "none")
+            removeParameter();
+        } else if (isEmpty(editBuffer_)) {
+            // Only dashes (e.g., "-") - remove parameter (set to "none")
+            removeParameter();
+        } else if (editBuffer_ == ".") {
+            // Single decimal point - remove parameter (set to "none")
+            removeParameter();
+        } else {
+            // Check if buffer contains only operators/dashes (for operators)
+            if (c == '+' || c == '*' || c == '/') {
+                bool onlyOpsOrDashes = true;
+                for (char ch : editBuffer_) {
+                    if (ch != '-' && ch != '+' && ch != '*' && ch != '/') {
+                        onlyOpsOrDashes = false;
+                        break;
+                    }
+                }
+                if (onlyOpsOrDashes) {
+                    // Only operators/dashes - remove parameter (set to "none")
+                    removeParameter();
+                    return true;
+                }
+            }
+            
+            // Apply buffer with fallback to original value
+            // This provides immediate visual feedback while maintaining stability
+            applyBufferWithFallback();
+        }
+    }
+    
+    return true;
+}
+
 void CellWidget::appendDigit(char digit) {
     if (!editing_) {
         enterEditMode();
     }
     editBuffer_ += digit;
-    bufferModifiedByUser_ = true;  // User modified the buffer
+    bufferState_ = EditBufferState::UserModified;  // User modified the buffer
     if (editBuffer_.length() > MAX_EDIT_BUFFER_LENGTH) {
         editBuffer_ = editBuffer_.substr(editBuffer_.length() - MAX_EDIT_BUFFER_LENGTH);
     }
@@ -499,7 +428,7 @@ void CellWidget::appendChar(char c) {
         enterEditMode();
     }
     editBuffer_ += c;
-    bufferModifiedByUser_ = true;  // User modified the buffer
+    bufferState_ = EditBufferState::UserModified;  // User modified the buffer
     if (editBuffer_.length() > MAX_EDIT_BUFFER_LENGTH) {
         editBuffer_ = editBuffer_.substr(editBuffer_.length() - MAX_EDIT_BUFFER_LENGTH);
     }
@@ -508,24 +437,34 @@ void CellWidget::appendChar(char c) {
 void CellWidget::backspace() {
     if (editing_ && !editBuffer_.empty()) {
         editBuffer_.pop_back();
-        editBufferInitialized_ = false;
-        bufferModifiedByUser_ = true;  // User modified the buffer
+        bufferState_ = EditBufferState::UserModified;  // User modified the buffer
     }
 }
 
 void CellWidget::deleteChar() {
     if (editing_) {
         editBuffer_.clear();
-        bufferModifiedByUser_ = true;  // User modified the buffer
-        editBufferInitialized_ = false;
+        bufferState_ = EditBufferState::UserModified;  // User modified the buffer
     }
 }
 
 void CellWidget::applyValue() {
-    parseAndApplyEditBuffer();
+    ofLogNotice("CellWidget") << "[ENTER_KEY] applyValue() called - calling parseAndApplyEditBuffer()";
+    bool result = parseAndApplyEditBuffer();
+    ofLogNotice("CellWidget") << "[ENTER_KEY] parseAndApplyEditBuffer() returned: " << (result ? "true" : "false");
 }
 
 void CellWidget::cancelEdit() {
+    // Restore original value before exiting
+    if (onValueApplied) {
+        if (std::isnan(originalValue_)) {
+            // Original was empty (NaN) - remove parameter to restore empty state
+            removeParameter();
+        } else {
+            // Original had a value - restore it
+            onValueApplied(parameterName, originalValue_);
+        }
+    }
     exitEditMode();
 }
 
@@ -572,10 +511,10 @@ void CellWidget::adjustValue(int delta, float customStepSize) {
     } else {
         editBuffer_ = getDefaultFormatValue(newValue);
     }
-    editBufferInitialized_ = false;
+    bufferState_ = EditBufferState::UserModified;  // Value was adjusted by user
     
-    // Apply immediately
-    applyEditValueFloat(newValue);
+    // Apply with buffer system for consistency
+    applyBufferWithFallback();
 }
 
 void CellWidget::initializeEditBuffer() {
@@ -627,13 +566,18 @@ float CellWidget::calculateFillPercent(float value) const {
     return 0.0f;
 }
 
-void CellWidget::applyEditValueFloat(float floatValue) {
+void CellWidget::applyEditValueFloat(float floatValue, bool updateBuffer) {
     // For integer parameters, round and clamp to integer range
     if (isInteger) {
         int intValue = (int)std::round(floatValue);
         // Clamp to valid range
         int clampedValue = std::max((int)minVal, std::min((int)maxVal, intValue));
-        applyEditValueInt(clampedValue);
+        
+        // Only update buffer if:
+        // 1. Explicitly requested (updateBuffer=true, e.g., on Enter key confirmation)
+        // 2. Value wasn't clamped (user typed valid value that doesn't need clamping)
+        bool shouldUpdateBuffer = updateBuffer || (intValue == clampedValue);
+        applyEditValueInt(clampedValue, shouldUpdateBuffer);
         return;
     }
     
@@ -651,32 +595,55 @@ void CellWidget::applyEditValueFloat(float floatValue) {
             if (onValueApplied) {
                 onValueApplied(parameterName, clampedValue);
             }
+            // Update buffer only if explicitly requested (final confirmation)
+            if (updateBuffer) {
+                if (formatValue) {
+                    editBuffer_ = formatValue(clampedValue);
+                } else {
+                    editBuffer_ = getDefaultFormatValue(clampedValue);
+                }
+            }
         }
     } else {
         // Value is within range - apply it
         if (onValueApplied) {
             onValueApplied(parameterName, floatValue);
         }
+        // Update buffer only if explicitly requested (final confirmation)
+        if (updateBuffer) {
+            if (formatValue) {
+                editBuffer_ = formatValue(floatValue);
+            } else {
+                editBuffer_ = getDefaultFormatValue(floatValue);
+            }
+        }
     }
 }
 
-void CellWidget::applyEditValueInt(int intValue) {
+void CellWidget::applyEditValueInt(int intValue, bool updateBuffer) {
     // Apply integer value (callbacks handle formatting)
     if (onValueApplied) {
         onValueApplied(parameterName, (float)intValue);
     }
-    // Update edit buffer using formatValue callback if available
-    if (formatValue) {
-        editBuffer_ = formatValue((float)intValue);
-    } else {
-        // Fallback: format as integer
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%d", intValue);
-        editBuffer_ = buf;
+    // Only update edit buffer if explicitly requested
+    // This prevents overwriting the buffer during reactive editing when values are clamped
+    // (e.g., typing '18' with min=4: '1' gets clamped to 4, but buffer should stay '1' so '8' can be appended)
+    if (updateBuffer) {
+        if (formatValue) {
+            editBuffer_ = formatValue((float)intValue);
+        } else {
+            // Fallback: format as integer
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d", intValue);
+            editBuffer_ = buf;
+        }
     }
 }
 
 bool CellWidget::parseAndApplyEditBuffer() {
+    // Debug logging
+    ofLogNotice("CellWidget") << "[ENTER_KEY] parseAndApplyEditBuffer called with buffer: '" << editBuffer_ << "'";
+    
     // Trim whitespace for comparison
     std::string trimmed = trimWhitespace(editBuffer_);
     
@@ -686,10 +653,12 @@ bool CellWidget::parseAndApplyEditBuffer() {
     if (trimmed.empty() || isEmpty(trimmed)) {
         if (isRemovable) {
             // Empty buffer or only dashes - remove parameter
+            ofLogNotice("CellWidget") << "[ENTER_KEY] Empty buffer - removing parameter";
             removeParameter();
             return true;
         } else {
             // Invalid value for non-removable column
+            ofLogNotice("CellWidget") << "[ENTER_KEY] Empty buffer invalid for non-removable column";
             return false;
         }
     }
@@ -730,16 +699,61 @@ bool CellWidget::parseAndApplyEditBuffer() {
             }
         }
         // Apply value (will check range and remove if out of range)
-        applyEditValueFloat(floatValue);
+        // updateBuffer=true: This is final confirmation (Enter key), so update buffer with final value
+        ofLogNotice("CellWidget") << "[ENTER_KEY] Parsed value: " << floatValue << " - applying with updateBuffer=true";
+        applyEditValueFloat(floatValue, true);
+        ofLogNotice("CellWidget") << "[ENTER_KEY] Successfully applied and returning true";
         return true;
     } catch (...) {
         // Parse failed - for removable parameters, remove it (set to "none")
+        ofLogNotice("CellWidget") << "[ENTER_KEY] Parse failed with exception";
         if (isRemovable) {
             removeParameter();
             return true;
         }
         // Invalid value for non-removable column
         return false;
+    }
+}
+
+void CellWidget::applyBufferWithFallback() {
+    // Apply buffer value immediately if valid, fallback to original if invalid
+    // This provides real-time feedback while maintaining a safety net
+    
+    if (editBuffer_.empty() || isEmpty(editBuffer_)) {
+        // Empty buffer - fallback to original value
+        if (!std::isnan(originalValue_) && onValueApplied) {
+            onValueApplied(parameterName, originalValue_);
+        }
+        return;
+    }
+    
+    try {
+        // Try to parse current buffer
+        float bufferValue;
+        if (parseValue) {
+            bufferValue = parseValue(editBuffer_);
+        } else {
+            bufferValue = ExpressionParser::evaluate(editBuffer_);
+        }
+        
+        // Check if value is in valid range
+        if (bufferValue >= minVal && bufferValue <= maxVal) {
+            // Valid buffer value - apply it immediately
+            if (onValueApplied) {
+                onValueApplied(parameterName, bufferValue);
+            }
+        } else {
+            // Out of range - fallback to original
+            if (!std::isnan(originalValue_) && onValueApplied) {
+                onValueApplied(parameterName, originalValue_);
+            }
+        }
+    } catch (...) {
+        // Invalid buffer - fallback to original
+        if (!std::isnan(originalValue_) && onValueApplied) {
+            onValueApplied(parameterName, originalValue_);
+        }
     }
 }
 
@@ -785,7 +799,6 @@ ImU32 CellWidget::getOrangeOutlineColor() const {
 CellWidgetInteraction CellWidget::draw(int uniqueId,
                                             bool isFocused,
                                             bool shouldFocusFirst,
-                                            bool shouldRefocusCurrentCell,
                                             const CellWidgetInputContext& inputContext) {
     ImGui::PushID(uniqueId);
     
@@ -796,14 +809,13 @@ CellWidgetInteraction CellWidget::draw(int uniqueId,
     ImVec2 cellMax = ImVec2(cellMin.x + cellWidth, cellMin.y + cellHeight);
     
     // Draw slider mode (only mode supported)
-    CellWidgetInteraction result = drawSliderMode(uniqueId, isFocused, shouldFocusFirst, shouldRefocusCurrentCell, inputContext, cellMin, cellMax);
+    CellWidgetInteraction result = drawSliderMode(uniqueId, isFocused, shouldFocusFirst, inputContext, cellMin, cellMax);
     ImGui::PopID();
     return result;
 }
 
-CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, bool shouldFocusFirst, bool shouldRefocusCurrentCell, const CellWidgetInputContext& inputContext, const ImVec2& cellMin, const ImVec2& cellMax) {
+CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, bool shouldFocusFirst, const CellWidgetInputContext& inputContext, const ImVec2& cellMin, const ImVec2& cellMax) {
     CellWidgetInteraction result;
-    bool wasEditingBeforeInput = editing_;  // Track if we were editing before this draw call
     
     // SLIDER mode (original implementation)
     // Get current value for display
@@ -814,7 +826,7 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
     
     // Get display text (formatDisplayText handles NaN and shows "--")
     std::string displayText;
-    if (editing_ && isSelected()) {
+    if (editing_) {
         // Show edit buffer when editing (even if empty, to show edit mode is active)
         if (editBuffer_.empty()) {
             displayText = formatDisplayText(displayVal);
@@ -831,8 +843,11 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
     // Draw visual feedback (fill bar)
     drawVisualFeedback(cellMin, cellMax, fillPercent);
     
+    // Navigation is managed by ModuleGUI::onEditModeChanged callback
+    // No need to disable it here - the callback handles it when entering edit mode
+    
     // Apply edit mode styling: dark grey/black background (Blender-style)
-    if (editing_ && isSelected()) {
+    if (editing_) {
         ImGui::PushStyleColor(ImGuiCol_Button, GUIConstants::Button::EditMode);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, GUIConstants::Button::EditModeHover);
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, GUIConstants::Button::EditModeActive);
@@ -848,9 +863,10 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
     // CRITICAL: Prevent ImGui from auto-focusing cells when clicking empty space
     ImGui::PushItemFlag(ImGuiItemFlags_NoNavDefaultFocus, true);
     
-    // Set focus on first cell if requested
-    if (shouldFocusFirst) {
+    // Set focus on first cell if requested OR if refocus is needed after edit exit
+    if (shouldFocusFirst || shouldRefocus_) {
         ImGui::SetKeyboardFocusHere(0);
+        shouldRefocus_ = false;  // Clear the flag after using it
     }
     
     // Draw button
@@ -867,8 +883,14 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
     bool spacebarPressed = ImGui::IsKeyPressed(ImGuiKey_Space, false);
     bool enterPressed = ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
     
-    // Check actual focus state after drawing (ImGui::IsItemFocused() works for last item)
+    // PHASE 2: TRUST IMGUI FOCUS - Use ImGui's native focus system directly
+    // Remove complex parallel focus tracking that caused race conditions
     bool actuallyFocused = ImGui::IsItemFocused();
+    bool isItemActive = ImGui::IsItemActive();
+    
+    // PHASE 2: TRUST IMGUI FOCUS - Remove defensive focus checking that causes race conditions
+    // Let ImGui handle focus changes naturally - edit mode will exit naturally when focus is lost
+    // The original defensive check was causing immediate exit due to focus detection timing issues
     
     // Handle activation (mouse click OR gamepad activation)
     // NOTE: Mouse clicks should only focus the cell, not enter edit mode
@@ -878,28 +900,13 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
         // Mouse click or gamepad "A" button - just signal click, don't enter edit mode
         // GUI layer will handle focus, Enter key or typing will enter edit mode
         result.clicked = true;
+        result.focusChanged = true;
     }
     
-    // Process keyboard input for this cell
-    // CRITICAL: Process input if cell is selected, focused, or in edit mode
-    // This handles Enter key, typing, and all other keyboard input
-    // Allow processing if selected OR focused (for direct typing on focused cell)
-    if (isSelected() || actuallyFocused || editing_) {
+    // Process keyboard input for focused cells
+    // Simplified: only process input when cell is actually focused by ImGui
+    if (actuallyFocused || editing_) {
         processInputInDraw(actuallyFocused);
-    }
-    
-    // Check if we just exited edit mode via Enter (was editing, now not editing)
-    // Signal refocus needed for next frame via interaction result
-    if (wasEditingBeforeInput && !editing_ && isSelected()) {
-        result.needsRefocus = true;
-    }
-    
-    // Refocus current cell after exiting edit mode
-    // This happens AFTER input processing so it works when Enter is handled during draw
-    // GUI layer passes shouldRefocusCurrentCell when refocus is needed (from previous frame's interaction.needsRefocus)
-    if (shouldRefocusCurrentCell && isSelected()) {
-        ImGui::SetKeyboardFocusHere(-1);
-        // NOTE: Navigation flags are already enabled (we don't disable them anymore)
     }
     
     // Handle drag state (Blender-style: works across entire window)
@@ -920,12 +927,8 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
         // IsItemActive() returns true when mouse was clicked on this item and is still held
         // IsMouseDragging(0) only returns true if mouse has moved while button is held
         // This works even if mouse has moved outside the cell (Blender-style)
-        // NOTE: Don't require isSelected - IsItemActive() is sufficient to indicate the cell was clicked
-        // Set isSelected when drag starts to maintain proper state
-        if (!isSelected()) {
-            setSelected(true);
-            result.focusChanged = true;
-        }
+        // IsItemActive() is sufficient to indicate the cell was clicked
+        result.focusChanged = true;
         startDrag();
         result.dragStarted = true;
     }
@@ -938,26 +941,7 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
         result.dragEnded = true;
     }
     
-    // Sync ImGui focus to selection state
-    // Only sync when item was actually clicked, keyboard-navigated, or refocusing after edit
-    if (actuallyFocused) {
-        bool itemWasClicked = ImGui::IsItemClicked(0);
-        bool keyboardNavActive = (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
-        bool needsRefocus = shouldRefocusCurrentCell && isSelected();
-        
-        // Only sync if this is an intentional focus (click, keyboard nav, or refocus)
-        if (itemWasClicked || keyboardNavActive || needsRefocus) {
-            result.focusChanged = true;
-            
-            // Lock focus to editing cell - arrow keys adjust values, not navigate
-            if (editing_ && !isSelected()) {
-                // Don't sync focus change during edit
-                result.shouldExitEarly = true;
-            } else {
-                setSelected(true);
-            }
-        }
-    }
+    // Simplified: no special focus locking needed - trust ImGui
     
     // Early exit after syncing (but before drawing outline)
     if (result.shouldExitEarly) {
@@ -969,10 +953,9 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
     
     // Handle click
     // CRITICAL: Ignore button clicks when Enter is pressed - Enter should only enter/edit mode, not trigger button click
-    bool isItemClicked = ImGui::IsItemClicked(0);
-    if (buttonClicked && !ImGui::IsMouseDragging(0) && !spacebarPressed && !enterPressed && isItemClicked) {
+    if (buttonClicked && !ImGui::IsMouseDragging(0) && !spacebarPressed && !enterPressed && ImGui::IsItemClicked(0)) {
         result.clicked = true;
-        setSelected(true);
+        result.focusChanged = true;
         // DON'T enter edit mode on click - just focus the cell
         // User can type numbers directly (auto-enters edit mode) or hit Enter to enter edit mode
         if (editing_) {
@@ -980,36 +963,28 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
         }
     }
     
-    // Handle double-click: clear the cell (remove parameter)
+    // Handle double-click: clear the cell to empty state
     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
-        // Exit edit mode if active
-        if (editing_) {
-            exitEditMode();
-        }
-        // Clear the cell by removing the parameter
-        removeParameter();
+        clearCell();
     }
     
-    // Maintain focus during drag (even when mouse leaves cell)
-    if (dragging_ && !actuallyFocused) {
-        // Keep cell focused during drag for visual feedback
-        // Don't require IsItemActive() - drag works across entire window
-        ImGui::SetKeyboardFocusHere(-1);
-    }
+    // Simplified drag focus: let ImGui handle focus naturally during drag
     
     // Pop style var and colors
     ImGui::PopStyleVar(1);
     ImGui::PopStyleColor(3);
     
     // Draw outline for selected/editing cells
-    bool shouldShowOutline = isSelected() || dragging_ || (actuallyFocused && !editing_);
+    // Show outline if focused, dragging, or active (mouse held)
+    // Use ImGui state directly - no parallel selection state needed
+    bool shouldShowOutline = actuallyFocused || dragging_ || isItemActive || editing_;
     if (shouldShowOutline) {
         ImDrawList* drawList = ImGui::GetWindowDrawList();
         if (drawList) {
             ImVec2 outlineMin = ImVec2(cellMin.x - 1, cellMin.y - 1);
             ImVec2 outlineMax = ImVec2(cellMax.x + 1, cellMax.y + 1);
             // Orange outline when in edit mode, red outline when just selected or dragging
-            ImU32 outlineColor = (isSelected() && editing_)
+            ImU32 outlineColor = editing_
                 ? getOrangeOutlineColor()
                 : getRedOutlineColor();
             drawList->AddRect(outlineMin, outlineMax, outlineColor, 0.0f, 0, 2.0f);
@@ -1031,15 +1006,26 @@ void CellWidget::drawVisualFeedback(const ImVec2& cellMin, const ImVec2& cellMax
 }
 
 void CellWidget::processInputInDraw(bool actuallyFocused) {
-    // Process keyboard input directly in draw() when cell is selected or editing
+    // Process keyboard input directly in draw() when cell is focused
     // This makes CellWidget self-contained and reusable across all modules
     
-    // Early exit if not selected, not editing, and not focused
-    if (!isSelected() && !editing_ && !actuallyFocused) {
+    // CRITICAL: Allow input processing if:
+    // 1. Cell is actually focused, OR
+    // 2. Cell is already in edit mode (handles focus detection edge cases)
+    // This ensures typing works even when focus detection has timing issues
+    if (!actuallyFocused && !editing_) {
+        // Not focused and not editing - don't process input
         return;
     }
     
     ImGuiIO& io = ImGui::GetIO();
+    
+    // DEFENSIVE: If we're in edit mode but navigation is enabled, disable it immediately
+    // This prevents navigation from interfering with edit mode (e.g., arrow keys navigating instead of editing)
+    if (editing_ && (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard)) {
+        ofLogNotice("CellWidget") << "[NAV_DEFENSE] Navigation enabled while in edit mode - disabling (this should rarely happen now)";
+        io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+    }
     
     // Check if ImGui navigation is active (gamepad/keyboard nav)
     bool navActive = (io.NavActive && (io.ConfigFlags & (ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad)));
@@ -1047,7 +1033,8 @@ void CellWidget::processInputInDraw(bool actuallyFocused) {
     // CRITICAL: Check for Enter key BEFORE navigation check
     // Enter should enter/edit mode even when navigation is active
     bool enterPressed = (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
-    if (enterPressed && isSelected()) {
+    if (enterPressed && (actuallyFocused || editing_)) {
+        // Allow Enter key when focused OR when already in edit mode (fixes buffer validation issue)
         bool ctrlPressed = io.KeyCtrl;
         bool shiftPressed = io.KeyShift;
         if (this->handleKeyPress(OF_KEY_RETURN, ctrlPressed, shiftPressed)) {
@@ -1055,8 +1042,9 @@ void CellWidget::processInputInDraw(bool actuallyFocused) {
         }
     }
     
-    // Process InputQueueCharacters (typed characters) - this should work even when navigation is active
-    // Direct typing should auto-enter edit mode, so we process it before the navigation check
+    // CRITICAL: Process InputQueueCharacters FIRST (typed characters)
+    // This MUST work even when navigation is active - typing should always work
+    // Direct typing should auto-enter edit mode, so we process it before any navigation checks
     bool inputQueueProcessed = false;
     if (io.InputQueueCharacters.Size > 0) {
         inputQueueProcessed = true;
@@ -1100,11 +1088,10 @@ void CellWidget::processInputInDraw(bool actuallyFocused) {
         io.InputQueueCharacters.clear();
     }
     
-    // If navigation is active and not editing, let ImGui handle navigation
-    // BUT: Only skip if we haven't processed typed characters (typing should work)
-    if (!editing_ && navActive && !inputQueueProcessed) {
-        return;  // Let ImGui handle navigation (gamepad/keyboard nav)
-    }
+    // CRITICAL: Don't block input processing when navigation is active
+    // Typing should work regardless of navigation state
+    // Only skip navigation-related keys (arrow keys) when not editing
+    // Navigation can coexist with typing - they don't conflict
     
     // Process special keys (only if not already processed via InputQueueCharacters)
         if (!inputQueueProcessed) {
@@ -1113,37 +1100,53 @@ void CellWidget::processInputInDraw(bool actuallyFocused) {
                 this->handleKeyPress(OF_KEY_ESC, false, false);
             }
             
-            // Backspace key
+            // Backspace key - clear to empty when not editing, backspace in buffer when editing
             if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) {
-                this->handleKeyPress(OF_KEY_BACKSPACE, false, false);
+                if (!editing_) {
+                    // Not in edit mode - clear cell to empty state
+                    clearCell();
+                } else {
+                    // In edit mode - handle backspace in buffer
+                    backspace();
+                    applyBufferWithFallback();
+                }
             }
             
-            // Delete key
+            // Delete key - clear to empty when not editing, clear buffer when editing  
             if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
-                this->handleKeyPress(OF_KEY_DEL, false, false);
+                if (!editing_) {
+                    // Not in edit mode - clear cell to empty state
+                    clearCell();
+                } else {
+                    // In edit mode - clear entire buffer
+                    deleteChar();
+                    applyBufferWithFallback();
+                }
             }
             
-            // Keypad keys (for numpad support)
-            if (ImGui::IsKeyPressed(ImGuiKey_Keypad0, false)) this->handleKeyPress('0', false, false);
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad1, false)) this->handleKeyPress('1', false, false);
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad2, false)) this->handleKeyPress('2', false, false);
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad3, false)) this->handleKeyPress('3', false, false);
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad4, false)) this->handleKeyPress('4', false, false);
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad5, false)) this->handleKeyPress('5', false, false);
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad6, false)) this->handleKeyPress('6', false, false);
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad7, false)) this->handleKeyPress('7', false, false);
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad8, false)) this->handleKeyPress('8', false, false);
-            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad9, false)) this->handleKeyPress('9', false, false);
-            else if (ImGui::IsKeyPressed(ImGuiKey_KeypadDecimal, false)) this->handleKeyPress('.', false, false);
+            // Keypad keys (for numpad support) - use unified character input handler
+            if (ImGui::IsKeyPressed(ImGuiKey_Keypad0, false)) this->handleCharacterInput('0');
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad1, false)) this->handleCharacterInput('1');
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad2, false)) this->handleCharacterInput('2');
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad3, false)) this->handleCharacterInput('3');
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad4, false)) this->handleCharacterInput('4');
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad5, false)) this->handleCharacterInput('5');
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad6, false)) this->handleCharacterInput('6');
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad7, false)) this->handleCharacterInput('7');
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad8, false)) this->handleCharacterInput('8');
+            else if (ImGui::IsKeyPressed(ImGuiKey_Keypad9, false)) this->handleCharacterInput('9');
+            else if (ImGui::IsKeyPressed(ImGuiKey_KeypadDecimal, false)) this->handleCharacterInput('.');
             
             if (editing_) {
-                if (ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false)) this->handleKeyPress('+', false, false);
-                if (ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false)) this->handleKeyPress('-', false, false);
-                if (ImGui::IsKeyPressed(ImGuiKey_KeypadMultiply, false)) this->handleKeyPress('*', false, false);
-                if (ImGui::IsKeyPressed(ImGuiKey_KeypadDivide, false)) this->handleKeyPress('/', false, false);
+                if (ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false)) this->handleCharacterInput('+');
+                if (ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false)) this->handleCharacterInput('-');
+                if (ImGui::IsKeyPressed(ImGuiKey_KeypadMultiply, false)) this->handleCharacterInput('*');
+                if (ImGui::IsKeyPressed(ImGuiKey_KeypadDivide, false)) this->handleCharacterInput('/');
             }
             
             // Arrow keys in edit mode (adjust values)
+            // CRITICAL: Arrow keys should work when editing, regardless of navigation state
+            // They adjust values, not navigate between cells
             if (editing_) {
                 bool shiftPressed = io.KeyShift;
                 if (ImGui::IsKeyDown(ImGuiKey_UpArrow)) {
@@ -1160,6 +1163,10 @@ void CellWidget::processInputInDraw(bool actuallyFocused) {
                 }
             }
         }
+    
+    // CRITICAL: After processing all input, if we processed typed characters and entered edit mode,
+    // ensure navigation doesn't interfere with editing
+    // Navigation is automatically disabled when typing starts (handled in handleCharacterInput)
 }
 
 void CellWidget::startDrag() {

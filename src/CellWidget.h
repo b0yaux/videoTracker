@@ -27,7 +27,6 @@ struct CellWidgetInteraction {
     bool dragStarted = false;
     bool dragEnded = false;
     bool shouldExitEarly = false;
-    bool needsRefocus = false;  // Signals that cell needs refocus after edit operations (e.g., Enter exits edit mode)
     
     CellWidgetInteraction() = default;
 };
@@ -47,8 +46,8 @@ struct CellWidgetInteraction {
 // 
 // This architecture makes CellWidget reusable across all modules without duplicating input logic.
 // 
-// Note: Focus management is handled by the GUI layer. CellWidget signals refocus needs
-// via interaction.needsRefocus flag, but the GUI layer executes the actual refocus.
+// Note: Focus management is handled by CellWidget itself. When exiting edit mode,
+// CellWidget immediately refocuses the cell if it's still focused, eliminating delays.
 // 
 // Supports numeric parameter editing with:
 //   - Keyboard input (direct typing, Enter to confirm, Escape to cancel)
@@ -76,10 +75,13 @@ public:
     void setEditBuffer(const std::string& buffer);
     void setEditBuffer(const std::string& buffer, bool initialized); // Overload to set both buffer and initialized flag
     const std::string& getEditBuffer() const { return editBuffer_; }
-    bool isEditBufferInitialized() const { return editBufferInitialized_; }
+    bool isEditBufferInitialized() const { return bufferState_ != EditBufferState::None; }
     
     // Keyboard input handling
     bool handleKeyPress(int key, bool ctrlPressed = false, bool shiftPressed = false);
+    
+    // Unified character input handling (for direct typing)
+    bool handleCharacterInput(char c);
     
     // Manual buffer manipulation
     void appendDigit(char digit);
@@ -100,7 +102,6 @@ public:
     CellWidgetInteraction draw(int uniqueId,
                                   bool isFocused,
                                   bool shouldFocusFirst = false,
-                                  bool shouldRefocusCurrentCell = false,
                                   const CellWidgetInputContext& inputContext = CellWidgetInputContext());
     
     // Drag editing
@@ -141,11 +142,7 @@ public:
     float maxVal = 1.0f;
     float defaultValue = 0.0f;
     
-    // Selection state accessors
-    void setSelected(bool selected) { selected_ = selected; }
-    bool isSelected() const { return selected_; }
-    
-    // Refocus flag removed - use CellWidgetInteraction.needsRefocus instead
+    // Refocus is handled immediately in exitEditMode() when cell is still focused
     
 private:
     // Constants
@@ -156,15 +153,24 @@ private:
     static constexpr int LENGTH_MIN = 1;
     static constexpr int LENGTH_MAX = 16;
     
-    // Selection state (private - use accessors)
-    bool selected_ = false;
-    bool shouldRefocus_ = false;
-    
     // Internal state
     bool editing_ = false;
-    bool editBufferInitialized_ = false;
-    bool bufferModifiedByUser_ = false;  // Track if buffer was modified by user input (vs initialized from current value)
+    
+    // Buffer state management - simplified with single enum
+    enum class EditBufferState {
+        None,           // No buffer (empty)
+        Initialized,    // Buffer initialized from current value
+        Restored,       // Buffer restored from cache (user had typed something)
+        UserModified    // Buffer modified by user input this frame
+    };
+    EditBufferState bufferState_ = EditBufferState::None;
     std::string editBuffer_;
+    
+    // Original value storage for buffer fallback
+    float originalValue_ = NAN;  // Value before edit mode started
+    
+    // Focus management
+    bool shouldRefocus_ = false;  // Flag to maintain focus after edit mode exit
     
     // Drag state
     bool dragging_ = false;
@@ -174,12 +180,13 @@ private:
     
     // Internal methods
     void initializeEditBuffer();
-    void applyEditValueFloat(float floatValue);
-    void applyEditValueInt(int intValue);
+    void applyEditValueFloat(float floatValue, bool updateBuffer = false);
+    void applyEditValueInt(int intValue, bool updateBuffer = true);
     bool parseAndApplyEditBuffer();
+    void applyBufferWithFallback();  // Apply buffer if valid, fallback to original if invalid
     
     // Drawing helpers (extracted from draw() for better organization)
-    CellWidgetInteraction drawSliderMode(int uniqueId, bool isFocused, bool shouldFocusFirst, bool shouldRefocusCurrentCell, const CellWidgetInputContext& inputContext, const ImVec2& cellMin, const ImVec2& cellMax);
+    CellWidgetInteraction drawSliderMode(int uniqueId, bool isFocused, bool shouldFocusFirst, const CellWidgetInputContext& inputContext, const ImVec2& cellMin, const ImVec2& cellMax);
     void processInputInDraw(bool actuallyFocused);  // Process keyboard input during draw
     void drawVisualFeedback(const ImVec2& cellMin, const ImVec2& cellMax, float fillPercent);
     
@@ -187,6 +194,10 @@ private:
     std::string getDefaultFormatValue(float value) const;
     float getDefaultParseValue(const std::string& str) const;
     void applyDragValue(float newValue);
+    
+    // Clear cell to empty state (unified for keyboard shortcuts and double-click)
+    // In tracker context, empty state IS the default state (not in parameterValues map)
+    void clearCell();
     
     // String utility helpers
     // Check if string represents empty/NaN value placeholder ("--")

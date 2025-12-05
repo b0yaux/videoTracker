@@ -411,19 +411,48 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
         const auto& colConfig = columnConfig[i];
         
         // Check if there's a special column renderer
+        // CRITICAL: drawSpecialColumn should only handle special cases (buttons, etc.)
+        // For regular parameter columns, we should use the default CellWidget rendering
+        // This ensures proper callback setup and input handling
+        bool handledBySpecialRenderer = false;
         if (callbacks.drawSpecialColumn) {
-            callbacks.drawSpecialColumn(row, absoluteCol, colConfig);
-        } else {
-            // Default: draw CellWidget using retained widget cache
-            // Focus state is managed by GUI layer via callbacks
-            bool isFocused = callbacks.isCellFocused ? callbacks.isCellFocused(row, absoluteCol) : false;
+            // Try special renderer - it should return true if it handled the column
+            // For now, we check if it's a button column by checking if drawSpecialColumn
+            // actually draws something (we can't return bool from callback, so we check
+            // if the column was handled by checking if it's a known button column)
+            // Actually, we need to let drawSpecialColumn handle button columns,
+            // but for regular parameter columns, we should use default rendering
+            // The issue is that drawSpecialColumn is called for ALL columns when set
+            // Solution: drawSpecialColumn should only be called for columns it needs to handle
+            // For now, we'll check if it's a button column by parameter name
+            bool isButtonColumn = (colConfig.parameterName == "mediaIndex" || 
+                                   colConfig.parameterName == "playStyle" || 
+                                   colConfig.parameterName == "polyphonyMode");
             
+            if (isButtonColumn) {
+                // Button columns: use special renderer
+                callbacks.drawSpecialColumn(row, absoluteCol, colConfig);
+                handledBySpecialRenderer = true;
+            } else {
+                // Regular parameter columns: use default CellWidget rendering
+                // This ensures proper callback setup and input handling
+                handledBySpecialRenderer = false;
+            }
+        }
+        
+        if (!handledBySpecialRenderer) {
+            // Default: draw CellWidget using retained widget cache
             // Get or create cell widget (retained across frames for performance)
             // Use absolute column index for widget cache key
             CellWidget& cell = getOrCreateCell(row, absoluteCol, colConfig);
+            
+            // Get initial focus hint from callback (optional - CellWidget will use actual ImGui focus)
+            // This is just a hint for initial state; actual focus is determined by ImGui after drawing
+            bool focusHint = callbacks.isCellFocused ? callbacks.isCellFocused(row, absoluteCol) : false;
                 
-            // Set up callbacks on first creation (they persist in retained widget)
-            if (!cell.getCurrentValue && callbacks.getCellValue) {
+            // Set up callbacks (always set, even if widget was recreated - defensive programming)
+            // This ensures callbacks are always properly wired even after cache clearing
+            if (callbacks.getCellValue) {
                 int rowCapture = row;
                 int colCapture = absoluteCol;  // Use absolute column index
                 const CellGridColumnConfig colConfigCapture = colConfig;  // Capture colConfig for parameter name access
@@ -432,7 +461,7 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
                 };
             }
                 
-            if (!cell.onValueApplied && callbacks.setCellValue) {
+            if (callbacks.setCellValue) {
                 int rowCapture = row;
                 int colCapture = absoluteCol;  // Use absolute column index
                 const CellGridColumnConfig colConfigCapture = colConfig;  // Capture colConfig for parameter name access
@@ -441,62 +470,48 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
                 };
             }
             
-            // Sync state TO cell (edit buffer, drag state, selection, etc.)
-            // State is managed by GUI layer via callbacks - no internal state needed
-            cell.setSelected(isFocused);
-            
-            // Drag state is synced via syncStateToCell callback from GUI layer
-            
-            // Callback handles all edit state synchronization (editing mode, edit buffer, etc.)
-            if (callbacks.syncStateToCell) {
-                callbacks.syncStateToCell(row, absoluteCol, cell);
+            // Set up onEditModeChanged callback (CellWidget manages editing state internally)
+            if (callbacks.onEditModeChanged) {
+                int rowCapture = row;
+                int colCapture = absoluteCol;  // Use absolute column index
+                cell.onEditModeChanged = [this, rowCapture, colCapture](bool editing) {
+                    callbacks.onEditModeChanged(rowCapture, colCapture, editing);
+                };
             }
-                
-            // Draw cell
+            
+            // Draw cell - CellWidget manages its own state (editing, selection, buffer, drag)
+            // Pass focus hint (CellWidget will use actual ImGui focus internally)
             int uniqueId = row * 1000 + absoluteCol;  // Use absolute column index for unique ID
-            // Refocus flag is managed by GUI layer via callbacks - pass shouldRefocusCurrentCell from GUI
-            // Note: CellGrid doesn't manage refocus state, it's passed from GUI layer
-            bool shouldRefocus = false;  // GUI layer should pass this via callbacks if needed
+            // Note: Refocus is now handled automatically by CellWidget when exiting edit mode
             
             // Create input context (simplified - no frame tracking needed)
             CellWidgetInputContext inputContext;
             
-            CellWidgetInteraction interaction = cell.draw(uniqueId, isFocused, false, shouldRefocus, inputContext);
+            // Draw cell - CellWidget will determine actual focus from ImGui after drawing
+            CellWidgetInteraction interaction = cell.draw(uniqueId, focusHint, false, inputContext);
                 
-            // Handle interactions - update internal state
-            // Check actual focus state after drawing (ImGui::IsItemFocused() works for last item)
-            bool actuallyFocused = ImGui::IsItemFocused();
+            // Handle interactions - check actual focus state after drawing
+            // ImGui::IsItemFocused() works for the last item drawn
+            bool actuallyFocusedAfterDraw = ImGui::IsItemFocused();
             
-            // Focus state is managed by GUI layer via callbacks
-            if (interaction.focusChanged) {
-                // Notify callback if provided - use absolute column index
-                if (callbacks.onCellFocusChanged) {
-                    callbacks.onCellFocusChanged(row, absoluteCol);
-                }
+            // Notify GUI layer of focus changes (CellWidget signals this via interaction)
+            // CRITICAL: Only call onCellFocusChanged when focus is actually GAINED, not when lost
+            // This prevents the callback from incorrectly setting focus state when navigating away
+            // The callback itself checks frame-based guard to prevent infinite loops
+            // We rely solely on CellWidget's focusChanged signal as the authoritative source
+            if (interaction.focusChanged && actuallyFocusedAfterDraw && callbacks.onCellFocusChanged) {
+                ofLogNotice("CellGrid") << "[FOCUS_GAINED] Calling onCellFocusChanged (row=" << row 
+                                       << ", col=" << absoluteCol << ") - interaction.focusChanged=true, actuallyFocused=true";
+                callbacks.onCellFocusChanged(row, absoluteCol);
             }
             
-            if (interaction.clicked) {
-                if (callbacks.onCellClicked) {
-                    callbacks.onCellClicked(row, absoluteCol);
-                }
+            if (interaction.clicked && callbacks.onCellClicked) {
+                callbacks.onCellClicked(row, absoluteCol);
             }
             
-            // Update isFocused to actual state for state syncing below
-            isFocused = actuallyFocused;
-                
-            // Sync state back FROM cell - edit state is handled by callback
-            // Focus tracking is handled by GUI layer via callbacks
-            
-            // Drag state is managed by GUI layer via syncStateFromCell callback
-            // No need to track it here - just pass it through
-            
-            // Refocus flag is managed by GUI layer via callbacks
-            
-            // Allow callback to handle additional state sync if provided (for backward compatibility)
-            // Use absolute column index
-            if (callbacks.syncStateFromCell) {
-                callbacks.syncStateFromCell(row, absoluteCol, cell, interaction);
-            }
+            // CellWidget manages its own state internally (editing, buffer, drag, selection)
+            // GUI layer only needs to track which cell is focused for UI coordination
+            // No state syncing needed - CellWidget persists its own state across frames
         }
     }
     

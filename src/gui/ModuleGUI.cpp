@@ -1,10 +1,14 @@
 #include "ModuleGUI.h"
 #include "core/ModuleRegistry.h"
+#include "ParameterCell.h"
+#include "Module.h"
 #include "GUIConstants.h"
 #include "ofLog.h"
 #include "imgui_internal.h"
 #include "ofJson.h"
 #include "ofFileUtils.h"
+#include "gui/CellGrid.h"
+#include "ofConstants.h"  // For OF_KEY_* constants
 
 // Static member initialization
 std::map<std::string, ImVec2> ModuleGUI::defaultLayouts;
@@ -396,6 +400,350 @@ bool ModuleGUI::isWindowCollapsed() const {
         return window->Collapsed;
     }
     
+    return false;
+}
+
+std::shared_ptr<Module> ModuleGUI::getModule() const {
+    if (!registry || instanceName.empty()) {
+        return nullptr;
+    }
+    return registry->getModule(instanceName);
+}
+
+CellWidget ModuleGUI::createCellWidget(
+    const ParameterDescriptor& paramDesc,
+    std::function<float()> customGetter,
+    std::function<void(float)> customSetter,
+    std::function<void()> customRemover,
+    std::function<std::string(float)> customFormatter,
+    std::function<float(const std::string&)> customParser
+) const {
+    auto module = getModule();
+    if (!module) {
+        // Return empty CellWidget if module not found
+        return CellWidget();
+    }
+    
+    // Use ParameterCell internally as implementation detail
+    ParameterCell cell(module.get(), paramDesc, parameterRouter);
+    
+    // Apply custom callbacks if provided
+    if (customGetter) {
+        cell.setCustomGetter(customGetter);
+    }
+    if (customSetter) {
+        cell.setCustomSetter(customSetter);
+    }
+    if (customRemover) {
+        cell.setCustomRemover(customRemover);
+    }
+    if (customFormatter) {
+        cell.setCustomFormatter(customFormatter);
+    }
+    if (customParser) {
+        cell.setCustomParser(customParser);
+    }
+    
+    // Return configured CellWidget
+    return cell.createCellWidget();
+}
+
+// ============================================================================
+// Unified CellGrid State Management - Helper Implementations
+// ============================================================================
+
+void ModuleGUI::setCellFocus(CellFocusState& state, int row, int column, const std::string& paramName) {
+    state.row = row;
+    state.column = column;
+    if (!paramName.empty()) {
+        state.editingParameter = paramName;
+    }
+}
+
+void ModuleGUI::clearCellFocus(CellFocusState& state) {
+    state.clear();
+}
+
+bool ModuleGUI::isCellFocused(const CellFocusState& state, int row, int column) const {
+    return state.matches(row, column);
+}
+
+int ModuleGUI::getFocusedRow(const CellFocusState& state) const {
+    return state.row;
+}
+
+void ModuleGUI::restoreImGuiKeyboardNavigation() {
+    ImGuiIO& io = ImGui::GetIO();
+    bool wasEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    bool nowEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+    if (!wasEnabled && nowEnabled) {
+        ofLogNotice("ModuleGUI") << "[NAV_RESTORE] Restored ImGui keyboard navigation (was disabled, now enabled)";
+    } else if (wasEnabled) {
+        ofLogVerbose("ModuleGUI") << "[NAV_RESTORE] Navigation already enabled";
+    }
+}
+
+// ============================================================================
+// Unified CellGrid Configuration - Helper Implementations
+// ============================================================================
+
+void ModuleGUI::configureCellGrid(CellGrid& grid, const CellGridConfig& config) {
+    grid.setTableId(config.tableId);
+    grid.setTableFlags(config.tableFlags);
+    grid.setCellPadding(config.cellPadding);
+    grid.setItemSpacing(config.itemSpacing);
+    grid.enableReordering(config.enableReordering);
+    if (config.enableScrolling) {
+        grid.enableScrolling(true, config.scrollHeight);
+        grid.setScrollbarSize(config.scrollbarSize);
+    } else {
+        grid.enableScrolling(false);
+    }
+}
+
+void ModuleGUI::updateColumnConfigIfChanged(CellGrid& grid, 
+                                             const std::vector<CellGridColumnConfig>& newConfig,
+                                             std::vector<CellGridColumnConfig>& lastConfig) {
+    // CRITICAL: Only call setColumnConfiguration() when config actually changes
+    // This prevents clearing the widget cache every frame, which destroys drag/edit state
+    if (newConfig != lastConfig) {
+        grid.setColumnConfiguration(newConfig);
+        lastConfig = newConfig;
+    }
+}
+
+// ============================================================================
+// Unified CellGrid Callback Setup - Helper Implementation
+// ============================================================================
+
+void ModuleGUI::setupStandardCellGridCallbacks(CellGridCallbacks& callbacks,
+                                                 CellFocusState& cellFocusState,
+                                                 CellGridCallbacksState& callbacksState,
+                                                 CellGrid& cellGrid,
+                                                 bool isSingleRow) {
+    // Standard focus row callback
+    callbacks.getFocusedRow = [&cellFocusState]() -> int {
+        return cellFocusState.row; // Return focused row (-1 if none)
+    };
+    
+    // Standard cell focus check callback
+    callbacks.isCellFocused = [&cellFocusState](int row, int col) -> bool {
+        // This is optional - CellGrid will use actual ImGui focus if not provided
+        return cellFocusState.row == row && cellFocusState.column == col;
+    };
+    
+    // Standard edit mode changed callback
+    callbacks.onEditModeChanged = [&cellFocusState](int row, int col, bool editing) {
+        // Track editing state for UI coordination (CellWidget manages editing state internally)
+        ImGuiIO& io = ImGui::GetIO();
+        bool navWasEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+        
+        // Update focus state if this is the focused cell
+        if (cellFocusState.row == row && cellFocusState.column == col) {
+            bool wasEditing = cellFocusState.isEditing;
+            cellFocusState.isEditing = editing;
+        }
+        
+        // CRITICAL: Always manage navigation based on edit mode, regardless of focus state
+        // This ensures navigation is restored even if focus was lost during edit mode
+        if (editing) {
+            // Disable ImGui keyboard navigation when entering edit mode
+            // Arrow keys should only adjust values, not navigate
+            io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+            ofLogNotice("ModuleGUI") << "[EDIT_MODE] Entering edit mode (row=" << row << ", col=" << col 
+                                     << ") - Navigation " << (navWasEnabled ? "was ENABLED, disabled" : "already disabled");
+        } else {
+            // Restore ImGui keyboard navigation when exiting edit mode
+            // CRITICAL: Always restore navigation when exiting edit mode, even if cell doesn't match focus state
+            // This handles cases where focus was lost but edit mode is still active
+            io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+            bool navNowEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+            bool isFocusedCell = (cellFocusState.row == row && cellFocusState.column == col);
+            ofLogNotice("ModuleGUI") << "[EDIT_MODE] Exiting edit mode (row=" << row << ", col=" << col 
+                                     << ", isFocused=" << isFocusedCell
+                                     << ") - Navigation " << (navWasEnabled ? "was already enabled" : "restored")
+                                     << ", now " << (navNowEnabled ? "ENABLED" : "DISABLED");
+        }
+        // Note: Refocus is now handled automatically by CellWidget when exiting edit mode
+    };
+    
+    // Standard cell focus changed callback
+    callbacks.onCellFocusChanged = [this, &cellFocusState, &callbacksState, &cellGrid, isSingleRow](int row, int col) {
+        // CRITICAL: Ignore focus callbacks if focus was cleared in the same frame
+        // This prevents infinite loops where clearing focus triggers a callback that restores focus
+        // Frame-based guard works regardless of execution order (drawRow vs handleFocusClearing)
+        int currentFrame = ImGui::GetFrameCount();
+        if (callbacksState.lastClearedFrame == currentFrame) {
+            ofLogVerbose("ModuleGUI") << "[FOCUS_SKIP] Ignoring onCellFocusChanged (row=" << row 
+                                      << ", col=" << col << ") - focus was cleared in frame " << currentFrame;
+            return;
+        }
+        
+        // Always update state - this ensures focus is maintained after Enter validates edit
+        int actualRow = isSingleRow ? 0 : row;
+        
+        int oldRow = cellFocusState.row;
+        int oldCol = cellFocusState.column;
+        
+        // Try to get parameter name from column config if available
+        if (col >= 0 && col < (int)cellGrid.getColumnConfiguration().size()) {
+            const auto& colConfig = cellGrid.getColumnConfiguration()[col];
+            this->setCellFocus(cellFocusState, actualRow, col, colConfig.parameterName);
+        } else {
+            this->setCellFocus(cellFocusState, actualRow, col);
+        }
+        callbacksState.anyCellFocusedThisFrame = true;
+        
+        ofLogNotice("ModuleGUI") << "[FOCUS_CHANGED] Cell focus changed from (" << oldRow << "," << oldCol 
+                                 << ") to (" << actualRow << "," << col 
+                                 << "), anyCellFocusedThisFrame=" << callbacksState.anyCellFocusedThisFrame
+                                 << ", isEditing=" << cellFocusState.isEditing;
+    };
+    
+    // Standard cell clicked callback
+    callbacks.onCellClicked = [this, &cellFocusState, &callbacksState, &cellGrid, isSingleRow](int row, int col) {
+        // Track which cell is clicked for UI purposes
+        int actualRow = isSingleRow ? 0 : row;
+        
+        // Try to get parameter name from column config if available
+        if (col >= 0 && col < (int)cellGrid.getColumnConfiguration().size()) {
+            const auto& colConfig = cellGrid.getColumnConfiguration()[col];
+            this->setCellFocus(cellFocusState, actualRow, col, colConfig.parameterName);
+        } else {
+            this->setCellFocus(cellFocusState, actualRow, col);
+        }
+        callbacksState.anyCellFocusedThisFrame = true;
+        // Note: Don't clear edit mode - let CellWidget handle it
+    };
+}
+
+// ============================================================================
+// Unified Input Handling - Helper Implementations
+// ============================================================================
+
+bool ModuleGUI::isTypingKey(int key) {
+    // Typing keys: numeric digits, decimal point, operators
+    return (key >= '0' && key <= '9') || 
+           key == '.' || 
+           key == '-' || 
+           key == '+' || 
+           key == '*' || 
+           key == '/';
+}
+
+bool ModuleGUI::shouldDelegateToCellWidget(int key, bool isEditing) {
+    // Always delegate these keys to CellWidget when in edit mode
+    if (isEditing) {
+        // Enter: validates edit
+        if (key == OF_KEY_RETURN) return true;
+        // Escape: cancels edit
+        if (key == OF_KEY_ESC) return true;
+        // Arrow keys: adjust value or navigate within cell
+        if (key == OF_KEY_UP || key == OF_KEY_DOWN || 
+            key == OF_KEY_LEFT || key == OF_KEY_RIGHT) return true;
+        // Backspace/Delete: edit buffer manipulation
+        if (key == OF_KEY_BACKSPACE || key == OF_KEY_DEL) return true;
+    }
+    
+    // Typing keys should always be delegated (CellWidget will auto-enter edit mode)
+    if (isTypingKey(key)) return true;
+    
+    return false;
+}
+
+bool ModuleGUI::handleCellInputKey(int key, bool isEditing, bool ctrlPressed, bool shiftPressed) {
+    // For typing keys: auto-enter edit mode if not already editing
+    // Return false to let the key pass through to ImGui so CellWidget can process it during draw()
+    if (isTypingKey(key)) {
+        // The caller should set isEditing = true if needed
+        // We just return false to delegate to CellWidget
+        return false;
+    }
+    
+    // For keys that should be delegated to CellWidget, return false
+    if (shouldDelegateToCellWidget(key, isEditing)) {
+        return false;
+    }
+    
+    // Special case: Ctrl+Enter or Shift+Enter to exit grid navigation
+    if (key == OF_KEY_RETURN && (ctrlPressed || shiftPressed)) {
+        // This should be handled by the caller (exit edit mode, clear focus)
+        // Return true to indicate it was handled (caller should process it)
+        return true;
+    }
+    
+    // All other keys: let them pass through (return false)
+    return false;
+}
+
+// ============================================================================
+// Unified Focus Clearing - Helper Implementations
+// ============================================================================
+
+bool ModuleGUI::shouldClearCellFocus(const CellFocusState& cellFocusState,
+                                     const CellGridCallbacksState& callbacksState,
+                                     std::function<bool()> additionalCondition) {
+    // Always clear if header was clicked
+    if (callbacksState.headerClickedThisFrame) {
+        ofLogVerbose("ModuleGUI") << "[SHOULD_CLEAR] Header clicked - clearing focus";
+        return true;
+    }
+    
+    // CRITICAL: Do NOT clear if a cell was focused this frame
+    // This prevents clearing focus immediately after it was just gained
+    if (callbacksState.anyCellFocusedThisFrame) {
+        ofLogVerbose("ModuleGUI") << "[SHOULD_CLEAR] Skipping - cell was focused this frame (anyCellFocusedThisFrame=true)";
+        return false;
+    }
+    
+    // Clear if cell was focused but no cell was focused this frame AND not editing
+    // This handles stale focus state from previous frames
+    if (cellFocusState.hasFocus() && !cellFocusState.isEditing) {
+        ofLogVerbose("ModuleGUI") << "[SHOULD_CLEAR] Stale focus detected - cell has focus but no cell focused this frame and not editing";
+        // Check additional condition if provided (e.g., not dragging)
+        if (additionalCondition) {
+            bool shouldClear = additionalCondition();
+            ofLogVerbose("ModuleGUI") << "[SHOULD_CLEAR] Additional condition returned: " << shouldClear;
+            return shouldClear;
+        }
+        return true;
+    }
+    
+    return false;
+}
+
+bool ModuleGUI::handleFocusClearing(CellFocusState& cellFocusState,
+                                     CellGridCallbacksState& callbacksState,
+                                     std::function<bool()> additionalCondition) {
+    if (shouldClearCellFocus(cellFocusState, callbacksState, additionalCondition)) {
+        // Set frame-based guard BEFORE clearing to prevent focus callbacks in the same frame
+        // This works regardless of execution order (drawRow vs handleFocusClearing)
+        int currentFrame = ImGui::GetFrameCount();
+        callbacksState.lastClearedFrame = currentFrame;
+        
+        // Clear focus state directly (same as clearCellFocus but static)
+        int oldRow = cellFocusState.row;
+        int oldCol = cellFocusState.column;
+        bool wasEditing = cellFocusState.isEditing;
+        
+        ofLogNotice("ModuleGUI") << "[CLEAR_FOCUS] Clearing cell focus (row=" << oldRow 
+                                 << ", col=" << oldCol << ", wasEditing=" << wasEditing 
+                                 << ", frame=" << currentFrame << ")";
+        
+        // Restore navigation if we were editing
+        if (wasEditing) {
+            restoreImGuiKeyboardNavigation();
+        }
+        
+        // Clear focus state
+        cellFocusState.clear();
+        
+        // Note: lastClearedFrame persists and is compared against current frame number
+        // This prevents focus callbacks from being triggered in the same frame as clearing
+        
+        return true;
+    }
     return false;
 }
 

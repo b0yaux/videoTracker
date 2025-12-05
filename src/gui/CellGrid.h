@@ -31,6 +31,15 @@ struct CellGridColumnConfig {
     
     CellGridColumnConfig(const std::string& param, const std::string& display, bool removable, int idx, bool draggable)
         : parameterName(param), displayName(display), isRemovable(removable), isDraggable(draggable), columnIndex(idx) {}
+    
+    // Equality operator for vector comparison
+    bool operator==(const CellGridColumnConfig& other) const {
+        return parameterName == other.parameterName &&
+               displayName == other.displayName &&
+               isRemovable == other.isRemovable &&
+               isDraggable == other.isDraggable &&
+               columnIndex == other.columnIndex;
+    }
 };
 
 // Header button definition - modular button system for column headers
@@ -83,9 +92,10 @@ struct CellGridCallbacks {
     
     // Focus management
     // col parameter is absolute column index (0-based, includes all columns in ImGui table)
-    std::function<bool(int row, int col)> isCellFocused;  // Check if cell is focused
+    std::function<bool(int row, int col)> isCellFocused;  // Check if cell is focused (optional - CellGrid uses actual ImGui focus if not provided)
     std::function<void(int row, int col)> onCellFocusChanged;  // Called when focus changes
     std::function<void(int row, int col)> onCellClicked;  // Called when cell is clicked
+    std::function<void(int row, int col, bool editing)> onEditModeChanged;  // Called when cell enters/exits edit mode (CellWidget manages editing state internally)
     
     // Header click callback (for focus clearing)
     // col parameter is parameter column index (0-based within parameter columns only)
@@ -132,17 +142,8 @@ struct CellGridCallbacks {
     //   };
     std::function<bool(int colIndex, const CellGridColumnConfig& colConfig, int absoluteColIndex)> setupParameterColumn;
     
-    // State syncing callbacks (for complex state like edit buffer, drag state)
-    // col parameter is absolute column index (0-based, includes all columns in ImGui table)
-    std::function<void(int row, int col, CellWidget& cell)> syncStateToCell;  // Sync state TO cell before drawing
-    std::function<void(int row, int col, const CellWidget& cell, const CellWidgetInteraction& interaction)> syncStateFromCell;  // Sync state FROM cell after drawing
-    
     // Auto-scroll management
     std::function<int()> getFocusedRow;  // Get currently focused row (-1 if none)
-    
-    // Refocus management (for maintaining focus after exiting edit mode via Enter)
-    // col parameter is absolute column index (0-based, includes all columns in ImGui table)
-    std::function<bool(int row, int col)> shouldRefocusCell;  // Check if cell should be refocused (e.g., after Enter exits edit mode)
 };
 
 // CellGrid - Reusable table component for parameter grids
@@ -197,9 +198,9 @@ public:
     // Widget cache management (for retained widgets across frames)
     void clearCellCache();  // Clear all cached cell widgets (call when grid structure changes)
     
-    // State management - REMOVED: Focus and drag state are now managed by GUI layer via callbacks
-    // The callbacks (isCellFocused, onCellFocusChanged, syncStateFromCell) handle all state synchronization
-    // CellGrid is now a pure rendering component focused on table rendering
+    // State management - REMOVED: All state (focus, drag, edit buffer) is managed by CellWidget itself
+    // CellGrid is now a pure rendering component focused on table layout and rendering
+    // GUI classes read state from CellWidgetInteraction results, no state syncing needed
     
 private:
     // Configuration
@@ -247,7 +248,7 @@ private:
     // Key: (row, col) pair, Value: CellWidget instance
     std::map<std::pair<int, int>, CellWidget> cellWidgets;
     
-    // Internal state management - REMOVED: All state (focus, drag, edit) managed by GUI layer via callbacks
+    // Internal state management - REMOVED: All state managed by CellWidget itself
     
     // Helper methods
     void updateColumnIndices();

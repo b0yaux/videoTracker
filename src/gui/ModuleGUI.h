@@ -4,9 +4,18 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 
 class ModuleRegistry;  // Forward declaration
 class ParameterRouter;  // Forward declaration
+class Module;  // Forward declaration
+struct ParameterDescriptor;  // Forward declaration (it's a struct, not a class)
+class ParameterCell;  // Forward declaration (internal implementation detail)
+class CellWidget;  // Forward declaration
+class CellGrid;  // Forward declaration
+struct CellGridColumnConfig;  // Forward declaration
+struct CellGridCallbacks;  // Forward declaration
+#include <functional>  // For std::function
 
 /**
  * ModuleGUI - Base class for all module GUI panels
@@ -138,6 +147,208 @@ protected:
     // Helper to set up drag drop target (call at start of drawContent())
     // Checks for FILE_PATHS payload and calls handleFileDrop() if found
     void setupDragDropTarget();
+    
+    // Parameter editing helpers
+    
+    /**
+     * Get the module instance for this GUI
+     * Uses registry and instanceName to retrieve the module
+     * @return Shared pointer to Module, or nullptr if not found
+     */
+    std::shared_ptr<Module> getModule() const;
+    
+    // ============================================================================
+    // Unified CellGrid State Management
+    // ============================================================================
+    // These structures and helpers provide a unified approach to managing
+    // cell focus, editing state, and callbacks across MediaPoolGUI and TrackerSequencerGUI
+    
+    /**
+     * Unified cell focus state structure
+     * Replaces separate focus tracking in MediaPoolGUI (editingColumnIndex, isEditingParameter_)
+     * and TrackerSequencerGUI (FocusState struct)
+     */
+    struct CellFocusState {
+        int row = -1;              // Focused row (-1 = none, 0 = single row for MediaPool)
+        int column = -1;           // Focused column (-1 = none)
+        bool isEditing = false;    // True when in edit mode (typing numeric value)
+        std::string editingParameter;  // Currently editing parameter name (empty if none)
+        
+        void clear() {
+            row = -1;
+            column = -1;
+            isEditing = false;
+            editingParameter.clear();
+        }
+        
+        bool hasFocus() const {
+            return row >= 0 && column >= 0;
+        }
+        
+        bool matches(int r, int c) const {
+            return row == r && column == c;
+        }
+    };
+    
+    /**
+     * Unified callback state tracking
+     * Tracks frame-level state for CellGrid callbacks
+     */
+    struct CellGridCallbacksState {
+        bool headerClickedThisFrame = false;
+        bool anyCellFocusedThisFrame = false;
+        int lastClearedFrame = -1;  // Frame number when focus was last cleared (for guard against same-frame callbacks)
+        
+        void resetFrame() {
+            headerClickedThisFrame = false;
+            anyCellFocusedThisFrame = false;
+            // Note: lastClearedFrame is NOT reset - it persists across frames for comparison
+            // We compare against current frame number, so old values are automatically invalid
+        }
+    };
+    
+    // Helper methods for CellFocusState management
+    void setCellFocus(CellFocusState& state, int row, int column, const std::string& paramName = "");
+    void clearCellFocus(CellFocusState& state);
+    bool isCellFocused(const CellFocusState& state, int row, int column) const;
+    int getFocusedRow(const CellFocusState& state) const;
+    
+    // Navigation restoration helper
+    static void restoreImGuiKeyboardNavigation();
+    
+    // ============================================================================
+    // Unified CellGrid Configuration
+    // ============================================================================
+    // These structures and helpers provide a unified approach to configuring
+    // CellGrid instances across MediaPoolGUI and TrackerSequencerGUI
+    
+    /**
+     * Unified CellGrid configuration structure
+     * Encapsulates all common CellGrid configuration options
+     */
+    struct CellGridConfig {
+        std::string tableId;
+        ImGuiTableFlags tableFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                     ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable;
+        ImVec2 cellPadding = ImVec2(2, 2);
+        ImVec2 itemSpacing = ImVec2(1, 1);
+        bool enableReordering = true;
+        bool enableScrolling = false;
+        float scrollHeight = 0.0f;  // 0.0f = auto-calculate
+        float scrollbarSize = 8.0f;
+        
+        // Default constructor with sensible defaults
+        CellGridConfig() = default;
+        
+        // Constructor for common cases
+        CellGridConfig(const std::string& id, ImGuiTableFlags flags, bool scrolling = false, float height = 0.0f)
+            : tableId(id), tableFlags(flags), enableScrolling(scrolling), scrollHeight(height) {}
+    };
+    
+    // Helper methods for CellGrid configuration
+    void configureCellGrid(CellGrid& grid, const CellGridConfig& config);
+    void updateColumnConfigIfChanged(CellGrid& grid, 
+                                      const std::vector<CellGridColumnConfig>& newConfig,
+                                      std::vector<CellGridColumnConfig>& lastConfig);
+    
+    // ============================================================================
+    // Unified CellGrid Callback Setup
+    // ============================================================================
+    // These helpers provide a unified approach to setting up standard CellGrid callbacks
+    // across MediaPoolGUI and TrackerSequencerGUI
+    
+    /**
+     * Setup standard CellGrid callbacks that are common across all module GUIs
+     * This includes focus tracking, edit mode handling, and state synchronization.
+     * 
+     * @param callbacks The CellGridCallbacks struct to populate
+     * @param cellFocusState Reference to the module's CellFocusState
+     * @param callbacksState Reference to the module's CellGridCallbacksState
+     * @param cellGrid Reference to the CellGrid instance (for column config access)
+     * @param isSingleRow If true, treats the grid as single-row (row always 0, like MediaPoolGUI)
+     */
+    void setupStandardCellGridCallbacks(CellGridCallbacks& callbacks,
+                                         CellFocusState& cellFocusState,
+                                         CellGridCallbacksState& callbacksState,
+                                         CellGrid& cellGrid,
+                                         bool isSingleRow = false);
+    
+    // ============================================================================
+    // Unified Input Handling Helpers
+    // ============================================================================
+    
+    /**
+     * Check if a key is a typing key (numeric digits, decimal point, operators)
+     * These keys should trigger auto-enter edit mode and be delegated to CellWidget
+     */
+    static bool isTypingKey(int key);
+    
+    /**
+     * Check if a key should be delegated to CellWidget for processing during draw()
+     * Returns true if the key should be handled by CellWidget, false otherwise
+     */
+    static bool shouldDelegateToCellWidget(int key, bool isEditing);
+    
+    /**
+     * Handle cell input key - centralizes logic for when to delegate to CellWidget vs handle directly
+     * Returns true if key was handled (caller should process it), false to let it pass through to CellWidget
+     */
+    static bool handleCellInputKey(int key, bool isEditing, bool ctrlPressed, bool shiftPressed);
+    
+    // ============================================================================
+    // Unified Focus Clearing Helpers
+    // ============================================================================
+    
+    /**
+     * Check if cell focus should be cleared based on common conditions
+     * Common pattern: clear if header clicked OR (cell focused but no cell focused this frame AND not editing)
+     * @param cellFocusState Current focus state
+     * @param callbacksState Current callback state (headerClickedThisFrame, anyCellFocusedThisFrame)
+     * @param additionalCondition Optional additional condition that must be true to clear (e.g., !dragging)
+     * @return true if focus should be cleared
+     */
+    static bool shouldClearCellFocus(const CellFocusState& cellFocusState,
+                                     const CellGridCallbacksState& callbacksState,
+                                     std::function<bool()> additionalCondition = nullptr);
+    
+    /**
+     * Handle focus clearing - checks conditions and clears focus if needed
+     * This is a convenience wrapper around shouldClearCellFocus() + clearCellFocus()
+     * @param cellFocusState Focus state to clear (modified if conditions are met)
+     * @param callbacksState Current callback state (modified to set focusClearingThisFrame flag)
+     * @param additionalCondition Optional additional condition
+     * @return true if focus was cleared
+     */
+    static bool handleFocusClearing(CellFocusState& cellFocusState,
+                                    CellGridCallbacksState& callbacksState,
+                                    std::function<bool()> additionalCondition = nullptr);
+    
+    /**
+     * Create a CellWidget for a module parameter
+     * Helper method that centralizes the common pattern:
+     * - Gets module from registry using instanceName
+     * - Gets ParameterRouter
+     * - Creates CellWidget with routing awareness
+     * 
+     * Subclasses can override for special cases (e.g., MediaPool activePlayer)
+     * or use this directly for standard Module parameter editing.
+     * 
+     * @param paramDesc Parameter descriptor
+     * @param customGetter Optional custom getter function (overrides default Module::getParameter)
+     * @param customSetter Optional custom setter function (overrides default Module::setParameter)
+     * @param customRemover Optional custom remover function (overrides default reset to defaultValue)
+     * @param customFormatter Optional custom formatter function (overrides default formatting)
+     * @param customParser Optional custom parser function (overrides default parsing)
+     * @return CellWidget instance configured for the parameter
+     */
+    CellWidget createCellWidget(
+        const ParameterDescriptor& paramDesc,
+        std::function<float()> customGetter = nullptr,
+        std::function<void(float)> customSetter = nullptr,
+        std::function<void()> customRemover = nullptr,
+        std::function<std::string(float)> customFormatter = nullptr,
+        std::function<float(const std::string&)> customParser = nullptr
+    ) const;
     
     // State
     std::string instanceName;

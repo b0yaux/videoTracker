@@ -12,8 +12,7 @@
 MediaPoolGUI::MediaPoolGUI() 
     : mediaPool(nullptr), waveformHeight(100.0f), parentWidgetId(0), 
       isParentWidgetFocused(false), requestFocusMoveToParentWidget(false),
-      editingColumnIndex(-1), shouldFocusFirstCell(false), shouldRefocusCurrentCell(false),
-      anyCellFocusedThisFrame(false) {
+      shouldFocusFirstCell(false) {
 }
 
 void MediaPoolGUI::setMediaPool(MediaPool& pool) {
@@ -99,39 +98,28 @@ void MediaPoolGUI::drawContent() {
         return;
     }
     
-    // Wrap content in a child window to enable drag & drop target
-    // The child window acts as the drop target area
-    ImGui::BeginChild("MediaPoolContent", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar);
+    // Child 1: Parameter table (auto-size to fit content, no extra space)
+    // Use a calculated height based on table structure: header + row + minimal padding
+    // Account for: header height, row height, cell padding (2px top + 2px bottom)
+    float tableHeaderHeight = ImGui::GetFrameHeight();
+    float tableRowHeight = ImGui::GetFrameHeight();
+    float cellVerticalPadding = 4.0f; // 2px top + 2px bottom (from CellGrid cellPadding ImVec2(2, 2))
+    // Use a tighter calculation - borders are included in frame height
+    float parameterTableHeight = tableHeaderHeight + tableRowHeight + cellVerticalPadding;
     
-    // Draw parameter editing section
+    ImGui::BeginChild("MediaPoolParameters", ImVec2(0, parameterTableHeight), false, ImGuiWindowFlags_NoScrollbar);
     drawParameters();
-
-    // Draw waveform on top
-    drawWaveform(); 
-    
-    // Calculate space needed for bottom controls (directory controls + separators)
-    // Estimate: directory controls (~button height + padding), separators
-    float bottomControlsHeight = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y + 
-                                 ImGui::GetStyle().ItemSpacing.y * 2; // Separators and spacing
-    
-    // Get remaining space after waveform (already accounts for waveform height)
-    float availableHeight = ImGui::GetContentRegionAvail().y;
-    
-    // Draw media list in scrollable area, reserving space for bottom controls
-    // Use availableHeight minus bottom controls height, but ensure minimum size
-    float mediaListHeight = availableHeight - bottomControlsHeight;
-    float minMediaListHeight = ImGui::GetFrameHeight(); // Minimum height is one media line
-    if (mediaListHeight < minMediaListHeight) {
-        mediaListHeight = minMediaListHeight;
-    }
-    
-    ImGui::BeginChild("MediaList", ImVec2(0, mediaListHeight), true);
-    drawMediaList();
     ImGui::EndChild();
     
-    drawDirectoryControls();
+    // Child 2: Waveform (fixed height)
+    ImGui::BeginChild("MediaPoolWaveform", ImVec2(0, waveformHeight), false, ImGuiWindowFlags_NoScrollbar);
+    drawWaveform();
+    ImGui::EndChild();
     
-    ImGui::EndChild(); // End MediaPoolContent
+    // Child 3: Media list (takes all remaining space)
+    ImGui::BeginChild("MediaList", ImVec2(0, 0), true);
+    drawMediaList();
+    ImGui::EndChild();
     
     // Set up drag & drop target on the main window (covers entire panel)
     // Must be called after all content is drawn, like AssetLibraryGUI does
@@ -139,28 +127,6 @@ void MediaPoolGUI::drawContent() {
     setupDragDropTarget();
 }
 
-void MediaPoolGUI::drawDirectoryControls() {
-    MediaPool* pool = getMediaPool();
-    if (!pool) return;
-    
-    // Browse Directory button - opens native directory browser
-    if (ImGui::Button("Browse Directory")) {
-        pool->browseForDirectory();
-    }
-    
-    ImGui::SameLine();
-    std::string displayPath = pool->getDataDirectory();
-    
-    // Calculate available width after button (account for spacing)
-    float availableWidth = ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x;
-    if (availableWidth > 0.0f) {
-        // For directory paths, show the end (directory name) rather than the beginning
-        displayPath = truncateTextToWidth(displayPath, availableWidth, true);
-    }
-    
-    ImGui::Text("%s", displayPath.c_str());
-    ImGui::Separator();
-}
 
 
 
@@ -169,15 +135,16 @@ void MediaPoolGUI::drawDirectoryControls() {
 /// @param paramDesc 
 /// @return CellWidget
 CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor& paramDesc) {
-    CellWidget cell;
-    cell.parameterName = paramDesc.name;
-    cell.isInteger = (paramDesc.type == ParameterType::INT);
-    cell.setValueRange(paramDesc.minValue, paramDesc.maxValue, paramDesc.defaultValue);
-    cell.calculateStepIncrement();
+    MediaPool* pool = getMediaPool();
+    if (!pool) {
+        return CellWidget();  // Return empty cell if no pool
+    }
     
-    // Set up getCurrentValue callback - capture mediaPool to get active player dynamically
+    // Use ModuleGUI helper to create CellWidget with routing awareness
+    // This centralizes the common pattern of getting module + router
+    // Set up custom getter - capture mediaPool to get active player dynamically
     // This ensures we always get the current active player, not a stale reference
-    cell.getCurrentValue = [this, paramDesc]() -> float {
+    auto customGetter = [this, paramDesc]() -> float {
         MediaPool* pool = getMediaPool();
         if (!pool) return std::numeric_limits<float>::quiet_NaN();
         
@@ -198,24 +165,22 @@ CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor&
         return std::numeric_limits<float>::quiet_NaN();
     };
     
-    // Set up onValueApplied callback
-    cell.onValueApplied = [this, paramDesc](const std::string&, float value) {
+    // Set up custom setter
+    auto customSetter = [this, paramDesc](float value) {
         MediaPool* pool = getMediaPool();
         if (pool && pool->getActivePlayer()) {
             pool->setParameter(paramDesc.name, value, true);
         }
     };
     
-    // Set up onValueRemoved callback: reset to default value (double-click to reset)
-    cell.onValueRemoved = [this, paramDesc](const std::string&) {
+    // Set up custom remover: reset to default value (double-click to reset)
+    auto customRemover = [this, paramDesc]() {
         MediaPool* pool = getMediaPool();
         if (pool && pool->getActivePlayer()) {
             pool->setParameter(paramDesc.name, paramDesc.defaultValue, true);
         }
     };
     
-    // Set up formatValue callback (use openFrameworks ofToString for modern C++ string formatting)
-    // Unified precision: 0.001 (3 decimal places) for all float parameters
     // Special handling for loopSize: logarithmic mapping for better precision at low values (1-100ms granular range)
     if (paramDesc.name == "loopSize") {
         // Logarithmic mapping: slider value (0.0-1.0) maps to loopSize (0.001s to 10s)
@@ -223,7 +188,6 @@ CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor&
         const float MIN_LOOP_SIZE = 0.001f;  // 1ms minimum
         const float MAX_LOOP_SIZE = 10.0f;   // 10s maximum
         
-        // Set cell value range to slider range (0.0-1.0) for logarithmic mapping
         // Calculate default slider value from default seconds value (1.0s)
         float defaultSeconds = 1.0f;
         float defaultSliderValue = 0.0f;
@@ -232,16 +196,17 @@ CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor&
         } else if (defaultSeconds >= MAX_LOOP_SIZE) {
             defaultSliderValue = 1.0f;
         }
-        cell.setValueRange(0.0f, 1.0f, defaultSliderValue);
-        cell.calculateStepIncrement();
         
-        // Map slider value to logarithmic range
-        cell.getCurrentValue = [this, paramDesc, MIN_LOOP_SIZE, MAX_LOOP_SIZE]() -> float {
+        // Create modified parameter descriptor with slider range (0.0-1.0)
+        ParameterDescriptor loopSizeParam(paramDesc.name, paramDesc.type, 0.0f, 1.0f, defaultSliderValue, paramDesc.displayName);
+        
+        // Override getter: Map from actual seconds to logarithmic slider value (0.0-1.0)
+        auto loopSizeGetter = [this, MIN_LOOP_SIZE, MAX_LOOP_SIZE]() -> float {
             MediaPool* pool = getMediaPool();
-            if (!pool) return paramDesc.defaultValue;
+            if (!pool) return 0.0f;
             
             auto activePlayer = pool->getActivePlayer();
-            if (!activePlayer) return paramDesc.defaultValue;
+            if (!activePlayer) return 0.0f;
             
             // Get actual loopSize value in seconds
             float actualValue = activePlayer->loopSize.get();
@@ -254,8 +219,8 @@ CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor&
             return sliderValue;
         };
         
-        // Map slider value back to actual seconds
-        cell.onValueApplied = [this, paramDesc, MIN_LOOP_SIZE, MAX_LOOP_SIZE](const std::string&, float sliderValue) {
+        // Override setter: Map from slider value to actual seconds
+        auto loopSizeSetter = [this, paramDesc, MIN_LOOP_SIZE, MAX_LOOP_SIZE](float sliderValue) {
             MediaPool* pool = getMediaPool();
             if (!pool) {
                 ofLogWarning("MediaPoolGUI") << "[CRASH PREVENTION] MediaPool is null in setValue callback for parameter: " << paramDesc.name;
@@ -281,9 +246,9 @@ CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor&
             pool->setParameter(paramDesc.name, actualValue, true);
         };
         
-        // Format display value: show actual seconds with appropriate precision
+        // Override formatter: Show actual seconds with appropriate precision
         // NOTE: No "s" suffix - keeps parsing simple and standard (no custom parseValue needed)
-        cell.formatValue = [MIN_LOOP_SIZE, MAX_LOOP_SIZE](float sliderValue) -> std::string {
+        auto loopSizeFormatter = [MIN_LOOP_SIZE, MAX_LOOP_SIZE](float sliderValue) -> std::string {
             // Map slider value to actual seconds for display
             sliderValue = std::max(0.0f, std::min(1.0f, sliderValue));
             float actualValue = MIN_LOOP_SIZE * std::pow(MAX_LOOP_SIZE / MIN_LOOP_SIZE, sliderValue);
@@ -300,18 +265,13 @@ CellWidget MediaPoolGUI::createCellWidgetForParameter(const ParameterDescriptor&
                 return ofToString(actualValue, 3);
             }
         };
-    } else {
-        // Standard linear mapping for other parameters
-        cell.formatValue = [paramDesc](float value) -> std::string {
-            if (paramDesc.type == ParameterType::INT) {
-                return ofToString((int)std::round(value));
-            } else {
-                return ofToString(value, 3); // 3 decimal places (0.001 precision) for all float parameters
-            }
-        };
+        
+        // Create and return CellWidget with custom callbacks
+        return createCellWidget(loopSizeParam, loopSizeGetter, loopSizeSetter, nullptr, loopSizeFormatter);
     }
     
-    return cell;
+    // For all other parameters: use standard createCellWidget with custom callbacks
+    return createCellWidget(paramDesc, customGetter, customSetter, customRemover);
 }
 
 
@@ -341,7 +301,9 @@ void MediaPoolGUI::drawParameters() {
     MediaPool* pool = getMediaPool();
     if (!pool) return;
     
-    ImGui::Separator();
+    // Start at the very top of the child window (no padding)
+    ImGui::SetCursorPosY(0);
+    
     // Get available parameters from MediaPool
     auto editableParams = getEditableParameters();
     
@@ -363,7 +325,8 @@ void MediaPoolGUI::drawParameters() {
     
     // Create an invisible button as the parent widget (similar to TrackerSequencer)
     // CRITICAL: InvisibleButton requires non-zero size (ImGui assertion)
-    // Use minimum size of 1x1 pixels to satisfy the requirement
+    // Position at top-left with minimum size (1x1 pixels)
+    ImGui::SetCursorPos(ImVec2(0, 0));
     ImGui::InvisibleButton("##MediaPoolParamsParent", ImVec2(1, 1));
     
     // Handle clicks on parent widget - clear cell focus when clicked
@@ -383,23 +346,25 @@ void MediaPoolGUI::drawParameters() {
     parentWidgetId = ImGui::GetItemID();
     ImGui::PopID();
     
+    // Reset cursor to top after InvisibleButton to ensure table starts at the top
+    ImGui::SetCursorPosY(0);
+    
     // Note: Table styling is handled by CellGrid (CellPadding, ItemSpacing)
     
     // Reset focus tracking at start of frame
-    anyCellFocusedThisFrame = false;
+    callbacksState.resetFrame();
     
     // Use versioned table ID to reset column order if needed (change version number to force reset)
     static int tableVersion = 3; // Increment this to reset all saved column settings (v2: added STYLE column, v3: reordered polyphonyMode after playStyle)
     std::string tableId = "MediaPoolParameters_v" + std::to_string(tableVersion);
     
-    // Configure CellGrid
-    cellGrid.setTableId(tableId);
-    cellGrid.setTableFlags(ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
-                                 ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable |
-                                 ImGuiTableFlags_SizingStretchProp);
-    cellGrid.setCellPadding(ImVec2(2, 2));
-    cellGrid.setItemSpacing(ImVec2(1, 1));
-    cellGrid.enableReordering(true);
+    // Configure CellGrid using unified helper
+    CellGridConfig gridConfig;
+    gridConfig.tableId = tableId;
+    gridConfig.tableFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                            ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable |
+                            ImGuiTableFlags_SizingStretchProp;
+    configureCellGrid(cellGrid, gridConfig);
         
     // Convert editableParams to CellGrid column configuration
     // Add Index, Play style, and Polyphony mode as regular columns at the beginning
@@ -419,26 +384,39 @@ void MediaPoolGUI::drawParameters() {
         tableColumnConfig.push_back(CellGridColumnConfig(
             paramDesc.name, paramDesc.displayName, true, 0));  // isRemovable = true for all parameters
         }
-    cellGrid.setColumnConfiguration(tableColumnConfig);
-    cellGrid.setAvailableParameters(editableParams);
+    
+    // Update column configuration using unified helper (only updates if changed)
+    updateColumnConfigIfChanged(cellGrid, tableColumnConfig, lastColumnConfig);
     
     // Clear special column widget cache when column configuration changes
-    specialColumnWidgetCache.clear();
+    if (tableColumnConfig != lastColumnConfig) {
+        specialColumnWidgetCache.clear();
+    }
+    
+    cellGrid.setAvailableParameters(editableParams);
     
     // Setup callbacks for CellGrid
     CellGridCallbacks callbacks;
-    callbacks.getFocusedRow = [this]() -> int {
-        return (editingColumnIndex >= 0) ? 0 : -1; // Single row table, row 0 if focused, -1 if not
+    
+    // Setup standard callbacks (focus tracking, edit mode, state sync)
+    setupStandardCellGridCallbacks(callbacks, cellFocusState, callbacksState, cellGrid, true); // true = single row
+    
+    // MediaPool-specific: Update isParentWidgetFocused in callbacks
+    // Wrap the standard callbacks to also update isParentWidgetFocused
+    auto originalOnCellFocusChanged = callbacks.onCellFocusChanged;
+    callbacks.onCellFocusChanged = [this, originalOnCellFocusChanged](int row, int col) {
+        if (originalOnCellFocusChanged) {
+            originalOnCellFocusChanged(row, col);
+        }
+        isParentWidgetFocused = false;
     };
-    callbacks.isCellFocused = [this](int row, int col) -> bool {
-        // col is now absolute column index
-        return (editingColumnIndex == col);
-    };
-    callbacks.onCellFocusChanged = [](int row, int col) {
-        // This will be handled by syncStateFromCell
-    };
-    callbacks.onCellClicked = [](int row, int col) {
-        // This will be handled by syncStateFromCell
+    
+    auto originalOnCellClicked = callbacks.onCellClicked;
+    callbacks.onCellClicked = [this, originalOnCellClicked](int row, int col) {
+        if (originalOnCellClicked) {
+            originalOnCellClicked(row, col);
+        }
+        isParentWidgetFocused = false;
     };
     callbacks.createCellWidget = [this](int row, int col, const CellGridColumnConfig& colConfig) -> CellWidget {
         // Use parameter name directly from colConfig - no need to search through all parameters
@@ -528,110 +506,23 @@ void MediaPoolGUI::drawParameters() {
         ImU32 rowBgColor = GUIConstants::toU32(GUIConstants::Background::TableRowFilled);
         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, rowBgColor);
     };
-    callbacks.syncStateToCell = [this](int row, int col, CellWidget& cell) {
-        // col is now absolute column index
-        bool isSelected = (editingColumnIndex == col);
-        cell.setSelected(isSelected);
-        cell.setEditing(isEditingParameter_ && isSelected);
-        
-        if (isEditingParameter_ && isSelected) {
-            cell.setEditBuffer(editBufferCache, editBufferInitializedCache);
-        }
-            
-        // Restore drag state - use parameter name directly from cell (no index conversion needed)
-        if (!draggingParameter.empty() && cell.parameterName == draggingParameter) {
-            cell.setDragState(true, dragStartY, dragStartX, lastDragValue);
-        }
-    };
-    callbacks.syncStateFromCell = [this](int row, int col, const CellWidget& cell, const CellWidgetInteraction& interaction) {
-        // col is now absolute column index
-        bool isSelected = (editingColumnIndex == col);
-        
-        // Use parameter name directly from cell - no index conversion needed
-        const std::string& paramName = cell.parameterName;
-        if (paramName.empty()) return;  // Skip if cell has no parameter name
-        
-        // Sync focus state
-            // CRITICAL: Check if cell is actually focused (including after refocus)
-            // This ensures focus is maintained after Enter validation even if focusChanged is false
-            bool actuallyFocused = ImGui::IsItemFocused();
-            if (interaction.focusChanged || (actuallyFocused && isSelected)) {
-                int previousColumn = editingColumnIndex;
-                editingParameter = paramName;
-                editingColumnIndex = col;  // Use absolute column index directly
-                anyCellFocusedThisFrame = true;
-                isParentWidgetFocused = false;
-                
-                if (previousColumn != col && isEditingParameter_) {
-                    isEditingParameter_ = false;
-                    editBufferCache.clear();
-                    editBufferInitializedCache = false;
-                }
-            }
-            
-            if (interaction.clicked) {
-                editingParameter = paramName;
-                editingColumnIndex = col;  // Use absolute column index directly
-                isEditingParameter_ = false;
-                anyCellFocusedThisFrame = true;
-                isParentWidgetFocused = false;
-            }
-            
-        // Sync drag state
-        if (cell.getIsDragging()) {
-                    draggingParameter = paramName;
-            dragStartY = cell.getDragStartY();
-            dragStartX = cell.getDragStartX();
-            lastDragValue = cell.getLastDragValue();
-                    // Maintain focus during drag
-                    editingColumnIndex = col;  // Use absolute column index directly
-                    editingParameter = paramName;
-                    anyCellFocusedThisFrame = true;
-        } else if (draggingParameter == paramName && !cell.getIsDragging()) {
-                    draggingParameter.clear();
-            }
-            
-            // Sync edit mode state
-        if (cell.isEditingMode()) {
-                isEditingParameter_ = true;
-            editBufferCache = cell.getEditBuffer();
-            editBufferInitializedCache = cell.isEditBufferInitialized();
-            anyCellFocusedThisFrame = true;
-        } else if (isEditingParameter_ && isSelected && !cell.isEditingMode()) {
-                isEditingParameter_ = false;
-                editBufferCache.clear();
-                editBufferInitializedCache = false;
-            
-            // Check if cell needs refocus (signaled via interaction.needsRefocus)
-            if (interaction.needsRefocus && isSelected) {
-                shouldRefocusCurrentCell = true;
-                anyCellFocusedThisFrame = true;  // ADD THIS: Prevent focus from being cleared
-            }
-            }
-            
-        // Clear refocus flag only when cell is actually focused after refocus
-        // Don't clear it just because focus changed - wait until refocus succeeds
-        if (shouldRefocusCurrentCell && isSelected && ImGui::IsItemFocused()) {
-                shouldRefocusCurrentCell = false;
-            }
-    };
+    // State sync callbacks removed - CellWidget manages its own state internally
+    // MediaPoolGUI only tracks which column is focused for UI purposes
     // Track if header was clicked to clear button cell focus
-    bool headerClickedThisFrame = false;
-    
     // Setup header click callback to detect when headers are clicked
-    callbacks.onHeaderClicked = [&headerClickedThisFrame](int col) {
-        headerClickedThisFrame = true;
+    callbacks.onHeaderClicked = [this](int col) {
+        callbacksState.headerClickedThisFrame = true;
     };
     
     // Setup custom header rendering callback for Position parameter
-    callbacks.drawCustomHeader = [this, pool, &headerClickedThisFrame](int col, const CellGridColumnConfig& colConfig, ImVec2 cellStartPos, float columnWidth, float cellMinY) -> bool {
+    callbacks.drawCustomHeader = [this](int col, const CellGridColumnConfig& colConfig, ImVec2 cellStartPos, float columnWidth, float cellMinY) -> bool {
         if (colConfig.parameterName == "position") {
             // Draw column name first (standard header)
             ImGui::TableHeader(colConfig.displayName.c_str());
             
             // Check if header was clicked
             if (ImGui::IsItemClicked(0)) {
-                headerClickedThisFrame = true;
+                callbacksState.headerClickedThisFrame = true;
             }
             
             return true; // Header was drawn by custom callback
@@ -648,14 +539,11 @@ void MediaPoolGUI::drawParameters() {
     auto setCellValueCallback = callbacks.setCellValue;
     auto createCellWidgetCallback = callbacks.createCellWidget;
     auto isCellFocusedCallback = callbacks.isCellFocused;
-    auto syncStateToCellCallback = callbacks.syncStateToCell;
-    auto syncStateFromCellCallback = callbacks.syncStateFromCell;
     auto onCellFocusChangedCallback = callbacks.onCellFocusChanged;
     auto onCellClickedCallback = callbacks.onCellClicked;
     
     callbacks.drawSpecialColumn = [this, pool, getCellValueCallback, setCellValueCallback, 
                                     createCellWidgetCallback, isCellFocusedCallback,
-                                    syncStateToCellCallback, syncStateFromCellCallback,
                                     onCellFocusChangedCallback, onCellClickedCallback]
                                     (int row, int col, const CellGridColumnConfig& colConfig) {
         const std::string& paramName = colConfig.parameterName;
@@ -665,7 +553,7 @@ void MediaPoolGUI::drawParameters() {
         if (paramName != "mediaIndex" && paramName != "playStyle" && paramName != "polyphonyMode") {
             // Not a button column - manually render CellWidget (replicating CellGrid's default behavior)
             // Get focus state
-            bool isFocused = (editingColumnIndex == col);
+            bool isFocused = ModuleGUI::isCellFocused(cellFocusState, row, col);
             if (!isFocused && isCellFocusedCallback) {
                 isFocused = isCellFocusedCallback(row, col);
             }
@@ -706,37 +594,25 @@ void MediaPoolGUI::drawParameters() {
                 };
             }
             
-            // Sync state TO cell
-            cell.setSelected(isFocused);
-            cell.setEditing(isEditingParameter_ && isFocused);
+            // CellWidget manages its own state (editing, buffer, drag, selection)
+            // We only track which cell is focused for UI coordination
+            // onEditModeChanged callback is set up by CellGrid automatically
             
-            if (isEditingParameter_ && isFocused) {
-                cell.setEditBuffer(editBufferCache, editBufferInitializedCache);
-            }
-            
-            // Allow callback to override state
-            if (syncStateToCellCallback) {
-                syncStateToCellCallback(row, col, cell);
-            }
-            
-            // Draw cell
+            // Draw cell - CellWidget handles all state internally
             int uniqueId = row * 1000 + col;
-            bool shouldRefocus = shouldRefocusCurrentCell && isFocused;
-            int currentFrame = ofGetFrameNum();
             CellWidgetInputContext inputContext;
             
-            CellWidgetInteraction interaction = cell.draw(uniqueId, isFocused, false, shouldRefocus, inputContext);
+            CellWidgetInteraction interaction = cell.draw(uniqueId, isFocused, false, inputContext);
             
             // Handle interactions
             bool actuallyFocused = ImGui::IsItemFocused();
             
             if (interaction.focusChanged) {
                 if (actuallyFocused) {
-                    editingColumnIndex = col;
-                    editingParameter = paramName;
-                    anyCellFocusedThisFrame = true;
-                } else if (editingColumnIndex == col) {
-                    clearCellFocus();
+                    setCellFocus(cellFocusState, row, col, paramName);
+                    callbacksState.anyCellFocusedThisFrame = true;
+                } else if (cellFocusState.column == col) {
+                    ModuleGUI::clearCellFocus(cellFocusState);
                 }
                 
                 if (onCellFocusChangedCallback) {
@@ -745,8 +621,7 @@ void MediaPoolGUI::drawParameters() {
             }
             
             if (interaction.clicked) {
-                editingColumnIndex = col;
-                editingParameter = paramName;
+                setCellFocus(cellFocusState, row, col, paramName);
                 if (onCellClickedCallback) {
                     onCellClickedCallback(row, col);
                 }
@@ -754,36 +629,19 @@ void MediaPoolGUI::drawParameters() {
             
             isFocused = actuallyFocused;
             
-            // Sync state FROM cell
-            if (cell.isEditingMode()) {
-                isEditingParameter_ = true;
-                editBufferCache = cell.getEditBuffer();
-                editBufferInitializedCache = cell.isEditBufferInitialized();
-                anyCellFocusedThisFrame = true;
-            } else if (isEditingParameter_ && isFocused && !cell.isEditingMode()) {
-                isEditingParameter_ = false;
-                editBufferCache.clear();
-                editBufferInitializedCache = false;
-                
-                // Check if cell needs refocus (signaled via interaction.needsRefocus)
-                if (interaction.needsRefocus) {
-                    shouldRefocusCurrentCell = true;
-                }
-            }
-            
-            // Allow callback to handle additional state sync
-            if (syncStateFromCellCallback) {
-                syncStateFromCellCallback(row, col, cell, interaction);
+            // Track editing state for UI purposes (CellWidget manages its own edit buffer)
+            if (cell.isEditingMode() && isFocused) {
+                cellFocusState.isEditing = true;
+                callbacksState.anyCellFocusedThisFrame = true;
+            } else if (cellFocusState.isEditing && isFocused && !cell.isEditingMode()) {
+                cellFocusState.isEditing = false;
+                // Note: Refocus is now handled automatically by CellWidget when exiting edit mode
             }
             
             return; // Done rendering CellWidget for this column
         }
         
         // Button columns: use direct ImGui::Button() calls
-        // Set cell background to match step number button style
-        static ImU32 buttonCellBgColor = GUIConstants::toU32(GUIConstants::Background::StepNumber);
-        ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, buttonCellBgColor);
-        
         if (paramName == "mediaIndex") {
             // Draw media index button (like step number button)
             size_t currentIndex = pool->getCurrentIndex();
@@ -924,43 +782,34 @@ void MediaPoolGUI::drawParameters() {
         }
         
         // Clear focus if:
-        // 1. Header was clicked (navigating to header row)
-        // 2. No cell was focused this frame AND we had a column focused (clicked outside grid)
-        // 3. CRITICAL: Don't clear focus if we're dragging - this prevents focus loss during smooth dragging
-        if (headerClickedThisFrame || 
-            (editingColumnIndex >= 0 && !anyCellFocusedThisFrame && !isEditingParameter_ && !shouldRefocusCurrentCell && draggingParameter.empty())) {
-            clearCellFocus();
-        }
+        // Clear focus using unified helper if conditions are met
+        // Conditions: header clicked OR (cell focused but no cell focused this frame AND not editing)
+        ModuleGUI::handleFocusClearing(cellFocusState, callbacksState);
         
     // End table
     cellGrid.endTable();
     
     // Check for clicks outside the grid (after table ends)
     // This handles clicks on empty space within the window
-    if (editingColumnIndex >= 0 && ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-        clearCellFocus();
+    if (cellFocusState.hasFocus() && ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
+        ModuleGUI::clearCellFocus(cellFocusState);
     }
 }
 
 void MediaPoolGUI::clearCellFocus() {
-    editingColumnIndex = -1;
-    editingParameter.clear();
-    isEditingParameter_ = false;
-    editBufferCache.clear();
-    editBufferInitializedCache = false;
-    draggingParameter.clear();
+    ModuleGUI::clearCellFocus(cellFocusState);
 }
 
 // Sync edit state from ImGui focus - called from InputRouter when keys are pressed
 void MediaPoolGUI::syncEditStateFromImGuiFocus(MediaPoolGUI& gui) {
     // Check if editingColumnIndex is already valid (GUI sync already happened)
-    if (gui.editingColumnIndex >= 0) {
-        // If editingParameter is empty but editingColumnIndex is set, look it up from column config
-        if (gui.editingParameter.empty() && gui.mediaPool) {
+    if (gui.cellFocusState.column >= 0) {
+        // If editingParameter is empty but column is set, look it up from column config
+        if (gui.cellFocusState.editingParameter.empty() && gui.mediaPool) {
             // Get column configuration from CellGrid
             auto columnConfig = gui.cellGrid.getColumnConfiguration();
-            if (gui.editingColumnIndex >= 0 && (size_t)gui.editingColumnIndex < columnConfig.size()) {
-                gui.editingParameter = columnConfig[gui.editingColumnIndex].parameterName;
+            if (gui.cellFocusState.column >= 0 && (size_t)gui.cellFocusState.column < columnConfig.size()) {
+                gui.cellFocusState.editingParameter = columnConfig[gui.cellFocusState.column].parameterName;
             }
         }
         return; // Already synced
@@ -1270,7 +1119,14 @@ void MediaPoolGUI::drawWaveform() {
     }
     
     // CRITICAL: Check if dragging a CellWidget - prevents interference with waveform interactions
-    bool isDraggingParameter = !draggingParameter.empty();
+    // Check cached widgets to see if any are currently dragging
+    bool isDraggingParameter = false;
+    for (const auto& [key, cell] : specialColumnWidgetCache) {
+        if (cell.getIsDragging()) {
+            isDraggingParameter = true;
+            break;
+        }
+    }
     
     // Handle zoom and pan interactions
     if (ImGui::IsItemHovered() && !isDraggingParameter) {
@@ -1342,8 +1198,7 @@ void MediaPoolGUI::drawWaveform() {
     bool hasAudioData = false;
     int numChannels = 0;
     int actualPoints = 0;
-    static std::vector<float> timeData;
-    static std::vector<std::vector<float>> channelData;
+    // Use instance members instead of static variables (fixes performance issue with multiple MediaPool instances)
     
     if (currentPlayer->isAudioLoaded()) {
         // Get audio buffer data
@@ -1370,10 +1225,10 @@ void MediaPoolGUI::drawWaveform() {
             int stepSize = std::max(1, numFrames / maxPoints);
             actualPoints = std::min(maxPoints, numFrames / stepSize);
             
-            timeData.resize(actualPoints);
-            channelData.resize(numChannels);
+            waveformTimeData.resize(actualPoints);
+            waveformChannelData.resize(numChannels);
             for (int ch = 0; ch < numChannels; ch++) {
-                channelData[ch].resize(actualPoints);
+                waveformChannelData[ch].resize(actualPoints);
             }
             
             // Downsample audio data (only for visible range if zoomed in)
@@ -1389,10 +1244,10 @@ void MediaPoolGUI::drawWaveform() {
                 int sampleIndex = (int)(absoluteTime * numFrames);
                 sampleIndex = std::max(0, std::min(numFrames - 1, sampleIndex));
                 
-                timeData[i] = timePos; // Normalized time within visible range (0-1)
+                waveformTimeData[i] = timePos; // Normalized time within visible range (0-1)
                 
                 for (int ch = 0; ch < numChannels; ch++) {
-                    channelData[ch][i] = buffer.getSample(sampleIndex, ch);
+                    waveformChannelData[ch][i] = buffer.getSample(sampleIndex, ch);
                 }
             }
         }
@@ -1412,10 +1267,10 @@ void MediaPoolGUI::drawWaveform() {
             ImU32 lineColor = GUIConstants::toU32(GUIConstants::Waveform::Line);
             
             for (int i = 0; i < actualPoints - 1; i++) {
-                float x1 = canvasPos.x + timeData[i] * canvasWidth;
-                float y1 = centerY - channelData[ch][i] * volume * amplitudeScale;
-                float x2 = canvasPos.x + timeData[i + 1] * canvasWidth;
-                float y2 = centerY - channelData[ch][i + 1] * volume * amplitudeScale;
+                float x1 = canvasPos.x + waveformTimeData[i] * canvasWidth;
+                float y1 = centerY - waveformChannelData[ch][i] * volume * amplitudeScale;
+                float x2 = canvasPos.x + waveformTimeData[i + 1] * canvasWidth;
+                float y2 = centerY - waveformChannelData[ch][i + 1] * volume * amplitudeScale;
                 
                 drawList->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), lineColor, 1.0f);
             }
@@ -1441,7 +1296,14 @@ void MediaPoolGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& c
     if (!currentPlayer) return;
     
     // CRITICAL: Check if dragging a CellWidget - prevents interference with waveform interactions
-    bool isDraggingParameter = !draggingParameter.empty();
+    // Check cached widgets to see if any are currently dragging
+    bool isDraggingParameter = false;
+    for (const auto& [key, cell] : specialColumnWidgetCache) {
+        if (cell.getIsDragging()) {
+            isDraggingParameter = true;
+            break;
+        }
+    }
     
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     
@@ -1947,132 +1809,16 @@ void MediaPoolGUI::setWaveformZoomState(size_t index, float zoom, float offset) 
 
 /// MARK: - KEY PRESS
 bool MediaPoolGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
-    // CRITICAL FIX: If editingColumnIndex is set but editingParameter is empty,
-    // look up the parameter name from the column index
-    // This handles cases where focus was synced from ImGui but editingParameter wasn't set yet
-    if (editingColumnIndex >= 0 && editingParameter.empty()) {
-        auto columnConfig = cellGrid.getColumnConfiguration();
-        if (editingColumnIndex >= 0 && (size_t)editingColumnIndex < columnConfig.size()) {
-            const std::string& paramName = columnConfig[editingColumnIndex].parameterName;
-            // Only set editingParameter for non-button columns
-            if (paramName != "mediaIndex" && paramName != "playStyle") {
-                editingParameter = paramName;
-            }
-        }
+    // PHASE 1: SINGLE INPUT PATH - CellWidget is sole input processor for cells
+    // If any cell has focus, let CellWidget handle ALL input
+    if (cellFocusState.hasFocus()) {
+        return false; // CellWidget will handle in processInputInDraw()
     }
     
-    // Helper function to check if current column is editable (not a button)
-    auto isEditableColumn = [this]() -> bool {
-        if (editingColumnIndex < 0) return false;
-        auto columnConfig = cellGrid.getColumnConfiguration();
-        if ((size_t)editingColumnIndex >= columnConfig.size()) return false;
-        const std::string& paramName = columnConfig[editingColumnIndex].parameterName;
-        return paramName != "mediaIndex" && paramName != "playStyle";
-    };
-    
-    // Handle direct typing (numeric keys, decimal point, operators) - auto-enter edit mode
-    // This matches TrackerSequencer behavior: typing directly enters edit mode
-    // NOTE: Once edit mode is entered, CellGrid's internal input handling (via CellWidget::handleInputInDraw)
-    // will process the actual key input during draw(). We just need to set the edit mode state here.
-    if ((key >= '0' && key <= '9') || key == '.' || key == '-' || key == '+' || key == '*' || key == '/') {
-        // Check if we have a valid parameter column focused (not Index or Play style button)
-        if (!isEditingParameter_ && isEditableColumn()) {
-            // Ensure editingParameter is set
-            if (editingParameter.empty()) {
-                auto columnConfig = cellGrid.getColumnConfiguration();
-                if (editingColumnIndex >= 0 && (size_t)editingColumnIndex < columnConfig.size()) {
-                    editingParameter = columnConfig[editingColumnIndex].parameterName;
-                }
-            }
-            
-            if (!editingParameter.empty()) {
-                // Enter edit mode - CellGrid will handle the actual key input during draw()
-                isEditingParameter_ = true;
-                
-                // Disable ImGui keyboard navigation when entering edit mode
-                ImGuiIO& io = ImGui::GetIO();
-                io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-                
-                // Don't consume the key - let it pass through to ImGui so CellGrid can handle it
-                // CellGrid's CellWidget::handleInputInDraw() will process it during draw()
-                return false;
-            }
-        }
-    }
-    
-    // CRITICAL: When NOT in edit mode, let ImGui handle arrow keys for native navigation
-    // We'll sync our state from ImGui focus after it processes the keys
-    if (!isEditingParameter_ && editingColumnIndex >= 0) {
-        // Not in edit mode: Let ImGui handle arrow keys for native navigation
-        // This allows smooth navigation between parameter cells
-        // Our state will be synced from ImGui focus in the next frame during draw()
-        if (key == OF_KEY_LEFT || key == OF_KEY_RIGHT || key == OF_KEY_UP || key == OF_KEY_DOWN) {
-            // Ensure ImGui navigation is enabled so it can handle the keys
-            ImGuiIO& io = ImGui::GetIO();
-            io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-            
-            // Don't consume the key - let ImGui handle navigation
-            // Our state will be synced from ImGui focus in drawParameters()
-            return false;
-        }
-    }
-    
-    // In edit mode: Let CellGrid handle arrow keys and other input internally
-    // CellGrid's CellWidget::handleInputInDraw() will process them during draw()
-    if (isEditingParameter_ && editingColumnIndex >= 0) {
-        // Let ImGui pass the key through so CellGrid can handle it
-        // This includes arrow keys (for value adjustment) and all other keys
-        return false;
-    }
-    
-    // Handle keyboard shortcuts for parameter navigation (special modifier combinations)
-    switch (key) {
-        case OF_KEY_RETURN:
-            if (ctrlPressed || shiftPressed) {
-                // Ctrl+Enter or Shift+Enter: Exit parameter editing
-                if (isEditingParameter_) {
-                    isEditingParameter_ = false;
-                    editBufferCache.clear();
-                    editBufferInitializedCache = false;
-                    ImGuiIO& io = ImGui::GetIO();
-                    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-                    shouldRefocusCurrentCell = true; // Refocus cell after exiting edit mode
-                    return true;
-                }
-            }
-            // For Enter key: Let CellWidget handle it completely via processInputInDraw()
-            // CellWidget will:
-            // - Enter edit mode if not editing
-            // - Apply value and exit edit mode if already editing
-            // We just need to ensure navigation is disabled when entering edit mode
-            if (isEditableColumn() && !isEditingParameter_) {
-                // Pre-emptively disable navigation so CellWidget can enter edit mode cleanly
-                ImGuiIO& io = ImGui::GetIO();
-                io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-            }
-            // Don't consume Enter - let CellWidget handle it via processInputInDraw()
-            return false;
-            
-        case OF_KEY_ESC:
-            // IMPORTANT: Only handle ESC when in edit mode. When NOT in edit mode, let ESC pass through
-            // to ImGui so it can use ESC to escape contained navigation contexts (like scrollable tables)
-            if (isEditingParameter_) {
-                // Exit edit mode - CellGrid will handle the actual ESC key processing
-                // We just set the state here so it's ready when CellGrid processes it
-                isEditingParameter_ = false;
-                editBufferCache.clear();
-                editBufferInitializedCache = false;
-                ImGuiIO& io = ImGui::GetIO();
-                io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-                shouldRefocusCurrentCell = true; // Refocus cell after exiting edit mode
-                // Let CellGrid handle ESC so it can properly exit edit mode and sync state
-                return false;
-            }
-            // NOT in edit mode: Let ESC pass through to ImGui for navigation escape
-            break;
-    }
-    
-    // All other keys: Let CellGrid handle them internally via CellWidget::handleInputInDraw()
+    // Only handle global shortcuts when no cell is focused
+    // Currently MediaPoolGUI doesn't have global shortcuts like play/pause
+    // (those are handled by TrackerSequencerGUI)
+    // So for now, just let all keys pass through to ImGui when no cell is focused
     return false;
 }
 
@@ -2107,3 +1853,5 @@ namespace {
     };
     static MediaPoolGUIRegistrar g_mediaPoolGUIRegistrar;
 }
+
+

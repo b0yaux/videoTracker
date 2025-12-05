@@ -3,6 +3,7 @@
 #include "GUIConstants.h"
 #include <array>
 #include <string>
+#include <vector>
 
 class Clock;
 class ClockGUI;
@@ -13,28 +14,18 @@ class CommandBar;
 class AssetLibraryGUI;
 class ofxSoundOutput;
 
-// Panel identifiers
-enum class Panel {
-    CLOCK = 0,
-    AUDIO_OUTPUT = 1,
-    TRACKER = 2,
-    MEDIA_POOL = 3,
-    FILE_BROWSER = 4,
-    CONSOLE = 5,
-    ASSET_LIBRARY = 6,
-    COUNT = 7
-};
+
 
 /**
- * ViewManager - Manages view/presentation layer and panel rendering
+ * ViewManager - Manages view/presentation layer and window rendering
  * 
- * RESPONSIBILITY: View rendering, panel navigation, and view state management
+ * RESPONSIBILITY: View rendering, window navigation, and view state management
  * 
  * Responsibilities:
- * - Render all panels (Clock, Audio Output, Tracker, Media Pool, File Browser, Console)
- * - Manage panel navigation (switching between panels)
- * - Manage focus state (which panel has keyboard focus)
- * - Manage panel visibility for utility panels (FileBrowser, Console)
+ * - Render all windows (Clock, Audio Output, Tracker, Media Pool, File Browser, Console)
+ * - Manage window navigation (switching between windows via Cmd+Arrow keys)
+ * - Manage focus state (which window has keyboard focus)
+ * - Manage window visibility for utility windows (FileBrowser, Console)
  * - Audio device selection UI and state (audio device list, selection)
  * - Audio volume/level visualization (UI only, actual audio processing in ofApp)
  * 
@@ -42,7 +33,7 @@ enum class Panel {
  * - ModuleFactory: Creates modules and manages identity
  * - ModuleRegistry: Stores and retrieves modules
  * - GUIManager: Creates/destroys GUI objects, manages instance visibility
- * - ViewManager: Renders panels, manages panel navigation/focus, audio UI state
+ * - ViewManager: Renders windows, manages window navigation/focus, audio UI state
  * - ofApp: Audio processing, global volume application, audio level calculation
  * 
  * Note: ViewManager manages audio UI state (device selection, volume slider, level display)
@@ -51,8 +42,8 @@ enum class Panel {
  * Usage Flow:
  *   1. ofApp calls viewManager.draw() each frame
  *   2. ViewManager gets GUI objects from GUIManager
- *   3. ViewManager renders each panel based on current panel state
- *   4. User interactions update view state (panel selection, focus, visibility)
+ *   3. ViewManager renders each window based on current window state
+ *   4. User interactions update view state (window selection, focus, visibility)
  */
 class ViewManager {
 public:
@@ -75,11 +66,14 @@ public:
     void navigateToWindow(const std::string& windowName);
     std::string getCurrentFocusedWindow() const { return currentFocusedWindow; }
     
-    // Panel navigation (DEPRECATED: Use navigateToWindow() instead - kept for backward compatibility)
-    void navigateToPanel(Panel panel);
-    void nextPanel();
-    void previousPanel();
-    Panel getCurrentPanel() const { return currentPanel; }
+    // Simple window cycling (lightweight keyboard navigation)
+    void nextWindow();        // Cmd+Right Arrow
+    void previousWindow();    // Cmd+Left Arrow
+    void upWindow();          // Cmd+Up Arrow
+    void downWindow();        // Cmd+Down Arrow
+    std::vector<std::string> getAvailableWindows() const;  // Get all navigable windows
+    
+
     
     // FileBrowser visibility
     void setFileBrowserVisible(bool visible) { fileBrowserVisible_ = visible; }
@@ -100,8 +94,7 @@ public:
     void draw();
 
     // Getters for current state
-    int getCurrentPanelIndex() const { return static_cast<int>(currentPanel); }
-    const char* getCurrentPanelName() const;
+    const char* getCurrentWindowName() const;
 
     // Audio state access (for ofApp to update currentAudioLevel)
     // Note: Audio device management is now handled by AudioOutputGUI
@@ -129,35 +122,28 @@ private:
     std::string currentFocusedWindow = "Clock ";  // Track focused window by name (works for ALL panels)
     std::string lastFocusedWindow;                // Track previous focused window for change detection
     
-    // State - Panel enum (DEPRECATED: Kept for backward compatibility)
-    Panel currentPanel = Panel::CLOCK;
-    Panel lastPanel = Panel::COUNT;  // Invalid, triggers focus on first draw
+
     bool fileBrowserVisible_ = false;  // FileBrowser visibility state
     bool consoleVisible_ = false;  // Console visibility state
     bool assetLibraryVisible_ = false;  // AssetLibrary visibility state
 
-    // Panel names for debugging/logging
-    static constexpr std::array<const char*, 7> PANEL_NAMES = {{
-        "Clock ",
-        "Audio Output",
-        "Tracker Sequencer",
-        "Media Pool",
-        "File Browser",
-        "Console",
-        "Asset Library"
-    }};
 
-    // Private draw methods for each panel
+
+    // Private draw methods for each window
     void drawClockPanel();
     
-    // Generic method to draw all visible module panels (handles all module types)
+    // Generic method to draw all visible module windows (handles all module types)
     void drawModulePanels();
-    void drawFileBrowserPanel();  // Draw FileBrowser panel
-    void drawConsolePanel();  // Draw Console panel
-    void drawAssetLibraryPanel();  // Draw AssetLibrary panel
+    void drawFileBrowserPanel();  // Draw FileBrowser window
+    void drawConsolePanel();  // Draw Console window
+    void drawAssetLibraryPanel();  // Draw AssetLibrary window
 
-    // Helper to set focus when panel changes (not every frame)
+    // Helper to set focus when window changes (not every frame)
     void setFocusIfChanged();
+    
+    // Spatial navigation helper - unified for all directions
+    std::string findWindowInDirection(const std::string& currentWindow, int direction) const;
+    // direction: 0=right, 1=left, 2=down, 3=up
     
     // Modular focus outline system - call from within window Begin/End context
     void drawWindowOutline();

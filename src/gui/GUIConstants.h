@@ -18,23 +18,22 @@ namespace GUIConstants {
     
     // Background colors
     namespace Background {
-        constexpr ImVec4 Window = ImVec4(0.15f, 0.15f, 0.15f, 0.4f);
-        constexpr ImVec4 Child = ImVec4(0.01f, 0.01f, 0.01f, 0.6f);
+        constexpr ImVec4 Window = ImVec4(0.5f, 0.5f, 0.5f, 0.05f);
+        constexpr ImVec4 Child = ImVec4(0.01f, 0.01f, 0.01f, 0.25f);
         constexpr ImVec4 Popup = ImVec4(0.1f, 0.1f, 0.1f, 0.95f);
         constexpr ImVec4 MenuBar = ImVec4(0.0f, 0.0f, 0.0f, 0.8f);
         constexpr ImVec4 Title = ImVec4(0.01f, 0.01f, 0.01f, 0.65f);
-        constexpr ImVec4 TitleActive = ImVec4(0.01f, 0.01f, 0.1f, 0.65f);
+        constexpr ImVec4 TitleActive = ImVec4(0.5f, 0.01f, 0.5f, 0.65f);
         constexpr ImVec4 DockingEmpty = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
         constexpr ImVec4 DockingPreview = ImVec4(0.9f, 0.1f, 0.1f, 0.4f); // Blue preview when docking, matches Button::Hovered theme
         constexpr ImVec4 ModalDim = ImVec4(0.0f, 0.0f, 0.0f, 0.5f);
         
         // Table/Grid backgrounds
-        constexpr ImVec4 TableHeader = ImVec4(0.01f, 0.01f, 0.01f, 0.8f);
+        constexpr ImVec4 TableHeader = ImVec4(0.01f, 0.01f, 0.01f, 0.65f);
         constexpr ImVec4 TableRow = ImVec4(0.0f, 0.0f, 0.0f, 0.05f);
         constexpr ImVec4 TableRowAlt = ImVec4(0.0f, 0.0f, 0.0f, 0.1f);
         constexpr ImVec4 TableRowFilled = ImVec4(0.01f, 0.01f, 0.01f, 0.5f);
         constexpr ImVec4 TableRowEmpty = ImVec4(0.05f, 0.05f, 0.05f, 0.05f); // Reduced opacity for empty rows
-        constexpr ImVec4 StepNumber = ImVec4(0.05f, 0.05f, 0.05f, 0.8f);
         
         // Waveform
         constexpr ImVec4 Waveform = ImVec4(0.0f, 0.0f, 0.0f, 0.55f); // ~100/255 alpha

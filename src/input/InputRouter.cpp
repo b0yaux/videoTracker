@@ -99,22 +99,12 @@ void InputRouter::setShowGUI(bool* showGUI_) {
 }
 
 void InputRouter::update() {
-    // Check for Tab/Shift+Tab for panel navigation
-    // Only when ImGui doesn't want keyboard focus (not in text fields)
-    // This avoids conflicts with text input while allowing panel navigation
-    ImGuiIO& io = ImGui::GetIO();
+    // OLD: Tab/Shift+Tab panel navigation (replaced with Cmd+Left/Right Arrow)
+    // Tab navigation conflicted with ImGui defaults and was inconsistent
+    // New system: Use Cmd+Left/Right Arrow keys for lightweight window cycling
+    // Implementation: See handleKeyPress() for Cmd+Arrow navigation
     
-    // Only handle Tab navigation when not in a text field
-    if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_Tab, false) && viewManager) {
-        bool shiftPressed = io.KeyShift;
-        if (shiftPressed) {
-            viewManager->previousPanel();
-            ofLogNotice("InputRouter") << "[TAB] ✅ Handled Shift+Tab - Previous Panel";
-        } else {
-            viewManager->nextPanel();
-            ofLogNotice("InputRouter") << "[TAB] ✅ Handled Tab - Next Panel";
-        }
-    }
+    // No active logic needed here - window navigation now handled in handleKeyPress()
 }
 
 bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
@@ -175,12 +165,11 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         bool visible = viewManager->isConsoleVisible();
         viewManager->setConsoleVisible(!visible);
         
-        // Sync Console's internal state and navigate to console panel when showing
+        // Sync Console's internal state and navigate to console window when showing
         if (!visible && console) {
             console->open();
-            // Navigate to console panel - Panel enum is defined in ViewManager.h (global namespace)
-            // We can access it directly since it's in the global namespace
-            viewManager->navigateToPanel(Panel::CONSOLE);
+            // Navigate to console window using window name
+            viewManager->navigateToWindow("Console");
         } else if (visible && console) {
             console->close();
         }
@@ -194,9 +183,9 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         bool visible = viewManager->isAssetLibraryVisible();
         viewManager->setAssetLibraryVisible(!visible);
         
-        // Navigate to Asset Library panel when showing
+        // Navigate to Asset Library window when showing
         if (!visible) {
-            viewManager->navigateToPanel(Panel::ASSET_LIBRARY);
+            viewManager->navigateToWindow("Asset Library");
         }
         
         logKeyPress(key, "Global: Cmd+L Toggle Asset Library");
@@ -208,9 +197,9 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         bool visible = viewManager->isFileBrowserVisible();
         viewManager->setFileBrowserVisible(!visible);
         
-        // Navigate to File Browser panel when showing
+        // Navigate to File Browser window when showing
         if (!visible) {
-            viewManager->navigateToPanel(Panel::FILE_BROWSER);
+            viewManager->navigateToWindow("File Browser");
         }
         
         logKeyPress(key, "Global: Cmd+B Toggle File Browser");
@@ -223,6 +212,30 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
             commandBar->toggle();
             logKeyPress(key, "Global: Cmd+'=' Toggle Command Bar");
             return true; // Consume the key
+        }
+    }
+    
+    // Priority 1: Window Navigation - Cmd+Arrow Keys (spatial navigation)
+    if (cmdPressed && viewManager) {
+        if (key == OF_KEY_LEFT) {
+            viewManager->previousWindow();
+            logKeyPress(key, "Navigation: Cmd+Left Arrow - Previous Window");
+            return true;
+        }
+        if (key == OF_KEY_RIGHT) {
+            viewManager->nextWindow(); 
+            logKeyPress(key, "Navigation: Cmd+Right Arrow - Next Window");
+            return true;
+        }
+        if (key == OF_KEY_UP) {
+            viewManager->upWindow();
+            logKeyPress(key, "Navigation: Cmd+Up Arrow - Up Window");
+            return true;
+        }
+        if (key == OF_KEY_DOWN) {
+            viewManager->downWindow();
+            logKeyPress(key, "Navigation: Cmd+Down Arrow - Down Window");
+            return true;
         }
     }
     
