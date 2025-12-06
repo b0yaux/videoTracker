@@ -491,6 +491,131 @@ bool TrackerSequencer::duplicateRange(int fromStep, int toStep, int destinationS
     return getCurrentPattern().duplicateRange(fromStep, toStep, destinationStep);
 }
 
+// Static clipboard definition (must be defined outside class)
+TrackerSequencer::StepClipboard TrackerSequencer::clipboard;
+
+//--------------------------------------------------------------
+// Clipboard operations
+//--------------------------------------------------------------
+void TrackerSequencer::copySteps(int fromStep, int toStep) {
+    if (!isValidStep(fromStep) || !isValidStep(toStep)) {
+        ofLogWarning("TrackerSequencer") << "Invalid step range for copy: " << fromStep << " to " << toStep;
+        return;
+    }
+    
+    if (fromStep > toStep) {
+        std::swap(fromStep, toStep);
+    }
+    
+    // Clear existing clipboard
+    clipboard.clear();
+    
+    // Copy steps to clipboard
+    for (int i = fromStep; i <= toStep; i++) {
+        clipboard.steps.push_back(getStep(i));
+    }
+    
+    clipboard.startStep = fromStep;
+    clipboard.endStep = toStep;
+    
+    ofLogNotice("TrackerSequencer") << "Copied " << (toStep - fromStep + 1) << " steps (" 
+                                     << (fromStep + 1) << "-" << (toStep + 1) << ")";
+}
+
+void TrackerSequencer::cutSteps(int fromStep, int toStep) {
+    if (!isValidStep(fromStep) || !isValidStep(toStep)) {
+        ofLogWarning("TrackerSequencer") << "Invalid step range for cut: " << fromStep << " to " << toStep;
+        return;
+    }
+    
+    if (fromStep > toStep) {
+        std::swap(fromStep, toStep);
+    }
+    
+    // Copy steps to clipboard first
+    copySteps(fromStep, toStep);
+    
+    // Then clear the steps
+    clearStepRange(fromStep, toStep);
+    
+    ofLogNotice("TrackerSequencer") << "Cut " << (toStep - fromStep + 1) << " steps (" 
+                                     << (fromStep + 1) << "-" << (toStep + 1) << ")";
+}
+
+bool TrackerSequencer::pasteSteps(int destinationStep) {
+    if (clipboard.isEmpty()) {
+        ofLogWarning("TrackerSequencer") << "Clipboard is empty, nothing to paste";
+        return false;
+    }
+    
+    if (!isValidStep(destinationStep)) {
+        ofLogWarning("TrackerSequencer") << "Invalid destination step for paste: " << destinationStep;
+        return false;
+    }
+    
+    // Check if paste would exceed pattern bounds
+    int numSteps = (int)clipboard.steps.size();
+    if (destinationStep + numSteps > getStepCount()) {
+        ofLogWarning("TrackerSequencer") << "Paste would exceed pattern bounds. Pattern has " 
+                                          << getStepCount() << " steps, paste requires " 
+                                          << (destinationStep + numSteps) << " steps";
+        return false;
+    }
+    
+    // Paste steps from clipboard
+    for (size_t i = 0; i < clipboard.steps.size(); i++) {
+        int targetStep = destinationStep + (int)i;
+        if (isValidStep(targetStep)) {
+            setStep(targetStep, clipboard.steps[i]);
+        }
+    }
+    
+    ofLogNotice("TrackerSequencer") << "Pasted " << numSteps << " steps starting at step " 
+                                     << (destinationStep + 1);
+    return true;
+}
+
+void TrackerSequencer::duplicateSteps(int fromStep, int toStep, int destinationStep) {
+    // Wrapper around duplicateRange for consistency with other clipboard operations
+    if (!isValidStep(fromStep) || !isValidStep(toStep) || !isValidStep(destinationStep)) {
+        ofLogWarning("TrackerSequencer") << "Invalid step range for duplicate: " << fromStep 
+                                          << " to " << toStep << " at " << destinationStep;
+        return;
+    }
+    
+    if (fromStep > toStep) {
+        std::swap(fromStep, toStep);
+    }
+    
+    // Use existing duplicateRange method
+    if (duplicateRange(fromStep, toStep, destinationStep)) {
+        ofLogNotice("TrackerSequencer") << "Duplicated " << (toStep - fromStep + 1) << " steps (" 
+                                         << (fromStep + 1) << "-" << (toStep + 1) 
+                                         << ") to step " << (destinationStep + 1);
+    } else {
+        ofLogWarning("TrackerSequencer") << "Failed to duplicate steps";
+    }
+}
+
+void TrackerSequencer::clearStepRange(int fromStep, int toStep) {
+    if (!isValidStep(fromStep) || !isValidStep(toStep)) {
+        ofLogWarning("TrackerSequencer") << "Invalid step range for clear: " << fromStep << " to " << toStep;
+        return;
+    }
+    
+    if (fromStep > toStep) {
+        std::swap(fromStep, toStep);
+    }
+    
+    // Clear each step in the range
+    for (int i = fromStep; i <= toStep; i++) {
+        clearStep(i);
+    }
+    
+    ofLogNotice("TrackerSequencer") << "Cleared " << (toStep - fromStep + 1) << " steps (" 
+                                     << (fromStep + 1) << "-" << (toStep + 1) << ")";
+}
+
 // Timing and playback control
 void TrackerSequencer::processAudioBuffer(ofSoundBuffer& buffer) {
     // Sample-accurate step timing based on this TrackerSequencer's own stepsPerBeat

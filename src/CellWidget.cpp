@@ -9,6 +9,9 @@
 #include <cctype>
 #include <limits>
 
+// Static clipboard definition (shared across all CellWidget instances)
+std::string CellWidget::cellClipboard;
+
 CellWidget::CellWidget() 
     : editing_(false), bufferState_(EditBufferState::None),
       originalValue_(NAN), shouldRefocus_(false), dragging_(false), dragStartY_(0.0f), dragStartX_(0.0f), lastDragValue_(0.0f) {
@@ -64,6 +67,68 @@ void CellWidget::clearCell() {
     if (onValueRemoved) {
         onValueRemoved(parameterName);
     }
+}
+
+//--------------------------------------------------------------
+// Cell-level clipboard operations
+//--------------------------------------------------------------
+void CellWidget::copyCellValue() {
+    if (!getCurrentValue) {
+        cellClipboard.clear();
+        return;
+    }
+    
+    float value = getCurrentValue();
+    
+    // Format value using custom formatter if available, otherwise use default
+    if (formatValue) {
+        cellClipboard = formatValue(value);
+    } else {
+        cellClipboard = getDefaultFormatValue(value);
+    }
+}
+
+bool CellWidget::pasteCellValue() {
+    if (cellClipboard.empty()) {
+        return false;
+    }
+    
+    // Parse clipboard value using custom parser if available, otherwise use default
+    float value;
+    if (parseValue) {
+        value = parseValue(cellClipboard);
+    } else {
+        value = getDefaultParseValue(cellClipboard);
+    }
+    
+    // Check if parsed value is valid (not NaN)
+    if (std::isnan(value)) {
+        return false;
+    }
+    
+    // Clamp to valid range
+    value = std::max(minVal, std::min(maxVal, value));
+    
+    // For integer parameters, round to nearest integer
+    if (isInteger) {
+        value = std::round(value);
+    }
+    
+    // Apply value via callback
+    if (onValueApplied) {
+        onValueApplied(parameterName, value);
+        return true;
+    }
+    
+    return false;
+}
+
+void CellWidget::cutCellValue() {
+    // Copy first
+    copyCellValue();
+    
+    // Then clear the cell
+    clearCell();
 }
 
 void CellWidget::setValueRange(float min, float max, float defaultValue) {
@@ -1122,6 +1187,31 @@ void CellWidget::processInputInDraw(bool actuallyFocused) {
                     deleteChar();
                     applyBufferWithFallback();
                 }
+            }
+            
+            // Clipboard operations for individual cell values (cmd+C/V/X)
+            // These work for any cell, not just tracker-specific
+            ImGuiIO& io = ImGui::GetIO();
+            bool cmdOrCtrlPressed = io.KeyCtrl || io.KeySuper; // Support both Ctrl and Cmd (Super)
+            
+            // cmd+C / ctrl+C: Copy cell value
+            if (cmdOrCtrlPressed && (ImGui::IsKeyPressed(ImGuiKey_C, false))) {
+                copyCellValue();
+            }
+            
+            // cmd+V / ctrl+V: Paste cell value
+            if (cmdOrCtrlPressed && (ImGui::IsKeyPressed(ImGuiKey_V, false))) {
+                if (pasteCellValue()) {
+                    // Successfully pasted - enter edit mode to show the pasted value
+                    if (!editing_) {
+                        enterEditMode();
+                    }
+                }
+            }
+            
+            // cmd+X / ctrl+X: Cut cell value (copy then clear)
+            if (cmdOrCtrlPressed && (ImGui::IsKeyPressed(ImGuiKey_X, false))) {
+                cutCellValue();
             }
             
             // Keypad keys (for numpad support) - use unified character input handler

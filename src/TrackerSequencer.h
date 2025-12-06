@@ -118,6 +118,28 @@ public:
     // Returns true if successful, false if range is invalid
     bool duplicateRange(int fromStep, int toStep, int destinationStep);
     
+    // Clipboard operations for step copy/paste/cut
+    // StepClipboard: stores copied/cut steps for paste operations
+    struct StepClipboard {
+        std::vector<Step> steps;  // Copied steps
+        int startStep = -1;       // Original start position (for reference)
+        int endStep = -1;         // Original end position (for reference)
+        
+        bool isEmpty() const { return steps.empty(); }
+        void clear() { 
+            steps.clear(); 
+            startStep = -1; 
+            endStep = -1; 
+        }
+    };
+    
+    // Clipboard operations
+    void copySteps(int fromStep, int toStep);  // Copy range to clipboard
+    void cutSteps(int fromStep, int toStep);    // Cut range to clipboard (copy + clear)
+    bool pasteSteps(int destinationStep);       // Paste from clipboard, returns true if successful
+    void duplicateSteps(int fromStep, int toStep, int destinationStep);  // Duplicate range (uses duplicateRange)
+    void clearStepRange(int fromStep, int toStep);  // Clear multiple steps
+    
     // Multi-pattern support
     int getNumPatterns() const { return (int)patterns.size(); }
     int getCurrentPatternIndex() const { return currentPatternIndex; }
@@ -357,6 +379,9 @@ private:
     
     // Helper to determine if edit should be queued (during playback on current step)
     bool shouldQueueEdit(int editStep, int editColumn) const;
+    
+    // Static clipboard (shared across all TrackerSequencer instances)
+    static StepClipboard clipboard;
     
     // CellWidget adapter methods removed - moved to TrackerSequencerGUI
     // Use TrackerSequencerGUI::createParameterCellForColumn() instead

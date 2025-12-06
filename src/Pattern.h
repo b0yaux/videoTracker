@@ -104,6 +104,7 @@ public:
 private:
     std::vector<Step> steps;  // Step data for each row in the pattern
     std::vector<ColumnConfig> columnConfig;  // Per-pattern column configuration
+    std::vector<Step> overflowSteps;  // Store steps that were cut off when reducing step count
     
     bool isValidStep(int stepIndex) const {
         return stepIndex >= 0 && stepIndex < (int)steps.size();

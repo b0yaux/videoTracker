@@ -212,6 +212,15 @@ private:
     // Value removal helper (public so GUI can call it via callback if needed)
     void removeParameter();
     
+    // Cell-level clipboard operations (for individual cell copy/paste)
+    // Static clipboard shared across all CellWidget instances
+    static std::string cellClipboard;
+    
+    // Clipboard operations for individual cell values
+    void copyCellValue();  // Copy current cell value to clipboard (as formatted text)
+    bool pasteCellValue(); // Paste from clipboard and apply to cell, returns true if successful
+    void cutCellValue();   // Copy then clear cell
+    
     // Color helpers
     ImU32 getFillBarColor() const;
     ImU32 getRedOutlineColor() const;

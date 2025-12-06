@@ -95,6 +95,42 @@ private:
     // Track last step triggered when paused (to prevent repeated triggers)
     int lastTriggeredStepWhenPaused;
     
+    // Multi-step selection state for copy/paste/cut operations
+    struct SelectionState {
+        int anchorStep = -1;      // Selection anchor (where shift was first pressed)
+        int currentStep = -1;     // Current selection end
+        bool isSelecting = false; // Whether shift is held
+        
+        int getStartStep() const { 
+            if (anchorStep < 0 || currentStep < 0) return -1;
+            return std::min(anchorStep, currentStep); 
+        }
+        int getEndStep() const { 
+            if (anchorStep < 0 || currentStep < 0) return -1;
+            return std::max(anchorStep, currentStep); 
+        }
+        bool hasSelection() const { 
+            return anchorStep >= 0 && currentStep >= 0 && anchorStep != currentStep; 
+        }
+        bool hasSingleStep() const {
+            return anchorStep >= 0 && currentStep >= 0 && anchorStep == currentStep;
+        }
+        void clear() { 
+            anchorStep = -1; 
+            currentStep = -1; 
+            isSelecting = false; 
+        }
+        void setAnchor(int step) { 
+            anchorStep = step; 
+            currentStep = step; 
+            isSelecting = true;
+        }
+        void extendTo(int step) { 
+            currentStep = step; 
+        }
+    };
+    SelectionState selectionState;
+    
     // Row outline tracking for step number hover
     struct RowOutlineState {
         int step;

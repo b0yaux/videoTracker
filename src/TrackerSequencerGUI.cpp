@@ -10,6 +10,7 @@
 #include "gui/GUIConstants.h"
 #include <cmath>  // For std::round
 #include <limits>  // For std::numeric_limits
+#include <algorithm>  // For std::max, std::min
 #include <set>
 #include <map>
 
@@ -623,10 +624,20 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
         });
         
         // After all cells in row are drawn, update row outline XMax if needed
-        if (pendingRowOutline.shouldDraw && pendingRowOutline.step == step) {
-            ImVec2 lastCellMin = ImGui::GetCursorScreenPos();
-            float lastCellWidth = ImGui::GetColumnWidth();
-            pendingRowOutline.rowXMax = lastCellMin.x + lastCellWidth + 1;
+        // For multi-row selection, update XMax for any row in the selection (last row will have final value)
+        if (pendingRowOutline.shouldDraw) {
+            bool isInSelection = false;
+            if (selectionState.hasSelection()) {
+                int selectionStart = selectionState.getStartStep();
+                int selectionEnd = selectionState.getEndStep();
+                isInSelection = (step >= selectionStart && step <= selectionEnd);
+            }
+            // Update XMax for single row selection or any row in multi-row selection
+            if (pendingRowOutline.step == step || isInSelection) {
+                ImVec2 lastCellMin = ImGui::GetCursorScreenPos();
+                float lastCellWidth = ImGui::GetColumnWidth();
+                pendingRowOutline.rowXMax = lastCellMin.x + lastCellWidth + 1;
+            }
         }
     }
     
@@ -800,16 +811,46 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
     bool isFocused = ImGui::IsItemFocused();
     bool shouldShowOutline = isSelected || (isFocused && !cellFocusState.isEditing && cellFocusState.row >= 0);
     
-    if (shouldShowOutline) {
-        if (isSelected) {
+    // Check if this step is part of a multi-row selection
+    bool isInSelection = false;
+    int selectionStart = -1;
+    int selectionEnd = -1;
+    if (selectionState.hasSelection()) {
+        selectionStart = selectionState.getStartStep();
+        selectionEnd = selectionState.getEndStep();
+        isInSelection = (step >= selectionStart && step <= selectionEnd);
+    }
+    
+    if (shouldShowOutline || isInSelection) {
+        if (isSelected || isInSelection) {
             // Store row outline info to draw after all cells are drawn
-            // Store Y position and first cell X position - XMax will be updated after all cells are drawn
-            pendingRowOutline.shouldDraw = true;
-            pendingRowOutline.step = step;
-            pendingRowOutline.rowYMin = cellMin.y - 1;
-            pendingRowOutline.rowYMax = cellMax.y + 1;
-            pendingRowOutline.rowXMin = cellMin.x - 1; // Store first cell X position
-            pendingRowOutline.rowXMax = cellMax.x + 1; // Will be updated after all cells drawn
+            // For multi-row selection, expand Y bounds to include all selected rows
+            if (isInSelection && selectionState.hasSelection()) {
+                // Multi-row selection: expand Y bounds
+                if (!pendingRowOutline.shouldDraw) {
+                    // First row in selection: initialize bounds
+                    pendingRowOutline.shouldDraw = true;
+                    pendingRowOutline.step = step;
+                    pendingRowOutline.rowYMin = cellMin.y - 1;
+                    pendingRowOutline.rowYMax = cellMax.y + 1;
+                    pendingRowOutline.rowXMin = cellMin.x - 1; // Store first cell X position
+                    pendingRowOutline.rowXMax = cellMax.x + 1; // Will be updated after all cells drawn
+                } else {
+                    // Subsequent row in selection: expand Y bounds
+                    pendingRowOutline.rowYMin = std::min(pendingRowOutline.rowYMin, cellMin.y - 1);
+                    pendingRowOutline.rowYMax = std::max(pendingRowOutline.rowYMax, cellMax.y + 1);
+                    // X bounds should be consistent (use first/last cell positions)
+                    // rowXMin stays at first cell, rowXMax will be updated after all cells drawn
+                }
+            } else {
+                // Single row selection: use existing logic
+                pendingRowOutline.shouldDraw = true;
+                pendingRowOutline.step = step;
+                pendingRowOutline.rowYMin = cellMin.y - 1;
+                pendingRowOutline.rowYMax = cellMax.y + 1;
+                pendingRowOutline.rowXMin = cellMin.x - 1; // Store first cell X position
+                pendingRowOutline.rowXMax = cellMax.x + 1; // Will be updated after all cells drawn
+            }
             
             // Static cached colors for row outline (calculated once at initialization)
             static ImU32 rowOrangeOutlineColor = GUIConstants::toU32(GUIConstants::Outline::Orange);
@@ -838,10 +879,198 @@ bool TrackerSequencerGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPr
     auto sequencer = getTrackerSequencer();
     if (!sequencer) return false;
     
+    // Use ImGui key detection for reliable clipboard operations (works across platforms)
+    ImGuiIO& io = ImGui::GetIO();
+    bool cmdOrCtrlPressed = io.KeyCtrl || io.KeySuper; // Support both Ctrl and Cmd (Super)
+    // Also check the passed ctrlPressed parameter as fallback (for OF key events)
+    if (!cmdOrCtrlPressed) {
+        cmdOrCtrlPressed = ctrlPressed;
+    }
+    
+    // CRITICAL: Step-level operations (copy/paste/cut/duplicate) only work when step number column is focused
+    // When parameter columns are focused (column != 0), CellWidget handles individual cell copy/paste
+    bool isStepColumnFocused = (cellFocusState.hasFocus() && cellFocusState.column == 0);
+    
+    // Handle step-level clipboard and selection operations (only for step number column)
+    // Use both ImGui key detection and OF key codes for maximum compatibility
+    if (isStepColumnFocused) {
+        // cmd+C / ctrl+C: Copy selected steps (step-level operation)
+        bool cKeyPressed = ImGui::IsKeyPressed(ImGuiKey_C, false) || (key == 'c' || key == 'C');
+        if (cmdOrCtrlPressed && cKeyPressed) {
+            if (selectionState.hasSelection()) {
+                sequencer->copySteps(selectionState.getStartStep(), selectionState.getEndStep());
+                return true;
+            } else if (selectionState.hasSingleStep()) {
+                sequencer->copySteps(selectionState.anchorStep, selectionState.anchorStep);
+                return true;
+            } else if (cellFocusState.row >= 0) {
+                // Copy single step at current focus
+                sequencer->copySteps(cellFocusState.row, cellFocusState.row);
+                return true;
+            }
+            return false; // Nothing to copy
+        }
+        
+        // cmd+V / ctrl+V: Paste steps (step-level operation)
+        bool vKeyPressed = ImGui::IsKeyPressed(ImGuiKey_V, false) || (key == 'v' || key == 'V');
+        if (cmdOrCtrlPressed && vKeyPressed) {
+            if (cellFocusState.row >= 0) {
+                if (sequencer->pasteSteps(cellFocusState.row)) {
+                    // Clear selection after paste
+                    selectionState.clear();
+                    return true;
+                }
+            }
+            return false; // No valid paste destination
+        }
+        
+        // cmd+X / ctrl+X: Cut selected steps (step-level operation)
+        bool xKeyPressed = ImGui::IsKeyPressed(ImGuiKey_X, false) || (key == 'x' || key == 'X');
+        if (cmdOrCtrlPressed && xKeyPressed) {
+            if (selectionState.hasSelection()) {
+                sequencer->cutSteps(selectionState.getStartStep(), selectionState.getEndStep());
+                selectionState.clear();
+                return true;
+            } else if (selectionState.hasSingleStep()) {
+                sequencer->cutSteps(selectionState.anchorStep, selectionState.anchorStep);
+                selectionState.clear();
+                return true;
+            } else if (cellFocusState.row >= 0) {
+                // Cut single step at current focus
+                sequencer->cutSteps(cellFocusState.row, cellFocusState.row);
+                return true;
+            }
+            return false; // Nothing to cut
+        }
+        
+        // cmd+A / ctrl+A: Select all steps in current pattern
+        bool aKeyPressed = ImGui::IsKeyPressed(ImGuiKey_A, false) || (key == 'a' || key == 'A');
+        if (cmdOrCtrlPressed && aKeyPressed) {
+            int stepCount = sequencer->getStepCount();
+            if (stepCount > 0) {
+                selectionState.setAnchor(0);
+                selectionState.extendTo(stepCount - 1);
+                return true;
+            }
+            return false; // No steps to select
+        }
+        
+        // cmd+D / ctrl+D: Duplicate selected steps (step-level operation)
+        // Auto-expands pattern if duplication would exceed current step count
+        bool dKeyPressed = ImGui::IsKeyPressed(ImGuiKey_D, false) || (key == 'd' || key == 'D');
+        if (cmdOrCtrlPressed && dKeyPressed) {
+            if (selectionState.hasSelection()) {
+                int start = selectionState.getStartStep();
+                int end = selectionState.getEndStep();
+                int numSteps = end - start + 1;
+                int dest = end + 1;  // Paste after selection
+                int currentStepCount = sequencer->getStepCount();
+                
+                // Auto-expand pattern if duplication would exceed bounds
+                if (dest + numSteps > currentStepCount) {
+                    int newStepCount = dest + numSteps;
+                    sequencer->setStepCount(newStepCount);
+                }
+                
+                sequencer->duplicateSteps(start, end, dest);
+                // Extend selection to include duplicated steps
+                selectionState.extendTo(dest + numSteps - 1);
+                return true;
+            } else if (selectionState.hasSingleStep()) {
+                int dest = selectionState.anchorStep + 1;
+                int currentStepCount = sequencer->getStepCount();
+                
+                // Auto-expand pattern if duplication would exceed bounds
+                if (dest >= currentStepCount) {
+                    int newStepCount = dest + 1;
+                    sequencer->setStepCount(newStepCount);
+                }
+                
+                sequencer->duplicateSteps(selectionState.anchorStep, selectionState.anchorStep, dest);
+                selectionState.extendTo(dest);
+                return true;
+            } else if (cellFocusState.row >= 0) {
+                // Duplicate single step at current focus
+                int dest = cellFocusState.row + 1;
+                int currentStepCount = sequencer->getStepCount();
+                
+                // Auto-expand pattern if duplication would exceed bounds
+                if (dest >= currentStepCount) {
+                    int newStepCount = dest + 1;
+                    sequencer->setStepCount(newStepCount);
+                }
+                
+                sequencer->duplicateSteps(cellFocusState.row, cellFocusState.row, dest);
+                return true;
+            }
+            return false; // Nothing to duplicate
+        }
+    } else if (cellFocusState.hasFocus() && cellFocusState.column != 0) {
+        // Parameter column focused - let CellWidget handle individual cell copy/paste
+        // Return false to allow CellWidget to process cmd+C/V/X
+        return false;
+    }
+    
+    // Backspace: Clear step (when not editing cell and on step column)
+    // Note: When on parameter columns, CellWidget handles Backspace for individual cells
+    if (key == OF_KEY_BACKSPACE && !cellFocusState.isEditing && isStepColumnFocused) {
+        if (selectionState.hasSelection()) {
+            sequencer->clearStepRange(selectionState.getStartStep(), selectionState.getEndStep());
+            selectionState.clear();
+            return true;
+        } else if (selectionState.hasSingleStep()) {
+            sequencer->clearStep(selectionState.anchorStep);
+            selectionState.clear();
+            return true;
+        } else if (cellFocusState.row >= 0) {
+            sequencer->clearStep(cellFocusState.row);
+            return true;
+        }
+        return false; // Nothing to clear
+    }
+    
+    // Shift + Arrow keys: Extend selection (only when pattern grid has focus)
+    if (shiftPressed && cellFocusState.hasFocus()) {
+        if (key == OF_KEY_UP || key == OF_KEY_DOWN) {
+            int currentStep = cellFocusState.row;
+            int newStep = currentStep;
+            
+            if (key == OF_KEY_UP) {
+                newStep = std::max(0, currentStep - 1);
+            } else if (key == OF_KEY_DOWN) {
+                newStep = std::min(sequencer->getStepCount() - 1, currentStep + 1);
+            }
+            
+            // Initialize selection if not already selecting
+            if (!selectionState.isSelecting) {
+                selectionState.setAnchor(currentStep);
+            }
+            
+            // Extend selection to new step
+            selectionState.extendTo(newStep);
+            
+            // Move focus to new step
+            setEditCell(newStep, cellFocusState.column);
+            
+            return true;
+        }
+    }
+    
+    // Clear selection when clicking/navigating without shift (handled in callbacks)
+    // But also clear if user presses a non-shift navigation key
+    if (!shiftPressed && (key == OF_KEY_UP || key == OF_KEY_DOWN || key == OF_KEY_LEFT || key == OF_KEY_RIGHT)) {
+        if (selectionState.isSelecting) {
+            selectionState.clear();
+        }
+    }
+    
     // PHASE 1: SINGLE INPUT PATH - CellWidget is sole input processor for cells
-    // If any cell has focus (pattern params or pattern grid), let CellWidget handle ALL input
+    // If any cell has focus (pattern params or pattern grid), let CellWidget handle remaining input
+    // BUT: We've already handled clipboard operations above, so only pass through if not handled
     if (patternParamsFocusState.hasFocus() || cellFocusState.hasFocus()) {
-        return false; // CellWidget will handle in processInputInDraw()
+        // CellWidget will handle remaining input in processInputInDraw()
+        // But we've already handled clipboard shortcuts above, so return false to let CellWidget handle other keys
+        return false;
     }
     
     // Only handle global shortcuts when no cell is focused
@@ -1066,31 +1295,41 @@ void TrackerSequencerGUI::setupHeaderCallbacks(CellGridCallbacks& callbacks, boo
         auto it = columnHeaderButtons.find(col);
         if (it != columnHeaderButtons.end() && !it->second.empty()) {
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
+            
+            // Calculate total button width including spacing
             float totalButtonWidth = 0.0f;
-            for (const auto& btn : it->second) {
+            for (size_t btnIdx = 0; btnIdx < it->second.size(); btnIdx++) {
+                const auto& btn = it->second[btnIdx];
                 std::string btnLabel = btn.getDynamicLabel ? btn.getDynamicLabel() : btn.label;
                 float btnWidth = ImGui::CalcTextSize(btnLabel.c_str()).x + 
                                 ImGui::GetStyle().FramePadding.x * 2.0f;
                 totalButtonWidth += btnWidth;
-                if (&btn != &it->second.back()) {
+                if (btnIdx < it->second.size() - 1) {
                     totalButtonWidth += BUTTON_SPACING; // Spacing between buttons
                 }
             }
             
-            float padding = ImGui::GetStyle().CellPadding.x;
+            // Calculate button start position: align to right edge of cell
+            // Use consistent padding that matches ImGui's table cell padding
+            float cellPadding = ImGui::GetStyle().CellPadding.x;
             float cellMaxX = cellStartPos.x + columnWidth;
-            float buttonStartX = cellMaxX - totalButtonWidth - padding;
+            float buttonStartX = cellMaxX - totalButtonWidth - cellPadding;
             
-            // Draw buttons from right to left
+            // Ensure buttons don't go outside cell bounds
+            buttonStartX = std::max(cellStartPos.x + cellPadding, buttonStartX);
+            
+            // Draw buttons from right to left (R button first, then L button if present)
             float currentX = buttonStartX;
             for (size_t btnIdx = 0; btnIdx < it->second.size(); btnIdx++) {
                 const auto& btn = it->second[btnIdx];
                 std::string btnLabel = btn.getDynamicLabel ? btn.getDynamicLabel() : btn.label;
                 std::string btnTooltip = btn.getDynamicTooltip ? btn.getDynamicTooltip() : btn.tooltip;
                 
+                // Recalculate button width to ensure consistency
                 float btnWidth = ImGui::CalcTextSize(btnLabel.c_str()).x + 
                                 ImGui::GetStyle().FramePadding.x * 2.0f;
                 
+                // Set cursor position for button (accounting for frame padding)
                 ImGui::SetCursorScreenPos(ImVec2(currentX, cellMinY));
                 
                 if (ImGui::SmallButton(btnLabel.c_str())) {
@@ -1103,6 +1342,7 @@ void TrackerSequencerGUI::setupHeaderCallbacks(CellGridCallbacks& callbacks, boo
                     ImGui::SetTooltip("%s", btnTooltip.c_str());
                 }
                 
+                // Move to next button position
                 currentX += btnWidth;
                 if (btnIdx < it->second.size() - 1) {
                     currentX += BUTTON_SPACING; // Spacing between buttons
@@ -1214,7 +1454,7 @@ void TrackerSequencerGUI::setupStateSyncCallbacks(CellGridCallbacks& callbacks, 
         }
     };
     
-    // Simple click callback for playback syncing only
+    // Simple click callback for playback syncing and selection management
     callbacks.onCellClicked = [this, &sequencer](int row, int col) {
         // TrackerSequencer-specific: When paused, sync playback position and trigger step (walk through)
         int previousStep = cellFocusState.row;
@@ -1222,6 +1462,25 @@ void TrackerSequencerGUI::setupStateSyncCallbacks(CellGridCallbacks& callbacks, 
         // Update minimal state needed for playback syncing
         cellFocusState.row = row;
         cellFocusState.column = col;
+        
+        // Handle selection state on click
+        ImGuiIO& io = ImGui::GetIO();
+        bool shiftPressed = io.KeyShift;
+        
+        if (shiftPressed) {
+            // Shift+click: extend selection
+            if (!selectionState.isSelecting) {
+                selectionState.setAnchor(previousStep >= 0 ? previousStep : row);
+            }
+            selectionState.extendTo(row);
+        } else {
+            // Normal click: clear selection or set single-step selection
+            if (selectionState.isSelecting) {
+                selectionState.clear();
+            }
+            // Set anchor for potential future shift+click
+            selectionState.setAnchor(row);
+        }
         
         bool stepChanged = (previousStep != row);
         bool fromHeaderRow = (previousStep == -1);

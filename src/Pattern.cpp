@@ -1,6 +1,7 @@
 #include "Pattern.h"
 #include "ofLog.h"
 #include "ofUtils.h"
+#include <algorithm>  // For std::min
 
 // Step implementation
 //--------------------------------------------------------------
@@ -189,12 +190,43 @@ void Pattern::setStepCount(int stepCount) {
     }
     
     size_t oldSize = steps.size();
-    steps.resize(stepCount);
     
-    // Initialize new steps
-    for (size_t i = oldSize; i < steps.size(); i++) {
-        steps[i] = Step();
+    if (stepCount < (int)oldSize) {
+        // Reducing step count: save overflow steps
+        // Get the steps that will be cut off in this reduction
+        std::vector<Step> newOverflow(steps.begin() + stepCount, steps.end());
+        
+        // Merge with existing overflow: new overflow (from lower indices in original pattern) goes at the beginning
+        // This preserves the original pattern order: [stepCount, stepCount+1, ..., oldSize-1]
+        overflowSteps.insert(overflowSteps.begin(), newOverflow.begin(), newOverflow.end());
+        
+        steps.resize(stepCount);
+        ofLogNotice("Pattern") << "Reduced pattern from " << oldSize << " to " << stepCount 
+                               << " steps (saved " << newOverflow.size() << " new overflow steps, total: " << overflowSteps.size() << ")";
+    } else if (stepCount > (int)oldSize) {
+        // Expanding step count: restore overflow steps if available
+        steps.resize(stepCount);
+        
+        // Restore overflow steps first (if any)
+        size_t overflowToRestore = std::min(overflowSteps.size(), 
+                                            (size_t)(stepCount - oldSize));
+        if (overflowToRestore > 0) {
+            for (size_t i = 0; i < overflowToRestore; i++) {
+                steps[oldSize + i] = overflowSteps[i];
+            }
+            // Remove restored steps from overflow buffer
+            overflowSteps.erase(overflowSteps.begin(), 
+                               overflowSteps.begin() + overflowToRestore);
+            ofLogNotice("Pattern") << "Expanded pattern from " << oldSize << " to " << stepCount 
+                                   << " steps (restored " << overflowToRestore << " overflow steps)";
+        }
+        
+        // Initialize any remaining new steps as empty
+        for (size_t i = oldSize + overflowToRestore; i < steps.size(); i++) {
+            steps[i] = Step();
+        }
     }
+    // If stepCount == oldSize, do nothing
 }
 
 void Pattern::doubleSteps() {
