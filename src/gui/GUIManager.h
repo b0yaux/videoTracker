@@ -92,6 +92,16 @@ public:
     ParameterRouter* getParameterRouter() const { return parameterRouter; }
     
     /**
+     * Set the connection manager (for connection-based parameter discovery)
+     */
+    void setConnectionManager(class ConnectionManager* manager);
+    
+    /**
+     * Get the connection manager
+     */
+    class ConnectionManager* getConnectionManager() const { return connectionManager; }
+    
+    /**
      * Sync GUI objects with registry (create/destroy as needed)
      * Call this when modules are added/removed from registry
      */
@@ -166,6 +176,7 @@ public:
 private:
     ModuleRegistry* registry = nullptr;
     ParameterRouter* parameterRouter = nullptr;
+    class ConnectionManager* connectionManager = nullptr;
     
     // Static registration map: typeName -> GUI creator function
     // Note: Implementation uses function-local static for initialization order safety

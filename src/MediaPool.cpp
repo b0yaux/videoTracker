@@ -2182,8 +2182,8 @@ std::vector<ParameterDescriptor> MediaPool::getParameters() const {
     int maxIndex = static_cast<int>(getNumPlayers()) - 1;
     if (maxIndex < 0) maxIndex = 0;  // Safety: at least 0
     params.push_back(ParameterDescriptor("index", ParameterType::INT, 0.0f, static_cast<float>(maxIndex), 0.0f, "Media Index"));
-    // Keep "note" as alias for backward compatibility, but use same dynamic range
-    params.push_back(ParameterDescriptor("note", ParameterType::INT, 0.0f, static_cast<float>(maxIndex), 0.0f, "Note"));
+    // Note: "note" is still handled in trigger events for backward compatibility, but not exposed as a parameter
+    // to avoid conflicts with TrackerSequencer's internal "note" parameter (musical notes)
     params.push_back(ParameterDescriptor("position", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Position"));
     params.push_back(ParameterDescriptor("speed", ParameterType::FLOAT, -10.0f, 10.0f, 1.0f, "Speed"));
     params.push_back(ParameterDescriptor("volume", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Volume"));

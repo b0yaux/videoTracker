@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <functional>
 
 // Forward declarations
@@ -48,6 +49,10 @@ public:
                                  Module::ConnectionType connectionType,
                                  ConnectionManager* connectionManager) override;
     
+    void onConnectionBroken(const std::string& targetModuleName,
+                           Module::ConnectionType connectionType,
+                           ConnectionManager* connectionManager) override;
+    
     // Initialize default pattern based on connected MediaPool (Phase 8.1)
     // Called after all modules are set up and connections are established
     void initializeDefaultPattern(class ModuleRegistry* registry, class ConnectionManager* connectionManager);
@@ -84,6 +89,15 @@ public:
     std::vector<Port> getInputPorts() const override;
     std::vector<Port> getOutputPorts() const override;
     
+    // Unified parameter registry for tracker-specific parameters
+    // Returns all tracker-specific parameters (index, note, length, chance)
+    // Note: index and length ranges are dynamic and need instance context
+    std::vector<ParameterDescriptor> getTrackerParameters() const;
+    
+    // Static helper to get tracker parameter descriptor (for static contexts)
+    // Returns descriptor with default ranges (caller should update ranges if needed)
+    static ParameterDescriptor getTrackerParameterDescriptor(const std::string& paramName);
+    
     // Expose TrackerSequencer parameters (for discovery by modules)
     // Combined: internal + external parameters
     // externalParams: optional list of external parameters from connected modules (provided by GUI layer)
@@ -93,8 +107,9 @@ public:
     // Static helper to get default parameters (for backward compatibility when no external params)
     static std::vector<ParameterDescriptor> getDefaultParameters();
     
-    // Static helper to get internal parameters (doesn't depend on instance state)
-    // Internal parameters: sequencer-specific (note, chance) - not sent to external modules
+    // DEPRECATED: Use getTrackerParameters() instead
+    // This method is kept for backward compatibility but will be removed in a future version
+    // @deprecated Use getTrackerParameters() which includes all tracker-specific parameters
     static std::vector<ParameterDescriptor> getInternalParameters();
     
     // Transport listener for Clock play/stop events
@@ -272,7 +287,7 @@ private:
     }
     bool isColumnFixed(int columnIndex) const {
         const auto& col = getCurrentPattern().getColumnConfig(columnIndex);
-        return !col.isRemovable;
+        return col.isRequired; // Fixed = required (not removable)
     }
     const ColumnConfig& getColumnConfig(int columnIndex) const { return getCurrentPattern().getColumnConfig(columnIndex); }
     int getColumnCount() const { return getCurrentPattern().getColumnCount(); }
@@ -345,6 +360,10 @@ private:
     
     // Connection management for index range discovery
     ConnectionManager* connectionManager_;  // Stored reference for querying connections
+    
+    // Connection tracking: store names of modules connected via EVENT connections
+    // Used to invalidate parameter cache when connections change
+    std::set<std::string> connectedModuleNames_;  // Names of modules connected via EVENT
     
     // Note: GUI state (showGUI, cell focus, etc.) is managed by TrackerSequencerGUI
     

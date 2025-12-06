@@ -1,7 +1,8 @@
 #include "TrackerSequencerGUI.h"
 // Note: TrackerSequencer.h is already included by TrackerSequencerGUI.h
 #include "CellWidget.h"
-#include "core/ModuleRegistry.h"
+#include "core/ModuleRegistry.h"  // Needed for registry->getModule() calls
+#include "core/ConnectionManager.h"  // Needed for ConnectionManager::ConnectionType and getConnectionsFrom()
 #include "gui/HeaderPopup.h"
 #include "gui/GUIManager.h"
 // ParameterCell.h no longer needed - ParameterCell is now an implementation detail of ModuleGUI
@@ -400,7 +401,7 @@ void TrackerSequencerGUI::drawPatternControls(TrackerSequencer& sequencer) {
                     sequencer.getCurrentPattern().setStepCount((int)value);
                 }
             );
-            widget.isRemovable = false;
+            widget.isRemovable = false;  // Pattern params are not removable (different from pattern grid columns)
             return widget;
         } else if (paramName == "stepsPerBeat") {
             ParameterDescriptor spbParam("stepsPerBeat", ParameterType::INT, 1, 96, 4, "Steps Per Beat");
@@ -413,7 +414,7 @@ void TrackerSequencerGUI::drawPatternControls(TrackerSequencer& sequencer) {
                     sequencer.setStepsPerBeat((int)value);
                 }
             );
-            widget.isRemovable = false;
+            widget.isRemovable = false;  // Pattern params are not removable (different from pattern grid columns)
             return widget;
         }
         
@@ -540,10 +541,12 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     std::vector<CellGridColumnConfig> tableColumnConfig;
     for (const auto& col : sequencer.getColumnConfiguration()) {
         // Index and Length columns should not be draggable and are not removable
-        bool isDraggable = (col.parameterName != "index" && col.parameterName != "length");
-        bool isRemovable = (col.parameterName != "index" && col.parameterName != "length");
+        bool isDraggable = !col.isRequired;  // Required columns (index, length) are not draggable
+        bool isRemovable = !col.isRequired;  // Use isRequired (inverted)
+        // Derive displayName from parameterName (capitalize first letter)
+        std::string displayName = col.getDisplayName();
         CellGridColumnConfig tableCol(
-            col.parameterName, col.displayName, isRemovable, col.columnIndex, isDraggable);
+            col.parameterName, displayName, isRemovable, col.columnIndex, isDraggable);
         tableColumnConfig.push_back(tableCol);
     }
     
@@ -556,7 +559,7 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     // Store header buttons per column for custom header rendering
     std::map<int, std::vector<HeaderButton>> columnHeaderButtons;
     
-    // Register header buttons
+    // Register header buttons based on column category/type
     // Column indexing system:
     // - Absolute indices: 0 = step number, 1 = index column, 2 = length column, 3+ = parameter columns
     // - All callbacks and CellGrid use absolute indices for consistency
@@ -565,16 +568,15 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     for (size_t i = 0; i < sequencer.getColumnConfiguration().size(); i++) {
         const auto& colConfig = sequencer.getColumnConfiguration()[i];
         int absoluteColIdx = (int)i + 1;  // Convert parameter-relative to absolute (1+)
-        bool isRemovable = (colConfig.parameterName != "index" && colConfig.parameterName != "length");
         
-        // Randomize button for all columns
+        // ALL columns get "R" (randomize) button - including index column (was missing before)
         HeaderButton randomizeBtn("R", "Randomize", [&sequencer, absoluteColIdx]() {
             sequencer.randomizeColumn(absoluteColIdx);
         });
         cellGrid.registerHeaderButton(absoluteColIdx, randomizeBtn);
         columnHeaderButtons[absoluteColIdx].push_back(randomizeBtn);
         
-        // Legato button for length column
+        // Length column additionally gets "L" (legato) button
         if (colConfig.parameterName == "length") {
             HeaderButton legatoBtn("L", "Legato", [&sequencer]() {
                 sequencer.applyLegato();
@@ -1101,31 +1103,52 @@ bool TrackerSequencerGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPr
 //--------------------------------------------------------------
 std::vector<ParameterDescriptor> TrackerSequencerGUI::queryExternalParameters(TrackerSequencer& sequencer) const {
     std::vector<ParameterDescriptor> externalParams;
-    ParameterRouter* router = getParameterRouter();
+    ConnectionManager* connectionManager = getConnectionManager();
     ModuleRegistry* registry = getRegistry();
     
-    if (!router || !registry) {
+    if (!connectionManager || !registry) {
+        // Only log once per frame to avoid spam - use static to track last log time
+        static float lastLogTime = 0.0f;
+        float currentTime = ofGetElapsedTimef();
+        if (currentTime - lastLogTime > 1.0f) {  // Log at most once per second
+            ofLogWarning("TrackerSequencerGUI") << "queryExternalParameters: Missing dependencies - "
+                                                << "ConnectionManager: " << (connectionManager ? "OK" : "NULL") 
+                                                << ", Registry: " << (registry ? "OK" : "NULL")
+                                                << " (instance: " << getInstanceName() << ")";
+            lastLogTime = currentTime;
+        }
         return externalParams; // Return empty if dependencies not available
     }
     
-    // Get internal parameter names to filter them out
-    auto internalParams = sequencer.getInternalParameters();
-    std::set<std::string> internalParamNames;
-    for (const auto& param : internalParams) {
-        internalParamNames.insert(param.name);
+    // Query parameters only from modules connected via EVENT connections
+    // This ensures we only show parameters from modules that this sequencer is actually connected to
+    // Use instance name from GUI instead of sequencer.getName() which returns type name
+    std::string sequencerName = getInstanceName();
+    if (sequencerName.empty()) {
+        // Fallback to sequencer.getName() if instance name not set (shouldn't happen)
+        sequencerName = sequencer.getName();
+        ofLogWarning("TrackerSequencerGUI") << "queryExternalParameters: Instance name empty, using type name: " << sequencerName;
     }
+    auto connections = connectionManager->getConnectionsFrom(sequencerName);
     
-    // Query all INSTRUMENT modules for their parameters
-    auto instruments = registry->getModulesByType(ModuleType::INSTRUMENT);
     std::map<std::string, ParameterDescriptor> uniqueParams;
     
-    for (const auto& instrument : instruments) {
-        auto instrumentParams = instrument->getParameters();
-        for (const auto& param : instrumentParams) {
-            // Skip internal parameters
-            if (internalParamNames.find(param.name) != internalParamNames.end()) {
-                continue;
-            }
+    for (const auto& conn : connections) {
+        // Only process EVENT connections (tracker -> instrument connections)
+        if (conn.type != ConnectionManager::ConnectionType::EVENT) {
+            continue;
+        }
+        
+        // Get the connected module
+        auto connectedModule = registry->getModule(conn.targetModule);
+        if (!connectedModule) {
+            continue;
+        }
+        
+        // Get parameters from this connected module
+        auto moduleParams = connectedModule->getParameters();
+        
+        for (const auto& param : moduleParams) {
             // Add parameter if not already seen (first occurrence wins)
             if (uniqueParams.find(param.name) == uniqueParams.end()) {
                 uniqueParams[param.name] = param;
@@ -1153,14 +1176,10 @@ void TrackerSequencerGUI::setupHeaderCallbacks(CellGridCallbacks& callbacks, boo
     };
     
     // Custom header rendering with context menu and swap popup
+    // UNIFIED: Now handles ALL columns (required and optional)
     callbacks.drawCustomHeader = [this, &sequencer, &columnHeaderButtons, &headerClickedThisFrame]
                                   (int col, const CellGridColumnConfig& colConfig, ImVec2 cellStartPos, float columnWidth, float cellMinY) -> bool {
-        // Only handle swap popup for removable columns
-        if (colConfig.parameterName == "index" || colConfig.parameterName == "length") {
-            return false; // Use default header rendering for fixed columns
-        }
-        
-        // Draw column name (left-aligned)
+        // Draw column name (left-aligned) for all columns
         ImGui::TableHeader(colConfig.displayName.c_str());
         
         // Check if header was clicked (for focus clearing)
@@ -1168,131 +1187,272 @@ void TrackerSequencerGUI::setupHeaderCallbacks(CellGridCallbacks& callbacks, boo
             headerClickedThisFrame = true;
         }
         
-        // Right-click context menu for column actions (must be called after TableHeader)
+        // UNIFIED: Right-click context menu for ALL columns (required and optional)
         std::string contextMenuId = "##ColumnContextMenu_" + std::to_string(col);
         if (ImGui::BeginPopupContextItem(contextMenuId.c_str())) {
             int columnConfigIndex = colConfig.columnIndex;
             
-            // Remove column option (only for removable columns)
-            if (colConfig.isRemovable) {
+            // Get actual ColumnConfig from sequencer to check category
+            const auto& sequencerCols = sequencer.getColumnConfiguration();
+            bool isRequiredCol = false;
+            ColumnCategory colCategory = ColumnCategory::PARAMETER;
+            if (columnConfigIndex >= 0 && columnConfigIndex < (int)sequencerCols.size()) {
+                const auto& actualCol = sequencerCols[columnConfigIndex];
+                isRequiredCol = actualCol.isRequired;
+                colCategory = actualCol.category;
+            }
+            
+            // Simple Add/Remove items (above column list)
+            // Add Column - try to add same column type, fallback to first available if can't duplicate
+            if (ImGui::MenuItem("Add Column")) {
+                std::string currentParamName = "";
+                ColumnCategory currentCategory = ColumnCategory::PARAMETER;
+                if (columnConfigIndex >= 0 && columnConfigIndex < (int)sequencerCols.size()) {
+                    currentParamName = sequencerCols[columnConfigIndex].parameterName;
+                    currentCategory = sequencerCols[columnConfigIndex].category;
+                }
+                
+                // Try to add same column type (only TRIGGER category allows duplicates)
+                bool added = false;
+                if (!currentParamName.empty() && currentCategory == ColumnCategory::TRIGGER) {
+                    std::string displayName = (currentParamName == "index") ? "Index" : 
+                                             (currentParamName == "note") ? "Note" : 
+                                             (currentParamName == "length") ? "Length" : currentParamName;
+                    sequencer.addColumn(currentParamName, displayName);
+                    added = true; // TRIGGER columns always allow duplicates
+                }
+                
+                // Fallback: find first available parameter
+                if (!added) {
+                    std::set<std::string> usedParamNames;
+                    for (const auto& col : sequencer.getColumnConfiguration()) {
+                        usedParamNames.insert(col.parameterName);
+                    }
+                    
+                    std::vector<ParameterDescriptor> externalParams = queryExternalParameters(sequencer);
+                    auto allParams = sequencer.getAvailableParameters(externalParams);
+                    
+                    for (const auto& param : allParams) {
+                        if (param.name == "index" || param.name == "length") continue; // Skip required
+                        if (usedParamNames.find(param.name) == usedParamNames.end()) {
+                            sequencer.addColumn(param.name, param.displayName);
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // Remove Column - only if this column is removable
+            if (!isRequiredCol) {
                 if (ImGui::MenuItem("Remove Column")) {
                     sequencer.removeColumn(columnConfigIndex);
                 }
             }
             
-            // Add column option (always available)
-            if (ImGui::BeginMenu("Add Column")) {
-                // Get available parameters (external only - internal params excluded)
-                auto internalParams = sequencer.getInternalParameters();
-                std::set<std::string> internalParamNames;
-                for (const auto& param : internalParams) {
-                    internalParamNames.insert(param.name);
-                }
+            ImGui::Separator();
+            
+            // Column visibility toggles (checkboxes for optional columns only, like View menu)
+            // Build map of used parameter names to their column indices
+            std::map<std::string, int> usedParamToColumnIndex;
+            for (const auto& col : sequencer.getColumnConfiguration()) {
+                usedParamToColumnIndex[col.parameterName] = col.columnIndex;
+            }
+            
+            // Helper lambda to show a parameter menu item
+            auto showParamItem = [&](const ParameterDescriptor& param) -> bool {
+                if (param.name == "index" || param.name == "length") return false; // Skip required
                 
-                // Build set of used parameter names
-                std::set<std::string> usedParamNames;
-                for (const auto& col : sequencer.getColumnConfiguration()) {
-                    usedParamNames.insert(col.parameterName);
-                }
-                
-                // Query external parameters
-                std::vector<ParameterDescriptor> externalParams = queryExternalParameters(sequencer);
-                
-                // Get all available parameters
-                auto allParams = sequencer.getAvailableParameters(externalParams);
-                
-                // Show available parameters that aren't already used
-                bool hasAvailableParams = false;
-                for (const auto& param : allParams) {
-                    // Skip internal parameters
-                    if (internalParamNames.find(param.name) != internalParamNames.end()) {
-                        continue;
-                    }
-                    // Skip already used parameters
-                    if (usedParamNames.find(param.name) != usedParamNames.end()) {
-                        continue;
-                    }
-                    
-                    hasAvailableParams = true;
-                    if (ImGui::MenuItem(param.displayName.c_str())) {
+                bool isColumnPresent = usedParamToColumnIndex.find(param.name) != usedParamToColumnIndex.end();
+                if (ImGui::MenuItem(param.displayName.c_str(), nullptr, isColumnPresent)) {
+                    if (isColumnPresent) {
+                        auto it = usedParamToColumnIndex.find(param.name);
+                        if (it != usedParamToColumnIndex.end()) {
+                            sequencer.removeColumn(it->second);
+                        }
+                    } else {
                         sequencer.addColumn(param.name, param.displayName);
                     }
                 }
-                
-                if (!hasAvailableParams) {
-                    ImGui::TextDisabled("No available parameters");
+                return true;
+            };
+            
+            bool hasItems = false;
+            
+            // Show internal parameters (sequencer-specific: index, note, chance)
+            // Count index/note columns for display
+            std::map<std::string, int> paramCounts;
+            for (const auto& col : sequencer.getColumnConfiguration()) {
+                if (col.parameterName == "index" || col.parameterName == "note") {
+                    paramCounts[col.parameterName]++;
                 }
+            }
+            
+            // Get tracker-specific parameters (index, note, length, chance)
+            auto trackerParams = sequencer.getTrackerParameters();
+            std::vector<ParameterDescriptor> internalOnlyParams;
+            std::set<std::string> internalParamNames; // Track to exclude from external
+            // Filter to only show index, note, chance (length is handled separately as required column)
+            for (const auto& param : trackerParams) {
+                if (param.name == "index" || param.name == "note" || param.name == "chance") {
+                    internalOnlyParams.push_back(param);
+                    internalParamNames.insert(param.name);
+                }
+            }
+            if (!internalOnlyParams.empty()) {
+                ImGui::Separator();
+                ImGui::TextDisabled("Internal");
+                for (const auto& param : internalOnlyParams) {
+                    // Show count for index/note columns
+                    std::string displayText = param.displayName;
+                    if ((param.name == "index" || param.name == "note") && paramCounts[param.name] > 0) {
+                        displayText += " (" + std::to_string(paramCounts[param.name]) + ")";
+                    }
+                    bool isColumnPresent = usedParamToColumnIndex.find(param.name) != usedParamToColumnIndex.end();
+                    if (ImGui::MenuItem(displayText.c_str(), nullptr, isColumnPresent)) {
+                        if (isColumnPresent) {
+                            auto it = usedParamToColumnIndex.find(param.name);
+                            if (it != usedParamToColumnIndex.end()) {
+                                sequencer.removeColumn(it->second);
+                            }
+                        } else {
+                            sequencer.addColumn(param.name, param.displayName);
+                        }
+                        hasItems = true;
+                    }
+                }
+            }
+            
+            // Show external parameters grouped by module
+            ConnectionManager* connectionManager = getConnectionManager();
+            ModuleRegistry* registry = getRegistry();
+            if (connectionManager && registry) {
+                std::string sequencerName = getInstanceName();
+                if (sequencerName.empty()) sequencerName = sequencer.getName();
                 
-                ImGui::EndMenu();
+                auto connections = connectionManager->getConnectionsFrom(sequencerName);
+                for (const auto& conn : connections) {
+                    if (conn.type != ConnectionManager::ConnectionType::EVENT) continue;
+                    
+                    auto connectedModule = registry->getModule(conn.targetModule);
+                    if (!connectedModule) continue;
+                    
+                    ImGui::Separator();
+                    ImGui::TextDisabled(conn.targetModule.c_str());
+                    
+                    for (const auto& param : connectedModule->getParameters()) {
+                        // Skip parameters that conflict with internal parameters
+                        if (internalParamNames.find(param.name) != internalParamNames.end()) {
+                            continue;
+                        }
+                        if (showParamItem(param)) hasItems = true;
+                    }
+                }
+            }
+            
+            if (!hasItems) {
+                ImGui::TextDisabled("No optional columns available");
             }
             
             ImGui::EndPopup();
         }
         
-        // Handle swap popup (draw every frame when open)
-        std::string popupId = "SwapPopup_" + std::to_string(col);
-        
-        // Check if popup should be opened (click or Enter on header)
-        bool headerClicked = ImGui::IsItemClicked(0);
-        bool enterPressed = ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter, false);
-        if (headerClicked || enterPressed) {
-            ImGui::OpenPopup(popupId.c_str());
-        }
-        
-        // Query external parameters from connected modules (GUI layer handles ParameterRouter dependency)
-        std::vector<ParameterDescriptor> externalParams = queryExternalParameters(sequencer);
-        
-        // Get available parameters (external only - internal params like "note" and "chance" are excluded from popup)
-        // Internal parameters are sequencer-specific and can't be swapped in external parameter columns
-        auto allParams = sequencer.getAvailableParameters(externalParams);
-        
-        // Get internal parameter names to filter them out from popup
-        auto internalParams = sequencer.getInternalParameters();
-        std::set<std::string> internalParamNames;
-        for (const auto& param : internalParams) {
-            internalParamNames.insert(param.name);
-        }
-        
-        // Build set of used parameter names (exclude current column)
-        std::set<std::string> usedParamNames;
-        for (const auto& col : sequencer.getColumnConfiguration()) {
-            usedParamNames.insert(col.parameterName);
-        }
-        
-        // Convert to HeaderPopup items, filtering out:
-        // 1. Internal parameters (note, chance) - these are sequencer-specific
-        // 2. Already used parameters
-        // Store parameter descriptors in a map for lookup by name
-        std::map<std::string, ParameterDescriptor> paramMap;
-        std::vector<HeaderPopup::PopupItem> items;
-        for (const auto& param : allParams) {
-            // Skip internal parameters - they shouldn't appear in external parameter column popup
-            if (internalParamNames.find(param.name) != internalParamNames.end()) {
-                continue;
-            }
-            // Skip already used parameters
-            if (usedParamNames.find(param.name) == usedParamNames.end()) {
-                items.push_back(HeaderPopup::PopupItem(param.name, param.displayName));
-                paramMap[param.name] = param; // Store for lookup
-            }
-        }
-        
-        // Draw popup (will only show if open)
-        // Use colConfig.columnIndex (index into sequencer's columnConfig) not absolute col index
+        // Handle swap popup (for optional columns and index/note columns)
+        const auto& sequencerCols = sequencer.getColumnConfiguration();
+        bool canSwap = false;
         int columnConfigIndex = colConfig.columnIndex;
-        HeaderPopup::draw(popupId, items, columnWidth, cellStartPos,
-                         [&sequencer, columnConfigIndex, paramMap](const std::string& paramName) {
-                             // Look up display name from the parameter map
-                             std::string displayName;
-                             auto it = paramMap.find(paramName);
-                             if (it != paramMap.end()) {
-                                 displayName = it->second.displayName;
-                             }
-                             sequencer.swapColumnParameter(columnConfigIndex, paramName, displayName);
-                         });
+        if (columnConfigIndex >= 0 && columnConfigIndex < (int)sequencerCols.size()) {
+            const auto& actualCol = sequencerCols[columnConfigIndex];
+            // Allow swapping: optional parameter columns, or index/note columns (to swap between them)
+            canSwap = (!actualCol.isRequired && actualCol.isParameterColumn()) || 
+                      (actualCol.parameterName == "index" || actualCol.parameterName == "note");
+        }
+        
+        if (canSwap) {
+            std::string popupId = "SwapPopup_" + std::to_string(col);
+            
+            // Check if popup should be opened (click or Enter on header)
+            bool headerClicked = ImGui::IsItemClicked(0);
+            bool enterPressed = ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+            if (headerClicked || enterPressed) {
+                ImGui::OpenPopup(popupId.c_str());
+            }
+            
+            // Check if this is an index/note column (can swap between them)
+            bool isIndexNoteColumn = false;
+            if (columnConfigIndex >= 0 && columnConfigIndex < (int)sequencerCols.size()) {
+                const auto& actualCol = sequencerCols[columnConfigIndex];
+                isIndexNoteColumn = (actualCol.parameterName == "index" || actualCol.parameterName == "note");
+            }
+            
+            std::map<std::string, ParameterDescriptor> paramMap;
+            std::vector<HeaderPopup::PopupItem> items;
+            
+            if (isIndexNoteColumn) {
+                // For index/note columns, show only the opposite option
+                const auto& actualCol = sequencerCols[columnConfigIndex];
+                
+                // Use unified registry for parameter descriptors
+                auto trackerParams = sequencer.getTrackerParameters();
+                if (actualCol.parameterName == "index") {
+                    // Currently index, show note option
+                    for (const auto& param : trackerParams) {
+                        if (param.name == "note") {
+                            items.push_back(HeaderPopup::PopupItem("note", "Note"));
+                            paramMap["note"] = param;
+                            break;
+                        }
+                    }
+                } else {
+                    // Currently note, show index option
+                    for (const auto& param : trackerParams) {
+                        if (param.name == "index") {
+                            items.push_back(HeaderPopup::PopupItem("index", "Index"));
+                            paramMap["index"] = param;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                // For other columns, show external parameters
+                std::vector<ParameterDescriptor> externalParams = queryExternalParameters(sequencer);
+                auto allParams = sequencer.getAvailableParameters(externalParams);
+                
+                std::set<std::string> usedParamNames;
+                for (const auto& col : sequencer.getColumnConfiguration()) {
+                    usedParamNames.insert(col.parameterName);
+                }
+                
+                for (const auto& param : allParams) {
+                    // Skip internal parameters (chance, note, index) - they're only for index/note columns
+                    if (param.name == "chance" || param.name == "note" || param.name == "index") {
+                        continue;
+                    }
+                    // Skip already used parameters
+                    if (usedParamNames.find(param.name) == usedParamNames.end()) {
+                        items.push_back(HeaderPopup::PopupItem(param.name, param.displayName));
+                        paramMap[param.name] = param;
+                    }
+                }
+            }
+            
+            // Draw popup (will only show if open)
+            HeaderPopup::draw(popupId, items, columnWidth, cellStartPos,
+                             [&sequencer, columnConfigIndex, paramMap](const std::string& paramName) {
+                                 // Look up display name from the parameter map
+                                 std::string displayName;
+                                 auto it = paramMap.find(paramName);
+                                 if (it != paramMap.end()) {
+                                     displayName = it->second.displayName;
+                                 }
+                                 sequencer.swapColumnParameter(columnConfigIndex, paramName, displayName);
+                             });
+        }
         
         // Draw header buttons manually (since we're using custom header renderer)
-        auto it = columnHeaderButtons.find(col);
+        // NOTE: 'col' is parameter column index (0-based), but buttons are registered with absolute indices
+        // Convert to absolute index: absolute = col + 1 (col 0 is step number, parameter columns start at 1)
+        int absoluteColIdx = col + 1;
+        auto it = columnHeaderButtons.find(absoluteColIdx);
         if (it != columnHeaderButtons.end() && !it->second.empty()) {
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
             
@@ -1355,22 +1515,13 @@ void TrackerSequencerGUI::setupHeaderCallbacks(CellGridCallbacks& callbacks, boo
         return true; // Header was drawn by custom renderer
     };
     
-    // Custom column sizing: index and length columns use fixed width, others stretch
+    // UNIFIED column sizing: All columns use WidthStretch with equal weight
+    // User can resize columns manually, and ImGui will save/restore widths in imgui.ini
     callbacks.setupParameterColumn = [](int colIndex, const CellGridColumnConfig& colConfig, int absoluteColIndex) -> bool {
-        ImGuiTableColumnFlags flags = 0;
-        float widthOrWeight = 0.0f;
+        ImGuiTableColumnFlags flags = ImGuiTableColumnFlags_WidthStretch;
+        float widthOrWeight = 1.0f;  // Equal weight for all columns
         
-        // Index and length columns: fixed width with reasonable defaults
-        if (colConfig.parameterName == "index" || colConfig.parameterName == "length") {
-            flags = ImGuiTableColumnFlags_WidthFixed;
-            widthOrWeight = INDEX_LENGTH_COLUMN_WIDTH;
-        } else {
-            // Other parameter columns: stretch to fill available space
-            flags = ImGuiTableColumnFlags_WidthStretch;
-            widthOrWeight = 1.0f;
-        }
-        
-        // Disable reordering for non-draggable columns
+        // Disable reordering for non-draggable columns (required columns like index, length)
         if (!colConfig.isDraggable) {
             flags |= ImGuiTableColumnFlags_NoReorder;
         }
@@ -1540,25 +1691,39 @@ CellWidget TrackerSequencerGUI::createParameterCellForColumn(TrackerSequencer& s
     
     // Configure basic properties
     cell.parameterName = col.parameterName;
-    cell.isRemovable = col.isRemovable; // Columns (index, length) cannot be removed
-    if (!col.isRemovable) {
+    cell.isRemovable = !col.isRequired; // Use isRequired (inverted)
+    if (col.isRequired) {
         // Required columns (index, length) are always integers
         cell.isInteger = true;
         cell.stepIncrement = 1.0f;
     }
     
-    // Set value range based on column type
-    if (!col.isRemovable && col.parameterName == "index") {
-        // Index column: 0 = rest, 1+ = media index (1-based display)
-        int maxIndex = sequencer.getIndexRange();
-        cell.setValueRange(0.0f, (float)maxIndex, 0.0f);
-        cell.getMaxIndex = [&sequencer]() { return sequencer.getIndexRange(); };
-    } else if (!col.isRemovable && col.parameterName == "length") {
-        // Length column: 1 to pattern stepCount range (dynamic)
-        int maxLength = sequencer.getStepCount();
-        cell.setValueRange((float)MIN_LENGTH_VALUE, (float)maxLength, 1.0f);
-    } else {
-        // Dynamic parameter column - use parameter ranges
+    // Set value range based on column type - use unified parameter registry
+    auto trackerParams = sequencer.getTrackerParameters();
+    bool isTrackerParam = false;
+    for (const auto& trackerParam : trackerParams) {
+        if (trackerParam.name == col.parameterName) {
+            // Tracker parameter: use registry with dynamic ranges
+            if (col.parameterName == "index") {
+                // Index: allow -1 for empty state (displayed as "--")
+                cell.setValueRange(-1.0f, trackerParam.maxValue, -1.0f);
+                cell.getMaxIndex = [&sequencer]() { return sequencer.getIndexRange(); };
+            } else if (col.parameterName == "note") {
+                // Note: allow -1 for empty state (displayed as "--")
+                cell.setValueRange(-1.0f, trackerParam.maxValue, -1.0f);
+            } else {
+                // Length, chance: use registry ranges
+                cell.setValueRange(trackerParam.minValue, trackerParam.maxValue, trackerParam.defaultValue);
+            }
+            cell.isInteger = (trackerParam.type == ParameterType::INT);
+            cell.stepIncrement = cell.isInteger ? 1.0f : 0.01f;
+            isTrackerParam = true;
+            break;
+        }
+    }
+    
+    if (!isTrackerParam) {
+        // External parameter column - use parameter ranges
         auto range = TrackerSequencer::getParameterRange(col.parameterName);
         float defaultValue = TrackerSequencer::getParameterDefault(col.parameterName);
         cell.setValueRange(range.first, range.second, defaultValue);
@@ -1592,8 +1757,8 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
     
     const auto& col = columnConfig[paramColIdx];
     std::string paramName = col.parameterName; // Capture by value for lambda
-    bool isRequiredCol = !col.isRemovable; // Capture by value
-    std::string requiredTypeCol = !col.isRemovable ? col.parameterName : ""; // Capture by value
+    bool isRequiredCol = col.isRequired; // Capture by value
+    std::string requiredTypeCol = col.isRequired ? col.parameterName : ""; // Capture by value
     
     // getCurrentValue callback - returns current value from Step
     // Returns NaN to indicate empty/not set (will display as "--")
@@ -1616,6 +1781,11 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
                 return std::numeric_limits<float>::quiet_NaN(); // Use NaN instead of -1.0f
             }
             return (float)stepData.length;
+        } else if (paramName == "note") {
+            // Note column: return NaN when empty (note < 0), otherwise return note value
+            // Use direct field access for performance (note is now a direct field)
+            int noteValue = stepData.note;
+            return (noteValue < 0) ? std::numeric_limits<float>::quiet_NaN() : (float)noteValue;
         } else {
             // Dynamic parameter: return NaN if parameter doesn't exist (will display as "--")
             // This allows parameters with negative ranges (like speed -10 to 10) to distinguish
@@ -1645,6 +1815,10 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             // Length: clamp to 1 to pattern stepCount (dynamic)
             int maxLength = sequencer.getStepCount();
             stepData.length = std::max(1, std::min(maxLength, (int)std::round(value)));
+        } else if (paramName == "note") {
+            // Note: store -1 for empty (NaN), otherwise store the note value
+            // Use direct field access for performance (note is now a direct field)
+            stepData.note = std::isnan(value) ? -1 : (int)std::round(value);
         } else {
             // Dynamic parameter
             stepData.setParameterValue(paramName, value);
@@ -1670,9 +1844,14 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             }
             sequencer.setStep(step, stepData);
         } else {
-            // Removable parameter - remove it
+            // Removable parameter - remove it (or set to -1 for note)
             Step stepData = sequencer.getStep(step);
-            stepData.removeParameter(paramName);
+            if (paramName == "note") {
+                // Use direct field access for performance (note is now a direct field)
+                stepData.note = -1;
+            } else {
+                stepData.removeParameter(paramName);
+            }
             sequencer.setStep(step, stepData);
         }
     };
@@ -1709,6 +1888,24 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             snprintf(buf, sizeof(buf), "%02d", lengthVal); // Zero-padded to 2 digits
             return std::string(buf);
         };
+    } else if (paramName == "note") {
+        // Note column: format as note name (C4, C#5, etc.), NaN = "--"
+        cell.formatValue = [](float value) -> std::string {
+            if (std::isnan(value) || value < 0) {
+                return "--";
+            }
+            int noteNum = (int)std::round(value);
+            if (noteNum < 0 || noteNum > 127) {
+                return "--";
+            }
+            
+            // MIDI note names
+            static const char* noteNames[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+            int octave = noteNum / 12;
+            int note = noteNum % 12;
+            
+            return std::string(noteNames[note]) + std::to_string(octave);
+        };
     } else {
         // Dynamic parameter: use TrackerSequencer's formatting
         cell.formatValue = [paramName](float value) -> std::string {
@@ -1744,6 +1941,41 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             } catch (...) {
                 return std::numeric_limits<float>::quiet_NaN();
             }
+        };
+    } else if (paramName == "note") {
+        // Note: parse note name (C4, C#5, etc.) or number, handle "--" as NaN
+        cell.parseValue = [](const std::string& str) -> float {
+            if (str == "--" || str.empty()) {
+                return std::numeric_limits<float>::quiet_NaN();
+            }
+            
+            // Try parsing as note name (C4, C#5, etc.)
+            static const char* noteNames[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+            for (int i = 0; i < 12; i++) {
+                std::string noteName = noteNames[i];
+                if (str.length() > noteName.length() && str.substr(0, noteName.length()) == noteName) {
+                    try {
+                        int octave = std::stoi(str.substr(noteName.length()));
+                        int noteNum = octave * 12 + i;
+                        if (noteNum >= 0 && noteNum <= 127) {
+                            return (float)noteNum;
+                        }
+                    } catch (...) {
+                        break;
+                    }
+                }
+            }
+            
+            // Fall back to parsing as number
+            try {
+                int val = std::stoi(str);
+                if (val >= 0 && val <= 127) {
+                    return (float)val;
+                }
+            } catch (...) {
+            }
+            
+            return std::numeric_limits<float>::quiet_NaN();
         };
     }
     // Dynamic parameters use ParameterCell's default parsing (expression evaluation)

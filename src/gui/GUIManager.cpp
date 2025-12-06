@@ -1,6 +1,7 @@
 #include "GUIManager.h"
 #include "core/ModuleRegistry.h"
 #include "core/ParameterRouter.h"
+#include "core/ConnectionManager.h"
 #include "ofLog.h"
 #include <imgui.h>
 #include <algorithm>
@@ -50,6 +51,31 @@ void GUIManager::setParameterRouter(ParameterRouter* router) {
     parameterRouter = router;
 }
 
+void GUIManager::setConnectionManager(ConnectionManager* manager) {
+    if (!manager) {
+        ofLogWarning("GUIManager") << "setConnectionManager called with null pointer!";
+        connectionManager = nullptr;
+        return;
+    }
+    
+    connectionManager = manager;
+    ofLogNotice("GUIManager") << "setConnectionManager called with valid pointer: " << (void*)manager;
+    
+    // Update all existing GUIs with the ConnectionManager
+    int updatedCount = 0;
+    for (auto& pair : allGUIs) {
+        if (pair.second) {
+            pair.second->setConnectionManager(connectionManager);
+            updatedCount++;
+        }
+    }
+    if (updatedCount > 0) {
+        ofLogNotice("GUIManager") << "Updated " << updatedCount << " existing GUIs with ConnectionManager";
+    } else {
+        ofLogNotice("GUIManager") << "setConnectionManager: No existing GUIs to update (will be set on new GUIs)";
+    }
+}
+
 /**
  * Sync GUI objects with registry (create/destroy as needed)
  * 
@@ -87,6 +113,10 @@ void GUIManager::syncWithRegistry() {
                     ofLogNotice("GUIManager") << "Creating GUI for instance: " << name;
                     gui->setRegistry(registry);
                     gui->setParameterRouter(parameterRouter);
+                    gui->setConnectionManager(connectionManager);
+                    if (!connectionManager) {
+                        ofLogWarning("GUIManager") << "WARNING: Creating GUI for " << name << " but ConnectionManager is null!";
+                    }
                     gui->setInstanceName(name);
                     allGUIs[name] = std::move(gui);
                     

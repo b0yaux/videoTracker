@@ -192,6 +192,30 @@ void TrackerSequencer::onConnectionEstablished(const std::string& targetModuleNa
     if (!connectionManager_) {
         connectionManager_ = connectionManager;
     }
+    
+    // Track connected module for parameter discovery
+    connectedModuleNames_.insert(targetModuleName);
+    
+    ofLogNotice("TrackerSequencer") << "Connection established to " << targetModuleName 
+                                    << " (total connected: " << connectedModuleNames_.size() << ")";
+}
+
+void TrackerSequencer::onConnectionBroken(const std::string& targetModuleName,
+                                          Module::ConnectionType connectionType,
+                                          ConnectionManager* connectionManager) {
+    // Only react to EVENT connections (tracker -> pool connections)
+    if (connectionType != Module::ConnectionType::EVENT) {
+        return;
+    }
+    
+    // Remove from connection tracking
+    connectedModuleNames_.erase(targetModuleName);
+    
+    ofLogNotice("TrackerSequencer") << "Connection broken to " << targetModuleName 
+                                    << " (remaining connected: " << connectedModuleNames_.size() << ")";
+    
+    // Note: Parameter cache invalidation will be handled by GUI layer
+    // when it queries parameters next time (connection-aware query will exclude this module)
 }
 
 //--------------------------------------------------------------
@@ -934,11 +958,9 @@ void TrackerSequencer::triggerStep(int step) {
     
     // Check chance parameter (internal) - only trigger if random roll succeeds
     // Chance is 0-100, default 100 (always trigger)
-    int chance = 100;
-    if (stepData.hasParameter("chance")) {
-        chance = (int)std::round(stepData.getParameterValue("chance", 100.0f));
-        chance = std::max(0, std::min(100, chance)); // Clamp to 0-100
-    }
+    // Use direct field access for performance (chance is now a direct field)
+    int chance = stepData.chance;
+    chance = std::max(0, std::min(100, chance)); // Clamp to 0-100 (safety check)
     
     // Roll for chance (0-100)
     if (chance < 100) {
@@ -957,17 +979,13 @@ void TrackerSequencer::triggerStep(int step) {
         triggerEvt.parameters["note"] = -1.0f; // Rest/empty step
     }
     
-    // Get internal parameter names to exclude from trigger event
-    // Internal parameters (note, chance) are sequencer-specific and not sent to external modules
-    auto internalParams = getInternalParameters();
-    std::set<std::string> internalParamNames;
-    for (const auto& param : internalParams) {
-        internalParamNames.insert(param.name);
-    }
+    // Tracker-specific parameters that are NOT sent to external modules
+    // These are sequencer-specific: index, length, note, chance
+    std::set<std::string> trackerOnlyParams = {"index", "length", "note", "chance"};
     
     // MODULAR: Only send parameters that are in the current pattern's column configuration
     // This ensures we only send parameters that are actually displayed/used in the grid
-    // Skip internal parameters (note, chance) - they're sequencer-specific and not sent to modules
+    // Skip tracker-specific parameters - they're sequencer-specific and not sent to modules
     const auto& columnConfig = getCurrentPattern().getColumnConfiguration();
     std::set<std::string> columnParamNames;
     for (const auto& col : columnConfig) {
@@ -980,13 +998,13 @@ void TrackerSequencer::triggerStep(int step) {
     // Only send parameters that are both:
     // 1. In the step's parameterValues (explicitly set)
     // 2. In the current pattern's column configuration (actually displayed in grid)
-    // 3. Not internal parameters (note, chance)
+    // 3. Not tracker-specific parameters (index, length, note, chance)
     for (const auto& paramPair : stepData.parameterValues) {
         const std::string& paramName = paramPair.first;
         float paramValue = paramPair.second;
         
-        // Skip internal parameters - they're sequencer-specific and not sent to modules
-        if (internalParamNames.find(paramName) != internalParamNames.end()) {
+        // Skip tracker-specific parameters - they're sequencer-specific and not sent to modules
+        if (trackerOnlyParams.find(paramName) != trackerOnlyParams.end()) {
             continue;
         }
         
@@ -1149,6 +1167,42 @@ float TrackerSequencer::getParameter(const std::string& paramName) const {
 // Keyboard input handling has been moved to TrackerSequencerGUI::handleKeyPress()
 
 // Static helper to get internal parameters (doesn't depend on instance state)
+// Unified parameter registry for tracker-specific parameters
+std::vector<ParameterDescriptor> TrackerSequencer::getTrackerParameters() const {
+    std::vector<ParameterDescriptor> params;
+    
+    // Index: media index (dynamic range based on connected module)
+    int maxIndex = getIndexRange();
+    params.push_back(ParameterDescriptor("index", ParameterType::INT, 0.0f, (float)maxIndex, 0.0f, "Index"));
+    
+    // Note: MIDI note (0-127, can replace or work alongside index column)
+    params.push_back(ParameterDescriptor("note", ParameterType::INT, 0.0f, 127.0f, 60.0f, "Note"));
+    
+    // Length: step length (dynamic range based on pattern size)
+    int maxLength = getCurrentPattern().getStepCount();
+    params.push_back(ParameterDescriptor("length", ParameterType::INT, 1.0f, (float)maxLength, 1.0f, "Length"));
+    
+    // Chance: trigger probability (0-100, controls whether step triggers)
+    params.push_back(ParameterDescriptor("chance", ParameterType::INT, 0.0f, 100.0f, 100.0f, "Chance"));
+    
+    return params;
+}
+
+// Static helper to get tracker parameter descriptor (for static contexts)
+ParameterDescriptor TrackerSequencer::getTrackerParameterDescriptor(const std::string& paramName) {
+    if (paramName == "index") {
+        return ParameterDescriptor("index", ParameterType::INT, 0.0f, 127.0f, 0.0f, "Index");
+    } else if (paramName == "note") {
+        return ParameterDescriptor("note", ParameterType::INT, 0.0f, 127.0f, 60.0f, "Note");
+    } else if (paramName == "length") {
+        return ParameterDescriptor("length", ParameterType::INT, 1.0f, 16.0f, 1.0f, "Length");
+    } else if (paramName == "chance") {
+        return ParameterDescriptor("chance", ParameterType::INT, 0.0f, 100.0f, 100.0f, "Chance");
+    }
+    // Return empty descriptor for unknown parameters
+    return ParameterDescriptor();
+}
+
 std::vector<ParameterDescriptor> TrackerSequencer::getInternalParameters() {
     std::vector<ParameterDescriptor> params;
     
@@ -1176,31 +1230,27 @@ std::vector<ParameterDescriptor> TrackerSequencer::getDefaultParameters() {
 std::vector<ParameterDescriptor> TrackerSequencer::getAvailableParameters(const std::vector<ParameterDescriptor>& externalParams) const {
     std::vector<ParameterDescriptor> params;
     
-    // Start with internal parameters (now static, but called from instance method)
-    auto internalParams = TrackerSequencer::getInternalParameters();
-    params.insert(params.end(), internalParams.begin(), internalParams.end());
+    // Start with tracker-specific parameters (index, note, length, chance)
+    // These use dynamic ranges from the instance
+    auto trackerParams = getTrackerParameters();
+    params.insert(params.end(), trackerParams.begin(), trackerParams.end());
     
-    // Add external parameters if provided
+    // Add external parameters if provided (from connected modules)
     if (!externalParams.empty()) {
-        // Filter out any internal parameters that might be in external params (safety check)
-        auto internalParamNames = getInternalParameters();
-        std::set<std::string> internalNames;
-        for (const auto& param : internalParamNames) {
-            internalNames.insert(param.name);
+        // Filter out any tracker parameters that might be in external params (safety check)
+        std::set<std::string> trackerParamNames;
+        for (const auto& param : trackerParams) {
+            trackerParamNames.insert(param.name);
         }
         
-        // Use a map to deduplicate by name (external params take precedence over hardcoded defaults)
+        // Use a map to deduplicate by name
         std::map<std::string, ParameterDescriptor> uniqueParams;
         
-        // First add hardcoded defaults (for backward compatibility when external params don't cover them)
-        uniqueParams["position"] = ParameterDescriptor("position", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Position");
-        uniqueParams["speed"] = ParameterDescriptor("speed", ParameterType::FLOAT, -10.0f, 10.0f, 1.0f, "Speed");
-        uniqueParams["volume"] = ParameterDescriptor("volume", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Volume");
-        
-        // Then add external params (will overwrite hardcoded defaults if they have the same name)
+        // Add external params from connected modules (no hardcoded defaults)
+        // This ensures we only show parameters from modules that are actually connected
         for (const auto& param : externalParams) {
-            if (internalNames.find(param.name) == internalNames.end()) {
-                uniqueParams[param.name] = param; // External params take precedence
+            if (trackerParamNames.find(param.name) == trackerParamNames.end()) {
+                uniqueParams[param.name] = param;
             }
         }
         
@@ -1208,13 +1258,9 @@ std::vector<ParameterDescriptor> TrackerSequencer::getAvailableParameters(const 
         for (const auto& pair : uniqueParams) {
             params.push_back(pair.second);
         }
-    } else {
-        // Backward compatibility: if no external params provided, return hardcoded defaults
-        // This maintains existing behavior when external params are not available
-    params.push_back(ParameterDescriptor("position", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Position"));
-    params.push_back(ParameterDescriptor("speed", ParameterType::FLOAT, -10.0f, 10.0f, 1.0f, "Speed"));
-        params.push_back(ParameterDescriptor("volume", ParameterType::FLOAT, 0.0f, 2.0f, 1.0f, "Volume"));
     }
+    // If externalParams is empty, it means no modules are connected
+    // In this case, we only show tracker-specific parameters, maintaining true modularity
     
     return params;
 }
@@ -1281,18 +1327,14 @@ float TrackerSequencer::getCurrentBpm() const {
 // These use actual parameter ranges from getAvailableParameters() dynamically
 //--------------------------------------------------------------
 std::pair<float, float> TrackerSequencer::getParameterRange(const std::string& paramName) {
-    // Get parameters from static helpers (no temporary instance needed)
-    auto internalParams = getInternalParameters();
-    auto defaultParams = getDefaultParameters();
-    
-    // Check internal parameters first
-    for (const auto& param : internalParams) {
-        if (param.name == paramName) {
-            return std::make_pair(param.minValue, param.maxValue);
-        }
+    // Check tracker parameters first (index, note, length, chance)
+    auto trackerParam = getTrackerParameterDescriptor(paramName);
+    if (!trackerParam.name.empty()) {
+        return std::make_pair(trackerParam.minValue, trackerParam.maxValue);
     }
     
-    // Check default parameters
+    // Check default parameters (for backward compatibility)
+    auto defaultParams = getDefaultParameters();
     for (const auto& param : defaultParams) {
         if (param.name == paramName) {
             return std::make_pair(param.minValue, param.maxValue);
@@ -1305,18 +1347,14 @@ std::pair<float, float> TrackerSequencer::getParameterRange(const std::string& p
 
 // Static helper to get default value
 float TrackerSequencer::getParameterDefault(const std::string& paramName) {
-    // Get parameters from static helpers (no temporary instance needed)
-    auto internalParams = getInternalParameters();
-    auto defaultParams = getDefaultParameters();
-    
-    // Check internal parameters first
-    for (const auto& param : internalParams) {
-        if (param.name == paramName) {
-            return param.defaultValue;
-        }
+    // Check tracker parameters first (index, note, length, chance)
+    auto trackerParam = getTrackerParameterDescriptor(paramName);
+    if (!trackerParam.name.empty()) {
+        return trackerParam.defaultValue;
     }
     
-    // Check default parameters
+    // Check default parameters (for backward compatibility)
+    auto defaultParams = getDefaultParameters();
     for (const auto& param : defaultParams) {
         if (param.name == paramName) {
             return param.defaultValue;
@@ -1329,18 +1367,14 @@ float TrackerSequencer::getParameterDefault(const std::string& paramName) {
 
 // Get parameter type dynamically from static helpers
 ParameterType TrackerSequencer::getParameterType(const std::string& paramName) {
-    // Get parameters from static helpers (no temporary instance needed)
-    auto internalParams = getInternalParameters();
-    auto defaultParams = getDefaultParameters();
-    
-    // Check internal parameters first
-    for (const auto& param : internalParams) {
-        if (param.name == paramName) {
-            return param.type;
-        }
+    // Check tracker parameters first (index, note, length, chance)
+    auto trackerParam = getTrackerParameterDescriptor(paramName);
+    if (!trackerParam.name.empty()) {
+        return trackerParam.type;
     }
     
-    // Check default parameters
+    // Check default parameters (for backward compatibility)
+    auto defaultParams = getDefaultParameters();
     for (const auto& param : defaultParams) {
         if (param.name == paramName) {
             return param.type;

@@ -372,6 +372,25 @@ public:
         class ConnectionManager* connectionManager
     ) {}
     
+    /**
+     * Called by ConnectionManager when a connection is broken/disconnected
+     * Allows modules to react to runtime disconnections (e.g., invalidate caches, refresh state)
+     * 
+     * @param targetModuleName Name of the module that was disconnected from
+     * @param connectionType Type of connection that was broken (AUDIO, VIDEO, PARAMETER, EVENT)
+     * @param connectionManager ConnectionManager instance for querying connections
+     * 
+     * Default implementation does nothing - override in subclasses that need to react to disconnections.
+     * 
+     * This is called when connections are removed at runtime (e.g., via Console), allowing modules
+     * to clean up state and invalidate caches related to the disconnected module.
+     */
+    virtual void onConnectionBroken(
+        const std::string& targetModuleName,
+        ConnectionType connectionType,
+        class ConnectionManager* connectionManager
+    ) {}
+    
     // Get module type name for serialization (e.g., "TrackerSequencer", "MediaPool")
     // Default implementation returns getName() - override only if different
     virtual std::string getTypeName() const {

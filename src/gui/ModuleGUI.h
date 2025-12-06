@@ -57,6 +57,10 @@ public:
     void setParameterRouter(ParameterRouter* router) { this->parameterRouter = router; }
     ParameterRouter* getParameterRouter() const { return parameterRouter; }
     
+    // ConnectionManager connection
+    void setConnectionManager(class ConnectionManager* manager) { this->connectionManager = manager; }
+    class ConnectionManager* getConnectionManager() const { return connectionManager; }
+    
     // Get module type name (e.g., "TrackerSequencer", "MediaPool")
     // Returns empty string if module not found in registry
     std::string getModuleTypeName() const;
@@ -356,6 +360,7 @@ protected:
     bool visible_ = true;
     ModuleRegistry* registry = nullptr;
     ParameterRouter* parameterRouter = nullptr;
+    class ConnectionManager* connectionManager = nullptr;
     
 private:
     // Sync enabled state from backend module (implemented in .cpp)

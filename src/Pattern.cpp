@@ -7,7 +7,9 @@
 //--------------------------------------------------------------
 void Step::clear() {
     index = -1;
-    length = 1;  // Changed to int
+    length = 1;
+    note = -1;      // Reset to not set
+    chance = 100;   // Reset to default (always trigger)
     parameterValues.clear();
     
     // Don't set default parameters here - defaults come from MediaPool/MediaPlayer
@@ -15,6 +17,15 @@ void Step::clear() {
 }
 
 float Step::getParameterValue(const std::string& paramName, float defaultValue) const {
+    // Handle tracker-specific parameters stored as direct fields
+    if (paramName == "note") {
+        return (note >= 0) ? (float)note : defaultValue;
+    }
+    if (paramName == "chance") {
+        return (float)chance;
+    }
+    
+    // Handle external parameters stored in map
     auto it = parameterValues.find(paramName);
     if (it != parameterValues.end()) {
         return it->second;
@@ -23,21 +34,63 @@ float Step::getParameterValue(const std::string& paramName, float defaultValue) 
 }
 
 void Step::setParameterValue(const std::string& paramName, float value) {
+    // Handle tracker-specific parameters stored as direct fields
+    if (paramName == "note") {
+        note = (int)std::round(value);
+        // Also remove from map if it exists (for migration)
+        parameterValues.erase("note");
+        return;
+    }
+    if (paramName == "chance") {
+        chance = (int)std::round(std::max(0.0f, std::min(100.0f, value)));
+        // Also remove from map if it exists (for migration)
+        parameterValues.erase("chance");
+        return;
+    }
+    
+    // Handle external parameters stored in map
     parameterValues[paramName] = value;
 }
 
 bool Step::hasParameter(const std::string& paramName) const {
+    // Handle tracker-specific parameters stored as direct fields
+    if (paramName == "note") {
+        return note >= 0;  // Note is set if >= 0
+    }
+    if (paramName == "chance") {
+        return true;  // Chance is always present (defaults to 100)
+    }
+    
+    // Handle external parameters stored in map
     return parameterValues.find(paramName) != parameterValues.end();
 }
 
 void Step::removeParameter(const std::string& paramName) {
+    // Handle tracker-specific parameters stored as direct fields
+    if (paramName == "note") {
+        note = -1;  // Reset to not set
+        // Also remove from map if it exists (for migration)
+        parameterValues.erase("note");
+        return;
+    }
+    if (paramName == "chance") {
+        chance = 100;  // Reset to default
+        // Also remove from map if it exists (for migration)
+        parameterValues.erase("chance");
+        return;
+    }
+    
+    // Handle external parameters stored in map
     parameterValues.erase(paramName);
 }
 
 bool Step::operator==(const Step& other) const {
-    if (index != other.index || length != other.length) {
+    // Compare direct fields first
+    if (index != other.index || length != other.length || 
+        note != other.note || chance != other.chance) {
         return false;
     }
+    // Compare parameter values map
     if (parameterValues.size() != other.parameterValues.size()) {
         return false;
     }
@@ -260,11 +313,16 @@ ofJson Pattern::toJson() const {
         const auto& step = steps[i];
         stepJson["index"] = step.index;
         stepJson["length"] = step.length;
+        stepJson["note"] = step.note;      // Save as direct field
+        stepJson["chance"] = step.chance;   // Save as direct field
         
-        // Save parameter values
+        // Save parameter values (external parameters only, note/chance are now direct fields)
         ofJson paramJson = ofJson::object();
         for (const auto& pair : step.parameterValues) {
-            paramJson[pair.first] = pair.second;
+            // Skip note and chance if they exist in map (for backward compatibility during migration)
+            if (pair.first != "note" && pair.first != "chance") {
+                paramJson[pair.first] = pair.second;
+            }
         }
         stepJson["parameters"] = paramJson;
         patternArray.push_back(stepJson);
@@ -276,9 +334,12 @@ ofJson Pattern::toJson() const {
     for (const auto& col : columnConfig) {
         ofJson colJson;
         colJson["parameterName"] = col.parameterName;
-        colJson["displayName"] = col.displayName;
-        colJson["isRemovable"] = col.isRemovable;
+        // displayName removed - derived from parameterName via getDisplayName()
+        colJson["category"] = static_cast<int>(col.category);  // Save as int for enum
+        colJson["isRequired"] = col.isRequired;
         colJson["columnIndex"] = col.columnIndex;
+        // Also save isRemovable for backward compatibility
+        colJson["isRemovable"] = col.isRemovable();
         columnArray.push_back(colJson);
     }
     json["columnConfig"] = columnArray;
@@ -322,8 +383,35 @@ void Pattern::fromJson(const ofJson& json) {
             for (const auto& colJson : json["columnConfig"]) {
                 ColumnConfig col;
                 if (colJson.contains("parameterName")) col.parameterName = colJson["parameterName"];
-                if (colJson.contains("displayName")) col.displayName = colJson["displayName"];
-                if (colJson.contains("isRemovable")) col.isRemovable = colJson["isRemovable"];
+                // displayName removed - derived from parameterName via getDisplayName()
+                
+                // Load new fields (with backward compatibility)
+                if (colJson.contains("category") && colJson["category"].is_number()) {
+                    col.category = static_cast<ColumnCategory>(static_cast<int>(colJson["category"]));
+                } else {
+                    // Backward compatibility: infer category from parameter name
+                    if (col.parameterName == "index" || col.parameterName == "length") {
+                        col.category = ColumnCategory::TRIGGER;
+                    } else if (col.parameterName == "chance") {
+                        col.category = ColumnCategory::CONDITION;
+                    } else {
+                        col.category = ColumnCategory::PARAMETER;
+                    }
+                }
+                
+                if (colJson.contains("isRequired") && colJson["isRequired"].is_boolean()) {
+                    col.isRequired = colJson["isRequired"];
+                } else if (colJson.contains("isRemovable") && colJson["isRemovable"].is_boolean()) {
+                    // Backward compatibility: convert isRemovable to isRequired (inverted)
+                    col.isRequired = !colJson["isRemovable"];
+                } else {
+                    // Default: infer from parameter name
+                    col.isRequired = (col.parameterName == "index" || col.parameterName == "length");
+                }
+                
+                // isInternal is always inferred from parameter name (not serialized)
+                // chance and note are internal, everything else is external
+                
                 if (colJson.contains("columnIndex")) col.columnIndex = colJson["columnIndex"];
                 columnConfig.push_back(col);
             }
@@ -364,13 +452,30 @@ void Pattern::fromJson(const ofJson& json) {
         }
         // else: use default value (1) from Step constructor
         
+        // Load note and chance as direct fields (new format)
+        if (stepJson.contains("note") && !stepJson["note"].is_null()) {
+            step.note = stepJson["note"];
+        }
+        // else: use default value (-1) from Step constructor
+        
+        if (stepJson.contains("chance") && !stepJson["chance"].is_null()) {
+            step.chance = stepJson["chance"];
+        }
+        // else: use default value (100) from Step constructor
+        
         // Load parameter values (new format)
         if (stepJson.contains("parameters") && stepJson["parameters"].is_object()) {
             auto paramJson = stepJson["parameters"];
             for (auto it = paramJson.begin(); it != paramJson.end(); ++it) {
                 // Skip null parameter values
                 if (!it.value().is_null() && it.value().is_number()) {
-                    step.setParameterValue(it.key(), it.value());
+                    std::string paramName = it.key();
+                    // Backward compatibility: migrate note/chance from parameters map to direct fields
+                    if (paramName == "note" || paramName == "chance") {
+                        step.setParameterValue(paramName, it.value()); // This will set the direct field and remove from map
+                    } else {
+                        step.setParameterValue(paramName, it.value());
+                    }
                 }
             }
         } else {
@@ -395,28 +500,82 @@ void Pattern::fromJson(const ofJson& json) {
 //--------------------------------------------------------------
 void Pattern::initializeDefaultColumns() {
     columnConfig.clear();
-    // Required columns (not removable)
-    columnConfig.push_back(ColumnConfig("index", "Index", false, 0));      // isRemovable = false
-    columnConfig.push_back(ColumnConfig("length", "Length", false, 1));    // isRemovable = false
-    // Default parameter columns (removable)
-    columnConfig.push_back(ColumnConfig("position", "Position", true, 2));  // isRemovable = true
-    columnConfig.push_back(ColumnConfig("speed", "Speed", true, 3));  // isRemovable = true
-    columnConfig.push_back(ColumnConfig("volume", "Volume", true, 4));  // isRemovable = true
+    // TRIGGER COLUMNS (Required - what to play)
+    columnConfig.push_back(ColumnConfig("index", ColumnCategory::TRIGGER, true, 0));
+    columnConfig.push_back(ColumnConfig("length", ColumnCategory::TRIGGER, true, 1));
+    // PARAMETER COLUMNS (Optional - how to play)
+    columnConfig.push_back(ColumnConfig("position", ColumnCategory::PARAMETER, false, 2));
+    columnConfig.push_back(ColumnConfig("speed", ColumnCategory::PARAMETER, false, 3));
+    columnConfig.push_back(ColumnConfig("volume", ColumnCategory::PARAMETER, false, 4));
+    // Note: chance is CONDITION category, but not added by default (user can add it via context menu)
 }
 
 void Pattern::addColumn(const std::string& parameterName, const std::string& displayName, int position) {
-    // Don't allow duplicate parameter names
-    for (const auto& col : columnConfig) {
-        if (col.parameterName == parameterName) {
-            ofLogWarning("Pattern") << "Column for parameter '" << parameterName << "' already exists";
-            return;
+    // displayName parameter kept for API compatibility but ignored (derived from parameterName)
+    
+    // Infer category based on parameter name
+    ColumnCategory category = ColumnCategory::PARAMETER;
+    
+    if (parameterName == "index" || parameterName == "length" || parameterName == "note") {
+        category = ColumnCategory::TRIGGER;
+    } else if (parameterName == "chance") {
+        category = ColumnCategory::CONDITION;
+    } else {
+        // External parameters are PARAMETER category
+        category = ColumnCategory::PARAMETER;
+    }
+    
+    // Allow multiple index/note columns, but prevent duplicates for other parameters
+    if (category != ColumnCategory::TRIGGER) {
+        for (const auto& col : columnConfig) {
+            if (col.parameterName == parameterName) {
+                ofLogWarning("Pattern") << "Column for parameter '" << parameterName << "' already exists";
+                return;
+            }
         }
     }
     
-    int insertPos = (position < 0 || position >= (int)columnConfig.size()) ? (int)columnConfig.size() : position;
+    // New columns are optional (not required) by default
+    bool isRequired = false;
     
-    // Insert at specified position (new columns are removable by default)
-    columnConfig.insert(columnConfig.begin() + insertPos, ColumnConfig(parameterName, displayName, true, insertPos));
+    // Determine insertion position
+    int insertPos;
+    if (position >= 0 && position < (int)columnConfig.size()) {
+        // Explicit position specified
+        insertPos = position;
+    } else {
+        // Auto-position based on category
+        if (category == ColumnCategory::TRIGGER) {
+            // Find last TRIGGER column position
+            insertPos = 0;
+            for (size_t i = 0; i < columnConfig.size() && columnConfig[i].category == ColumnCategory::TRIGGER; i++) {
+                insertPos = (int)i + 1;
+                // If this is length, insert before it (unless we're adding length)
+                if (columnConfig[i].parameterName == "length" && parameterName != "length") {
+                    insertPos = (int)i;
+                    break;
+                }
+            }
+        } else if (category == ColumnCategory::CONDITION) {
+            // Insert after TRIGGER, before PARAMETER
+            insertPos = 0;
+            for (size_t i = 0; i < columnConfig.size(); i++) {
+                if (columnConfig[i].category == ColumnCategory::TRIGGER) {
+                    insertPos = (int)i + 1;
+                } else if (columnConfig[i].category == ColumnCategory::PARAMETER) {
+                    break;
+                } else if (columnConfig[i].category == ColumnCategory::CONDITION) {
+                    insertPos = (int)i + 1;
+                }
+            }
+        } else {
+            insertPos = (int)columnConfig.size();
+        }
+    }
+    
+    // Insert at calculated position
+    columnConfig.insert(columnConfig.begin() + insertPos, 
+                       ColumnConfig(parameterName, category, isRequired, insertPos));
     
     // Update column indices
     for (size_t i = 0; i < columnConfig.size(); i++) {
@@ -430,10 +589,24 @@ void Pattern::removeColumn(int columnIndex) {
         return;
     }
     
-    // Don't allow removing non-removable columns
-    if (!columnConfig[columnIndex].isRemovable) {
+    // Don't allow removing required columns
+    if (columnConfig[columnIndex].isRequired) {
         ofLogWarning("Pattern") << "Cannot remove required column: " << columnConfig[columnIndex].parameterName;
         return;
+    }
+    
+    // Ensure at least one index/note column remains
+    if (columnConfig[columnIndex].parameterName == "index" || columnConfig[columnIndex].parameterName == "note") {
+        int indexNoteCount = 0;
+        for (const auto& col : columnConfig) {
+            if (col.parameterName == "index" || col.parameterName == "note") {
+                indexNoteCount++;
+            }
+        }
+        if (indexNoteCount <= 1) {
+            ofLogWarning("Pattern") << "Cannot remove last index/note column. At least one is required.";
+            return;
+        }
     }
     
     // NOTE: We do NOT remove parameter values from steps when removing a column
@@ -473,8 +646,10 @@ void Pattern::swapColumnParameter(int columnIndex, const std::string& newParamet
         return;
     }
     
-    // Don't allow swapping non-removable columns
-    if (!columnConfig[columnIndex].isRemovable) {
+    // Don't allow swapping required columns (except index/note which can swap between each other)
+    bool isIndexNoteSwap = (columnConfig[columnIndex].parameterName == "index" || columnConfig[columnIndex].parameterName == "note") &&
+                           (newParameterName == "index" || newParameterName == "note");
+    if (columnConfig[columnIndex].isRequired && !isIndexNoteSwap) {
         ofLogWarning("Pattern") << "Cannot swap parameter for required column: " << columnConfig[columnIndex].parameterName;
         return;
     }
@@ -484,15 +659,16 @@ void Pattern::swapColumnParameter(int columnIndex, const std::string& newParamet
     // The column configuration only controls what's displayed in the grid, not what's stored
     // Old parameter values remain in steps and are saved/loaded with the pattern
     
-    // Update parameter name (this only changes what the column displays)
+    // Update parameter name and category if needed
     columnConfig[columnIndex].parameterName = newParameterName;
     
-    // Update display name
-    if (!newDisplayName.empty()) {
-        columnConfig[columnIndex].displayName = newDisplayName;
+    // Update category based on new parameter name
+    if (newParameterName == "index" || newParameterName == "length" || newParameterName == "note") {
+        columnConfig[columnIndex].category = ColumnCategory::TRIGGER;
+    } else if (newParameterName == "chance") {
+        columnConfig[columnIndex].category = ColumnCategory::CONDITION;
     } else {
-        // Use parameter name as fallback
-        columnConfig[columnIndex].displayName = newParameterName;
+        columnConfig[columnIndex].category = ColumnCategory::PARAMETER;
     }
 }
 

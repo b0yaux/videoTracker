@@ -15,6 +15,9 @@
 // Forward declarations to avoid circular dependency
 class MediaPlayer;
 class Clock;
+class ModuleRegistry;
+class ConnectionManager;
+class ParameterRouter;
 
 // Playback state machine enum
 // Simplified to 2 modes: IDLE (no playback) and PLAYING (any playback active)

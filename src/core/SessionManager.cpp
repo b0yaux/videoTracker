@@ -394,6 +394,11 @@ bool SessionManager::deserializeAll(const ofJson& json) {
     // Sync GUIManager after modules are loaded to ensure GUIs are created
     // This must happen after modules are loaded but before visibility state is restored
     if (guiManager_) {
+        // Ensure ConnectionManager is set on GUIManager before syncing
+        // (it should already be set in ofApp::setup(), but this is a safety check)
+        if (connectionManager_) {
+            guiManager_->setConnectionManager(connectionManager_);
+        }
         guiManager_->syncWithRegistry();
         ofLogNotice("SessionManager") << "Synced GUIManager after loading session modules";
         
@@ -931,6 +936,10 @@ void SessionManager::loadPendingImGuiState() {
         // This handles the case where modules were added after the session was saved
         // The GUIManager should have already synced, but we ensure windows are created
         if (guiManager_) {
+            // Ensure ConnectionManager is set before syncing (safety check)
+            if (connectionManager_) {
+                guiManager_->setConnectionManager(connectionManager_);
+            }
             guiManager_->syncWithRegistry();
             ofLogNotice("SessionManager") << "Synced GUIManager after loading ImGui state to ensure all modules have windows";
         }

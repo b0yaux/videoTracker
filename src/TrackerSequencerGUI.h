@@ -11,6 +11,7 @@ typedef unsigned int ImGuiID;
 typedef unsigned int ImU32;
 
 class ModuleRegistry;  // Forward declaration
+class ConnectionManager;  // Forward declaration
 
 // GUIState struct for passing GUI state to TrackerSequencer::handleKeyPress()
 // This is a temporary parameter struct - NOT a source of truth
@@ -194,7 +195,6 @@ private:
     static constexpr float BUTTON_HEIGHT = 16.0f;
     static constexpr float PATTERN_CELL_WIDTH = 32.0f;
     static constexpr float REPEAT_CELL_HEIGHT = 18.0f;
-    static constexpr float INDEX_LENGTH_COLUMN_WIDTH = 45.0f;
     static constexpr float STEP_NUMBER_COLUMN_WIDTH = 30.0f;
     static constexpr float SCROLLBAR_SIZE = 8.0f;
     static constexpr float OUTLINE_THICKNESS = 2.0f;
