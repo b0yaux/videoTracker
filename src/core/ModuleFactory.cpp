@@ -228,12 +228,14 @@ std::string ModuleFactory::generateInstanceName(const std::string& typeName, con
     std::string baseName = pascalToCamelCase(typeName);
     
     // Generate unique name by appending number
+    // Only check existingNames (from registry) - this is the source of truth for currently used names
+    // Don't check isHumanNameUsed() as factory's maps may contain stale data from removed modules
     int instanceNum = 1;
     std::string instanceName;
     do {
         instanceName = baseName + std::to_string(instanceNum);
         instanceNum++;
-    } while (existingNames.find(instanceName) != existingNames.end() || isHumanNameUsed(instanceName));
+    } while (existingNames.find(instanceName) != existingNames.end());
     
     return instanceName;
 }

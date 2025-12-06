@@ -520,9 +520,9 @@ void TrackerSequencer::processAudioBuffer(ofSoundBuffer& buffer) {
 void TrackerSequencer::onTimeEvent(TimeEvent& data) {
     if (!playbackState.isPlaying) return;
     
-    // Reset step accumulator on each beat to keep steps synchronized to beats
-    // Step timing is handled by processAudioBuffer() for sample accuracy
-    playbackState.sampleAccumulator = 0.0;
+    // Update BPM from beat event (for synchronization)
+    // DO NOT reset step accumulator - it's handled by processAudioBuffer() for sample accuracy
+    // Resetting here causes timing drift when beat events arrive at slightly different times
     playbackState.lastBpm = data.bpm;
 }
 

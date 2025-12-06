@@ -86,6 +86,10 @@ public:
     // AssetLibrary visibility
     void setAssetLibraryVisible(bool visible) { assetLibraryVisible_ = visible; }
     bool isAssetLibraryVisible() const { return assetLibraryVisible_; }
+    
+    // Master modules visibility (Clock + master outputs)
+    void setMasterModulesVisible(bool visible) { masterModulesVisible_ = visible; }
+    bool isMasterModulesVisible() const { return masterModulesVisible_; }
 
     // Mouse click detection and panel switching
     void handleMouseClick(int x, int y);
@@ -126,6 +130,7 @@ private:
     bool fileBrowserVisible_ = false;  // FileBrowser visibility state
     bool consoleVisible_ = false;  // Console visibility state
     bool assetLibraryVisible_ = false;  // AssetLibrary visibility state
+    bool masterModulesVisible_ = true;  // Master modules visibility state (clock + master outputs)
 
 
 
@@ -143,6 +148,7 @@ private:
     
     // Spatial navigation helper - unified for all directions
     std::string findWindowInDirection(const std::string& currentWindow, int direction) const;
+    std::string findAlignedCycleWindow(const std::string& currentWindow, int direction) const;
     // direction: 0=right, 1=left, 2=down, 3=up
     
     // Modular focus outline system - call from within window Begin/End context

@@ -1,4 +1,5 @@
 #include "MenuBar.h"
+#include "AddMenu.h"
 #include "ViewManager.h"
 #include "core/SessionManager.h"
 #include "core/ProjectManager.h"
@@ -12,7 +13,7 @@
 #include <set>
 
 MenuBar::MenuBar() {
-    initializeAvailableModules();
+
     // Set recent sessions path
     recentSessionsPath_ = ofFilePath::join(ofFilePath::getUserHomeDir(), "videoTracker_recent_sessions.json");
     loadRecentSessions();
@@ -76,11 +77,7 @@ void MenuBar::setup(
     ofLogNotice("MenuBar") << "Setup complete";
 }
 
-void MenuBar::initializeAvailableModules() {
-    availableModules.clear();
-    availableModules.push_back({"MediaPool", "Media Pool", "Video/audio media pool"});
-    availableModules.push_back({"TrackerSequencer", "Tracker Sequencer", "Step sequencer for patterns"});
-}
+
 
 void MenuBar::draw() {
     if (ImGui::BeginMainMenuBar()) {
@@ -120,21 +117,10 @@ void MenuBar::draw() {
         ImGui::EndPopup();
     }
     
-    // Add Module popup
-    drawAddModulePopup();
+
 }
 
-bool MenuBar::handleKeyPress(int key, bool shiftPressed) {
-    // MAJ+a (Shift+A) opens Add Module popup
-    if (shiftPressed && (key == 'A' || key == 'a')) {
-        showAddModulePopup = true;
-        // Reset filter and selection when opening
-        memset(addModuleFilter, 0, sizeof(addModuleFilter));
-        selectedModuleIndex = 0;
-        return true;
-    }
-    return false;
-}
+
 
 void MenuBar::drawFileMenu() {
     if (ImGui::BeginMenu("File")) {
@@ -288,10 +274,12 @@ void MenuBar::drawViewMenu() {
         bool fileBrowserVisible = false;
         bool consoleVisible = false;
         bool assetLibraryVisible = false;
+        bool masterModulesVisible = true;
         if (viewManager_) {
             fileBrowserVisible = viewManager_->isFileBrowserVisible();
             consoleVisible = viewManager_->isConsoleVisible();
             assetLibraryVisible = viewManager_->isAssetLibraryVisible();
+            masterModulesVisible = viewManager_->isMasterModulesVisible();
         }
         if (ImGui::MenuItem("Console", "Cmd+:", consoleVisible)) {
             if (onToggleConsole) onToggleConsole();
@@ -301,6 +289,18 @@ void MenuBar::drawViewMenu() {
         }
         if (ImGui::MenuItem("File Browser", "Cmd+B", fileBrowserVisible)) {
             if (onToggleFileBrowser) onToggleFileBrowser();
+        }
+        if (ImGui::MenuItem("Master Modules", "Cmd+Alt+M", masterModulesVisible)) {
+            // Toggle master modules visibility directly through ViewManager
+            if (viewManager_) {
+                bool visible = viewManager_->isMasterModulesVisible();
+                viewManager_->setMasterModulesVisible(!visible);
+                
+                // Navigate to Clock window when showing master modules
+                if (!visible) {
+                    viewManager_->navigateToWindow("Clock ");
+                }
+            }
         }
 
         ImGui::Separator();
@@ -313,11 +313,10 @@ void MenuBar::drawViewMenu() {
 
 void MenuBar::drawAddMenu() {
     if (ImGui::BeginMenu("Add")) {
-        if (ImGui::MenuItem("Add Module...", "MAJ+A")) {
-            showAddModulePopup = true;
-            // Reset filter and selection when opening
-            memset(addModuleFilter, 0, sizeof(addModuleFilter));
-            selectedModuleIndex = 0;
+        if (ImGui::MenuItem("Add Module...", "Shift+A")) {
+            // Get current mouse position for menu placement
+            ImGuiIO& io = ImGui::GetIO();
+            openAddMenu(io.MousePos.x, io.MousePos.y);
         }
         ImGui::EndMenu();
     }
@@ -347,98 +346,19 @@ void MenuBar::drawHelpMenu() {
     }
 }
 
-void MenuBar::drawAddModulePopup() {
-    if (!showAddModulePopup) return;
-    
-    // Open popup on first frame
-    if (showAddModulePopup) {
-        ImGui::OpenPopup("Add Module");
+bool MenuBar::isAddMenuOpen() const {
+    return addMenu_ ? addMenu_->isOpen() : false;
+}
+
+void MenuBar::openAddMenu(float mouseX, float mouseY) {
+    if (addMenu_) {
+        addMenu_->open(mouseX, mouseY);
     }
-    
-    // Center popup on screen
-    ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), 
-                           ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    
-    if (ImGui::BeginPopupModal("Add Module", &showAddModulePopup, 
-                               ImGuiWindowFlags_AlwaysAutoResize)) {
-        // Filter input (auto-focus on first frame)
-        if (ImGui::IsWindowAppearing()) {
-            ImGui::SetKeyboardFocusHere();
-        }
-        ImGui::InputText("##filter", addModuleFilter, sizeof(addModuleFilter));
-        
-        // Build filtered list
-        std::vector<int> filteredIndices;
-        std::string filterLower = addModuleFilter;
-        std::transform(filterLower.begin(), filterLower.end(), filterLower.begin(), ::tolower);
-        
-        for (size_t i = 0; i < availableModules.size(); i++) {
-            if (filterLower.empty()) {
-                filteredIndices.push_back(i);
-            } else {
-                std::string nameLower = availableModules[i].displayName;
-                std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
-                
-                if (nameLower.find(filterLower) != std::string::npos) {
-                    filteredIndices.push_back(i);
-                }
-            }
-        }
-        
-        // Clamp selected index to valid range
-        if (selectedModuleIndex >= static_cast<int>(filteredIndices.size())) {
-            selectedModuleIndex = 0;
-        }
-        if (selectedModuleIndex < 0 && !filteredIndices.empty()) {
-            selectedModuleIndex = 0;
-        }
-        
-        // Draw filtered list
-        for (size_t listIdx = 0; listIdx < filteredIndices.size(); listIdx++) {
-            int moduleIdx = filteredIndices[listIdx];
-            const auto& module = availableModules[moduleIdx];
-            
-            bool isSelected = (static_cast<int>(listIdx) == selectedModuleIndex);
-            
-            if (ImGui::Selectable(module.displayName.c_str(), isSelected)) {
-                selectedModuleIndex = static_cast<int>(listIdx);
-            }
-        }
-        
-        // Handle keyboard input
-        if (ImGui::IsWindowFocused()) {
-            // Arrow key navigation
-            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && selectedModuleIndex > 0) {
-                selectedModuleIndex--;
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && 
-                selectedModuleIndex < static_cast<int>(filteredIndices.size()) - 1) {
-                selectedModuleIndex++;
-            }
-            
-            // Enter to add, Escape to cancel
-            bool canAdd = !filteredIndices.empty() && selectedModuleIndex >= 0 && 
-                          selectedModuleIndex < static_cast<int>(filteredIndices.size());
-            
-            if (ImGui::IsKeyPressed(ImGuiKey_Enter) && canAdd) {
-                if (onAddModule) {
-                    int moduleIdx = filteredIndices[selectedModuleIndex];
-                    onAddModule(availableModules[moduleIdx].typeName);
-                    showAddModulePopup = false;
-                    memset(addModuleFilter, 0, sizeof(addModuleFilter));
-                    selectedModuleIndex = 0;
-                }
-            }
-            
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-                showAddModulePopup = false;
-                memset(addModuleFilter, 0, sizeof(addModuleFilter));
-                selectedModuleIndex = 0;
-            }
-        }
-        
-        ImGui::EndPopup();
+}
+
+void MenuBar::closeAddMenu() {
+    if (addMenu_) {
+        addMenu_->close();
     }
 }
 

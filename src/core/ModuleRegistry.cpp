@@ -401,20 +401,6 @@ bool ModuleRegistry::removeModule(
         return false;
     }
     
-    // Prevent removing if it's the only instance of its type
-    ModuleType moduleType = module->getType();
-    int instanceCount = 0;
-    forEachModule([moduleType, &instanceCount](const std::string& uuid, const std::string& name, std::shared_ptr<Module> m) {
-        if (m && m->getType() == moduleType) {
-            instanceCount++;
-        }
-    });
-    
-    if (instanceCount <= 1) {
-        ofLogWarning("ModuleRegistry") << "Cannot remove last instance of type " << static_cast<int>(moduleType) << ": " << moduleName;
-        return false;
-    }
-    
     // Disconnect all connections BEFORE removing from registry
     // This ensures connections are cleaned up properly
     if (connectionManager) {

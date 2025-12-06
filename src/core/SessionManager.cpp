@@ -58,6 +58,9 @@ ofJson SessionManager::serializeAll() const {
     // Clock state
     if (clock) {
         json["clock"] = clock->toJson();
+        ofLogNotice("SessionManager") << "Saving Clock BPM: " << clock->getBPM();
+    } else {
+        ofLogWarning("SessionManager") << "Clock is null, cannot save BPM to session";
     }
     
     // Modules
@@ -140,11 +143,28 @@ ofJson SessionManager::serializeAll() const {
     // ImGui window state (docking, positions, sizes)
     // Save ImGui ini settings to memory and store in session JSON
     // This allows each session to have its own window layout
+    ofLogNotice("SessionManager") << "DEBUG: Attempting to save ImGui window state...";
+    
+    // Check if ImGui is initialized
+    ImGuiContext* ctx = ImGui::GetCurrentContext();
+    if (!ctx) {
+        ofLogError("SessionManager") << "DEBUG: ImGui context is null when trying to save state!";
+    } else {
+        ofLogNotice("SessionManager") << "DEBUG: ImGui context is valid";
+    }
+    
     size_t iniSize = 0;
     const char* iniData = ImGui::SaveIniSettingsToMemory(&iniSize);
+    ofLogNotice("SessionManager") << "DEBUG: ImGui::SaveIniSettingsToMemory returned " << iniSize << " bytes";
+    
     if (iniData && iniSize > 0) {
+        // Show first 100 chars of the data for debugging
+        std::string preview(iniData, std::min<size_t>(100, iniSize));
+        ofLogNotice("SessionManager") << "DEBUG: ImGui data preview: " << preview;
         json["gui"]["imguiState"] = std::string(iniData, iniSize);
-        ofLogNotice("SessionManager") << "Saved ImGui window state (" << iniSize << " bytes)";
+        ofLogNotice("SessionManager") << "✓ Saved ImGui window state (" << iniSize << " bytes) to session";
+    } else {
+        ofLogWarning("SessionManager") << "DEBUG: ImGui state is EMPTY! iniData=" << (void*)iniData << ", iniSize=" << iniSize;
     }
     
     return json;
@@ -174,10 +194,20 @@ bool SessionManager::deserializeAll(const ofJson& json) {
     // Load clock
     if (clock && json.contains("clock")) {
         try {
+            float bpmBefore = clock->getBPM();
+            ofLogNotice("SessionManager") << "Loading Clock BPM from session (current: " << bpmBefore << ")";
             clock->fromJson(json["clock"]);
+            float bpmAfter = clock->getBPM();
+            ofLogNotice("SessionManager") << "Clock BPM loaded: " << bpmAfter << " (was: " << bpmBefore << ")";
         } catch (const std::exception& e) {
             ofLogError("SessionManager") << "Failed to load clock: " << e.what();
             return false;
+        }
+    } else {
+        if (!clock) {
+            ofLogWarning("SessionManager") << "Clock is null, cannot load BPM from session";
+        } else if (!json.contains("clock")) {
+            ofLogWarning("SessionManager") << "Session JSON does not contain 'clock' key, using default BPM";
         }
     }
     
@@ -218,6 +248,7 @@ bool SessionManager::deserializeAll(const ofJson& json) {
         if (connectionManager_ && modulesJson.contains("connections")) {
             try {
                 // ConnectionManager::fromJson() will restore connections immediately
+                // This establishes the physical connections but sets default volumes/opacities
                 if (!connectionManager_->fromJson(modulesJson["connections"])) {
                     ofLogError("SessionManager") << "Failed to load module connections";
                     return false;
@@ -225,6 +256,14 @@ bool SessionManager::deserializeAll(const ofJson& json) {
             } catch (const std::exception& e) {
                 ofLogError("SessionManager") << "Failed to load module connections: " << e.what();
                 return false;
+            }
+            
+            // CRITICAL: After ConnectionManager restores connections, restore connection-specific
+            // parameters (volumes, opacities, blend modes) from module JSON data
+            // ConnectionManager only establishes the connections, but doesn't restore the parameters
+            if (modulesJson.contains("instances")) {
+                ofLogNotice("SessionManager") << "Restoring connection parameters (volumes, opacities, blend modes)...";
+                restoreMixerConnections(modulesJson["instances"]);
             }
         } else {
             // Fallback: Restore mixer connections from module data (backward compatibility)
@@ -318,11 +357,25 @@ bool SessionManager::deserializeAll(const ofJson& json) {
         
         // Store ImGui window state for later loading (after ImGui is initialized)
         // We can't load it here because ImGui might not be initialized yet
+        ofLogNotice("SessionManager") << "DEBUG: Checking for ImGui state in loaded session...";
+        ofLogNotice("SessionManager") << "DEBUG: guiJson.contains('imguiState'): " << (guiJson.contains("imguiState") ? "YES" : "NO");
+        
+        if (guiJson.contains("imguiState")) {
+            ofLogNotice("SessionManager") << "DEBUG: imguiState is_string: " << (guiJson["imguiState"].is_string() ? "YES" : "NO");
+            if (!guiJson["imguiState"].is_string()) {
+                ofLogWarning("SessionManager") << "DEBUG: imguiState exists but is not a string!";
+            }
+        }
+        
         if (guiJson.contains("imguiState") && guiJson["imguiState"].is_string()) {
             pendingImGuiState_ = guiJson["imguiState"].get<std::string>();
-            ofLogNotice("SessionManager") << "Stored ImGui window state for later loading (" 
+            ofLogNotice("SessionManager") << "✓ Stored ImGui window state for later loading (" 
                                          << pendingImGuiState_.size() << " bytes)";
+            // Show first 100 chars for debugging
+            std::string preview = pendingImGuiState_.substr(0, std::min<size_t>(100, pendingImGuiState_.size()));
+            ofLogNotice("SessionManager") << "DEBUG: Stored ImGui data preview: " << preview;
         } else {
+            ofLogWarning("SessionManager") << "DEBUG: No ImGui state found in session - pendingImGuiState_ cleared";
             pendingImGuiState_.clear();
         }
         
@@ -393,6 +446,8 @@ std::string SessionManager::resolveSessionPath(const std::string& sessionName) c
 
 //--------------------------------------------------------------
 bool SessionManager::saveSession(const std::string& sessionName) {
+    ofLogNotice("SessionManager") << "DEBUG: saveSession called with sessionName: " << sessionName;
+    
     if (!clock || !registry || !factory || !router) {
         ofLogError("SessionManager") << "Cannot save session: null pointers";
         return false;
@@ -404,11 +459,14 @@ bool SessionManager::saveSession(const std::string& sessionName) {
         return false;
     }
     
+    ofLogNotice("SessionManager") << "DEBUG: Resolved session path: " << filePath;
     return saveSessionToPath(filePath);
 }
 
 //--------------------------------------------------------------
 bool SessionManager::saveSessionToPath(const std::string& filePath) {
+    ofLogNotice("SessionManager") << "DEBUG: saveSessionToPath called with filePath: " << filePath;
+    
     if (!clock || !registry || !factory || !router) {
         ofLogError("SessionManager") << "Cannot save session: null pointers";
         return false;
@@ -456,6 +514,8 @@ bool SessionManager::saveSessionToPath(const std::string& filePath) {
 
 //--------------------------------------------------------------
 bool SessionManager::loadSession(const std::string& sessionName) {
+    ofLogNotice("SessionManager") << "DEBUG: loadSession called with sessionName: " << sessionName;
+    
     if (!clock || !registry || !factory || !router) {
         ofLogError("SessionManager") << "Cannot load session: null pointers";
         return false;
@@ -467,11 +527,14 @@ bool SessionManager::loadSession(const std::string& sessionName) {
         return false;
     }
     
+    ofLogNotice("SessionManager") << "DEBUG: Resolved session path: " << filePath;
     return loadSessionFromPath(filePath);
 }
 
 //--------------------------------------------------------------
 bool SessionManager::loadSessionFromPath(const std::string& filePath) {
+    ofLogNotice("SessionManager") << "DEBUG: loadSessionFromPath called with filePath: " << filePath;
+    
     if (!clock || !registry || !factory || !router) {
         ofLogError("SessionManager") << "Cannot load session: null pointers";
         return false;
@@ -827,8 +890,11 @@ void SessionManager::restoreVisibilityState() {
 }
 
 void SessionManager::loadPendingImGuiState() {
+    ofLogNotice("SessionManager") << "DEBUG: loadPendingImGuiState called, pendingImGuiState_.size() = " << pendingImGuiState_.size();
+    
     // Only load if we have pending state and ImGui is initialized
     if (pendingImGuiState_.empty()) {
+        ofLogWarning("SessionManager") << "DEBUG: No pending ImGui state, falling back to imgui.ini";
         // No pending state, try to load from imgui.ini as fallback
         std::string iniPath = ofToDataPath("imgui.ini", true);
         if (ofFile::doesFileExist(iniPath)) {
@@ -838,9 +904,16 @@ void SessionManager::loadPendingImGuiState() {
             } catch (const std::exception& e) {
                 ofLogError("SessionManager") << "Failed to load imgui.ini: " << e.what();
             }
+        } else {
+            ofLogWarning("SessionManager") << "DEBUG: No imgui.ini file found either";
         }
         return;
     }
+    
+    ofLogNotice("SessionManager") << "DEBUG: Loading ImGui state from session (" << pendingImGuiState_.size() << " bytes)";
+    // Show first 100 chars for debugging
+    std::string preview = pendingImGuiState_.substr(0, std::min<size_t>(100, pendingImGuiState_.size()));
+    ofLogNotice("SessionManager") << "DEBUG: ImGui data preview: " << preview;
     
     // Check if ImGui is initialized (by checking if context exists)
     ImGuiContext* ctx = ImGui::GetCurrentContext();
@@ -969,6 +1042,8 @@ bool SessionManager::initializeProjectAndSession(const std::string& dataPath) {
             if (loadSession(sessionToLoad)) {
                 sessionLoaded = true;
                 ofLogNotice("SessionManager") << "✓ Session loaded successfully";
+                // Apply ImGui layout from the loaded session immediately
+                loadPendingImGuiState();
             }
         } else {
             // Create default session
@@ -984,6 +1059,8 @@ bool SessionManager::initializeProjectAndSession(const std::string& dataPath) {
             if (loadSessionFromPath("session.json")) {
                 sessionLoaded = true;
                 ofLogNotice("SessionManager") << "✓ Legacy session loaded successfully";
+                // Apply ImGui layout from the loaded session immediately
+                loadPendingImGuiState();
             }
         }
     }
@@ -1077,9 +1154,8 @@ bool SessionManager::setupGUI(GUIManager* guiManager) {
         }
     });
     
-    // Load pending ImGui state after ImGui is initialized
-    // Note: If session was loaded, GUIs are already created in post-load callback
-    // This will load the window state if it wasn't loaded already
+    // Load pending ImGui state if available, otherwise load default layout
+    // This ensures we always have some layout loaded
     loadPendingImGuiState();
     
     return true;

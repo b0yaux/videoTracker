@@ -8,6 +8,7 @@ class Console;
 class CommandBar;
 class ModuleRegistry;
 class GUIManager;
+class AddMenu;
 
 class InputRouter {
 public:
@@ -23,6 +24,9 @@ public:
         Console* console,
         CommandBar* commandBar
     );
+    
+    // Set AddMenu reference for handling Add Menu
+    void setAddMenu(AddMenu* addMenu);
     
     // Set callbacks for session save/load (called by 'S' key)
     void setSessionCallbacks(
@@ -62,7 +66,6 @@ public:
         CommandBar* commandBar,
         class SessionManager* sessionManager,
         class ProjectManager* projectManager,
-        class MenuBar* menuBar,
         std::function<void()> onUpdateWindowTitle,
         int* currentStep,
         int* lastTriggeredStep,
@@ -102,6 +105,7 @@ private:
     ViewManager* viewManager = nullptr;
     Console* console = nullptr;
     CommandBar* commandBar = nullptr;
+    AddMenu* addMenu = nullptr;
     
     // Focus-based routing helpers (InputRouter refactoring)
     class ModuleGUI* getFocusedGUI() const;

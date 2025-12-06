@@ -76,6 +76,11 @@ public:
     const ofParameter<float>* getFloatParameter(const std::string& name) const;
     ofParameter<float>* getFloatParameter(const std::string& name);
     
+    // Position capture helper - single source of truth for position reading
+    // Prioritizes: playing audio > playing video > parameter > stopped audio > stopped video
+    // Public for use by MediaPool for position memory (NEXT mode only)
+    float captureCurrentPosition() const;
+    
     // Setup method to initialize parameters and connections
     void setup();
     
@@ -97,10 +102,6 @@ private:
     void onSpeedChanged(float& speed);
     void onLoopChanged(bool& loop);
     void onVolumeChanged(float& vol);
-    
-    // Position capture helper - single source of truth for position reading
-    // Prioritizes: playing audio > playing video > parameter > stopped audio > stopped video
-    float captureCurrentPosition() const;
     
     // Internal state
     bool isSetup;

@@ -1123,6 +1123,10 @@ void MediaPool::stopTemporaryPlayback() {
     
     if (activePlayer && activePlayer->isPlaying()) {
         activePlayer->stop();
+        // For LOOP mode, reset position after stopping (no position memory)
+        if (currentPlayStyle == PlayStyle::LOOP) {
+            activePlayer->playheadPosition.set(0.0f);
+        }
         ensurePlayerAudioDisconnected(activePlayer);
         ensurePlayerVideoDisconnected(activePlayer);
         // Don't change mode - keep it as it was
@@ -1374,12 +1378,10 @@ void MediaPool::update() {
     
     // Update all playing players (this syncs playheadPosition for scheduled stop checks)
     // Scheduled stops are checked AFTER player updates so position is synced
-    size_t playingCount = 0;
     for (auto& player : players) {
         if (player && player->isPlaying()) {
             try {
                 player->update();  // Updates playhead position and handles playback state
-                playingCount++;
             } catch (const std::exception& e) {
                 ofLogError("MediaPool") << "Exception updating player: " << e.what();
             } catch (...) {
@@ -1411,8 +1413,11 @@ void MediaPool::update() {
         if (currentTime >= it->stopTime) {
             // Gate duration expired - stop the player
             if (it->player && it->player->isPlaying()) {
-                // MediaPlayer::stop() already preserves position internally, so just call stop()
                 it->player->stop();
+                // For LOOP mode, reset position after stopping (no position memory)
+                if (currentPlayStyle == PlayStyle::LOOP) {
+                    it->player->playheadPosition.set(0.0f);
+                }
                 ensurePlayerAudioDisconnected(it->player);
                 ensurePlayerVideoDisconnected(it->player);
                 ofLogVerbose("MediaPool") << "[GATE_STOP] Stopped player after gate duration expired";
@@ -1548,8 +1553,9 @@ void MediaPool::update() {
                 }
             }
             
-            // Position memory is now handled automatically by MediaPlayer::playheadPosition
-            // No explicit capture needed - MediaPlayer preserves position on stop()
+            // Position memory: Only for NEXT mode, captured before stop() in processEventQueue()
+            // LOOP mode: Position is reset to 0 when stopping (no position memory)
+            // ONCE mode: Position is NOT preserved (starts from startPosition each time)
         } else if (!isCurrentlyPlaying) {
             // Player stopped - transitions are handled by the early check above
             // No additional action needed here
@@ -1622,6 +1628,10 @@ void MediaPool::processEventQueue() {
         if (mediaIndex < 0) {
             if (activePlayer) {
                 activePlayer->stop();
+                // For LOOP mode, reset position after stopping (no position memory)
+                if (currentPlayStyle == PlayStyle::LOOP) {
+                    activePlayer->playheadPosition.set(0.0f);
+                }
                 // Disconnect stopped player from mixers
                 ensurePlayerAudioDisconnected(activePlayer);
                 ensurePlayerVideoDisconnected(activePlayer);
@@ -1657,13 +1667,21 @@ void MediaPool::processEventQueue() {
                 lastTriggerTime = ofGetElapsedTimef();
             }
             
-            // Position memory: For NEXT mode, use playheadPosition if position not explicitly set
+            // Position memory: For NEXT mode only, capture position before stopping
             // This allows NEXT mode to continue from where it left off
             if (event.parameters.find("position") == event.parameters.end()) {
-                // For NEXT mode, use position memory from playheadPosition
-                // For ONCE/LOOP modes, use startPosition (GUI-set value)
+                // For NEXT mode, capture position from player if playing, otherwise use playheadPosition
+                // For ONCE/LOOP modes, use startPosition (GUI-set value) - no position memory
                 if (currentPlayStyle == PlayStyle::NEXT) {
-                    float rememberedPosition = player->playheadPosition.get();
+                    // Capture position BEFORE any stop() calls happen
+                    float rememberedPosition = 0.0f;
+                    if (player->isPlaying()) {
+                        rememberedPosition = player->captureCurrentPosition();
+                    } else {
+                        // Player already stopped - use playheadPosition parameter
+                        rememberedPosition = player->playheadPosition.get();
+                    }
+                    
                     if (rememberedPosition > POSITION_THRESHOLD) {
                         // Convert absolute position to relative position for startPosition
                         float regionStart = player->regionStart.get();
@@ -1674,6 +1692,9 @@ void MediaPool::processEventQueue() {
                         if (relativePos >= END_POSITION_THRESHOLD || relativePos < POSITION_THRESHOLD) {
                             relativePos = 0.0f;
                             player->playheadPosition.set(0.0f);
+                        } else {
+                            // Preserve the position in playheadPosition for next time
+                            player->playheadPosition.set(rememberedPosition);
                         }
                         
                         event.parameters["position"] = relativePos;
@@ -1699,6 +1720,10 @@ void MediaPool::processEventQueue() {
             if (polyphonyMode_ == PolyphonyMode::MONOPHONIC) {
                 if (previousActivePlayer && previousActivePlayer != player && previousActivePlayer->isPlaying()) {
                     previousActivePlayer->stop();
+                    // For LOOP mode, reset position after stopping (no position memory)
+                    if (currentPlayStyle == PlayStyle::LOOP) {
+                        previousActivePlayer->playheadPosition.set(0.0f);
+                    }
                     // Disconnect stopped player from mixer
                     ensurePlayerVideoDisconnected(previousActivePlayer);
                     ofLogVerbose("MediaPool") << "[MONO] Stopped previous active player before starting new player (index " << mediaIndex << ")";
@@ -1714,6 +1739,10 @@ void MediaPool::processEventQueue() {
                 // MONO: Stop it first to restart from new position (prevents layering)
                 if (player && player->isPlaying()) {
                     player->stop();
+                    // For LOOP mode, reset position after stopping (no position memory)
+                    if (currentPlayStyle == PlayStyle::LOOP) {
+                        player->playheadPosition.set(0.0f);
+                    }
                     // Disconnect stopped player from mixers (will reconnect when it starts again)
                     ensurePlayerAudioDisconnected(player);
                     ensurePlayerVideoDisconnected(player);
@@ -1814,6 +1843,7 @@ void MediaPool::onPlaybackEnd() {
         case PlayStyle::ONCE:
             // Stop the current player - update() will transition to IDLE when it detects player stopped
             if (activePlayer) {
+                // ONCE mode: Position is NOT preserved (starts from startPosition each time)
                 activePlayer->stop();
             }
             break;
@@ -1854,6 +1884,7 @@ void MediaPool::onPlaybackEnd() {
                     // No next player available - stop current player
                     // update() will transition to IDLE when it detects player stopped
                     if (activePlayer) {
+                        // NEXT mode: Position is preserved before stop() in processEventQueue()
                         activePlayer->stop();
                     }
                 }
@@ -1861,6 +1892,7 @@ void MediaPool::onPlaybackEnd() {
                 // Only one player (no next player) - stop current player
                 // update() will transition to IDLE when it detects player stopped
                 if (activePlayer) {
+                    // NEXT mode: Position is preserved before stop() in processEventQueue()
                     activePlayer->stop();
                 }
             }
@@ -2647,11 +2679,8 @@ void MediaPool::handleRegionEnd(MediaPlayer* player, float currentPosition,
     // This function should never be called for LOOP mode - if it is, it's a bug
     switch (playStyle) {
         case PlayStyle::ONCE:
-            // ONCE mode: Stop playback but preserve position for scanning
-            // Scanning should work even in ONCE mode - each trigger resumes from where it left off
-            // Only reset position when media actually finishes (reaches end)
-            // Position is preserved by MediaPlayer::stop()
-            // Position will be reset by MediaPool when appropriate (e.g., transport start)
+            // ONCE mode: Stop playback
+            // Position is NOT preserved - each trigger starts from startPosition
             player->stop();
             break;
         case PlayStyle::LOOP:
@@ -2772,6 +2801,10 @@ void MediaPool::stopAllNonActivePlayersLocked() {
         auto& player = players[i];
         if (player && player.get() != activePlayer && player->isPlaying()) {
             player->stop();
+            // For LOOP mode, reset position after stopping (no position memory)
+            if (currentPlayStyle == PlayStyle::LOOP) {
+                player->playheadPosition.set(0.0f);
+            }
             ofLogVerbose("MediaPool") << "[POLYPHONY] Stopped non-active player at index " << i;
         }
     }

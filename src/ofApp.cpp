@@ -121,7 +121,6 @@ void ofApp::setup() {
         &commandBar,
         &sessionManager,
         &projectManager,
-        &menuBar,
         [this]() { updateWindowTitle(); },
         &currentStep,
         &lastTriggeredStep,

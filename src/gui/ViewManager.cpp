@@ -54,36 +54,51 @@ void ViewManager::navigateToWindow(const std::string& windowName) {
 
 void ViewManager::nextWindow() {
     std::string next = findWindowInDirection(currentFocusedWindow, 0); // 0 = right
-    navigateToWindow(next.empty() ? findWindowInDirection("", 0) : next); // cycle if empty
+    navigateToWindow(next.empty() ? findAlignedCycleWindow(currentFocusedWindow, 0) : next);
     ofLogNotice("ViewManager") << "Next window: " << getCurrentFocusedWindow();
 }
 
 void ViewManager::previousWindow() {
     std::string prev = findWindowInDirection(currentFocusedWindow, 1); // 1 = left
-    navigateToWindow(prev.empty() ? findWindowInDirection("", 1) : prev); // cycle if empty
+    navigateToWindow(prev.empty() ? findAlignedCycleWindow(currentFocusedWindow, 1) : prev);
     ofLogNotice("ViewManager") << "Previous window: " << getCurrentFocusedWindow();
+}
+
+void ViewManager::upWindow() {
+    std::string up = findWindowInDirection(currentFocusedWindow, 3); // 3 = up
+    navigateToWindow(up.empty() ? findAlignedCycleWindow(currentFocusedWindow, 3) : up);
+    ofLogNotice("ViewManager") << "Up window: " << getCurrentFocusedWindow();
+}
+
+void ViewManager::downWindow() {
+    std::string down = findWindowInDirection(currentFocusedWindow, 2); // 2 = down
+    navigateToWindow(down.empty() ? findAlignedCycleWindow(currentFocusedWindow, 2) : down);
+    ofLogNotice("ViewManager") << "Down window: " << getCurrentFocusedWindow();
 }
 
 std::vector<std::string> ViewManager::getAvailableWindows() const {
     std::vector<std::string> windows;
-    
+
     // Helper lambda to check if a window actually exists and is visible
     auto isWindowVisible = [](const std::string& windowName) -> bool {
         ImGuiWindow* window = ImGui::FindWindowByName(windowName.c_str());
         return window && window->Active && !window->Hidden && window->WasActive;
     };
-    
+
     // Add core windows only if they actually exist and are visible
-    std::vector<std::string> coreWindows = {
-        "Clock ", "Audio Output"
-    };
-    
-    for (const auto& windowName : coreWindows) {
-        if (isWindowVisible(windowName)) {
-            windows.push_back(windowName);
+    // Respect master modules visibility setting
+    if (masterModulesVisible_) {
+        std::vector<std::string> coreWindows = {
+            "Clock ", "masterAudioOut", "masterVideoOut"
+        };
+
+        for (const auto& windowName : coreWindows) {
+            if (isWindowVisible(windowName)) {
+                windows.push_back(windowName);
+            }
         }
     }
-    
+
     // Add utility windows only if visible and exist
     if (fileBrowserVisible_ && isWindowVisible("File Browser")) {
         windows.push_back("File Browser");
@@ -94,90 +109,105 @@ std::vector<std::string> ViewManager::getAvailableWindows() const {
     if (assetLibraryVisible_ && isWindowVisible("Asset Library")) {
         windows.push_back("Asset Library");
     }
-    
+
     // Add all visible module instances (uses actual instance names, not hardcoded types)
     if (guiManager) {
         auto instances = guiManager->getAllInstanceNames();
         for (const auto& name : instances) {
+            // Skip master modules if they're hidden
+            if (!masterModulesVisible_ && (name == "masterAudioOut" || name == "masterVideoOut")) {
+                continue;
+            }
+            
             if (isWindowVisible(name)) {
                 windows.push_back(name);
             }
         }
     }
-    
+
     return windows;
-}
-
-void ViewManager::upWindow() {
-    std::string up = findWindowInDirection(currentFocusedWindow, 3); // 3 = up
-    navigateToWindow(up.empty() ? findWindowInDirection("", 3) : up); // cycle if empty
-    ofLogNotice("ViewManager") << "Up window: " << getCurrentFocusedWindow();
-}
-
-void ViewManager::downWindow() {
-    std::string down = findWindowInDirection(currentFocusedWindow, 2); // 2 = down
-    navigateToWindow(down.empty() ? findWindowInDirection("", 2) : down); // cycle if empty
-    ofLogNotice("ViewManager") << "Down window: " << getCurrentFocusedWindow();
 }
 
 std::string ViewManager::findWindowInDirection(const std::string& currentWindow, int direction) const {
     auto windows = getAvailableWindows();
     if (windows.empty()) return "";
-    
-    // If no current window (cycling), find edge window
-    if (currentWindow.empty()) {
-        ImGuiWindow* best = nullptr;
-        for (const auto& name : windows) {
-            ImGuiWindow* w = ImGui::FindWindowByName(name.c_str());
-            if (!w || !w->Active) continue;
-            
-            if (!best || 
-                (direction == 0 && w->Pos.x < best->Pos.x) || // right->leftmost
-                (direction == 1 && w->Pos.x > best->Pos.x) || // left->rightmost  
-                (direction == 2 && w->Pos.y < best->Pos.y) || // down->topmost
-                (direction == 3 && w->Pos.y > best->Pos.y)) { // up->bottommost
-                best = w;
-            }
-        }
-        return best ? best->Name : "";
-    }
-    
-    // Find closest window in direction
+
     ImGuiWindow* current = ImGui::FindWindowByName(currentWindow.c_str());
     if (!current) return "";
-    
+
     ImGuiWindow* closest = nullptr;
     float minDist = FLT_MAX;
-    
+
     for (const auto& name : windows) {
         if (name == currentWindow) continue;
         ImGuiWindow* w = ImGui::FindWindowByName(name.c_str());
         if (!w || !w->Active) continue;
-        
+
         float dx = w->Pos.x - current->Pos.x;
         float dy = w->Pos.y - current->Pos.y;
-        
-        bool correctDir = (direction == 0 && dx > 0) || // right
-                         (direction == 1 && dx < 0) || // left
-                         (direction == 2 && dy > 0) || // down  
-                         (direction == 3 && dy < 0);   // up
-        
-        if (correctDir) {
-            // Prioritize movement in the primary axis
-            float primaryDist = (direction <= 1) ? abs(dx) : abs(dy);
-            float secondaryDist = (direction <= 1) ? abs(dy) : abs(dx);
-            
-            // Heavily weight primary axis movement (3:1 ratio)
-            float dist = primaryDist + secondaryDist * 3.0f;
-            
-            if (dist < minDist) {
-                minDist = dist;
+
+        // Calculate proximity to current window for better cycling behavior
+        float proximity = sqrt(dx * dx + dy * dy);
+
+        // Simple directional check
+        bool correctDirection = (direction == 0 && dx > 0) ||  // right
+                               (direction == 1 && dx < 0) ||  // left
+                               (direction == 2 && dy > 0) ||  // down
+                               (direction == 3 && dy < 0);    // up
+
+        if (correctDirection) {
+            // For up/down: prioritize same column (closest X), then distance
+            // For left/right: prioritize same row (closest Y), then distance
+            float alignmentDist = (direction <= 1) ? abs(dy) : abs(dx);  // row/column alignment
+            float primaryDist = (direction <= 1) ? abs(dx) : abs(dy);    // primary movement distance
+
+            float score = alignmentDist * 10 + primaryDist + proximity;  // alignment is 100x more important
+
+            if (score < minDist) {
+                minDist = score;
                 closest = w;
             }
         }
     }
-    
+
     return closest ? closest->Name : "";
+}
+
+std::string ViewManager::findAlignedCycleWindow(const std::string& currentWindow, int direction) const {
+    auto windows = getAvailableWindows();
+    if (windows.empty()) return "";
+
+    ImGuiWindow* current = ImGui::FindWindowByName(currentWindow.c_str());
+    if (!current) return "";
+
+    ImGuiWindow* best = nullptr;
+    float bestScore = FLT_MAX;
+
+    for (const auto& name : windows) {
+        if (name == currentWindow) continue;
+        ImGuiWindow* w = ImGui::FindWindowByName(name.c_str());
+        if (!w || !w->Active) continue;
+
+        // Calculate alignment distance (how well aligned the windows are)
+        float alignmentDist = (direction <= 1) ? abs(w->Pos.y - current->Pos.y) :  // horizontal: same row
+                                                 abs(w->Pos.x - current->Pos.x);    // vertical: same column
+
+        // Bias towards edge positions for cycling, but consider proximity
+        float edgeScore = (direction == 0) ? w->Pos.x :      // right->leftmost
+                         (direction == 1) ? -w->Pos.x :     // left->rightmost
+                         (direction == 2) ? w->Pos.y :      // down->topmost
+                                           -w->Pos.y;       // up->bottommost
+
+        // Balanced scoring: prioritize alignment, then edge position, with proximity as tiebreaker
+        float totalScore = alignmentDist * 20 + edgeScore * 40;
+
+        if (totalScore < bestScore) {
+            bestScore = totalScore;
+            best = w;
+        }
+    }
+
+    return best ? best->Name : "";
 }
 
 void ViewManager::handleMouseClick(int x, int y) {
@@ -205,7 +235,10 @@ void ViewManager::draw() {
 
     ofLogVerbose("ViewManager") << "draw() called";
 
-    drawClockPanel();
+    // Draw clock panel only if master modules are visible
+    if (masterModulesVisible_) {
+        drawClockPanel();
+    }
 
     // Draw all visible module panels (generic - handles all module types)
     if (guiManager) {
@@ -278,6 +311,11 @@ void ViewManager::drawModulePanels() {
 
         // Only draw if instance is visible (visibility system handles all filtering)
         if (!guiManager->isInstanceVisible(instanceName)) {
+            continue;
+        }
+        
+        // Skip master modules if they are set to hidden
+        if (!masterModulesVisible_ && (instanceName == "masterAudioOut" || instanceName == "masterVideoOut")) {
             continue;
         }
 

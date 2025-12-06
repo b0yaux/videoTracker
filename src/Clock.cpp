@@ -251,7 +251,12 @@ void Clock::onBPMChanged() {
 //--------------------------------------------------------------
 ofJson Clock::toJson() const {
     ofJson json;
-    json["bpm"] = currentBpm.load();
+    // CRITICAL: Save targetBpm, not currentBpm
+    // currentBpm is the smoothed/interpolated value that updates in audio thread
+    // targetBpm is the actual user-set value that should be preserved
+    float bpm = targetBpm.load();
+    json["bpm"] = bpm;
+    ofLogNotice("Clock") << "Serializing BPM to JSON: " << bpm << " (targetBpm, currentBpm: " << currentBpm.load() << ")";
     // Note: stepsPerBeat removed - step timing is now per-TrackerSequencer instance
     // Note: isPlaying is intentionally not saved (transient state)
     return json;
@@ -260,8 +265,25 @@ ofJson Clock::toJson() const {
 //--------------------------------------------------------------
 void Clock::fromJson(const ofJson& json) {
     if (json.contains("bpm")) {
-        float bpm = json["bpm"];
+        float bpm = json["bpm"].get<float>();
+        float bpmBefore = getBPM();
+        float targetBefore = targetBpm.load();
+        ofLogNotice("Clock") << "Loading BPM from JSON: " << bpm << " (current: " << bpmBefore << ", target: " << targetBefore << ")";
+        
+        // Set the target BPM (this will clamp if needed)
         setBPM(bpm);
+        
+        // CRITICAL: Immediately sync currentBpm to targetBpm when loading from JSON
+        // This ensures the BPM is correct immediately, not after audio thread smoothing
+        // Without this, getBPM() would return the old currentBpm value until smoothing completes
+        float newTarget = targetBpm.load();
+        currentBpm.store(newTarget);
+        
+        float bpmAfter = getBPM();
+        float targetAfter = targetBpm.load();
+        ofLogNotice("Clock") << "BPM loaded - current: " << bpmAfter << ", target: " << targetAfter << " (requested: " << bpm << ")";
+    } else {
+        ofLogWarning("Clock") << "JSON does not contain 'bpm' key, keeping current BPM: " << getBPM();
     }
     // Note: stepsPerBeat removed - step timing is now per-TrackerSequencer instance
     // Old JSON files with stepsPerBeat will be ignored (backward compatible)

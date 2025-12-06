@@ -9,6 +9,7 @@
 
 // Forward declarations
 class ViewManager;
+class AddMenu;
 class SessionManager;
 class ProjectManager;
 class AssetLibrary;
@@ -58,22 +59,26 @@ public:
     // Returns true if menu bar is active (prevents input below)
     void draw();
     
-    // Handle keyboard input (for MAJ+a shortcut)
-    bool handleKeyPress(int key, bool shiftPressed);
+
 
     // Accessor for help popup state (optional, for external management)
     bool isHelpPopupOpen() const { return showControlsHelp; }
     void closeHelpPopup() { showControlsHelp = false; }
     
-    // Accessor for Add Module popup state
-    bool isAddModulePopupOpen() const { return showAddModulePopup; }
-    void openAddModulePopup() { showAddModulePopup = true; }
-    void closeAddModulePopup() { showAddModulePopup = false; }
+    // Accessor for Add Menu state
+    bool isAddMenuOpen() const;
+    void openAddMenu(float mouseX = -1, float mouseY = -1);
+    void closeAddMenu();
     
     /**
      * Set ViewManager reference (for checking panel visibility state)
      */
     void setViewManager(ViewManager* viewManager) { viewManager_ = viewManager; }
+    
+    /**
+     * Set AddMenu reference (for handling Add Menu)
+     */
+    void setAddMenu(AddMenu* addMenu) { addMenu_ = addMenu; }
     
     /**
      * Setup with dependencies - creates callbacks internally (Phase 13.6)
@@ -136,11 +141,6 @@ private:
 
     // UI state
     bool showControlsHelp = false;
-    bool showAddModulePopup = false;
-    
-    // Add Module popup state
-    char addModuleFilter[256] = "";
-    int selectedModuleIndex = 0;
     
     // Recent sessions tracking
     std::vector<std::string> recentSessions_;
@@ -150,13 +150,8 @@ private:
     // ViewManager reference (for checking panel visibility)
     ViewManager* viewManager_ = nullptr;
     
-    // Available module types
-    struct ModuleTypeInfo {
-        std::string typeName;      // "MediaPool", "TrackerSequencer"
-        std::string displayName;   // "Media Pool", "Tracker Sequencer"
-        std::string description;   // "Video/audio media pool"
-    };
-    std::vector<ModuleTypeInfo> availableModules;
+    // AddMenu reference (for handling menu)
+    AddMenu* addMenu_ = nullptr;
 
     // Private helper methods for each menu section
     void drawFileMenu();      // Import File/Folder
@@ -166,7 +161,5 @@ private:
     void drawAddMenu();
     void drawLayoutMenu();
     void drawHelpMenu();
-    void drawAddModulePopup();
-    void initializeAvailableModules();
 };
 

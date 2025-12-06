@@ -148,3 +148,4 @@ private:
     static constexpr const char* MASTER_AUDIO_OUT_NAME = "masterAudioOut";
     static constexpr const char* MASTER_VIDEO_OUT_NAME = "masterVideoOut";
 };
+
