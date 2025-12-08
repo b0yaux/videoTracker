@@ -56,6 +56,8 @@ struct Step {
     int length = 1;              // Step length in sequencer steps (1-16, integer count)
     int note = -1;               // MIDI note (-1 = not set, 0-127 = MIDI note number)
     int chance = 100;            // Trigger probability (0-100, default 100 = always trigger)
+    int ratioA = 1;              // Ratio trigger: which cycle to trigger (1-16, default 1)
+    int ratioB = 1;              // Ratio trigger: total cycles in loop (1-16, default 1)
     
     // Dynamic parameter values (keyed by parameter name)
     // These use float for precision (position: 0-1, speed: -10 to 10, volume: 0-2)

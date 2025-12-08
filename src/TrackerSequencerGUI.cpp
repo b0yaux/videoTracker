@@ -1224,19 +1224,19 @@ void TrackerSequencerGUI::setupHeaderCallbacks(CellGridCallbacks& callbacks, boo
                 
                 // Fallback: find first available parameter
                 if (!added) {
-                    std::set<std::string> usedParamNames;
-                    for (const auto& col : sequencer.getColumnConfiguration()) {
-                        usedParamNames.insert(col.parameterName);
-                    }
-                    
-                    std::vector<ParameterDescriptor> externalParams = queryExternalParameters(sequencer);
-                    auto allParams = sequencer.getAvailableParameters(externalParams);
-                    
-                    for (const auto& param : allParams) {
-                        if (param.name == "index" || param.name == "length") continue; // Skip required
-                        if (usedParamNames.find(param.name) == usedParamNames.end()) {
-                            sequencer.addColumn(param.name, param.displayName);
-                            break;
+                std::set<std::string> usedParamNames;
+                for (const auto& col : sequencer.getColumnConfiguration()) {
+                    usedParamNames.insert(col.parameterName);
+                }
+                
+                std::vector<ParameterDescriptor> externalParams = queryExternalParameters(sequencer);
+                auto allParams = sequencer.getAvailableParameters(externalParams);
+                
+                for (const auto& param : allParams) {
+                    if (param.name == "index" || param.name == "length") continue; // Skip required
+                    if (usedParamNames.find(param.name) == usedParamNames.end()) {
+                        sequencer.addColumn(param.name, param.displayName);
+                        break;
                         }
                     }
                 }
@@ -1278,7 +1278,7 @@ void TrackerSequencerGUI::setupHeaderCallbacks(CellGridCallbacks& callbacks, boo
             
             bool hasItems = false;
             
-            // Show internal parameters (sequencer-specific: index, note, chance)
+            // Show internal parameters (sequencer-specific: index, note, chance, ratio)
             // Count index/note columns for display
             std::map<std::string, int> paramCounts;
             for (const auto& col : sequencer.getColumnConfiguration()) {
@@ -1287,13 +1287,13 @@ void TrackerSequencerGUI::setupHeaderCallbacks(CellGridCallbacks& callbacks, boo
                 }
             }
             
-            // Get tracker-specific parameters (index, note, length, chance)
+            // Get tracker-specific parameters (index, note, length, chance, ratio)
             auto trackerParams = sequencer.getTrackerParameters();
             std::vector<ParameterDescriptor> internalOnlyParams;
             std::set<std::string> internalParamNames; // Track to exclude from external
-            // Filter to only show index, note, chance (length is handled separately as required column)
+            // Filter to only show index, note, chance, ratio (length is handled separately as required column)
             for (const auto& param : trackerParams) {
-                if (param.name == "index" || param.name == "note" || param.name == "chance") {
+                if (param.name == "index" || param.name == "note" || param.name == "chance" || param.name == "ratio") {
                     internalOnlyParams.push_back(param);
                     internalParamNames.insert(param.name);
                 }
@@ -1316,8 +1316,8 @@ void TrackerSequencerGUI::setupHeaderCallbacks(CellGridCallbacks& callbacks, boo
                             }
                         } else {
                             sequencer.addColumn(param.name, param.displayName);
-                        }
-                        hasItems = true;
+                }
+                hasItems = true;
                     }
                 }
             }
@@ -1390,7 +1390,7 @@ void TrackerSequencerGUI::setupHeaderCallbacks(CellGridCallbacks& callbacks, boo
             if (isIndexNoteColumn) {
                 // For index/note columns, show only the opposite option
                 const auto& actualCol = sequencerCols[columnConfigIndex];
-                
+            
                 // Use unified registry for parameter descriptors
                 auto trackerParams = sequencer.getTrackerParameters();
                 if (actualCol.parameterName == "index") {
@@ -1415,21 +1415,21 @@ void TrackerSequencerGUI::setupHeaderCallbacks(CellGridCallbacks& callbacks, boo
             } else {
                 // For other columns, show external parameters
                 std::vector<ParameterDescriptor> externalParams = queryExternalParameters(sequencer);
-                auto allParams = sequencer.getAvailableParameters(externalParams);
-                
-                std::set<std::string> usedParamNames;
-                for (const auto& col : sequencer.getColumnConfiguration()) {
-                    usedParamNames.insert(col.parameterName);
+            auto allParams = sequencer.getAvailableParameters(externalParams);
+            
+            std::set<std::string> usedParamNames;
+            for (const auto& col : sequencer.getColumnConfiguration()) {
+                usedParamNames.insert(col.parameterName);
+            }
+            
+            for (const auto& param : allParams) {
+                    // Skip internal parameters (chance, ratio, note, index) - they're only for index/note columns or condition columns
+                    if (param.name == "chance" || param.name == "ratio" || param.name == "note" || param.name == "index") {
+                    continue;
                 }
-                
-                for (const auto& param : allParams) {
-                    // Skip internal parameters (chance, note, index) - they're only for index/note columns
-                    if (param.name == "chance" || param.name == "note" || param.name == "index") {
-                        continue;
-                    }
-                    // Skip already used parameters
-                    if (usedParamNames.find(param.name) == usedParamNames.end()) {
-                        items.push_back(HeaderPopup::PopupItem(param.name, param.displayName));
+                // Skip already used parameters
+                if (usedParamNames.find(param.name) == usedParamNames.end()) {
+                    items.push_back(HeaderPopup::PopupItem(param.name, param.displayName));
                         paramMap[param.name] = param;
                     }
                 }
@@ -1540,21 +1540,33 @@ void TrackerSequencerGUI::setupCellValueCallbacks(CellGridCallbacks& callbacks, 
         const std::string& paramName = colConfig.parameterName;
         const auto& step = sequencer.getCurrentPattern()[row];
         
-        // SPECIAL CASE: "index" parameter
+        // Trigger columns (index, note) - these ARE the triggers themselves
         if (paramName == "index") {
             int idx = step.index;
             return (idx < 0) ? std::numeric_limits<float>::quiet_NaN() : (float)(idx + 1);
         }
-        
-        // SPECIAL CASE: "length" parameter
-        if (paramName == "length") {
-            if (step.index < 0) {
-                return std::numeric_limits<float>::quiet_NaN();
-            }
-            return (float)step.length;
+        if (paramName == "note") {
+            int noteValue = step.note;
+            return (noteValue < 0) ? std::numeric_limits<float>::quiet_NaN() : (float)noteValue;
         }
         
-        // Dynamic parameter: returns NaN if not set (displays as "--")
+        // All other parameters are trigger-dependent - show '--' if step has no trigger
+        if (step.isEmpty()) {
+            return std::numeric_limits<float>::quiet_NaN();
+        }
+        
+        // Handle parameter-specific formatting/encoding
+        if (paramName == "length") {
+            return (float)step.length;
+        }
+        if (paramName == "chance") {
+            return (float)step.chance;
+        }
+        if (paramName == "ratio") {
+            return (float)(step.ratioA * 1000 + step.ratioB);
+        }
+        
+        // External parameters: returns NaN if not set (displays as "--")
         if (!step.hasParameter(paramName)) {
             return std::numeric_limits<float>::quiet_NaN();
         }
@@ -1565,17 +1577,32 @@ void TrackerSequencerGUI::setupCellValueCallbacks(CellGridCallbacks& callbacks, 
         const std::string& paramName = colConfig.parameterName;
         Step step = sequencer.getStep(row);
         
-        // SPECIAL CASE: "index" parameter
+        // Trigger columns (index, note) - handle directly
         if (paramName == "index") {
             int indexValue = (int)std::round(value);
             step.index = (indexValue == 0) ? -1 : (indexValue - 1);
         }
-        // SPECIAL CASE: "length" parameter - range is 1 to pattern stepCount
+        // Length parameter - range is 1 to pattern stepCount
         else if (paramName == "length") {
             int maxLength = sequencer.getStepCount();
             step.length = std::max(MIN_LENGTH_VALUE, std::min(maxLength, (int)std::round(value)));
         }
-        // Dynamic parameter: set value directly
+        // Ratio parameter - decode from encoded value (A * 1000 + B)
+        else if (paramName == "ratio") {
+            if (std::isnan(value)) {
+                step.ratioA = 1;
+                step.ratioB = 1;
+            } else {
+                int encoded = (int)std::round(value);
+                step.ratioA = std::max(1, std::min(16, encoded / 1000));
+                step.ratioB = std::max(1, std::min(16, encoded % 1000));
+                // Validate A <= B (A can't exceed B)
+                if (step.ratioA > step.ratioB) {
+                    step.ratioA = step.ratioB;
+                }
+            }
+        }
+        // All other parameters: use setParameterValue (handles note, chance, and external params)
         else {
             step.setParameterValue(paramName, value);
         }
@@ -1692,11 +1719,6 @@ CellWidget TrackerSequencerGUI::createParameterCellForColumn(TrackerSequencer& s
     // Configure basic properties
     cell.parameterName = col.parameterName;
     cell.isRemovable = !col.isRequired; // Use isRequired (inverted)
-    if (col.isRequired) {
-        // Required columns (index, length) are always integers
-        cell.isInteger = true;
-        cell.stepIncrement = 1.0f;
-    }
     
     // Set value range based on column type - use unified parameter registry
     auto trackerParams = sequencer.getTrackerParameters();
@@ -1711,12 +1733,14 @@ CellWidget TrackerSequencerGUI::createParameterCellForColumn(TrackerSequencer& s
             } else if (col.parameterName == "note") {
                 // Note: allow -1 for empty state (displayed as "--")
                 cell.setValueRange(-1.0f, trackerParam.maxValue, -1.0f);
+            } else if (col.parameterName == "ratio") {
+                // Ratio: use registry ranges (encoded as A * 1000 + B)
+                cell.setValueRange(trackerParam.minValue, trackerParam.maxValue, trackerParam.defaultValue);
             } else {
                 // Length, chance: use registry ranges
                 cell.setValueRange(trackerParam.minValue, trackerParam.maxValue, trackerParam.defaultValue);
             }
             cell.isInteger = (trackerParam.type == ParameterType::INT);
-            cell.stepIncrement = cell.isInteger ? 1.0f : 0.01f;
             isTrackerParam = true;
             break;
         }
@@ -1731,10 +1755,11 @@ CellWidget TrackerSequencerGUI::createParameterCellForColumn(TrackerSequencer& s
         // Determine if parameter is integer or float
         ParameterType paramType = TrackerSequencer::getParameterType(col.parameterName);
         cell.isInteger = (paramType == ParameterType::INT);
-        
-        // Calculate optimal step increment based on range and type
-        cell.calculateStepIncrement();
     }
+    
+    // Calculate optimal step increment based on range and type (single source of truth)
+    // This sets stepIncrement = 1.0f for integers, 0.001f for floats
+    cell.calculateStepIncrement();
     
     // Configure callbacks
     configureParameterCellCallbacks(sequencer, cell, step, column);
@@ -1771,30 +1796,41 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
         
         const Step& stepData = sequencer.getCurrentPattern()[step];
         
+        // Trigger columns (index, note) - these ARE the triggers themselves
         if (isRequiredCol && requiredTypeCol == "index") {
-            // Index: return NaN when empty (index <= 0), otherwise return 1-based display value
+            // Index: return NaN when empty, otherwise return 1-based display value
             int idx = stepData.index;
             return (idx < 0) ? std::numeric_limits<float>::quiet_NaN() : (float)(idx + 1);
-        } else if (isRequiredCol && requiredTypeCol == "length") {
-            // Length: return NaN when index < 0 (rest), otherwise return length
-            if (stepData.index < 0) {
-                return std::numeric_limits<float>::quiet_NaN(); // Use NaN instead of -1.0f
-            }
-            return (float)stepData.length;
-        } else if (paramName == "note") {
-            // Note column: return NaN when empty (note < 0), otherwise return note value
-            // Use direct field access for performance (note is now a direct field)
+        }
+        if (paramName == "note") {
+            // Note column: return NaN when empty, otherwise return note value
             int noteValue = stepData.note;
             return (noteValue < 0) ? std::numeric_limits<float>::quiet_NaN() : (float)noteValue;
-        } else {
-            // Dynamic parameter: return NaN if parameter doesn't exist (will display as "--")
-            // This allows parameters with negative ranges (like speed -10 to 10) to distinguish
-            // between "not set" (NaN/--) and explicit values like 1.0 or -1.0
-            if (!stepData.hasParameter(paramName)) {
-                return std::numeric_limits<float>::quiet_NaN();
-            }
-            return stepData.getParameterValue(paramName, 0.0f);
         }
+        
+        // All other parameters are trigger-dependent - show '--' if step has no trigger
+        if (stepData.isEmpty()) {
+            return std::numeric_limits<float>::quiet_NaN();
+        }
+        
+        // Handle parameter-specific formatting/encoding
+        if (isRequiredCol && requiredTypeCol == "length") {
+            return (float)stepData.length;
+        }
+        if (paramName == "chance") {
+            return (float)stepData.chance;
+        }
+        if (paramName == "ratio") {
+            return (float)(stepData.ratioA * 1000 + stepData.ratioB);
+        }
+        
+        // External parameters: return NaN if parameter doesn't exist (will display as "--")
+        // This allows parameters with negative ranges (like speed -10 to 10) to distinguish
+        // between "not set" (NaN/--) and explicit values like 1.0 or -1.0
+        if (!stepData.hasParameter(paramName)) {
+            return std::numeric_limits<float>::quiet_NaN();
+        }
+        return stepData.getParameterValue(paramName, 0.0f);
     };
     
     // onValueApplied callback - applies value to Step
@@ -1819,6 +1855,20 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             // Note: store -1 for empty (NaN), otherwise store the note value
             // Use direct field access for performance (note is now a direct field)
             stepData.note = std::isnan(value) ? -1 : (int)std::round(value);
+        } else if (paramName == "ratio") {
+            // Ratio: decode from encoded value (A * 1000 + B)
+            if (std::isnan(value)) {
+                stepData.ratioA = 1;
+                stepData.ratioB = 1;
+            } else {
+                int encoded = (int)std::round(value);
+                stepData.ratioA = std::max(1, std::min(16, encoded / 1000));
+                stepData.ratioB = std::max(1, std::min(16, encoded % 1000));
+                // Validate A <= B (A can't exceed B)
+                if (stepData.ratioA > stepData.ratioB) {
+                    stepData.ratioA = stepData.ratioB;
+                }
+            }
         } else {
             // Dynamic parameter
             stepData.setParameterValue(paramName, value);
@@ -1844,13 +1894,16 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             }
             sequencer.setStep(step, stepData);
         } else {
-            // Removable parameter - remove it (or set to -1 for note)
+            // Removable parameter - remove it (or set to -1 for note, or reset ratio to 1:1)
             Step stepData = sequencer.getStep(step);
             if (paramName == "note") {
                 // Use direct field access for performance (note is now a direct field)
                 stepData.note = -1;
+            } else if (paramName == "ratio") {
+                stepData.ratioA = 1;
+                stepData.ratioB = 1;
             } else {
-                stepData.removeParameter(paramName);
+            stepData.removeParameter(paramName);
             }
             sequencer.setStep(step, stepData);
         }
@@ -1906,10 +1959,79 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             
             return std::string(noteNames[note]) + std::to_string(octave);
         };
+    } else if (paramName == "ratio") {
+        // Ratio column: format as A:B (e.g., 2:4), NaN = "--"
+        cell.formatValue = [](float value) -> std::string {
+            if (std::isnan(value)) {
+                return "--";
+            }
+            int encoded = (int)std::round(value);
+            int ratioA = encoded / 1000;
+            int ratioB = encoded % 1000;
+            // Clamp to valid range (1-16)
+            ratioA = std::max(1, std::min(16, ratioA));
+            ratioB = std::max(1, std::min(16, ratioB));
+            return std::to_string(ratioA) + ":" + std::to_string(ratioB);
+        };
     } else {
         // Dynamic parameter: use TrackerSequencer's formatting
         cell.formatValue = [paramName](float value) -> std::string {
             return TrackerSequencer::formatParameterValue(paramName, value);
+        };
+    }
+    
+    // Ratio cycling helpers: Convert between linear index (0-135) and ratio (A:B)
+    // Pattern: For each B (1-16), cycle A from 1 to B
+    // Total valid ratios: 1+2+3+...+16 = 136
+    auto ratioIndexToEncoded = [](int index) -> int {
+        // Clamp index to valid range [0, 135]
+        index = std::max(0, std::min(135, index));
+        int sum = 0;
+        for (int B = 1; B <= 16; B++) {
+            if (index < sum + B) {
+                int A = (index - sum) + 1;  // A ranges from 1 to B
+                return A * 1000 + B;
+            }
+            sum += B;
+        }
+        return 16016; // Fallback to 16:16
+    };
+    
+    auto ratioEncodedToIndex = [](int encoded) -> int {
+        int A = encoded / 1000;
+        int B = encoded % 1000;
+        // Clamp to valid range
+        A = std::max(1, std::min(16, A));
+        B = std::max(1, std::min(16, B));
+        // Ensure A <= B
+        if (A > B) A = B;
+        
+        int index = 0;
+        // Sum all ratios for B < current B
+        for (int b = 1; b < B; b++) {
+            index += b;
+        }
+        // Add position within current B (A ranges from 1 to B, so A-1 is the offset)
+        index += (A - 1);
+        return std::max(0, std::min(135, index));
+    };
+    
+    // Custom adjustValue callback for ratio (cycles through valid ratios)
+    if (paramName == "ratio") {
+        cell.customAdjustValue = [&sequencer, step, ratioIndexToEncoded, ratioEncodedToIndex](int delta, float) -> void {
+            if (step < 0 || step >= sequencer.getStepCount()) return;
+            
+            const Step& stepData = sequencer.getCurrentPattern()[step];
+            int currentEncoded = (int)(stepData.ratioA * 1000 + stepData.ratioB);
+            int currentIndex = ratioEncodedToIndex(currentEncoded);
+            int newIndex = currentIndex + delta;
+            int newEncoded = ratioIndexToEncoded(newIndex);
+            
+            // Apply new value
+            Step updatedStep = stepData;
+            updatedStep.ratioA = newEncoded / 1000;
+            updatedStep.ratioB = newEncoded % 1000;
+            sequencer.setStep(step, updatedStep);
         };
     }
     
@@ -1972,6 +2094,63 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
                 if (val >= 0 && val <= 127) {
                     return (float)val;
                 }
+            } catch (...) {
+            }
+            
+            return std::numeric_limits<float>::quiet_NaN();
+        };
+    } else if (paramName == "ratio") {
+        // Ratio: parse A:B format (e.g., "2:4"), handle "--" as NaN
+        cell.parseValue = [](const std::string& str) -> float {
+            if (str == "--" || str.empty()) {
+                return std::numeric_limits<float>::quiet_NaN();
+            }
+            
+            // Parse A:B format
+            size_t colonPos = str.find(':');
+            if (colonPos != std::string::npos && colonPos > 0 && colonPos < str.length() - 1) {
+                try {
+                    int ratioA = std::stoi(str.substr(0, colonPos));
+                    int ratioB = std::stoi(str.substr(colonPos + 1));
+                    // Validate and clamp to 1-16 range
+                    ratioA = std::max(1, std::min(16, ratioA));
+                    ratioB = std::max(1, std::min(16, ratioB));
+                    // Validate A <= B (A can't exceed B)
+                    if (ratioA > ratioB) {
+                        ratioA = ratioB; // Clamp A to B
+                    }
+                    // Encode as A * 1000 + B
+                    return (float)(ratioA * 1000 + ratioB);
+                } catch (...) {
+                    return std::numeric_limits<float>::quiet_NaN();
+                }
+            }
+            
+            // Try slash format: "A/B" → "A:B"
+            size_t slashPos = str.find('/');
+            if (slashPos != std::string::npos && slashPos > 0 && slashPos < str.length() - 1) {
+                try {
+                    int ratioA = std::stoi(str.substr(0, slashPos));
+                    int ratioB = std::stoi(str.substr(slashPos + 1));
+                    // Validate and clamp to 1-16 range
+                    ratioA = std::max(1, std::min(16, ratioA));
+                    ratioB = std::max(1, std::min(16, ratioB));
+                    // Validate A <= B (A can't exceed B)
+                    if (ratioA > ratioB) {
+                        ratioA = ratioB; // Clamp A to B
+                    }
+                    // Encode as A * 1000 + B
+                    return (float)(ratioA * 1000 + ratioB);
+                } catch (...) {
+                    return std::numeric_limits<float>::quiet_NaN();
+                }
+            }
+            
+            // Fall back: try parsing as single number (treat as A:A, e.g., "4" → "4:4")
+            try {
+                int val = std::stoi(str);
+                val = std::max(1, std::min(16, val));
+                return (float)(val * 1000 + val); // A:A format
             } catch (...) {
             }
             

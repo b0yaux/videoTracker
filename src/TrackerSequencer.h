@@ -50,8 +50,8 @@ public:
                                  ConnectionManager* connectionManager) override;
     
     void onConnectionBroken(const std::string& targetModuleName,
-                           Module::ConnectionType connectionType,
-                           ConnectionManager* connectionManager) override;
+                                 Module::ConnectionType connectionType,
+                                 ConnectionManager* connectionManager) override;
     
     // Initialize default pattern based on connected MediaPool (Phase 8.1)
     // Called after all modules are set up and connections are established
@@ -329,6 +329,9 @@ private:
         double sampleAccumulator = 0.0; // Sample accumulator for step timing
         float lastBpm = 120.0f;         // Last known BPM for timing calculations
         
+        // Pattern cycle counting for ratio conditional triggering
+        int patternCycleCount = 0;      // Global cycle counter (increments when pattern wraps, resets on transport stop)
+        
         void reset() {
             playbackStep = 0;
             currentPlayingStep = -1;
@@ -336,6 +339,7 @@ private:
             stepStartTime = 0.0f;
             stepEndTime = 0.0f;
             sampleAccumulator = 0.0;
+            patternCycleCount = 0;
         }
         
         void clearPlayingStep() {
@@ -375,9 +379,7 @@ private:
     struct PendingEdit {
         enum class EditType {
             NONE,
-            PARAMETER,  // Set parameter value
-            INDEX,      // Set index value
-            LENGTH,     // Set length value
+            PARAMETER,  // Set any parameter value (index, length, note, chance, or external params)
             REMOVE      // Remove parameter
         };
         
@@ -385,8 +387,7 @@ private:
         int column = -1;
         EditType type = EditType::NONE;
         std::string parameterName;
-        float value = 0.0f;
-        int intValue = -1;  // Used for index and length
+        float value = 0.0f;  // Used for all parameters (setParameterValue handles conversion)
         
         bool isValid() const { return step >= 0 && type != EditType::NONE; }
         void clear() { *this = PendingEdit(); }

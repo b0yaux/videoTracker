@@ -14,7 +14,8 @@ std::string CellWidget::cellClipboard;
 
 CellWidget::CellWidget() 
     : editing_(false), bufferState_(EditBufferState::None),
-      originalValue_(NAN), shouldRefocus_(false), dragging_(false), dragStartY_(0.0f), dragStartX_(0.0f), lastDragValue_(0.0f) {
+      originalValue_(NAN), shouldRefocus_(false), dragging_(false), dragStartY_(0.0f), dragStartX_(0.0f), lastDragValue_(0.0f),
+      arrowKeyRepeatTimer_(0.0f), arrowKeyLastRepeatTime_(0.0f) {
 }
 
 // Helper function implementations
@@ -234,6 +235,8 @@ void CellWidget::exitEditMode() {
     editBuffer_.clear();
     bufferState_ = EditBufferState::None;  // Reset buffer state when exiting edit mode
     originalValue_ = NAN;  // Clear original value
+    arrowKeyRepeatTimer_ = 0.0f;  // Reset arrow key repeat timer
+    arrowKeyLastRepeatTime_ = 0.0f;
     
     // Re-enable ImGui navigation when exiting edit mode
     ImGuiIO& io = ImGui::GetIO();
@@ -309,15 +312,15 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
         return false;
     }
     
-    // Character input (numeric, operators, decimal, minus) - use unified handler
-    if ((key >= '0' && key <= '9') || key == '+' || key == '*' || key == '/' || key == '.' || key == '-') {
+    // Character input (numeric, operators, decimal, minus, colon for ratio) - use unified handler
+    if ((key >= '0' && key <= '9') || key == '+' || key == '*' || key == '/' || key == '.' || key == '-' || (key == ':' && parameterName == "ratio")) {
         return handleCharacterInput((char)key);
     }
     
     // Arrow keys in edit mode: Adjust values ONLY (no navigation)
     // CRITICAL: When editing, arrow keys must ONLY adjust values, never navigate
     // This ensures focus stays locked to the editing cell
-    // Multi-precision: Shift = fine precision (0.001), standard = range-based increment
+    // Multi-precision: Standard = 0.01, Shift = 0.001 (fine), Ctrl = 0.1 (coarse)
     if (editing_) {
         if (key == OF_KEY_UP || key == OF_KEY_DOWN || key == OF_KEY_LEFT || key == OF_KEY_RIGHT) {
             // Adjust value based on arrow direction
@@ -328,27 +331,26 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
                 delta = -1; // Down/Left = decrease
             }
             
-            // Multi-precision arrow key adjustment: check modifier keys
-            // Shift: Unified fine precision (0.001 per arrow key press)
-            // Standard: Range-based increment for practical traversal (rangeSize/100 per press)
-            // This matches the drag system's multi-precision approach
+            // Multi-precision arrow key adjustment
+            ImGuiIO& io = ImGui::GetIO();
+            bool shiftPressed = io.KeyShift;
+            bool ctrlPressed = io.KeyCtrl;  // Use io.KeyCtrl for reliable macOS Control key detection
+            
             float stepSize;
             if (isInteger) {
                 // Integer parameters: Always 1 step per arrow key (modifiers don't affect integers)
                 stepSize = 1.0f;
             } else {
                 // Float parameters: Multi-precision based on modifier keys
-                ImGuiIO& io = ImGui::GetIO();
-                bool shiftPressed = (io.KeyMods & ImGuiMod_Shift) != 0;
-                
-                if (shiftPressed) {
-                    // Shift: Unified fine precision (0.001 per arrow key) for precise adjustments
-                    stepSize = 0.001f;
+                if (ctrlPressed) {
+                    // Ctrl: Coarse increment (0.1)
+                    stepSize = 0.1f;
+                } else if (shiftPressed) {
+                    // Shift: Fine precision (0.001 = stepIncrement)
+                    stepSize = stepIncrement;  // stepIncrement is 0.001f for floats
                 } else {
-                    // Standard: Practical increment for full-range traversal (rangeSize/100 per arrow key)
-                    // This allows traversing full range in ~100 arrow key presses while maintaining reasonable precision
-                    float rangeSize = maxVal - minVal;
-                    stepSize = rangeSize / 100.0f;
+                    // Standard: Practical increment (0.01)
+                    stepSize = 0.01f;
                 }
             }
             
@@ -363,12 +365,17 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
 
 bool CellWidget::handleCharacterInput(char c) {
     // Unified character input handler for direct typing
-    // Handles: numeric (0-9), operators (+, *, /), decimal (.), minus (-)
+    // Handles: numeric (0-9), operators (+, *, /), decimal (.), minus (-), colon (:) for ratio
     
     // Special validation for integer columns
     if (c == '.' && isInteger) {
         // Ignore decimal point for integer columns
         return true;  // Consume the event but don't add decimal point
+    }
+    
+    // Allow colon only for ratio parameter
+    if (c == ':' && parameterName != "ratio") {
+        return false;  // Don't consume - let it pass through
     }
     
     // Enter edit mode if not already editing
@@ -534,6 +541,23 @@ void CellWidget::cancelEdit() {
 }
 
 void CellWidget::adjustValue(int delta, float customStepSize) {
+    // If custom adjustValue callback is provided, use it instead of default behavior
+    if (customAdjustValue) {
+        customAdjustValue(delta, customStepSize);
+        // After custom callback, refresh display by getting current value
+        // This ensures the edit buffer and display update properly
+        if (getCurrentValue) {
+            float newVal = getCurrentValue();
+            if (formatValue) {
+                editBuffer_ = formatValue(newVal);
+            } else {
+                editBuffer_ = getDefaultFormatValue(newVal);
+            }
+            bufferState_ = EditBufferState::UserModified;
+        }
+        return;
+    }
+    
     if (!getCurrentValue) return;
     
     float currentVal = getCurrentValue();
@@ -1130,6 +1154,10 @@ void CellWidget::processInputInDraw(bool actuallyFocused) {
             else if (c == '-') {
                 handled = this->handleKeyPress('-', false, false);
             }
+            // Check for colon (for ratio parameter, e.g., "2:4")
+            else if (c == ':' && parameterName == "ratio") {
+                handled = this->handleKeyPress(':', false, false);
+            }
             // Check for operators (only in edit mode)
             else if (editing_) {
                 if (c == '+') {
@@ -1237,19 +1265,60 @@ void CellWidget::processInputInDraw(bool actuallyFocused) {
             // Arrow keys in edit mode (adjust values)
             // CRITICAL: Arrow keys should work when editing, regardless of navigation state
             // They adjust values, not navigate between cells
+            // Brief press: single increment (IsKeyPressed)
+            // Held key: smooth continuous movement with repeat delay (IsKeyDown)
             if (editing_) {
                 bool shiftPressed = io.KeyShift;
-                if (ImGui::IsKeyDown(ImGuiKey_UpArrow)) {
-                    this->handleKeyPress(OF_KEY_UP, false, shiftPressed);
+                float deltaTime = io.DeltaTime;  // Time since last frame
+                
+                // Check each arrow key
+                bool upPressed = ImGui::IsKeyPressed(ImGuiKey_UpArrow, false);
+                bool upDown = ImGui::IsKeyDown(ImGuiKey_UpArrow);
+                bool downPressed = ImGui::IsKeyPressed(ImGuiKey_DownArrow, false);
+                bool downDown = ImGui::IsKeyDown(ImGuiKey_DownArrow);
+                bool leftPressed = ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false);
+                bool leftDown = ImGui::IsKeyDown(ImGuiKey_LeftArrow);
+                bool rightPressed = ImGui::IsKeyPressed(ImGuiKey_RightArrow, false);
+                bool rightDown = ImGui::IsKeyDown(ImGuiKey_RightArrow);
+                
+                // Handle initial press (single increment) - resets timer
+                if (upPressed || downPressed || leftPressed || rightPressed) {
+                    arrowKeyRepeatTimer_ = 0.0f;  // Reset timer on any initial press
+                    if (upPressed) this->handleKeyPress(OF_KEY_UP, false, shiftPressed);
+                    if (downPressed) this->handleKeyPress(OF_KEY_DOWN, false, shiftPressed);
+                    if (leftPressed) this->handleKeyPress(OF_KEY_LEFT, false, shiftPressed);
+                    if (rightPressed) this->handleKeyPress(OF_KEY_RIGHT, false, shiftPressed);
                 }
-                if (ImGui::IsKeyDown(ImGuiKey_DownArrow)) {
-                    this->handleKeyPress(OF_KEY_DOWN, false, shiftPressed);
-                }
-                if (ImGui::IsKeyDown(ImGuiKey_LeftArrow)) {
-                    this->handleKeyPress(OF_KEY_LEFT, false, shiftPressed);
-                }
-                if (ImGui::IsKeyDown(ImGuiKey_RightArrow)) {
-                    this->handleKeyPress(OF_KEY_RIGHT, false, shiftPressed);
+                
+                // Handle held keys (smooth continuous movement with repeat delay)
+                // Shift modifier affects repeat rate: faster repeat when Shift is pressed
+                bool anyArrowDown = upDown || downDown || leftDown || rightDown;
+                if (anyArrowDown) {
+                    arrowKeyRepeatTimer_ += deltaTime;
+                    
+                    // Use faster repeat rate when Shift is pressed (for fine adjustments)
+                    float repeatRate = shiftPressed ? ARROW_KEY_REPEAT_RATE_SHIFT : ARROW_KEY_REPEAT_RATE;
+                    
+                    // After initial delay, repeat at fixed rate
+                    if (arrowKeyRepeatTimer_ >= ARROW_KEY_REPEAT_DELAY) {
+                        // Calculate time since repeat started
+                        float timeSinceRepeatStart = arrowKeyRepeatTimer_ - ARROW_KEY_REPEAT_DELAY;
+                        
+                        // Check if enough time has passed for next increment
+                        if (timeSinceRepeatStart - arrowKeyLastRepeatTime_ >= repeatRate) {
+                            arrowKeyLastRepeatTime_ = timeSinceRepeatStart;
+                            
+                            // Process one increment per frame for smoothness
+                            if (upDown) this->handleKeyPress(OF_KEY_UP, false, shiftPressed);
+                            if (downDown) this->handleKeyPress(OF_KEY_DOWN, false, shiftPressed);
+                            if (leftDown) this->handleKeyPress(OF_KEY_LEFT, false, shiftPressed);
+                            if (rightDown) this->handleKeyPress(OF_KEY_RIGHT, false, shiftPressed);
+                        }
+                    }
+                } else {
+                    // No arrow keys down - reset timer and repeat tracking
+                    arrowKeyRepeatTimer_ = 0.0f;
+                    arrowKeyLastRepeatTime_ = 0.0f;
                 }
             }
         }
@@ -1309,7 +1378,38 @@ void CellWidget::updateDrag() {
     
     // Use the larger of horizontal or vertical movement for maximum precision
     // This allows dragging in any direction with equal effectiveness
+    // Preserve sign for direction (positive = increase, negative = decrease)
     float totalDragDelta = std::abs(dragDeltaY) > std::abs(dragDeltaX) ? dragDeltaY : dragDeltaX;
+    
+    // SPECIAL CASE: Ratio parameter - use discrete index-based cycling
+    // This ensures we cycle through all valid ratios (1:1, 1:2, 2:2, 1:3, 2:3, 3:3, ...)
+    if (customAdjustValue && parameterName == "ratio") {
+        // Convert pixel movement to discrete ratio index steps
+        // Target: ~200 pixels for full range (136 ratios) = ~1.47 pixels per step
+        ImGuiIO& io = ImGui::GetIO();
+        bool shiftPressed = (io.KeyMods & ImGuiMod_Shift) != 0;
+        float pixelsPerStep = shiftPressed ? 0.74f : 1.47f;  // Fine precision with Shift
+        
+        // Calculate discrete step delta (preserve sign for direction)
+        int stepDelta = (int)std::round(totalDragDelta / pixelsPerStep);
+        // Ensure we have a direction (at least 1 step if movement is significant)
+        if (stepDelta == 0 && std::abs(totalDragDelta) > pixelsPerStep * 0.5f) {
+            stepDelta = (totalDragDelta > 0) ? 1 : -1;
+        }
+        
+        if (stepDelta != 0) {
+            // Use custom adjustValue to cycle through valid ratios
+            customAdjustValue(stepDelta, 0.0f);
+            // Reset drag start to prevent accumulation and ensure discrete steps
+            dragStartY_ = currentPos.y;
+            dragStartX_ = currentPos.x;
+            // Update lastDragValue_ to current value to prevent drift
+            if (getCurrentValue) {
+                lastDragValue_ = getCurrentValue();
+            }
+        }
+        return;
+    }
     
     // Multi-precision dragging: standard for full-range traversal, Shift for unified fine precision
     // Check modifier keys for precision control

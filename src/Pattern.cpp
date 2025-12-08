@@ -10,6 +10,8 @@ void Step::clear() {
     length = 1;
     note = -1;      // Reset to not set
     chance = 100;   // Reset to default (always trigger)
+    ratioA = 1;     // Reset to default (always trigger)
+    ratioB = 1;     // Reset to default (always trigger)
     parameterValues.clear();
     
     // Don't set default parameters here - defaults come from MediaPool/MediaPlayer
@@ -23,6 +25,10 @@ float Step::getParameterValue(const std::string& paramName, float defaultValue) 
     }
     if (paramName == "chance") {
         return (float)chance;
+    }
+    if (paramName == "ratio") {
+        // Encode ratio as A * 1000 + B (e.g., 2:4 = 2004)
+        return (float)(ratioA * 1000 + ratioB);
     }
     
     // Handle external parameters stored in map
@@ -47,6 +53,15 @@ void Step::setParameterValue(const std::string& paramName, float value) {
         parameterValues.erase("chance");
         return;
     }
+    if (paramName == "ratio") {
+        // Decode ratio from encoded value (A * 1000 + B)
+        int encoded = (int)std::round(value);
+        ratioA = std::max(1, std::min(16, encoded / 1000));
+        ratioB = std::max(1, std::min(16, encoded % 1000));
+        // Also remove from map if it exists (for migration)
+        parameterValues.erase("ratio");
+        return;
+    }
     
     // Handle external parameters stored in map
     parameterValues[paramName] = value;
@@ -59,6 +74,9 @@ bool Step::hasParameter(const std::string& paramName) const {
     }
     if (paramName == "chance") {
         return true;  // Chance is always present (defaults to 100)
+    }
+    if (paramName == "ratio") {
+        return true;  // Ratio is always present (defaults to 1:1)
     }
     
     // Handle external parameters stored in map
@@ -79,6 +97,13 @@ void Step::removeParameter(const std::string& paramName) {
         parameterValues.erase("chance");
         return;
     }
+    if (paramName == "ratio") {
+        ratioA = 1;  // Reset to default
+        ratioB = 1;  // Reset to default
+        // Also remove from map if it exists (for migration)
+        parameterValues.erase("ratio");
+        return;
+    }
     
     // Handle external parameters stored in map
     parameterValues.erase(paramName);
@@ -87,7 +112,8 @@ void Step::removeParameter(const std::string& paramName) {
 bool Step::operator==(const Step& other) const {
     // Compare direct fields first
     if (index != other.index || length != other.length || 
-        note != other.note || chance != other.chance) {
+        note != other.note || chance != other.chance ||
+        ratioA != other.ratioA || ratioB != other.ratioB) {
         return false;
     }
     // Compare parameter values map
@@ -315,13 +341,15 @@ ofJson Pattern::toJson() const {
         stepJson["length"] = step.length;
         stepJson["note"] = step.note;      // Save as direct field
         stepJson["chance"] = step.chance;   // Save as direct field
+        stepJson["ratioA"] = step.ratioA;   // Save as direct field
+        stepJson["ratioB"] = step.ratioB;   // Save as direct field
         
-        // Save parameter values (external parameters only, note/chance are now direct fields)
+        // Save parameter values (external parameters only, note/chance/ratio are now direct fields)
         ofJson paramJson = ofJson::object();
         for (const auto& pair : step.parameterValues) {
-            // Skip note and chance if they exist in map (for backward compatibility during migration)
-            if (pair.first != "note" && pair.first != "chance") {
-                paramJson[pair.first] = pair.second;
+            // Skip note, chance, and ratio if they exist in map (for backward compatibility during migration)
+            if (pair.first != "note" && pair.first != "chance" && pair.first != "ratio") {
+            paramJson[pair.first] = pair.second;
             }
         }
         stepJson["parameters"] = paramJson;
@@ -392,7 +420,7 @@ void Pattern::fromJson(const ofJson& json) {
                     // Backward compatibility: infer category from parameter name
                     if (col.parameterName == "index" || col.parameterName == "length") {
                         col.category = ColumnCategory::TRIGGER;
-                    } else if (col.parameterName == "chance") {
+                    } else if (col.parameterName == "chance" || col.parameterName == "ratio") {
                         col.category = ColumnCategory::CONDITION;
                     } else {
                         col.category = ColumnCategory::PARAMETER;
@@ -463,6 +491,17 @@ void Pattern::fromJson(const ofJson& json) {
         }
         // else: use default value (100) from Step constructor
         
+        // Load ratio as direct fields (new format)
+        if (stepJson.contains("ratioA") && !stepJson["ratioA"].is_null()) {
+            step.ratioA = stepJson["ratioA"];
+        }
+        // else: use default value (1) from Step constructor
+        
+        if (stepJson.contains("ratioB") && !stepJson["ratioB"].is_null()) {
+            step.ratioB = stepJson["ratioB"];
+        }
+        // else: use default value (1) from Step constructor
+        
         // Load parameter values (new format)
         if (stepJson.contains("parameters") && stepJson["parameters"].is_object()) {
             auto paramJson = stepJson["parameters"];
@@ -470,8 +509,8 @@ void Pattern::fromJson(const ofJson& json) {
                 // Skip null parameter values
                 if (!it.value().is_null() && it.value().is_number()) {
                     std::string paramName = it.key();
-                    // Backward compatibility: migrate note/chance from parameters map to direct fields
-                    if (paramName == "note" || paramName == "chance") {
+                    // Backward compatibility: migrate note/chance/ratio from parameters map to direct fields
+                    if (paramName == "note" || paramName == "chance" || paramName == "ratio") {
                         step.setParameterValue(paramName, it.value()); // This will set the direct field and remove from map
                     } else {
                         step.setParameterValue(paramName, it.value());
@@ -507,7 +546,7 @@ void Pattern::initializeDefaultColumns() {
     columnConfig.push_back(ColumnConfig("position", ColumnCategory::PARAMETER, false, 2));
     columnConfig.push_back(ColumnConfig("speed", ColumnCategory::PARAMETER, false, 3));
     columnConfig.push_back(ColumnConfig("volume", ColumnCategory::PARAMETER, false, 4));
-    // Note: chance is CONDITION category, but not added by default (user can add it via context menu)
+    // Note: chance and ratio are CONDITION category, but not added by default (user can add them via context menu)
 }
 
 void Pattern::addColumn(const std::string& parameterName, const std::string& displayName, int position) {
@@ -665,7 +704,7 @@ void Pattern::swapColumnParameter(int columnIndex, const std::string& newParamet
     // Update category based on new parameter name
     if (newParameterName == "index" || newParameterName == "length" || newParameterName == "note") {
         columnConfig[columnIndex].category = ColumnCategory::TRIGGER;
-    } else if (newParameterName == "chance") {
+    } else if (newParameterName == "chance" || newParameterName == "ratio") {
         columnConfig[columnIndex].category = ColumnCategory::CONDITION;
     } else {
         columnConfig[columnIndex].category = ColumnCategory::PARAMETER;

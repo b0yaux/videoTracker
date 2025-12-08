@@ -129,6 +129,7 @@ public:
     std::function<std::string(float)> formatValue;       // Optional: custom formatter
     std::function<float(const std::string&)> parseValue; // Optional: custom parser
     std::function<int()> getMaxIndex;                    // For index columns: max index value
+    std::function<void(int, float)> customAdjustValue;  // Optional: custom adjustValue callback (overrides default behavior)
     
     // Configuration properties
     std::string parameterName;  // Parameter name (e.g., "position", "speed", "volume")
@@ -177,6 +178,13 @@ private:
     float dragStartY_ = 0.0f;
     float dragStartX_ = 0.0f;
     float lastDragValue_ = 0.0f;
+    
+    // Arrow key repeat state (for smooth continuous movement when held)
+    float arrowKeyRepeatTimer_ = 0.0f;  // Time since arrow key was first pressed
+    float arrowKeyLastRepeatTime_ = 0.0f;  // Time of last repeat increment (relative to repeat start)
+    static constexpr float ARROW_KEY_REPEAT_DELAY = 0.25f;  // Initial delay before repeat starts (seconds)
+    static constexpr float ARROW_KEY_REPEAT_RATE = 0.05f;  // Repeat rate once started (seconds per increment)
+    static constexpr float ARROW_KEY_REPEAT_RATE_SHIFT = 0.02f;  // Faster repeat rate when Shift is pressed (seconds per increment)
     
     // Internal methods
     void initializeEditBuffer();

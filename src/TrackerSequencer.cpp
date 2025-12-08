@@ -286,11 +286,13 @@ void TrackerSequencer::onClockTransportChanged(bool isPlaying) {
         // Reset to step 1 and trigger it
         playbackState.playbackStep = 0; // Start playback at step 0 (0-based internally, so step 1 is index 0)
         playbackState.clearPlayingStep();
+        playbackState.patternCycleCount = 0; // Reset cycle counter on transport start
         triggerStep(0);  // Trigger step 1 (0-based)
         ofLogNotice("TrackerSequencer") << "Clock transport started - sequencer playing from step 1";
     } else {
         // Clock stopped - pause the sequencer (don't reset step)
         pause();
+        playbackState.patternCycleCount = 0; // Reset cycle counter on transport stop
         ofLogNotice("TrackerSequencer") << "Clock transport stopped - sequencer paused at step " << (playbackState.playbackStep + 1);
     }
 }
@@ -717,7 +719,7 @@ void TrackerSequencer::pause() {
 
 void TrackerSequencer::stop() {
     playbackState.isPlaying = false;
-    playbackState.reset();
+    playbackState.reset();  // reset() already resets patternCycleCount to 0
 }
 
 void TrackerSequencer::reset() {
@@ -896,6 +898,11 @@ void TrackerSequencer::advanceStep() {
     // Check if we wrapped around (pattern finished)
     bool patternFinished = (playbackState.playbackStep == 0 && previousStep == stepCount - 1);
     
+    // Increment pattern cycle count when pattern wraps (one pattern repeat = one cycle)
+    if (patternFinished) {
+        playbackState.patternCycleCount++;
+    }
+    
     // If pattern finished and using pattern chain, handle repeat counts
     if (patternFinished) {
         int nextPatternIdx = patternChain.advanceOnPatternFinish((int)patterns.size());
@@ -956,6 +963,25 @@ void TrackerSequencer::triggerStep(int step) {
     triggerEvt.duration = duration;
     triggerEvt.step = step;  // Include step number for position memory modes
     
+    // Check ratio parameter (internal) - only trigger if current cycle matches ratio
+    // Ratio is A:B format, where A is which cycle to trigger (1-based) and B is total cycles
+    // Default is 1:1 (always trigger)
+    // Use direct field access for performance (ratioA/ratioB are now direct fields)
+    if (stepData.index >= 0) {  // Only check ratio if step has a trigger
+        int ratioA = std::max(1, std::min(16, stepData.ratioA)); // Clamp to 1-16
+        int ratioB = std::max(1, std::min(16, stepData.ratioB)); // Clamp to 1-16
+        
+        // Calculate current cycle position in ratio loop (1-based)
+        // patternCycleCount is 0-based, so add 1 for 1-based cycle position
+        int currentCycle = playbackState.patternCycleCount + 1;
+        int cycleInLoop = ((currentCycle - 1) % ratioB) + 1;  // 1-based position in loop
+        
+        if (cycleInLoop != ratioA) {
+            // Ratio condition failed - don't trigger this step
+            return;
+        }
+    }
+    
     // Check chance parameter (internal) - only trigger if random roll succeeds
     // Chance is 0-100, default 100 (always trigger)
     // Use direct field access for performance (chance is now a direct field)
@@ -980,8 +1006,8 @@ void TrackerSequencer::triggerStep(int step) {
     }
     
     // Tracker-specific parameters that are NOT sent to external modules
-    // These are sequencer-specific: index, length, note, chance
-    std::set<std::string> trackerOnlyParams = {"index", "length", "note", "chance"};
+    // These are sequencer-specific: index, length, note, chance, ratio
+    std::set<std::string> trackerOnlyParams = {"index", "length", "note", "chance", "ratio"};
     
     // MODULAR: Only send parameters that are in the current pattern's column configuration
     // This ensures we only send parameters that are actually displayed/used in the grid
@@ -1047,20 +1073,12 @@ void TrackerSequencer::applyPendingEdit() {
         return;
     }
     
-    Step step = getStep(pendingEdit.step);
+    Step& step = getPatternStep(pendingEdit.step);
     
     // Apply edit based on type
     switch (pendingEdit.type) {
         case PendingEdit::EditType::REMOVE:
             step.removeParameter(pendingEdit.parameterName);
-            break;
-            
-        case PendingEdit::EditType::LENGTH:
-            step.length = pendingEdit.intValue;
-            break;
-            
-        case PendingEdit::EditType::INDEX:
-            step.index = pendingEdit.intValue;
             break;
             
         case PendingEdit::EditType::PARAMETER:
@@ -1072,11 +1090,11 @@ void TrackerSequencer::applyPendingEdit() {
             break;
             
         case PendingEdit::EditType::NONE:
-            return;  // No edit to apply
+            break;
     }
     
-    // Update the pattern with modified step
-    setStep(pendingEdit.step, step);
+    // Clear after applying
+    pendingEdit.clear();
 }
 
 // initializeEditBuffer() removed - use ParameterCell::enterEditMode() instead
@@ -1185,6 +1203,10 @@ std::vector<ParameterDescriptor> TrackerSequencer::getTrackerParameters() const 
     // Chance: trigger probability (0-100, controls whether step triggers)
     params.push_back(ParameterDescriptor("chance", ParameterType::INT, 0.0f, 100.0f, 100.0f, "Chance"));
     
+    // Ratio: conditional triggering (A:B format, 1-16 range for both A and B)
+    // Note: Ratio is encoded as A * 1000 + B for storage, but displayed as A:B
+    params.push_back(ParameterDescriptor("ratio", ParameterType::INT, 1001.0f, 16016.0f, 1001.0f, "Ratio"));
+    
     return params;
 }
 
@@ -1198,6 +1220,9 @@ ParameterDescriptor TrackerSequencer::getTrackerParameterDescriptor(const std::s
         return ParameterDescriptor("length", ParameterType::INT, 1.0f, 16.0f, 1.0f, "Length");
     } else if (paramName == "chance") {
         return ParameterDescriptor("chance", ParameterType::INT, 0.0f, 100.0f, 100.0f, "Chance");
+    } else if (paramName == "ratio") {
+        // Ratio is encoded as A * 1000 + B (e.g., 2:4 = 2004)
+        return ParameterDescriptor("ratio", ParameterType::INT, 1001.0f, 16016.0f, 1001.0f, "Ratio");
     }
     // Return empty descriptor for unknown parameters
     return ParameterDescriptor();
@@ -1211,6 +1236,8 @@ std::vector<ParameterDescriptor> TrackerSequencer::getInternalParameters() {
     params.push_back(ParameterDescriptor("note", ParameterType::INT, 0.0f, 127.0f, 60.0f, "Note"));
     // "chance" - trigger probability (0-100, controls whether step triggers)
     params.push_back(ParameterDescriptor("chance", ParameterType::INT, 0.0f, 100.0f, 100.0f, "Chance"));
+    // "ratio" - conditional triggering (A:B format, encoded as A * 1000 + B)
+    params.push_back(ParameterDescriptor("ratio", ParameterType::INT, 1001.0f, 16016.0f, 1001.0f, "Ratio"));
     
     return params;
 }
