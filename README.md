@@ -1,12 +1,113 @@
 # videoTracker
 
-A modular audiovisual sequencer built with openFrameworks, featuring a tracker-style step sequencer, media pool management, and real-time audio/video mixing capabilities.
+openFrameworks / ImGui / C++ project - modular audiovisual sampling and synthesis.
 
-## Overview
+## Remaining issues / needed enhancements :
 
-videoTracker is a professional-grade audiovisual performance and composition tool that combines the precision of tracker-style sequencing with the flexibility of modular synthesis. It provides sample-accurate timing, real-time media playback, and a powerful module-based architecture for creating complex audiovisual compositions.
+### trackerSequencer (+ GUI) :
 
-### Key Features
+**Pattern grid :**
+
+- X miss a unified column headers context menu
+- X needs to fix mismatch/offset in columns buttons R/L (GUI)
+- 'Index' cells max value should depend on mediaPool's index count if connected and >0
+- misses 'Condition' optional internal columns for step conditional triggering (inspired by Elektron sequencers).
+- 'Chance' parameter should displayed as '--' if step has no trigger (just like the 'length' parameter since it only affects triggers)
+	→ this should apply to 'Condition' as well
+- Pattern should be scrollable when too long to display in tracker window, and pattern should auto-scroll during playback (for now it only auto-scroll when user navigate using keyboard)
+
+**Pattern controls GUI :**
+
+- remove 'clear pattern' and 'D' big buttons in pattern control section
+
+**Pattern chain GUI :**
+
+- refactor existing pattern chaining to use a proper CellGrid table instead (inspired by how we use CellGrids elsewhere in our modules), where each column is a pattern in chain :
+	- header : pattern selector with Header Popup allowing selection of any existing pattern. user can drag them to reoder patterns
+	- row 0 : numbered chain position : replace existing '01' '02' ... buttons (theses should never move when reordering column headers)
+	- row 1 : simple pattern count (similar to current)
+- keep the existing +/-/D buttons for now aside the table on the right ON/OFF toggle on the left, and adapt all working features to this layout (like pattern mute when playing)
+
+### mediaPool (+GUI)
+
+**Parameter Grid :**
+
+- should clarify PLAY/STOP toggle button and Index cell : index cell set the active index, PLAY button is used to control manual playback & display current playback state for active index
+- consider dividing mediaPool into two distinct modules : Sampler and multiSampler.
+- 'loop Size' parameter cell is inconvenient because of custom mapping (impossible to edit properly like other cells, present issues when trying to edit buffer, should prevent this while preserving some kind of logarithmic precision)
+
+### assetLibrary
+
+**Refresh asset list :**
+
+- re-scan project directory for converted assets (handle assets that user adds manually & folders that have been manually re-organized)
+
+**Conversion settings GUI :**
+
+- adjust conversion configuration to allow smaller file sizes w/ more compression in a GUI menu in assetLibrary
+
+**Tooltip Preview :**
+
+- Waveforms for Audio-only assets are not properly generated (displays : 'Waveform not cached (will be generated on re-import)'), despite it works for AV assets.
+
+## Future features & ideas :
+
+consider sorting ideas depending on complexity
+
+**high priority : high value for performance purposes**
+
+### Modulators
+
+In our videoTracker app, we have a ParameterCell, a ParameterPath class, and ParameterRouter.
+
+In GUI, Cellwidgets are editable cells that contains parameters values.
+
+The goal of this system is to have a unified parameter system, in order to enable parameter mappings and modulations (as in ableton live, or bespokeSynth).
+
+Analyze the codebase to explain the current state, and how far we are for proper mapping system and modulation (with a potential new LFO class)
+
+### Better multi-input handling
+
+- For now, our 'InputRouter' class handle keyboard input. it may better be refactored to a 'KeyboardInput' class, alongside which we could add a 'GamepadInput' class in order to handle mapping a gamePad to some parameter
+- currently, the '0.1' increment works with cmd+arrow keys, which isn't right and conflicts with our navigation shortcut. How to properly use the 'Control' macos Key here if 'KeyCtrl' is command ? and the previous keyMods & imGuiMod_Ctrl doesn't work as well, why ?
+
+Should we leverage openFrameworks for proper modifier state ?
+
+**medium priority : high value, potentially complex to fully implement**
+
+### Oscilloscope (or spectrogram?)
+
+- implement simple oscilloscope / spectrogram audiovisualizations for usage across codebase ; for example as optional display above app background (inspired by MiniMeters audiovisualizations)
+
+### AV feedback loops
+
+- Integrate live system desktop captures to have a live AV input of the software window (with or without GUI) and use it for live AV feedback
+- Use Audiovisual recording feature with external OBS (or integrated feature below)
+- Use a webcam (insta360) inside OBS then use OBS as webcam in-app ?
+
+### Audiovisual recording (ffmpeg integration ?)
+
+- Simple integrated RECORD button to quickly record an AV media for saving purpose (with or without GUI)
+
+**low priority : accessory value, potentially complex**
+
+### Rolling sampler (Audio-only or AV)
+
+- Inspired by bird's rolling sampler, w/ direct drag&drop
+
+## Long-term emancipation plans [sur la comète] :
+
+Forgetting oF dependency for better long term architecture, more control, but with more work to build video processing (hypothesis) :
+
+hello-imgui (App Framework)
+	├── ImGui (GUI)
+	├── JUCE (Audio Engine)
+	└── Custom Video Processing (or other library comparable to openFrameworks?)
+		├── FFmpeg directly
+		├── OpenCV
+		└── Custom OpenGL rendering
+
+# Key Features
 
 - **Tracker-Style Sequencer**: Step-based pattern sequencing with multi-pattern support and pattern chaining
 - **Modular Architecture**: Plugin-style module system supporting sequencers, instruments, effects, and utilities
@@ -16,6 +117,7 @@ videoTracker is a professional-grade audiovisual performance and composition too
 - **Session Management**: Complete project and session save/load with asset management
 - **Parameter Routing**: Flexible parameter modulation and automation system
 - **Connection Management**: Dynamic module connections for audio, video, parameters, and events
+
 
 ## Architecture
 
@@ -229,42 +331,6 @@ Check `addons.make` for the complete list. Key addons include:
 - `ofxSoundObjects` - Audio routing and processing
 - `ofxVisualObjects` - Video routing and processing
 - `ofxImGui` (or direct ImGui integration) - GUI system
-
-## Usage
-
-### Basic Workflow
-
-1. **Start the Application**: The app creates default modules (TrackerSequencer and MediaPool)
-2. **Load Media**: Drag media files into the MediaPool or use the file browser
-3. **Create Patterns**: Use the TrackerSequencer to create step patterns
-4. **Connect Modules**: Modules automatically connect, or use the connection manager
-5. **Play**: Use the Clock transport controls to start playback
-
-### Module Management
-
-- **Add Module**: Use the module factory to create new instances
-- **Remove Module**: Delete modules through the GUI or programmatically
-- **Configure Module**: Each module has its own GUI panel for configuration
-
-### Pattern Sequencing
-
-- **Set Steps**: Configure step count per pattern
-- **Edit Cells**: Click cells in the sequencer grid to set values
-- **Pattern Chain**: Create pattern chains with repeat counts
-- **Parameter Columns**: Map sequencer columns to module parameters
-
-### Media Management
-
-- **Scan Directory**: MediaPool automatically scans for media files
-- **File Pairing**: Audio/video files are automatically paired by base name
-- **Playback Modes**: Configure ONCE, LOOP, or NEXT playback styles
-- **Position Scanning**: Choose how position is tracked across triggers
-
-### Session Management
-
-- **Save Session**: Save complete project state including modules, connections, and media paths
-- **Load Session**: Restore previous sessions with all state intact
-- **Project Organization**: Organize work into projects with asset management
 
 ## Development
 
