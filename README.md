@@ -8,12 +8,7 @@ openFrameworks / ImGui / C++ project - modular audiovisual sampling and synthesi
 
 **Pattern grid :**
 
-- X miss a unified column headers context menu
-- X needs to fix mismatch/offset in columns buttons R/L (GUI)
 - 'Index' cells max value should depend on mediaPool's index count if connected and >0
-- misses 'Condition' optional internal columns for step conditional triggering (inspired by Elektron sequencers).
-- 'Chance' parameter should displayed as '--' if step has no trigger (just like the 'length' parameter since it only affects triggers)
-	→ this should apply to 'Condition' as well
 - Pattern should be scrollable when too long to display in tracker window, and pattern should auto-scroll during playback (for now it only auto-scroll when user navigate using keyboard)
 
 **Pattern controls GUI :**
@@ -33,8 +28,9 @@ openFrameworks / ImGui / C++ project - modular audiovisual sampling and synthesi
 **Parameter Grid :**
 
 - should clarify PLAY/STOP toggle button and Index cell : index cell set the active index, PLAY button is used to control manual playback & display current playback state for active index
-- consider dividing mediaPool into two distinct modules : Sampler and multiSampler.
 - 'loop Size' parameter cell is inconvenient because of custom mapping (impossible to edit properly like other cells, present issues when trying to edit buffer, should prevent this while preserving some kind of logarithmic precision)
+- rationalize the POLYPHONY mode to properly handle multiple players (up to 16 per instance)
+- add BLEND MODE MULTI-STATE button when in POLY mode
 
 ### assetLibrary
 
