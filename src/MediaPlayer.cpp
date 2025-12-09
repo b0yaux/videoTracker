@@ -321,12 +321,7 @@ float MediaPlayer::captureCurrentPosition() const {
 }
 
 void MediaPlayer::stop() {
-    // CRITICAL: Capture actual playback position BEFORE stopping underlying players
-    // Once we call stop() on the players, they may reset their position to 0
-    // So we must capture position from the players BEFORE stopping them
-    float actualPlaybackPosition = captureCurrentPosition();
-    
-    // NOW stop the players (after capturing position)
+    // Stop the underlying players
     audioPlayer.stop();
     videoPlayer.stop();
     
@@ -340,34 +335,19 @@ void MediaPlayer::stop() {
     if (isVideoLoaded()) {
         videoPlayer.setPaused(false);   // Ensure not paused
         videoPlayer.stop();             // Stop again to be sure
-        // Force texture update to clear any stale frames
-        videoPlayer.getVideoFile().update();
-    }
-    
-    // CRITICAL: Preserve position IMMEDIATELY after stopping players
-    // The players may have reset their position to 0, and any callbacks/listeners
-    // might try to read from them and reset the playheadPosition parameter
-    // So we MUST set the playheadPosition parameter to the captured value right away
-    // 
-    // NOTE: We preserve position even if it's at the end - this allows scanning
-    // to work properly. The position will be reset by MediaPool when appropriate
-    // (e.g., when transport starts, or when explicitly cleared).
-    if (actualPlaybackPosition > POSITION_VALID_THRESHOLD) {
-        playheadPosition.set(actualPlaybackPosition);
-        ofLogNotice("MediaPlayer") << "Preserved playback position in stop(): " << actualPlaybackPosition 
-                                       << " (startPosition: " << startPosition.get() << ")";
-    } else {
-        // If position is still 0, check if we had a valid position before (might be a race condition)
-        // In this case, keep the existing playheadPosition parameter value if it's valid
-        float existingPos = playheadPosition.get();
-        if (existingPos > POSITION_VALID_THRESHOLD) {
-            ofLogNotice("MediaPlayer") << "Keeping existing playheadPosition parameter in stop(): " << existingPos
-                                           << " (startPosition: " << startPosition.get() << ")";
-            // Don't overwrite - playheadPosition parameter already has a valid value
-        } else {
-            ofLogVerbose("MediaPlayer") << "No valid position to preserve in stop() (was: " << existingPos << ")";
+        // PERFORMANCE: Only update video if it was actually playing
+        // This avoids expensive update() calls when stopping already-stopped videos
+        // (e.g., when NEXT mode switches media and stops the next player before it starts)
+        // Video output is disabled below anyway, so stale frames won't be visible
+        if (videoPlayer.isPlaying()) {
+            // Force texture update to clear any stale frames (only if was playing)
+            videoPlayer.getVideoFile().update();
         }
     }
+    
+    // NOTE: Position preservation is handled by MediaPool, not MediaPlayer.
+    // MediaPool captures position before stop() for NEXT mode and manages
+    // position memory according to play style (NEXT/LOOP/ONCE).
     
     // CRITICAL: Disable video output to gate out frames when stopped
     // This ensures stopped videos don't show stale frames in the mixer
@@ -514,8 +494,8 @@ void MediaPlayer::update() {
     
     // Sync position parameter with actual playback position
     // CRITICAL: Only update position when actively playing
-    // When stopped, position is preserved by stop() method and should NOT be overwritten
-    // by reading from underlying players (which are reset to 0)
+    // When stopped, position management is handled by MediaPool (for position memory in NEXT mode)
+    // We don't read from underlying players when stopped as they may be reset to 0
     if (isPlaying()) {
         // Cache parameter reads to avoid redundant calls
         float speedVal = speed.get();
@@ -567,9 +547,10 @@ void MediaPlayer::update() {
             playheadPosition.set(currentPosition);
         }
     }
-    // CRITICAL: When stopped, position is preserved by stop() method
-    // DO NOT read from underlying players (which are reset to 0) and overwrite the preserved position
-    // The playheadPosition parameter contains the preserved playback position for position memory
+    // NOTE: When stopped, position management is handled by MediaPool.
+    // MediaPool captures position before stop() for NEXT mode and manages position memory
+    // according to play style. We don't update playheadPosition when stopped to avoid
+    // overwriting values set by MediaPool.
     // NOTE: Gating (scheduled stops) is now handled by MediaPool, not MediaPlayer
 }
 
@@ -611,23 +592,13 @@ void MediaPlayer::onPlayheadPositionChanged(float& pos) {
         return;
     }
     
-    // CRITICAL: When stopped, the playheadPosition parameter contains the preserved playback position
-    // for position memory. We should NOT read from the players (which are reset to 0) and
-    // overwrite the playheadPosition parameter. Only seek if the position is being explicitly set
-    // (e.g., by user seeking), not if it's being preserved from stop().
-    // 
-    // If position is > 0.01f, it's likely a preserved position from stop() - don't overwrite it
-    // by reading from players (which are at 0). Only seek if we're explicitly setting a new position.
-    // 
-    // However, we still need to allow seeking when paused/stopped for user interaction.
-    // The key is: if playheadPosition parameter is valid (> 0.01f), trust it and seek to it.
-    // Don't read from players and potentially reset it to 0.
-    
     // PERFORMANCE CRITICAL: Only seek when NOT playing (paused/stopped state)
-    // This is for seeking while paused, not for playback position updates
-    // CRITICAL: Don't read from players and reset position - if pos is valid, seek to it
+    // This is for seeking while paused/stopped, not for playback position updates.
+    // NOTE: Position memory is managed by MediaPool, not MediaPlayer. When stopped,
+    // MediaPool may set playheadPosition for NEXT mode position memory. We trust
+    // the playheadPosition parameter value and seek to it when it changes.
     if (pos > POSITION_VALID_THRESHOLD) {
-        // Position is valid - seek to it (user seeking or preserved position)
+        // Position is valid - seek to it (user seeking or position set by MediaPool)
         if (isAudioLoaded()) {
             // Only set audio position if it's significantly different (audio seeking is fast, but still avoid unnecessary calls)
             float currentAudioPos = audioPlayer.getPosition();
@@ -645,8 +616,7 @@ void MediaPlayer::onPlayheadPositionChanged(float& pos) {
             }
         }
     }
-    // If pos is 0 or very small, don't seek - this might be a reset that we want to ignore
-    // (e.g., if players reset to 0 but we want to preserve the playheadPosition parameter)
+    // If pos is 0 or very small, don't seek - this might be a reset or MediaPool clearing position
     
     lastPosition = pos;
 }

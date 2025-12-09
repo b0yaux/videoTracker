@@ -10,10 +10,12 @@
 #include "ofxSoundObjects.h"
 #include <imgui.h>
 #include <imgui_internal.h>
+#include "ofMain.h"
 #include "ofLog.h"
 #include <map>
 #include <vector>
 #include <algorithm>
+#include <iomanip>
 
 ViewManager::ViewManager() {
 }
@@ -89,7 +91,7 @@ std::vector<std::string> ViewManager::getAvailableWindows() const {
     // Respect master modules visibility setting
     if (masterModulesVisible_) {
         std::vector<std::string> coreWindows = {
-            "Clock ", "masterAudioOut", "masterVideoOut"
+            "Clock ", "masterAudioOut", "masterVideoOut", "masterOscilloscope", "masterSpectrogram"
         };
 
         for (const auto& windowName : coreWindows) {
@@ -115,7 +117,8 @@ std::vector<std::string> ViewManager::getAvailableWindows() const {
         auto instances = guiManager->getAllInstanceNames();
         for (const auto& name : instances) {
             // Skip master modules if they're hidden
-            if (!masterModulesVisible_ && (name == "masterAudioOut" || name == "masterVideoOut")) {
+            if (!masterModulesVisible_ && (name == "masterAudioOut" || name == "masterVideoOut" || 
+                name == "masterOscilloscope" || name == "masterSpectrogram")) {
                 continue;
             }
             
@@ -315,7 +318,8 @@ void ViewManager::drawModulePanels() {
         }
         
         // Skip master modules if they are set to hidden
-        if (!masterModulesVisible_ && (instanceName == "masterAudioOut" || instanceName == "masterVideoOut")) {
+        if (!masterModulesVisible_ && (instanceName == "masterAudioOut" || instanceName == "masterVideoOut" || 
+            instanceName == "masterOscilloscope" || instanceName == "masterSpectrogram")) {
             continue;
         }
 
@@ -384,7 +388,14 @@ void ViewManager::drawModulePanels() {
 
                 // Draw GUI content (may throw if not fully initialized)
                 try {
+                    float guiStartTime = ofGetElapsedTimef();
                     gui->draw();
+                    float guiTime = (ofGetElapsedTimef() - guiStartTime) * 1000.0f;
+                    // Log slow GUI windows (> 1ms)
+                    if (guiTime > 1.0f) {
+                        ofLogNotice("ViewManager") << "[PERF] Window '" << windowTitle << "' GUI: " 
+                                                   << std::fixed << std::setprecision(2) << guiTime << "ms";
+                    }
                 } catch (...) {
                     // Continue to next GUI instead of crashing
                 }
@@ -499,7 +510,13 @@ void ViewManager::drawClockPanel() {
                     navigateToWindow(windowName);
                 }
 
+                float clockStartTime = ofGetElapsedTimef();
                 clockGUI->draw(*clock);
+                float clockTime = (ofGetElapsedTimef() - clockStartTime) * 1000.0f;
+                if (clockTime > 1.0f) {
+                    ofLogNotice("ViewManager") << "[PERF] Window 'Clock' GUI: " 
+                                              << std::fixed << std::setprecision(2) << clockTime << "ms";
+                }
 
                 // Draw outline for docked windows (native borders work for undocked)
                 drawWindowOutline();
@@ -554,7 +571,13 @@ void ViewManager::drawAssetLibraryPanel() {
                 navigateToWindow(windowName);
             }
 
+            float assetStartTime = ofGetElapsedTimef();
             assetLibraryGUI->draw();
+            float assetTime = (ofGetElapsedTimef() - assetStartTime) * 1000.0f;
+            if (assetTime > 1.0f) {
+                ofLogNotice("ViewManager") << "[PERF] Window 'Asset Library' GUI: " 
+                                          << std::fixed << std::setprecision(2) << assetTime << "ms";
+            }
 
             // Draw outline for docked windows (native borders work for undocked)
             drawWindowOutline();
@@ -607,7 +630,13 @@ void ViewManager::drawFileBrowserPanel() {
                 navigateToWindow(windowName);
             }
 
+            float fileBrowserStartTime = ofGetElapsedTimef();
             fileBrowser->draw();
+            float fileBrowserTime = (ofGetElapsedTimef() - fileBrowserStartTime) * 1000.0f;
+            if (fileBrowserTime > 1.0f) {
+                ofLogNotice("ViewManager") << "[PERF] Window 'File Browser' GUI: " 
+                                          << std::fixed << std::setprecision(2) << fileBrowserTime << "ms";
+            }
 
             // Draw outline for docked windows (native borders work for undocked)
             drawWindowOutline();
@@ -687,7 +716,13 @@ void ViewManager::drawConsolePanel() {
                 navigateToWindow(windowName);
             }
 
+            float consoleStartTime = ofGetElapsedTimef();
             console->drawContent();
+            float consoleTime = (ofGetElapsedTimef() - consoleStartTime) * 1000.0f;
+            if (consoleTime > 1.0f) {
+                ofLogNotice("ViewManager") << "[PERF] Window 'Console' GUI: " 
+                                          << std::fixed << std::setprecision(2) << consoleTime << "ms";
+            }
 
             // Draw outline for docked windows (native borders work for undocked)
             drawWindowOutline();

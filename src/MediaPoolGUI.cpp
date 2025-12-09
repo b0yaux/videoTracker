@@ -7,7 +7,11 @@
 #include "gui/GUIConstants.h"
 #include "gui/MediaPreview.h"
 #include "gui/GUIManager.h"
+#include "ofMain.h"
+#include "ofLog.h"
 #include <limits>
+#include <iomanip>
+#include <cmath>
 
 MediaPoolGUI::MediaPoolGUI() 
     : mediaPool(nullptr), waveformHeight(100.0f), parentWidgetId(0), 
@@ -108,17 +112,38 @@ void MediaPoolGUI::drawContent() {
     float parameterTableHeight = tableHeaderHeight + tableRowHeight + cellVerticalPadding;
     
     ImGui::BeginChild("MediaPoolParameters", ImVec2(0, parameterTableHeight), false, ImGuiWindowFlags_NoScrollbar);
+    float paramsStartTime = ofGetElapsedTimef();
     drawParameters();
+    float paramsTime = (ofGetElapsedTimef() - paramsStartTime) * 1000.0f;
+    if (paramsTime > 1.0f) {
+        std::string instanceName = ModuleGUI::getInstanceName();
+        ofLogNotice("MediaPoolGUI") << "[PERF] '" << instanceName << "' drawParameters: " 
+                                    << std::fixed << std::setprecision(2) << paramsTime << "ms";
+    }
     ImGui::EndChild();
     
     // Child 2: Waveform (fixed height)
     ImGui::BeginChild("MediaPoolWaveform", ImVec2(0, waveformHeight), false, ImGuiWindowFlags_NoScrollbar);
+    float waveformStartTime = ofGetElapsedTimef();
     drawWaveform();
+    float waveformTime = (ofGetElapsedTimef() - waveformStartTime) * 1000.0f;
+    if (waveformTime > 1.0f) {
+        std::string instanceName = ModuleGUI::getInstanceName();
+        ofLogNotice("MediaPoolGUI") << "[PERF] '" << instanceName << "' drawWaveform: " 
+                                    << std::fixed << std::setprecision(2) << waveformTime << "ms";
+    }
     ImGui::EndChild();
     
     // Child 3: Media list (takes all remaining space)
     ImGui::BeginChild("MediaList", ImVec2(0, 0), true);
+    float listStartTime = ofGetElapsedTimef();
     drawMediaList();
+    float listTime = (ofGetElapsedTimef() - listStartTime) * 1000.0f;
+    if (listTime > 1.0f) {
+        std::string instanceName = ModuleGUI::getInstanceName();
+        ofLogNotice("MediaPoolGUI") << "[PERF] '" << instanceName << "' drawMediaList: " 
+                                    << std::fixed << std::setprecision(2) << listTime << "ms";
+    }
     ImGui::EndChild();
     
     // Set up drag & drop target on the main window (covers entire panel)
@@ -1077,23 +1102,14 @@ void MediaPoolGUI::drawWaveform() {
     float waveformZoom = zoomState.first;
     float waveformOffset = zoomState.second;
     
-    // Create invisible button for interaction area
-    // CRITICAL: Ensure non-zero size for InvisibleButton (ImGui assertion requirement)
-    // This can fail during initial window setup before layout is complete
+    // Create invisible button for interaction area (ensure non-zero size for ImGui)
     float safeHeight = std::max(waveformHeight, 1.0f);
-    float availableWidth = ImGui::GetContentRegionAvail().x;
-    
-    // Ensure both dimensions are positive (required by ImGui)
-    // Use fallback values if window isn't ready yet
-    if (availableWidth <= 0.0f) {
-        availableWidth = 100.0f; // Fallback minimum width
-    }
-    // safeHeight is already guaranteed to be >= 1.0f
+    float availableWidth = std::max(ImGui::GetContentRegionAvail().x, 100.0f); // Fallback if window not ready
     
     ImVec2 canvasSize = ImVec2(availableWidth, safeHeight);
     ImGui::InvisibleButton("waveform_canvas", canvasSize);
     
-    // Get draw list for custom rendering
+    // Get draw list and canvas dimensions
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     ImVec2 canvasPos = ImGui::GetItemRectMin();
     ImVec2 canvasMax = ImGui::GetItemRectMax();
@@ -1101,7 +1117,7 @@ void MediaPoolGUI::drawWaveform() {
     float canvasHeight = canvasMax.y - canvasPos.y;
     float centerY = canvasPos.y + canvasHeight * 0.5f;
     
-    // Always draw the background rectangle
+    // Draw background
     ImU32 bgColor = GUIConstants::toIM_COL32(GUIConstants::Background::Waveform);
     drawList->AddRectFilled(canvasPos, canvasMax, bgColor);
     
@@ -1146,7 +1162,7 @@ void MediaPoolGUI::drawWaveform() {
             // Zoom factor (1.2x per scroll step)
             float zoomFactor = (wheel > 0.0f) ? 1.2f : 1.0f / 1.2f;
             float newZoom = waveformZoom * zoomFactor;
-            newZoom = std::max(1.0f, std::min(100.0f, newZoom)); // Clamp zoom
+            newZoom = std::max(1.0f, std::min(10000.0f, newZoom)); // Clamp zoom (10000x for extreme precision)
             
             // Calculate new offset to keep mouse position fixed
             float newVisibleRange = 1.0f / newZoom;
@@ -1157,6 +1173,8 @@ void MediaPoolGUI::drawWaveform() {
             setWaveformZoomState(currentIndex, newZoom, newOffset);
             waveformZoom = newZoom;
             waveformOffset = newOffset;
+            // Invalidate waveform cache when zoom changes
+            waveformCacheValid_ = false;
         }
         
         // Handle panning with middle mouse or Shift+drag (only if not dragging a marker or CellWidget)
@@ -1177,6 +1195,8 @@ void MediaPoolGUI::drawWaveform() {
                 // Store updated offset for current index
                 setWaveformZoomState(currentIndex, waveformZoom, newOffset);
                 waveformOffset = newOffset;
+                // Invalidate waveform cache when pan changes
+                waveformCacheValid_ = false;
                 
                 ImGui::ResetMouseDragDelta(ImGui::IsMouseDown(2) ? 2 : 0);
             }
@@ -1187,6 +1207,8 @@ void MediaPoolGUI::drawWaveform() {
             setWaveformZoomState(currentIndex, 1.0f, 0.0f);
             waveformZoom = 1.0f;
             waveformOffset = 0.0f;
+            // Invalidate waveform cache when zoom resets
+            waveformCacheValid_ = false;
         }
     }
     
@@ -1194,85 +1216,171 @@ void MediaPoolGUI::drawWaveform() {
     float visibleRange = 1.0f / waveformZoom;
     float visibleStart = waveformOffset;
     
-    // Check if we have audio data to draw waveform
+    // Waveform data for rendering (min/max pairs for industry-standard visualization)
     bool hasAudioData = false;
     int numChannels = 0;
     int actualPoints = 0;
-    // Use instance members instead of static variables (fixes performance issue with multiple MediaPool instances)
+    std::vector<float> waveformTimeData;
+    std::vector<std::vector<float>> waveformChannelMinData;
+    std::vector<std::vector<float>> waveformChannelMaxData;
     
     if (currentPlayer->isAudioLoaded()) {
-        // Get audio buffer data
-        ofSoundBuffer buffer = currentPlayer->getAudioPlayer().getBuffer();
+        // Cache audio buffer (getBuffer() is expensive ~10ms)
+        std::string currentAudioPath = currentPlayer->getAudioFilePath();
+        bool bufferNeedsRefresh = !audioBufferCacheValid_ || (cachedAudioFilePath_ != currentAudioPath);
+        
+        if (bufferNeedsRefresh) {
+            cachedAudioBuffer_ = currentPlayer->getAudioPlayer().getBuffer();
+            cachedAudioFilePath_ = currentAudioPath;
+            audioBufferCacheValid_ = true;
+            waveformCacheValid_ = false; // Invalidate waveform cache
+        }
+        const ofSoundBuffer& buffer = cachedAudioBuffer_;
+        
         int numFrames = buffer.getNumFrames();
         numChannels = buffer.getNumChannels();
         
         if (numFrames > 0 && numChannels > 0) {
             hasAudioData = true;
             
-            // Calculate how many points we need for visible range
-            // When zoomed out (visibleRange = 1.0): use base precision (MAX_WAVEFORM_POINTS)
-            // When zoomed in (visibleRange < 1.0): increase precision proportionally to zoom level
-            // This ensures better detail when zoomed in while maintaining performance when zoomed out
-            // Formula: base points for visible range * (1 + zoom bonus)
-            // The zoom bonus increases precision when zoomed in, allowing more points per visible range
-            float zoomLevel = 1.0f / visibleRange; // Convert visibleRange back to zoom level (1.0 = no zoom, 10.0 = 10x zoom)
-            float zoomPrecisionBonus = (zoomLevel - 1.0f) * ZOOM_PRECISION_MULTIPLIER; // Bonus precision when zoomed in
-            float precisionMultiplier = 1.0f + zoomPrecisionBonus;
-            // Base points for visible range, multiplied by precision to get more detail when zoomed
-            int maxPoints = (int)(MAX_WAVEFORM_POINTS * visibleRange * precisionMultiplier);
-            maxPoints = std::max(MIN_WAVEFORM_POINTS, std::min(MAX_WAVEFORM_POINTS, maxPoints));
+            // Check if waveform cache is valid
+            bool cacheValid = waveformCacheValid_ &&
+                             (cachedMediaIndex_ == currentIndex) &&
+                             (cachedNumFrames_ == numFrames) &&
+                             (cachedNumChannels_ == numChannels) &&
+                             (std::abs(cachedVisibleStart_ - visibleStart) < 0.0001f) &&
+                             (std::abs(cachedVisibleRange_ - visibleRange) < 0.0001f) &&
+                             (std::abs(cachedCanvasWidth_ - canvasWidth) < 1.0f);
             
-            int stepSize = std::max(1, numFrames / maxPoints);
-            actualPoints = std::min(maxPoints, numFrames / stepSize);
-            
-            waveformTimeData.resize(actualPoints);
-            waveformChannelData.resize(numChannels);
-            for (int ch = 0; ch < numChannels; ch++) {
-                waveformChannelData[ch].resize(actualPoints);
-            }
-            
-            // Downsample audio data (only for visible range if zoomed in)
-            for (int i = 0; i < actualPoints; i++) {
-                // Map point index to time position within visible range
-                float timePos = (float)i / (float)actualPoints;
-                float absoluteTime = visibleStart + timePos * visibleRange;
+            if (cacheValid && !cachedWaveformTimeData_.empty()) {
+                // Use cached waveform data
+                waveformTimeData = cachedWaveformTimeData_;
+                waveformChannelMinData = cachedWaveformMinData_;
+                waveformChannelMaxData = cachedWaveformMaxData_;
+                actualPoints = static_cast<int>(waveformTimeData.size());
+            } else {
+                // Recalculate waveform data with adaptive quality
+                // Calculate points based on canvas width (pixels) and zoom level
+                // Base: 2.0 points per pixel for better unzoomed precision (increased from 1.5)
+                float pointsPerPixel = 2.0f;
                 
-                // Clamp to valid range
-                absoluteTime = std::max(0.0f, std::min(1.0f, absoluteTime));
-                
-                // Map to sample index
-                int sampleIndex = (int)(absoluteTime * numFrames);
-                sampleIndex = std::max(0, std::min(numFrames - 1, sampleIndex));
-                
-                waveformTimeData[i] = timePos; // Normalized time within visible range (0-1)
-                
-                for (int ch = 0; ch < numChannels; ch++) {
-                    waveformChannelData[ch][i] = buffer.getSample(sampleIndex, ch);
+                // Adaptive precision scaling for deep zooming
+                // Uses logarithmic scaling to provide more precision at higher zoom levels
+                if (visibleRange < 1.0f) {
+                    float zoomLevel = 1.0f / visibleRange; // 1.0 = no zoom, 10000.0 = 10000x zoom
+                    
+                    // Logarithmic scaling: provides smooth precision increase from 1x to 10000x zoom
+                    // At 1x zoom: multiplier = 1.0
+                    // At 10x zoom: multiplier ≈ 1.5
+                    // At 100x zoom: multiplier ≈ 2.0
+                    // At 1000x zoom: multiplier ≈ 2.5
+                    // At 10000x zoom: multiplier ≈ 3.0
+                    // This ensures we get more detail as we zoom deeper without excessive points at low zoom
+                    float logZoom = std::log10(std::max(1.0f, zoomLevel));
+                    float zoomDetailMultiplier = 1.0f + logZoom * 0.5f; // Logarithmic scaling factor
+                    
+                    // Cap at 10.0x for extremely deep zoom (10000x+) to prevent excessive point counts
+                    // This allows up to 20 points per pixel at maximum zoom
+                    pointsPerPixel *= std::min(zoomDetailMultiplier, 10.0f);
                 }
+                
+                // Calculate max points based on canvas width and adaptive precision
+                int maxPoints = (int)(canvasWidth * pointsPerPixel);
+                // Clamp to reasonable bounds (supports up to 64000 points for extreme zoom)
+                maxPoints = std::max(MIN_WAVEFORM_POINTS, std::min(MAX_WAVEFORM_POINTS, maxPoints));
+                
+                int stepSize = std::max(1, numFrames / maxPoints);
+                actualPoints = std::min(maxPoints, numFrames / stepSize);
+                
+                waveformTimeData.resize(actualPoints);
+                waveformChannelMinData.resize(numChannels);
+                waveformChannelMaxData.resize(numChannels);
+                for (int ch = 0; ch < numChannels; ch++) {
+                    waveformChannelMinData[ch].resize(actualPoints);
+                    waveformChannelMaxData[ch].resize(actualPoints);
+                }
+                
+                // Downsample audio using min/max peak detection (industry standard)
+                for (int i = 0; i < actualPoints; i++) {
+                    // Map point index to time position within visible range
+                    float timePos = (float)i / (float)actualPoints;
+                    float absoluteTime = visibleStart + timePos * visibleRange;
+                    
+                    // Clamp to valid range
+                    absoluteTime = std::max(0.0f, std::min(1.0f, absoluteTime));
+                    
+                    // Calculate sample range for this display point
+                    // Each point represents a range of samples to avoid aliasing
+                    float nextTimePos = (float)(i + 1) / (float)actualPoints;
+                    float nextAbsoluteTime = visibleStart + nextTimePos * visibleRange;
+                    nextAbsoluteTime = std::max(0.0f, std::min(1.0f, nextAbsoluteTime));
+                    
+                    // Convert time range to sample indices (use float precision)
+                    float startSample = absoluteTime * numFrames;
+                    float endSample = nextAbsoluteTime * numFrames;
+                    
+                    // Ensure we have at least one sample
+                    int startIdx = std::max(0, std::min(numFrames - 1, (int)std::floor(startSample)));
+                    int endIdx = std::max(0, std::min(numFrames - 1, (int)std::floor(endSample)));
+                    
+                    // Use at least one sample, but prefer range for smoothing
+                    if (endIdx <= startIdx) {
+                        endIdx = std::min(numFrames - 1, startIdx + 1);
+                    }
+                    
+                    waveformTimeData[i] = timePos; // Normalized time within visible range (0-1)
+                    
+                    // Find min/max across sample range for each channel
+                    for (int ch = 0; ch < numChannels; ch++) {
+                        float minVal = buffer.getSample(startIdx, ch);
+                        float maxVal = minVal;
+                        
+                        for (int s = startIdx; s <= endIdx && s < numFrames; s++) {
+                            float sample = buffer.getSample(s, ch);
+                            minVal = std::min(minVal, sample);
+                            maxVal = std::max(maxVal, sample);
+                        }
+                        
+                        // Store both min and max (preserves full dynamic range)
+                        waveformChannelMinData[ch][i] = minVal;
+                        waveformChannelMaxData[ch][i] = maxVal;
+                    }
+                }
+                
+                // Cache the calculated waveform data
+                cachedWaveformTimeData_ = waveformTimeData;
+                cachedWaveformMinData_ = waveformChannelMinData;
+                cachedWaveformMaxData_ = waveformChannelMaxData;
+                cachedVisibleStart_ = visibleStart;
+                cachedVisibleRange_ = visibleRange;
+                cachedCanvasWidth_ = canvasWidth;
+                cachedNumFrames_ = numFrames;
+                cachedNumChannels_ = numChannels;
+                cachedMediaIndex_ = currentIndex;
+                waveformCacheValid_ = true;
             }
         }
+    } else {
+        // No audio - invalidate all caches
+        audioBufferCacheValid_ = false;
+        waveformCacheValid_ = false;
     }
     
-    // Background rectangle already drawn earlier (before early return for no player case)
-    // Only draw waveform if we have audio data
+    // Draw waveform using industry-standard min/max vertical lines
     if (hasAudioData) {
-        // Draw actual waveform
         float amplitudeScale = canvasHeight * WAVEFORM_AMPLITUDE_SCALE;
-        
-        // Get volume to scale waveform amplitude proportionally
         float volume = currentPlayer->volume.get();
+        ImU32 lineColor = GUIConstants::toU32(GUIConstants::Waveform::Line);
         
-        // Draw each channel with white color
+        // Draw each channel as vertical lines from min to max
         for (int ch = 0; ch < numChannels; ch++) {
-            ImU32 lineColor = GUIConstants::toU32(GUIConstants::Waveform::Line);
-            
-            for (int i = 0; i < actualPoints - 1; i++) {
-                float x1 = canvasPos.x + waveformTimeData[i] * canvasWidth;
-                float y1 = centerY - waveformChannelData[ch][i] * volume * amplitudeScale;
-                float x2 = canvasPos.x + waveformTimeData[i + 1] * canvasWidth;
-                float y2 = centerY - waveformChannelData[ch][i + 1] * volume * amplitudeScale;
+            for (int i = 0; i < actualPoints; i++) {
+                float x = canvasPos.x + waveformTimeData[i] * canvasWidth;
+                float yMin = centerY - waveformChannelMinData[ch][i] * volume * amplitudeScale;
+                float yMax = centerY - waveformChannelMaxData[ch][i] * volume * amplitudeScale;
                 
-                drawList->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), lineColor, 1.0f);
+                // Vertical line from min to max (filled waveform appearance)
+                drawList->AddLine(ImVec2(x, yMin), ImVec2(x, yMax), lineColor, 1.0f);
             }
         }
     }

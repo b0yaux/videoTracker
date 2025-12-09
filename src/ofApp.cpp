@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <sstream>
 #include <cstdint>
+#include <chrono>
 
 //--------------------------------------------------------------
 ofApp::ofApp() : assetLibrary(&projectManager, &mediaConverter, &moduleRegistry), assetLibraryGUI(&assetLibrary) {
@@ -149,7 +150,7 @@ void ofApp::setup() {
     );
     
     // Setup CommandExecutor (backend for command execution)
-    commandExecutor.setup(&moduleRegistry, &guiManager, &connectionManager);
+    commandExecutor.setup(&moduleRegistry, &guiManager, &connectionManager, &assetLibrary);
     commandExecutor.setOnAddModule([this](const std::string& moduleType) {
         moduleRegistry.addModule(
             moduleFactory,
@@ -331,19 +332,30 @@ void ofApp::setup() {
 
 //--------------------------------------------------------------
 void ofApp::update() {
+    // Performance monitoring: Start update timing
+    float updateStartTime = ofGetElapsedTimef();
+    
     // Update session manager (handles auto-save)
+    float sessionStartTime = ofGetElapsedTimef();
     sessionManager.update();
+    float sessionTime = (ofGetElapsedTimef() - sessionStartTime) * 1000.0f;
     
     // Update input router
+    float inputStartTime = ofGetElapsedTimef();
     inputRouter.update();
+    float inputTime = (ofGetElapsedTimef() - inputStartTime) * 1000.0f;
     
     // Update asset library (processes conversion status updates)
+    float assetStartTime = ofGetElapsedTimef();
     assetLibrary.update();
+    float assetTime = (ofGetElapsedTimef() - assetStartTime) * 1000.0f;
     
     // Update all modules (MediaPool, TrackerSequencer, etc.)
     // This is critical for MediaPool to process its event queue
+    float modulesStartTime = ofGetElapsedTimef();
     moduleRegistry.forEachModule([this](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
         if (module) {
+            float moduleStartTime = ofGetElapsedTimef();
             try {
                 module->update();
             } catch (const std::exception& e) {
@@ -351,23 +363,79 @@ void ofApp::update() {
             } catch (...) {
                 ofLogError("ofApp") << "Unknown error updating module '" << name << "'";
             }
+            float moduleTime = (ofGetElapsedTimef() - moduleStartTime) * 1000.0f;
+            // Only log very slow modules (> 3ms) to reduce log spam
+            if (moduleTime > 3.0f) {
+                ofLogWarning("ofApp") << "[PERF] Slow module update '" << name << "': " 
+                                     << std::fixed << std::setprecision(2) << moduleTime << "ms";
+            }
         }
     });
+    float modulesTime = (ofGetElapsedTimef() - modulesStartTime) * 1000.0f;
+    
+    // Log slow update cycles
+    float totalUpdateTime = (ofGetElapsedTimef() - updateStartTime) * 1000.0f;
+    if (totalUpdateTime > 5.0f) { // Warn if update takes > 5ms
+        ofLogWarning("ofApp") << "[PERF] Slow update: " << std::fixed << std::setprecision(2) << totalUpdateTime 
+                             << "ms (session: " << sessionTime << "ms, input: " << inputTime 
+                             << "ms, asset: " << assetTime << "ms, modules: " << modulesTime << "ms)";
+    }
 }
 
 //--------------------------------------------------------------
 void ofApp::draw() {
+    // Performance monitoring: Start frame timing
+    float frameStartTime = ofGetElapsedTimef();
+    
     // Clear background first (important for video output)
     ofClear(0, 0, 0, 255);
     
     // Draw video output (fills entire window, drawn behind GUI)
+    float videoStartTime = ofGetElapsedTimef();
     if (masterVideoOut) {
         masterVideoOut->draw();
     }
+    float videoTime = (ofGetElapsedTimef() - videoStartTime) * 1000.0f;
     
     // Draw GUI on top of video
+    float guiStartTime = ofGetElapsedTimef();
     if (showGUI) {
         drawGUI();
+    }
+    float guiTime = (ofGetElapsedTimef() - guiStartTime) * 1000.0f;
+    
+    // Calculate total frame time
+    float frameTime = (ofGetElapsedTimef() - frameStartTime) * 1000.0f; // Convert to ms
+    lastFrameTime_ = frameTime;
+    
+    // Accumulate for FPS calculation
+    frameTimeAccumulator_ += frameTime;
+    frameCount_++;
+    
+    // Log performance stats periodically
+    float currentTime = ofGetElapsedTimef();
+    if (currentTime - lastFpsLogTime_ >= FPS_LOG_INTERVAL) {
+        if (frameCount_ > 0) {
+            float avgFrameTime = frameTimeAccumulator_ / frameCount_;
+            float avgFps = 1000.0f / avgFrameTime;
+            float currentFps = 1000.0f / frameTime;
+            
+            ofLogNotice("ofApp") << "[PERF] Overall FPS: " << std::fixed << std::setprecision(1) << currentFps
+                                << " (avg: " << avgFps << ")"
+                                << " | Frame: " << std::setprecision(2) << frameTime << "ms"
+                                << " (video: " << videoTime << "ms, GUI: " << guiTime << "ms)";
+            
+            // Reset accumulator
+            frameTimeAccumulator_ = 0.0f;
+            frameCount_ = 0;
+            lastFpsLogTime_ = currentTime;
+        }
+    }
+    
+    // Log slow frames (warn if frame takes > 20ms, which is < 50fps)
+    if (frameTime > 20.0f) {
+        ofLogWarning("ofApp") << "[PERF] Slow frame detected: " << std::fixed << std::setprecision(2) 
+                             << frameTime << "ms (video: " << videoTime << "ms, GUI: " << guiTime << "ms)";
     }
 }
 

@@ -29,8 +29,8 @@ enum class PlaybackMode {
 
 enum class PlayStyle {
     ONCE,      // Stop when playback reaches region end
-    LOOP,      // Loop within region
-    NEXT       // Play next media in pool
+    LOOP,      // Loop within region (uses startPosition when retriggered, no position memory)
+    NEXT       // Loop within region with position memory (continues from where it left off when retriggered)
 };
 
 // Position scan mode: how scan position is stored and restored

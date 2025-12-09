@@ -119,6 +119,13 @@ private:
     int currentStep = 0;
     int lastTriggeredStep = 0;  // Track the last step that was actually triggered
     
+    // Performance monitoring
+    float lastFrameTime_ = 0.0f;
+    float frameTimeAccumulator_ = 0.0f;
+    int frameCount_ = 0;
+    float lastFpsLogTime_ = 0.0f;
+    static constexpr float FPS_LOG_INTERVAL = 5.0f; // Log FPS every 5 seconds
+    
     // Methods
     void setupSoundObjects();  // Minimal setup - audio device management is in ViewManager
     void setupVisualObjects();

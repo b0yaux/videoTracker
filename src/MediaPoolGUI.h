@@ -55,8 +55,8 @@ private:
     
     // Waveform visualization
     float waveformHeight;
-    static constexpr int MAX_WAVEFORM_POINTS = 4000;  // Maximum number of points for smooth waveform rendering (increased for better default precision)
-    static constexpr int MIN_WAVEFORM_POINTS = 200;   // Minimum number of points for waveform rendering (increased for better default precision)
+    static constexpr int MAX_WAVEFORM_POINTS = 64000;  // Maximum number of points for extreme zoom precision (supports up to 10000x zoom)
+    static constexpr int MIN_WAVEFORM_POINTS = 200;   // Minimum number of points for waveform rendering
     static constexpr int MAX_TOOLTIP_WAVEFORM_POINTS = 600;  // Maximum number of points for tooltip waveform preview
     static constexpr int MIN_WAVEFORM_POINTS_FOR_DRAW = 2;   // Minimum points required to draw waveform (need at least 2 for a line)
     static constexpr float WAVEFORM_AMPLITUDE_SCALE = 0.4f;  // Amplitude scaling factor (0.4 = 40% of canvas height, using 80% total range)
@@ -67,6 +67,24 @@ private:
     // Waveform data buffers (instance-specific, not static - fixes performance issue with multiple MediaPool instances)
     std::vector<float> waveformTimeData;
     std::vector<std::vector<float>> waveformChannelData;
+    
+    // Audio buffer cache (CRITICAL: getBuffer() takes ~10ms, so we cache it)
+    ofSoundBuffer cachedAudioBuffer_;
+    std::string cachedAudioFilePath_;
+    bool audioBufferCacheValid_ = false;
+    
+    // Waveform cache for performance optimization (only recalculate when audio/zoom/canvas changes)
+    // Uses min/max pairs for industry-standard waveform rendering
+    std::vector<float> cachedWaveformTimeData_;
+    std::vector<std::vector<float>> cachedWaveformMinData_;  // [channel][point] - minimum values
+    std::vector<std::vector<float>> cachedWaveformMaxData_;  // [channel][point] - maximum values
+    float cachedVisibleStart_ = -1.0f;
+    float cachedVisibleRange_ = -1.0f;
+    float cachedCanvasWidth_ = -1.0f;
+    int cachedNumFrames_ = -1;
+    int cachedNumChannels_ = -1;
+    size_t cachedMediaIndex_ = SIZE_MAX;
+    bool waveformCacheValid_ = false;
     
     // Waveform marker dragging state
     enum class WaveformMarker {

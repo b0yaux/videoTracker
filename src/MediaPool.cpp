@@ -1123,10 +1123,6 @@ void MediaPool::stopTemporaryPlayback() {
     
     if (activePlayer && activePlayer->isPlaying()) {
         activePlayer->stop();
-        // For LOOP mode, reset position after stopping (no position memory)
-        if (currentPlayStyle == PlayStyle::LOOP) {
-            activePlayer->playheadPosition.set(0.0f);
-        }
         ensurePlayerAudioDisconnected(activePlayer);
         ensurePlayerVideoDisconnected(activePlayer);
         // Don't change mode - keep it as it was
@@ -1414,10 +1410,6 @@ void MediaPool::update() {
             // Gate duration expired - stop the player
             if (it->player && it->player->isPlaying()) {
                 it->player->stop();
-                // For LOOP mode, reset position after stopping (no position memory)
-                if (currentPlayStyle == PlayStyle::LOOP) {
-                    it->player->playheadPosition.set(0.0f);
-                }
                 ensurePlayerAudioDisconnected(it->player);
                 ensurePlayerVideoDisconnected(it->player);
                 ofLogVerbose("MediaPool") << "[GATE_STOP] Stopped player after gate duration expired";
@@ -1528,24 +1520,42 @@ void MediaPool::update() {
             float loopStartPos = loopBounds.start;
             float loopEndPos = loopBounds.end;
             
-            // CRITICAL: In LOOP play style, handle looping manually
+            // CRITICAL: In LOOP and NEXT play styles, handle looping manually
             // We don't enable underlying player loop because it loops at full media level (0.0-1.0),
             // but we need region-level looping (loopStart to loopEnd based on loopSize).
-            if (currentPlayStyle == PlayStyle::LOOP) {
-                // Check if playhead went below loop start - clamp to loop start
-                if (currentPosition < loopStartPos - thresholdNormalized) {
-                    seekPlayerToPosition(activePlayer, loopStartPos);
-                    currentPosition = loopStartPos;  // Update for subsequent checks
-                }
+            // NEXT mode loops like LOOP but preserves position memory when retriggered.
+            if (currentPlayStyle == PlayStyle::LOOP || currentPlayStyle == PlayStyle::NEXT) {
+                // Get current playback speed to determine direction
+                float currentSpeed = activePlayer->speed.get();
+                bool isPlayingBackward = (currentSpeed < 0.0f);
                 
-                // Check if playhead reached loop end - loop back to loop start
-                if (currentPosition >= loopEndPos - thresholdNormalized) {
-                    seekPlayerToPosition(activePlayer, loopStartPos);
-                    // Don't call handleRegionEnd() - we're looping, not stopping
-                    // Skip region end handling for LOOP mode
+                if (isPlayingBackward) {
+                    // Backward playback: loop to loopEndPos when going below loopStartPos
+                    if (currentPosition < loopStartPos - thresholdNormalized) {
+                        seekPlayerToPosition(activePlayer, loopEndPos);
+                        currentPosition = loopEndPos;  // Update for subsequent checks
+                    }
+                    // Also handle case where backward playback goes above loopEndPos (shouldn't happen, but handle it)
+                    if (currentPosition > loopEndPos + thresholdNormalized) {
+                        seekPlayerToPosition(activePlayer, loopEndPos);
+                        currentPosition = loopEndPos;
+                    }
+                } else {
+                    // Forward playback: loop to loopStartPos when reaching loopEndPos
+                    if (currentPosition >= loopEndPos - thresholdNormalized) {
+                        seekPlayerToPosition(activePlayer, loopStartPos);
+                        currentPosition = loopStartPos;  // Update for subsequent checks
+                    }
+                    // Also handle case where forward playback goes below loopStartPos (shouldn't happen, but handle it)
+                    if (currentPosition < loopStartPos - thresholdNormalized) {
+                        seekPlayerToPosition(activePlayer, loopStartPos);
+                        currentPosition = loopStartPos;
+                    }
                 }
+                // Don't call handleRegionEnd() - we're looping, not stopping
+                // Skip region end handling for LOOP and NEXT modes
             } else {
-                // For ONCE and NEXT modes: Check if playhead has reached region end
+                // For ONCE mode: Check if playhead has reached region end
                 bool reachedRegionEnd = (currentPosition >= effectiveRegionEnd - thresholdNormalized);
                 if (reachedRegionEnd) {
                     handleRegionEnd(activePlayer, currentPosition, effectiveRegionEnd, 
@@ -1554,7 +1564,7 @@ void MediaPool::update() {
             }
             
             // Position memory: Only for NEXT mode, captured before stop() in processEventQueue()
-            // LOOP mode: Position is reset to 0 when stopping (no position memory)
+            // LOOP mode: Uses startPosition when retriggered (no position memory)
             // ONCE mode: Position is NOT preserved (starts from startPosition each time)
         } else if (!isCurrentlyPlaying) {
             // Player stopped - transitions are handled by the early check above
@@ -1628,10 +1638,6 @@ void MediaPool::processEventQueue() {
         if (mediaIndex < 0) {
             if (activePlayer) {
                 activePlayer->stop();
-                // For LOOP mode, reset position after stopping (no position memory)
-                if (currentPlayStyle == PlayStyle::LOOP) {
-                    activePlayer->playheadPosition.set(0.0f);
-                }
                 // Disconnect stopped player from mixers
                 ensurePlayerAudioDisconnected(activePlayer);
                 ensurePlayerVideoDisconnected(activePlayer);
@@ -1720,10 +1726,6 @@ void MediaPool::processEventQueue() {
             if (polyphonyMode_ == PolyphonyMode::MONOPHONIC) {
                 if (previousActivePlayer && previousActivePlayer != player && previousActivePlayer->isPlaying()) {
                     previousActivePlayer->stop();
-                    // For LOOP mode, reset position after stopping (no position memory)
-                    if (currentPlayStyle == PlayStyle::LOOP) {
-                        previousActivePlayer->playheadPosition.set(0.0f);
-                    }
                     // Disconnect stopped player from mixer
                     ensurePlayerVideoDisconnected(previousActivePlayer);
                     ofLogVerbose("MediaPool") << "[MONO] Stopped previous active player before starting new player (index " << mediaIndex << ")";
@@ -1739,10 +1741,6 @@ void MediaPool::processEventQueue() {
                 // MONO: Stop it first to restart from new position (prevents layering)
                 if (player && player->isPlaying()) {
                     player->stop();
-                    // For LOOP mode, reset position after stopping (no position memory)
-                    if (currentPlayStyle == PlayStyle::LOOP) {
-                        player->playheadPosition.set(0.0f);
-                    }
                     // Disconnect stopped player from mixers (will reconnect when it starts again)
                     ensurePlayerAudioDisconnected(player);
                     ensurePlayerVideoDisconnected(player);
@@ -1848,54 +1846,12 @@ void MediaPool::onPlaybackEnd() {
             }
             break;
         case PlayStyle::LOOP:
-            // Already handled by loop=true
+            // Already handled by loop=true in update()
             break;
         case PlayStyle::NEXT:
-            if (players.size() > 1) {
-                size_t nextIndex = (currentIndex + 1) % players.size();
-                ofLogNotice("MediaPool") << "Playing next media: " << nextIndex;
-                
-                // Get next player and validate it's available
-                MediaPlayer* nextPlayer = players[nextIndex].get();
-                if (nextPlayer && (nextPlayer->isAudioLoaded() || nextPlayer->isVideoLoaded())) {
-                    // Set as active player and connect to outputs
-                    setActivePlayer(nextIndex);
-                    
-                    // Reset and prepare for playback
-                    nextPlayer->stop();
-                    nextPlayer->playheadPosition.set(0.0f);
-                    
-                    // Re-enable audio/video if they were loaded
-                    if (nextPlayer->isAudioLoaded()) {
-                        nextPlayer->audioEnabled.set(true);
-                    }
-                    if (nextPlayer->isVideoLoaded()) {
-                        nextPlayer->videoEnabled.set(true);
-                    }
-                    
-                    // Set loop to false for PLAY_NEXT mode
-                    nextPlayer->loop.set(false);
-                    
-                    // Start playback
-                    nextPlayer->play();
-                    
-                    ofLogNotice("MediaPool") << "Started next media " << nextIndex << " (PLAYING mode)";
-                } else {
-                    // No next player available - stop current player
-                    // update() will transition to IDLE when it detects player stopped
-                    if (activePlayer) {
-                        // NEXT mode: Position is preserved before stop() in processEventQueue()
-                        activePlayer->stop();
-                    }
-                }
-            } else {
-                // Only one player (no next player) - stop current player
-                // update() will transition to IDLE when it detects player stopped
-                if (activePlayer) {
-                    // NEXT mode: Position is preserved before stop() in processEventQueue()
-                    activePlayer->stop();
-                }
-            }
+            // NEXT mode: Loop behavior (handled in update()), just like LOOP
+            // Position memory is preserved when retriggered (handled in processEventQueue())
+            // No action needed here - looping is handled in update()
             break;
     }
 }
@@ -2675,8 +2631,8 @@ void MediaPool::handleRegionEnd(MediaPlayer* player, float currentPosition,
     if (!player) return;
     
     // CRITICAL: This function only handles STOPPING at region end, not looping
-    // LOOP mode handles looping manually in update() by checking loopEnd and seeking to loopStart
-    // This function should never be called for LOOP mode - if it is, it's a bug
+    // LOOP and NEXT modes handle looping manually in update() by checking loopEnd and seeking to loopStart
+    // This function should never be called for LOOP or NEXT modes - if it is, it's a bug
     switch (playStyle) {
         case PlayStyle::ONCE:
             // ONCE mode: Stop playback
@@ -2690,8 +2646,9 @@ void MediaPool::handleRegionEnd(MediaPlayer* player, float currentPosition,
             seekPlayerToPosition(player, loopStartPos);
             break;
         case PlayStyle::NEXT:
-            // NEXT mode: Stop current player - onPlaybackEnd() will handle playing next media
-            player->stop();
+            // NEXT mode: Loop behavior (handled in update() like LOOP mode)
+            // This should never be reached - NEXT mode loops in update(), not stops
+            ofLogWarning("MediaPool") << "handleRegionEnd() called for NEXT mode - this should not happen. NEXT mode loops in update().";
             break;
     }
 }
@@ -2801,10 +2758,6 @@ void MediaPool::stopAllNonActivePlayersLocked() {
         auto& player = players[i];
         if (player && player.get() != activePlayer && player->isPlaying()) {
             player->stop();
-            // For LOOP mode, reset position after stopping (no position memory)
-            if (currentPlayStyle == PlayStyle::LOOP) {
-                player->playheadPosition.set(0.0f);
-            }
             ofLogVerbose("MediaPool") << "[POLYPHONY] Stopped non-active player at index " << i;
         }
     }
