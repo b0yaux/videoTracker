@@ -83,6 +83,27 @@ void ofApp::setup() {
     masterAudioOut->initialize(&clock, &moduleRegistry, &connectionManager, &parameterRouter, false);
     masterVideoOut->initialize(&clock, &moduleRegistry, &connectionManager, &parameterRouter, false);
     
+    // Initialize master oscilloscope and spectrogram if they exist
+    {
+        auto masterOscilloscope = moduleRegistry.getModule("masterOscilloscope");
+        auto masterSpectrogram = moduleRegistry.getModule("masterSpectrogram");
+        
+        if (masterOscilloscope) {
+            masterOscilloscope->initialize(&clock, &moduleRegistry, &connectionManager, &parameterRouter, false);
+        }
+        if (masterSpectrogram) {
+            masterSpectrogram->initialize(&clock, &moduleRegistry, &connectionManager, &parameterRouter, false);
+        }
+    }
+    
+    // Ensure GUIs are created for all modules (including master oscilloscope and spectrogram)
+    // This must happen after modules are created
+    guiManager.syncWithRegistry();
+    
+    // Make master oscilloscope and spectrogram visible by default
+    guiManager.setInstanceVisible("masterOscilloscope", true);
+    guiManager.setInstanceVisible("masterSpectrogram", true);
+    
     // ============================================================
     // PHASE 3: GUI Setup (before session load for state restoration)
     // ============================================================
@@ -185,6 +206,11 @@ void ofApp::setup() {
         sessionManager.ensureDefaultModules({"TrackerSequencer", "MediaPool"});
     }
     
+    // CRITICAL: Ensure system modules exist after session load
+    // This is needed because old sessions might not have masterOscilloscope/masterSpectrogram
+    // Session load clears the registry and restores from file, so we need to ensure these exist
+    moduleFactory.ensureSystemModules(&moduleRegistry, MASTER_AUDIO_OUT_NAME, MASTER_VIDEO_OUT_NAME);
+    
     // CRITICAL: Refresh master outputs after session load
     // Session load clears the registry and creates new module instances,
     // so we need to update our pointers to point to the new instances
@@ -201,6 +227,19 @@ void ofApp::setup() {
     masterAudioOut->initialize(&clock, &moduleRegistry, &connectionManager, &parameterRouter, true);
     masterVideoOut->initialize(&clock, &moduleRegistry, &connectionManager, &parameterRouter, true);
     
+    // Initialize master oscilloscope and spectrogram if they exist (they should after ensureSystemModules)
+    {
+        auto masterOscilloscope = moduleRegistry.getModule("masterOscilloscope");
+        auto masterSpectrogram = moduleRegistry.getModule("masterSpectrogram");
+        
+        if (masterOscilloscope) {
+            masterOscilloscope->initialize(&clock, &moduleRegistry, &connectionManager, &parameterRouter, true);
+        }
+        if (masterSpectrogram) {
+            masterSpectrogram->initialize(&clock, &moduleRegistry, &connectionManager, &parameterRouter, true);
+        }
+    }
+    
     // CRITICAL: Set audio output for AssetLibrary preview routing
     // This must be done after masterAudioOut is refreshed after session load
     assetLibraryGUI.setAudioMixer(masterAudioOut.get());
@@ -208,6 +247,43 @@ void ofApp::setup() {
     // Setup default connections for any modules not restored from session
     // This ensures new modules get auto-connected to masters
     connectionManager.setupDefaultConnections(&clock, MASTER_AUDIO_OUT_NAME, MASTER_VIDEO_OUT_NAME);
+    
+    // Ensure GUIs are created for master oscilloscope and spectrogram
+    // This must happen after modules are created and before routing
+    guiManager.syncWithRegistry();
+    
+    // Setup automatic routing for master oscilloscope and spectrogram
+    // Connect them as inputs to masterAudioOutput to monitor the mixed audio
+    // They pass audio through and output video to masterVideoOutput
+    {
+        auto masterOscilloscope = moduleRegistry.getModule("masterOscilloscope");
+        auto masterSpectrogram = moduleRegistry.getModule("masterSpectrogram");
+        
+        if (masterOscilloscope) {
+            // Connect masterAudioOutput → masterOscilloscope (audio input)
+            // This allows masterOscilloscope to receive the mixed audio from all sources
+            // The audio passes through unchanged (monitoring only)
+            connectionManager.connectAudio(MASTER_AUDIO_OUT_NAME, "masterOscilloscope");
+            
+            // Connect masterOscilloscope → masterVideoOutput (video output)
+            connectionManager.connectVideo("masterOscilloscope", MASTER_VIDEO_OUT_NAME);
+            
+            // Make GUI visible (master modules should be visible by default)
+            guiManager.setInstanceVisible("masterOscilloscope", true);
+        }
+        
+        if (masterSpectrogram) {
+            // Connect masterAudioOutput → masterSpectrogram (audio input)
+            // This allows masterSpectrogram to receive the mixed audio from all sources
+            connectionManager.connectAudio(MASTER_AUDIO_OUT_NAME, "masterSpectrogram");
+            
+            // Connect masterSpectrogram → masterVideoOutput (video output)
+            connectionManager.connectVideo("masterSpectrogram", MASTER_VIDEO_OUT_NAME);
+            
+            // Make GUI visible (master modules should be visible by default)
+            guiManager.setInstanceVisible("masterSpectrogram", true);
+        }
+    }
     
     // DEBUG: Verify audio connections after session load and default connections
     if (masterAudioOut) {

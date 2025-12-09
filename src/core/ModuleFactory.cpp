@@ -297,6 +297,54 @@ bool ModuleFactory::ensureSystemModules(ModuleRegistry* registry,
         ofLogNotice("ModuleFactory") << "Created master video output: " << videoOutName;
     }
     
+    // Check if master oscilloscope exists
+    std::string oscilloscopeName = "masterOscilloscope";
+    auto oscilloscope = registry->getModule(oscilloscopeName);
+    if (!oscilloscope) {
+        auto newOscilloscope = createModule("Oscilloscope", oscilloscopeName);
+        if (!newOscilloscope) {
+            ofLogError("ModuleFactory") << "Failed to create master oscilloscope";
+            return false;
+        }
+        
+        std::string oscilloscopeUUID = getUUID(oscilloscopeName);
+        if (oscilloscopeUUID.empty()) {
+            ofLogError("ModuleFactory") << "Failed to get UUID for master oscilloscope";
+            return false;
+        }
+        
+        if (!registry->registerModule(oscilloscopeUUID, newOscilloscope, oscilloscopeName)) {
+            ofLogError("ModuleFactory") << "Failed to register master oscilloscope in registry";
+            return false;
+        }
+        
+        ofLogNotice("ModuleFactory") << "Created master oscilloscope: " << oscilloscopeName;
+    }
+    
+    // Check if master spectrogram exists
+    std::string spectrogramName = "masterSpectrogram";
+    auto spectrogram = registry->getModule(spectrogramName);
+    if (!spectrogram) {
+        auto newSpectrogram = createModule("Spectrogram", spectrogramName);
+        if (!newSpectrogram) {
+            ofLogError("ModuleFactory") << "Failed to create master spectrogram";
+            return false;
+        }
+        
+        std::string spectrogramUUID = getUUID(spectrogramName);
+        if (spectrogramUUID.empty()) {
+            ofLogError("ModuleFactory") << "Failed to get UUID for master spectrogram";
+            return false;
+        }
+        
+        if (!registry->registerModule(spectrogramUUID, newSpectrogram, spectrogramName)) {
+            ofLogError("ModuleFactory") << "Failed to register master spectrogram in registry";
+            return false;
+        }
+        
+        ofLogNotice("ModuleFactory") << "Created master spectrogram: " << spectrogramName;
+    }
+    
     return true;
 }
 
