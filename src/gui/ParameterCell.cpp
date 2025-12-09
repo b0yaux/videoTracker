@@ -1,9 +1,9 @@
 #include "ParameterCell.h"
 #include "CellWidget.h"
-#include "Module.h"
+#include "modules/Module.h"
 #include "core/ParameterRouter.h"
 #include "core/ParameterPath.h"
-#include "ExpressionParser.h"
+#include "utils/ExpressionParser.h"
 #include "ofMain.h"
 #include <limits>
 #include <cmath>

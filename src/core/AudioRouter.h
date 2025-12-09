@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Module.h"
+#include "modules/Module.h"
 #include "ModuleRegistry.h"
 #include <string>
 #include <map>

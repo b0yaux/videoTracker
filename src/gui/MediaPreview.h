@@ -1,6 +1,6 @@
 #pragma once
 
-#include "MediaPlayer.h"
+#include "modules/MediaPlayer.h"
 #include "gui/GUIConstants.h"
 #include <imgui.h>
 

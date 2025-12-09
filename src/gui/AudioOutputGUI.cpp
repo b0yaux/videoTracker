@@ -1,6 +1,6 @@
 #include "AudioOutputGUI.h"
-#include "AudioOutput.h"
-#include "Module.h"
+#include "modules/AudioOutput.h"
+#include "modules/Module.h"
 #include "core/ModuleRegistry.h"
 #include "core/ParameterRouter.h"
 #include "gui/ModuleGUI.h"

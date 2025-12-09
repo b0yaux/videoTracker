@@ -1,8 +1,8 @@
 #include "MediaPoolGUI.h"
-#include "MediaPool.h"  // Includes PlayStyle enum
-#include "MediaPlayer.h"
+#include "modules/MediaPool.h"  // Includes PlayStyle enum
+#include "modules/MediaPlayer.h"
 #include "CellWidget.h"
-#include "Module.h"
+#include "modules/Module.h"
 #include "core/ModuleRegistry.h"
 #include "gui/GUIConstants.h"
 #include "gui/MediaPreview.h"

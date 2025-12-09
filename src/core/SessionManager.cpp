@@ -1,5 +1,5 @@
 #include "SessionManager.h"
-#include "Clock.h"  // Needed for Clock* member access (must be before SessionManager.h if SessionManager.h uses Clock)
+#include "utils/Clock.h"  // Needed for Clock* member access (must be before SessionManager.h if SessionManager.h uses Clock)
 #include "ProjectManager.h"
 #include "ModuleRegistry.h"
 #include "ModuleFactory.h"
@@ -8,7 +8,7 @@
 #include "gui/ViewManager.h"
 #include "gui/GUIManager.h"
 #include "gui/ModuleGUI.h"
-#include "Module.h"
+#include "modules/Module.h"
 #include "ofMain.h"  // For ofGetElapsedTimef()
 #include "ofLog.h"
 #include "ofJson.h"

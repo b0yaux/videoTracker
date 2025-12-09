@@ -2,7 +2,7 @@
 #include <imgui.h>
 #include "ofxSoundObjects.h"
 #include "CellWidget.h"
-#include "Module.h"  // For ParameterDescriptor
+#include "modules/Module.h"  // For ParameterDescriptor
 #include "gui/ModuleGUI.h"
 #include "gui/CellGrid.h"
 #include <string>

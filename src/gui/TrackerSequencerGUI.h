@@ -1,7 +1,7 @@
 #pragma once
 
-#include "TrackerSequencer.h"
-#include "Pattern.h"
+#include "modules/TrackerSequencer.h"
+#include "data/Pattern.h"
 #include "gui/ModuleGUI.h"
 #include "gui/CellGrid.h"
 #include "CellWidget.h"

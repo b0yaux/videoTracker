@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ParameterPath.h"
-#include "Module.h"
+#include "modules/Module.h"
 #include "ModuleRegistry.h"
 #include "readerwriterqueue.h"
 #include <string>

@@ -1,6 +1,6 @@
 #include "AudioRouter.h"
-#include "AudioOutput.h"
-#include "AudioMixer.h"
+#include "modules/AudioOutput.h"
+#include "modules/AudioMixer.h"
 #include "ModuleRegistry.h"
 #include "ofLog.h"
 #include "ofxSoundObjects.h"

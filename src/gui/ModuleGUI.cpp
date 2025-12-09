@@ -1,7 +1,7 @@
 #include "ModuleGUI.h"
 #include "core/ModuleRegistry.h"
 #include "ParameterCell.h"
-#include "Module.h"
+#include "modules/Module.h"
 #include "GUIConstants.h"
 #include "ofLog.h"
 #include "imgui_internal.h"

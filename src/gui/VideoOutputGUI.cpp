@@ -1,5 +1,5 @@
 #include "VideoOutputGUI.h"
-#include "VideoOutput.h"
+#include "modules/VideoOutput.h"
 #include "core/ModuleRegistry.h"
 #include "core/ParameterRouter.h"
 #include "gui/ModuleGUI.h"

@@ -3,7 +3,7 @@
 #include "ViewManager.h"
 #include "core/SessionManager.h"
 #include "core/ProjectManager.h"
-#include "AssetLibrary.h"
+#include "utils/AssetLibrary.h"
 #include "FileBrowser.h"
 #include "ofLog.h"
 #include "GUIConstants.h"

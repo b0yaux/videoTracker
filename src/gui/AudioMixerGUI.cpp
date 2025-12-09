@@ -1,5 +1,5 @@
 #include "AudioMixerGUI.h"
-#include "AudioMixer.h"
+#include "modules/AudioMixer.h"
 #include "core/ModuleRegistry.h"
 #include "core/ParameterRouter.h"
 #include "gui/GUIConstants.h"

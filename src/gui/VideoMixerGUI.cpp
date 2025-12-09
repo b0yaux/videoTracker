@@ -1,5 +1,5 @@
 #include "VideoMixerGUI.h"
-#include "VideoMixer.h"
+#include "modules/VideoMixer.h"
 #include "core/ModuleRegistry.h"
 #include "core/ParameterRouter.h"
 #include "gui/GUIConstants.h"

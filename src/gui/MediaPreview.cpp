@@ -1,5 +1,5 @@
 #include "MediaPreview.h"
-#include "MediaPlayer.h"
+#include "modules/MediaPlayer.h"
 #include "ofxSoundObjects.h"
 #include "ofxVisualObjects.h"
 #include "ofImage.h"

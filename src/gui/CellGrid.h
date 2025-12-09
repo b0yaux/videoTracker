@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ofMain.h"
-#include "Module.h"  // For ParameterDescriptor
+#include "modules/Module.h"  // For ParameterDescriptor
 #include "CellWidget.h"
 #include "gui/HeaderPopup.h"
 #include <imgui.h>

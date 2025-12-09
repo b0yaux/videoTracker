@@ -1,6 +1,6 @@
 #include "TrackerSequencer.h"
-#include "TrackerSequencerGUI.h"  // For GUIState definition
-#include "Clock.h"
+#include "gui/TrackerSequencerGUI.h"  // For GUIState definition
+#include "utils/Clock.h"
 #include "Module.h"
 #include "core/ModuleRegistry.h"
 #include "core/ConnectionManager.h"

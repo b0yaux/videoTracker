@@ -9,12 +9,12 @@
 #include "ofMain.h"
 #include "ofxSoundObjects.h"
 #include "ofxVisualObjects.h"
-#include "MediaPlayer.h"
-#include "MediaPool.h"
-#include "TrackerSequencer.h"
-#include "Pattern.h"
-#include "Clock.h"
-#include "ClockGUI.h"
+#include "modules/MediaPlayer.h"
+#include "modules/MediaPool.h"
+#include "modules/TrackerSequencer.h"
+#include "data/Pattern.h"
+#include "utils/Clock.h"
+#include "gui/ClockGUI.h"
 #include "ImGuiIntegration.h"  // Direct ImGui integration wrapper (replaces ofxImGui)
 #include <imgui_internal.h> // For DockBuilder API (now resolves to addons/imgui/ version 1.92.5)
 #include <implot.h>
@@ -27,15 +27,15 @@
 #include "gui/AssetLibraryGUI.h"
 #include "input/InputRouter.h"
 #include "core/CommandExecutor.h"
-#include "Module.h"
+#include "modules/Module.h"
 #include "core/ModuleFactory.h"
 #include "core/ModuleRegistry.h"
 #include "core/ParameterRouter.h"
 #include "core/ConnectionManager.h"
 #include "core/ProjectManager.h"
 #include "core/SessionManager.h"
-#include "MediaConverter.h"
-#include "AssetLibrary.h"
+#include "utils/MediaConverter.h"
+#include "utils/AssetLibrary.h"
 
 class ofApp : public ofBaseApp {
 public:

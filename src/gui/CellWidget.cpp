@@ -1,5 +1,5 @@
 #include "CellWidget.h"
-#include "ExpressionParser.h"
+#include "utils/ExpressionParser.h"
 #include "gui/GUIConstants.h"
 #include <imgui.h>
 #include "ofLog.h"

@@ -5,8 +5,8 @@
 //
 
 #include "ofApp.h"
-#include "AudioOutput.h"
-#include "VideoOutput.h"
+#include "modules/AudioOutput.h"
+#include "modules/VideoOutput.h"
 #include "ofLog.h"
 #include "gui/GUIConstants.h"
 #include <imgui.h>

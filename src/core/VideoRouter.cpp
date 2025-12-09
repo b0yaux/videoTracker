@@ -1,6 +1,6 @@
 #include "VideoRouter.h"
-#include "VideoOutput.h"
-#include "VideoMixer.h"
+#include "modules/VideoOutput.h"
+#include "modules/VideoMixer.h"
 #include "ModuleRegistry.h"
 #include "ofLog.h"
 #include "ofxVisualObjects.h"

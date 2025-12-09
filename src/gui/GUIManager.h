@@ -2,7 +2,7 @@
 
 #include "core/ModuleRegistry.h"
 #include "gui/ModuleGUI.h"
-#include "Module.h"
+#include "modules/Module.h"
 #include <memory>
 #include <map>
 #include <set>

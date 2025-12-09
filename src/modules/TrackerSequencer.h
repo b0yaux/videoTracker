@@ -3,9 +3,9 @@
 #include "ofMain.h"
 #include "ofEvents.h"
 #include "Module.h"
-#include "Pattern.h"
-#include "CellWidget.h"
-#include "PatternChain.h"
+#include "data/Pattern.h"
+#include "gui/CellWidget.h"
+#include "data/PatternChain.h"
 #include "ofJson.h"
 #include <string>
 #include <vector>

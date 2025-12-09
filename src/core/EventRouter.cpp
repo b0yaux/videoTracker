@@ -1,6 +1,6 @@
 #include "EventRouter.h"
 #include "ModuleRegistry.h"
-#include "Module.h"
+#include "modules/Module.h"
 #include "ofLog.h"
 #include "ofEvents.h"
 

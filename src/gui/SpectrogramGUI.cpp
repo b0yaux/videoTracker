@@ -1,6 +1,6 @@
 #include "SpectrogramGUI.h"
-#include "Spectrogram.h"
-#include "Module.h"
+#include "modules/Spectrogram.h"
+#include "modules/Module.h"
 #include "core/ModuleRegistry.h"
 #include "gui/ModuleGUI.h"
 #include "gui/GUIManager.h"

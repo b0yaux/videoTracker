@@ -1,6 +1,6 @@
 #include "OscilloscopeGUI.h"
-#include "Oscilloscope.h"
-#include "Module.h"
+#include "modules/Oscilloscope.h"
+#include "modules/Module.h"
 #include "core/ModuleRegistry.h"
 #include "gui/ModuleGUI.h"
 #include "gui/GUIManager.h"

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "CellWidget.h"
-#include "Module.h"
+#include "modules/Module.h"
 #include "core/ParameterRouter.h"
 #include "core/ParameterPath.h"
 #include "ofMain.h"  // for ofToString

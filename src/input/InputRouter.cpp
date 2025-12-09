@@ -1,5 +1,5 @@
 #include "InputRouter.h"
-#include "Clock.h"
+#include "utils/Clock.h"
 #include "gui/ViewManager.h"
 #include "gui/Console.h"
 #include "gui/CommandBar.h"
@@ -9,8 +9,8 @@
 #include "core/SessionManager.h"
 #include "core/ProjectManager.h"
 #include "gui/AddMenu.h"
-#include "AssetLibrary.h"
-#include "Module.h"
+#include "utils/AssetLibrary.h"
+#include "modules/Module.h"
 #include <imgui.h>
 #include <imgui_internal.h>
 #include "ofLog.h"

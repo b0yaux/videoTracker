@@ -1,9 +1,9 @@
 #include "ConnectionManager.h"
-#include "AudioOutput.h"
-#include "VideoOutput.h"
+#include "modules/AudioOutput.h"
+#include "modules/VideoOutput.h"
 #include "ModuleRegistry.h"
-#include "Clock.h"
-#include "Module.h"
+#include "utils/Clock.h"
+#include "modules/Module.h"
 #include "ofLog.h"
 
 ConnectionManager::ConnectionManager(ModuleRegistry* registry)
