@@ -1,0 +1,314 @@
+#include "PatternChain.h"
+#include "ofLog.h"
+#include "ofJson.h"
+
+PatternChain::PatternChain() {
+    // Default initialization
+}
+
+void PatternChain::setCurrentIndex(int index) {
+    if (index >= 0 && index < (int)chain.size()) {
+        currentIndex = index;
+        currentRepeat = 0;  // Reset repeat counter
+    } else {
+        ofLogWarning("PatternChain") << "Invalid chain index: " << index;
+    }
+}
+
+void PatternChain::addEntry(int patternIndex) {
+    int newIndex = (int)chain.size();
+    chain.push_back(patternIndex);
+    repeatCounts[newIndex] = 1;  // Default repeat count
+    ofLogNotice("PatternChain") << "Added pattern " << patternIndex << " to chain";
+}
+
+void PatternChain::removeEntry(int chainIndex) {
+    if (!isValidIndex(chainIndex)) {
+        ofLogWarning("PatternChain") << "Invalid chain index for removal: " << chainIndex;
+        return;
+    }
+    
+    chain.erase(chain.begin() + chainIndex);
+    
+    // Remove repeat count and adjust indices
+    repeatCounts.erase(chainIndex);
+    std::map<int, int> newRepeatCounts;
+    for (const auto& pair : repeatCounts) {
+        if (pair.first < chainIndex) {
+            newRepeatCounts[pair.first] = pair.second;
+        } else if (pair.first > chainIndex) {
+            newRepeatCounts[pair.first - 1] = pair.second;
+        }
+    }
+    repeatCounts = newRepeatCounts;
+    
+    // Remove disabled state and adjust indices
+    disabled.erase(chainIndex);
+    std::map<int, bool> newDisabled;
+    for (const auto& pair : disabled) {
+        if (pair.first < chainIndex) {
+            newDisabled[pair.first] = pair.second;
+        } else if (pair.first > chainIndex) {
+            newDisabled[pair.first - 1] = pair.second;
+        }
+    }
+    disabled = newDisabled;
+    
+    // Adjust current chain index if necessary
+    bool wasCurrentIndex = (currentIndex == chainIndex);
+    if (currentIndex > chainIndex) {
+        currentIndex--;
+    }
+    // If current index is out of bounds, clamp to last valid index
+    if (currentIndex >= (int)chain.size()) {
+        currentIndex = std::max(0, (int)chain.size() - 1);
+    }
+    if (wasCurrentIndex) {
+        // If we removed the current index, reset repeat counter
+        currentRepeat = 0;
+    }
+    
+    ofLogNotice("PatternChain") << "Removed chain entry at index " << chainIndex;
+}
+
+void PatternChain::clear() {
+    chain.clear();
+    repeatCounts.clear();
+    disabled.clear();
+    currentIndex = 0;
+    currentRepeat = 0;
+    enabled = false;
+    ofLogNotice("PatternChain") << "Pattern chain cleared";
+}
+
+int PatternChain::getEntry(int chainIndex) const {
+    if (isValidIndex(chainIndex)) {
+        return chain[chainIndex];
+    }
+    return -1;
+}
+
+void PatternChain::setEntry(int chainIndex, int patternIndex) {
+    if (chainIndex < 0) {
+        ofLogWarning("PatternChain") << "Invalid chain index: " << chainIndex;
+        return;
+    }
+    
+    // Resize pattern chain if necessary
+    if (chainIndex >= (int)chain.size()) {
+        chain.resize(chainIndex + 1, 0);
+        // Set default repeat count for new entries
+        if (repeatCounts.find(chainIndex) == repeatCounts.end()) {
+            repeatCounts[chainIndex] = 1;
+        }
+    }
+    
+    chain[chainIndex] = patternIndex;
+    ofLogNotice("PatternChain") << "Set chain entry " << chainIndex << " to pattern " << patternIndex;
+}
+
+int PatternChain::getRepeatCount(int chainIndex) const {
+    if (!isValidIndex(chainIndex)) {
+        return 1;  // Default repeat count
+    }
+    auto it = repeatCounts.find(chainIndex);
+    if (it != repeatCounts.end()) {
+        return it->second;
+    }
+    return 1;  // Default repeat count
+}
+
+void PatternChain::setRepeatCount(int chainIndex, int repeatCount) {
+    if (!isValidIndex(chainIndex)) {
+        ofLogWarning("PatternChain") << "Invalid chain index: " << chainIndex;
+        return;
+    }
+    
+    repeatCount = std::max(1, std::min(99, repeatCount));  // Clamp to 1-99
+    repeatCounts[chainIndex] = repeatCount;
+    ofLogNotice("PatternChain") << "Set chain entry " << chainIndex << " repeat count to " << repeatCount;
+}
+
+bool PatternChain::isEntryDisabled(int chainIndex) const {
+    if (!isValidIndex(chainIndex)) {
+        return false;
+    }
+    auto it = disabled.find(chainIndex);
+    return (it != disabled.end() && it->second);
+}
+
+void PatternChain::setEntryDisabled(int chainIndex, bool disabledState) {
+    if (!isValidIndex(chainIndex)) {
+        ofLogWarning("PatternChain") << "Invalid chain index: " << chainIndex;
+        return;
+    }
+    disabled[chainIndex] = disabledState;
+    ofLogVerbose("PatternChain") << "Set chain entry " << chainIndex << " disabled: " << (disabledState ? "true" : "false");
+}
+
+int PatternChain::advanceOnPatternFinish(int numPatterns) {
+    if (!enabled || chain.empty()) {
+        return -1;  // Chain disabled or empty
+    }
+    
+    // Increment repeat counter
+    currentRepeat++;
+    
+    // Get repeat count for current chain entry (default to 1 if not set)
+    int repeatCount = getRepeatCount(currentIndex);
+    
+    // Check if we've finished all repeats for current chain entry
+    if (currentRepeat >= repeatCount) {
+        // Move to next chain entry (skip disabled entries)
+        currentRepeat = 0;
+        int startIndex = currentIndex;
+        do {
+            currentIndex = (currentIndex + 1) % (int)chain.size();
+            // If we've looped back to start and all are disabled, break to avoid infinite loop
+            if (currentIndex == startIndex) break;
+        } while (isEntryDisabled(currentIndex) && currentIndex != startIndex);
+    }
+    
+    // Return the next pattern index (only if not disabled)
+    if (!isEntryDisabled(currentIndex)) {
+        int nextPatternIdx = chain[currentIndex];
+        if (nextPatternIdx >= 0 && nextPatternIdx < numPatterns) {
+            ofLogVerbose("PatternChain") << "Pattern finished, advancing to pattern " << nextPatternIdx 
+                                         << " (chain position " << currentIndex 
+                                         << ", repeat " << (currentRepeat + 1) << "/" << repeatCount << ")";
+            return nextPatternIdx;
+        }
+    }
+    
+    return -1;  // No valid pattern to advance to
+}
+
+void PatternChain::reset() {
+    currentIndex = 0;
+    currentRepeat = 0;
+}
+
+void PatternChain::toJson(ofJson& json) const {
+    ofJson chainArray = ofJson::array();
+    for (size_t i = 0; i < chain.size(); i++) {
+        ofJson entry;
+        entry["patternIndex"] = chain[i];
+        entry["repeatCount"] = getRepeatCount((int)i);
+        chainArray.push_back(entry);
+    }
+    json["patternChain"] = chainArray;
+    json["usePatternChain"] = enabled;
+    json["currentChainIndex"] = currentIndex;
+    json["currentChainRepeat"] = currentRepeat;
+}
+
+void PatternChain::fromJson(const ofJson& json, int numPatterns) {
+    chain.clear();
+    repeatCounts.clear();
+    disabled.clear();
+    
+    // Load pattern chain with repeat counts (support both new and legacy keys)
+    ofJson chainArray;
+    if (json.contains("patternChain") && json["patternChain"].is_array()) {
+        chainArray = json["patternChain"];
+    } else if (json.contains("orderList") && json["orderList"].is_array()) {
+        // Legacy: support old "orderList" key
+        chainArray = json["orderList"];
+    }
+    
+    if (!chainArray.is_null() && chainArray.is_array()) {
+        for (size_t i = 0; i < chainArray.size(); i++) {
+            const auto& chainEntry = chainArray[i];
+            int patternIdx = -1;
+            int repeatCount = 1;
+            
+            // Support both old format (int) and new format (object)
+            if (chainEntry.is_number()) {
+                // Legacy format: just pattern index
+                patternIdx = chainEntry;
+            } else if (chainEntry.is_object()) {
+                // New format: object with patternIndex and repeatCount
+                if (chainEntry.contains("patternIndex")) {
+                    patternIdx = chainEntry["patternIndex"];
+                }
+                if (chainEntry.contains("repeatCount")) {
+                    repeatCount = chainEntry["repeatCount"];
+                    repeatCount = std::max(1, std::min(99, repeatCount));
+                }
+            }
+            
+            if (patternIdx >= 0 && patternIdx < numPatterns) {
+                chain.push_back(patternIdx);
+                repeatCounts[(int)i] = repeatCount;
+                disabled[(int)i] = false;  // Default to enabled when loading
+            }
+        }
+    }
+    
+    // Load pattern chain settings (support both new and legacy keys)
+    if (json.contains("usePatternChain")) {
+        enabled = json["usePatternChain"];
+    } else if (json.contains("useOrderList")) {
+        // Legacy: support old "useOrderList" key
+        enabled = json["useOrderList"];
+    } else {
+        // Default to enabled for new files
+        enabled = true;
+    }
+    
+    if (json.contains("currentChainIndex")) {
+        int loadedChainIndex = json["currentChainIndex"];
+        if (loadedChainIndex >= 0 && loadedChainIndex < (int)chain.size()) {
+            currentIndex = loadedChainIndex;
+        } else {
+            currentIndex = 0;
+        }
+    } else if (json.contains("currentOrderIndex")) {
+        // Legacy: support old "currentOrderIndex" key
+        int loadedChainIndex = json["currentOrderIndex"];
+        if (loadedChainIndex >= 0 && loadedChainIndex < (int)chain.size()) {
+            currentIndex = loadedChainIndex;
+        } else {
+            currentIndex = 0;
+        }
+    }
+    
+    if (json.contains("currentChainRepeat")) {
+        currentRepeat = json["currentChainRepeat"];
+    } else if (json.contains("currentOrderRepeat")) {
+        // Legacy: support old "currentOrderRepeat" key
+        currentRepeat = json["currentOrderRepeat"];
+    } else {
+        currentRepeat = 0;
+    }
+    
+    // If pattern chain is empty but enabled, initialize with all patterns
+    if (enabled && chain.empty() && numPatterns > 0) {
+        for (int i = 0; i < numPatterns; i++) {
+            chain.push_back(i);
+            repeatCounts[i] = 1;
+        }
+        currentIndex = 0;
+        currentRepeat = 0;
+    }
+}
+
+bool PatternChain::isValidIndex(int index) const {
+    return index >= 0 && index < (int)chain.size();
+}
+
+int PatternChain::findNextEnabledIndex(int startIndex) const {
+    if (chain.empty()) return -1;
+    
+    int index = startIndex;
+    int attempts = 0;
+    while (attempts < (int)chain.size()) {
+        if (!isEntryDisabled(index)) {
+            return index;
+        }
+        index = (index + 1) % (int)chain.size();
+        attempts++;
+    }
+    return -1;  // All entries disabled
+}
+

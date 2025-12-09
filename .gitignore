@@ -10,6 +10,9 @@ obj/
 *.exe
 *.app/
 
+# Data directory (contains media files for default project)
+bin/data/
+
 # Backup files
 *.bak
 *.tmp
@@ -53,6 +56,11 @@ libs/
 addons/
 !addons/.gitkeep
 
+# Exclude embedded git repositories in addons (add as submodules if needed)
+addons/ImGui-FileBrowser/.git
+addons/imgui-command-palette/.git
+addons/imgui/.git
+
 # ImGui config files
 *.ini
 
@@ -73,7 +81,6 @@ POSITION_*.md
 SHORT_TERM_PLAN.txt
 *-refactoring-plan.txt
 *-refactor-prd.txt
-*-refactoring-plan.txt
 cleanup-worktrees.sh
 test_include.cpp
 
@@ -111,3 +118,4 @@ openFrameworks-Info.plist
 !src/**/*.cpp
 !src/**/*.h
 !src/**/*.hpp
+
