@@ -238,6 +238,43 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
         }
     }
 
+    // Priority 0.5: Cmd+G - Toggle GUI visibility (global shortcut, works everywhere)
+    if (cmdPressed && (key == 'g' || key == 'G')) {
+        if (showGUI) {
+            *showGUI = !*showGUI;
+            logKeyPress(key, "Global: Cmd+G Toggle GUI");
+            return true; // Consume the key
+        }
+    }
+
+    // Priority 0.5: Cmd+0 - Toggle focused module ON/OFF (global shortcut, works everywhere)
+    // Only works when a module window is focused (not Console, FileBrowser, etc.)
+    if (cmdPressed && key == '0') {
+        // Use ViewManager's focus tracking to get the currently focused window
+        if (viewManager && guiManager && registry) {
+            std::string focusedWindowName = viewManager->getCurrentFocusedWindow();
+            if (!focusedWindowName.empty()) {
+                // Check if this is a module window (has a GUI in GUIManager)
+                if (guiManager->hasGUI(focusedWindowName)) {
+                    // Get GUI for the focused module window
+                    auto* gui = guiManager->getGUI(focusedWindowName);
+                    if (gui) {
+                        std::string instanceName = gui->getInstanceName();
+                        auto module = registry->getModule(instanceName);
+                        if (module) {
+                            bool currentlyEnabled = module->isEnabled();
+                            module->setEnabled(!currentlyEnabled);
+                            gui->setEnabled(!currentlyEnabled);
+                            std::string logMsg = "Global: Cmd+0 Toggle Module " + instanceName + " " + (currentlyEnabled ? "OFF" : "ON");
+                            logKeyPress(key, logMsg.c_str());
+                            return true; // Consume the key
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Priority 0.5: Shift+A - Open Add Menu (global shortcut, works everywhere)
     if (shiftPressed && (key == 'A' || key == 'a')) {
         if (addMenu) {
@@ -368,14 +405,9 @@ bool InputRouter::handleGlobalShortcuts(int key) {
             }
             break;
 
-        case 'g':
-        case 'G':  // G - Toggle GUI
-            if (showGUI) {
-                *showGUI = !*showGUI;
-                logKeyPress(key, "Global: Toggle GUI");
-                return true;
-            }
-            break;
+        // Note: Cmd+G is now handled at Priority 0.5 level (above)
+        // This case is kept for backward compatibility but should not be reached
+        // when Cmd modifier is pressed
 
         case 'S':  // S - Save session (capital S to distinguish from speed)
             if (onSaveSession) {

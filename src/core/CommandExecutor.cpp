@@ -29,6 +29,10 @@ CommandExecutor::~CommandExecutor() {
     // Signal download thread to stop
     shouldStopDownloadThread_ = true;
     
+    // CRITICAL: Notify condition variable to wake waiting thread
+    // Without this, the thread may be stuck waiting on downloadCondition_
+    downloadCondition_.notify_all();
+    
     // Wait for thread to finish
     if (downloadThread_.joinable()) {
         downloadThread_.join();

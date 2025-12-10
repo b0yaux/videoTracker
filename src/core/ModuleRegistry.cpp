@@ -5,6 +5,7 @@
 #include "ofLog.h"
 #include "ofJson.h"
 #include <set>
+#include <cctype>
 
 ModuleRegistry::ModuleRegistry() {
 }
@@ -115,6 +116,61 @@ bool ModuleRegistry::removeModule(const std::string& identifier) {
     nameToUUID.erase(humanName);
     
     ofLogNotice("ModuleRegistry") << "Removed module: UUID=" << uuid << ", name=" << humanName;
+    
+    return true;
+}
+
+//--------------------------------------------------------------
+bool ModuleRegistry::renameModule(const std::string& oldName, const std::string& newName) {
+    // Validate old name exists
+    auto oldNameIt = nameToUUID.find(oldName);
+    if (oldNameIt == nameToUUID.end()) {
+        ofLogError("ModuleRegistry") << "Cannot rename: old name not found: " << oldName;
+        return false;
+    }
+    
+    // Validate new name is not empty
+    if (newName.empty()) {
+        ofLogError("ModuleRegistry") << "Cannot rename: new name cannot be empty";
+        return false;
+    }
+    
+    // Validate new name is different from old name
+    if (oldName == newName) {
+        ofLogWarning("ModuleRegistry") << "Cannot rename: new name is same as old name: " << oldName;
+        return false;
+    }
+    
+    // Validate new name is unique (not already registered)
+    if (nameToUUID.find(newName) != nameToUUID.end()) {
+        ofLogError("ModuleRegistry") << "Cannot rename: new name already exists: " << newName;
+        return false;
+    }
+    
+    // Validate new name contains only valid characters (alphanumeric, underscore, hyphen)
+    // This matches typical naming conventions and prevents issues with path parsing
+    for (char c : newName) {
+        if (!std::isalnum(c) && c != '_' && c != '-') {
+            ofLogError("ModuleRegistry") << "Cannot rename: new name contains invalid character '" << c 
+                                        << "'. Only alphanumeric characters, underscores, and hyphens are allowed.";
+            return false;
+        }
+    }
+    
+    // Get UUID for the old name
+    std::string uuid = oldNameIt->second;
+    
+    // Update mappings
+    // 1. Update uuidToName mapping
+    uuidToName[uuid] = newName;
+    
+    // 2. Remove old name from nameToUUID
+    nameToUUID.erase(oldName);
+    
+    // 3. Add new name to nameToUUID
+    nameToUUID[newName] = uuid;
+    
+    ofLogNotice("ModuleRegistry") << "Renamed module: " << oldName << " -> " << newName << " (UUID: " << uuid << ")";
     
     return true;
 }

@@ -61,6 +61,10 @@ public:
     void setConnectionManager(class ConnectionManager* manager) { this->connectionManager = manager; }
     class ConnectionManager* getConnectionManager() const { return connectionManager; }
     
+    // GUIManager connection (for rename operations)
+    void setGUIManager(class GUIManager* manager) { this->guiManager = manager; }
+    class GUIManager* getGUIManager() const { return guiManager; }
+    
     // Get module type name (e.g., "TrackerSequencer", "MediaPool")
     // Returns empty string if module not found in registry
     std::string getModuleTypeName() const;
@@ -72,6 +76,14 @@ public:
     // Draw ON/OFF toggle button in ImGui's native title bar
     // Uses foreground draw list to draw on top of title bar decorations
     void drawTitleBarToggle();
+    
+    // Draw module menu icon button in title bar (opens popup menu)
+    // Positioned to the left of the ON/OFF toggle
+    void drawTitleBarMenuIcon();
+    
+    // Draw module popup menu (rename, connections)
+    // Called when menu icon is clicked
+    void drawModulePopup();
     
     // Override this to hide toggle for specific module types (e.g., master outputs)
     // Returns true if toggle should be shown, false to hide it
@@ -361,6 +373,10 @@ protected:
     ModuleRegistry* registry = nullptr;
     ParameterRouter* parameterRouter = nullptr;
     class ConnectionManager* connectionManager = nullptr;
+    class GUIManager* guiManager = nullptr;
+    
+    // Module popup menu state
+    char renameBuffer_[256] = {0};  // Buffer for rename input field
     
 private:
     // Sync enabled state from backend module (implemented in .cpp)

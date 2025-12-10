@@ -63,6 +63,26 @@ public:
     bool removeModule(const std::string& identifier);
     
     /**
+     * Rename a module instance
+     * @param oldName Current human-readable name of the module
+     * @param newName New human-readable name for the module
+     * @return true if rename succeeded, false if old name not found, new name already exists, or validation failed
+     * 
+     * Validation rules:
+     * - Old name must exist in registry
+     * - New name must be unique (not already registered)
+     * - New name must be non-empty
+     * - New name must contain only alphanumeric characters, underscores, and hyphens
+     * - New name cannot be the same as old name
+     * 
+     * Note: This only updates the registry's internal mappings. Callers are responsible for:
+     * - Updating ConnectionManager connections that reference the old name
+     * - Updating GUIManager instance names
+     * - Updating any other systems that reference module names
+     */
+    bool renameModule(const std::string& oldName, const std::string& newName);
+    
+    /**
      * Get UUID for a human-readable name
      * @param humanName Human-readable name
      * @return UUID string, or empty string if not found

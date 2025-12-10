@@ -172,6 +172,15 @@ public:
      * @param instanceName Instance name to remove
      */
     void removeGUI(const std::string& instanceName);
+    
+    /**
+     * Rename a module instance (updates GUI mapping)
+     * Called when ModuleRegistry::renameModule() succeeds
+     * @param oldName Old instance name
+     * @param newName New instance name
+     * @return true if rename succeeded, false if GUI not found
+     */
+    bool renameInstance(const std::string& oldName, const std::string& newName);
 
 private:
     ModuleRegistry* registry = nullptr;

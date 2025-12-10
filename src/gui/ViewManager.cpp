@@ -370,9 +370,21 @@ void ViewManager::drawModulePanels() {
         // ImGui::Begin() returns false when window is collapsed
         if (ImGui::Begin(windowTitle.c_str(), nullptr, windowFlags)) {
             if (!ImGui::IsWindowCollapsed()) {
+                // Draw menu icon button in ImGui's native title bar
+                try {
+                    gui->drawTitleBarMenuIcon();
+                } catch (...) {
+                }
+                
                 // Draw ON/OFF toggle button in ImGui's native title bar
                 try {
                     gui->drawTitleBarToggle();
+                } catch (...) {
+                }
+                
+                // Draw module popup menu (if open)
+                try {
+                    gui->drawModulePopup();
                 } catch (...) {
                 }
 

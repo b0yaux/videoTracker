@@ -174,6 +174,10 @@ private:
     int fboWidth_ = 1920;
     int fboHeight_ = 512;  // Spectrogram is typically taller
     
+    // Performance optimization: dirty flag and incremental max tracking
+    bool textureDirty_ = false;  // Set to true when new FFT data arrives
+    float rollingMaxMagnitude_ = 1.0f;  // Incrementally tracked max magnitude
+    
     // Helper methods
     void ensureOutputFbo(int width = 1920, int height = 512);
     void setupFft();

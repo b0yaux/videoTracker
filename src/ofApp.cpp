@@ -444,20 +444,63 @@ void ofApp::draw() {
 
 //--------------------------------------------------------------
 void ofApp::exit() {
-    // Auto-save full session before exiting
-    if (sessionManager.saveSession("session.json")) {
-        ofLogNotice("ofApp") << "Session saved to file";
-    }
+    ofLogNotice("ofApp") << "Exiting application...";
     
-    // Cleanup ImGui (wrapper handles ImPlot and ImGui cleanup)
-    gui.shutdown();
-    
-    // Stop clock and close audio stream
+    // Step 1: Stop clock first to stop all timing-dependent operations
+    // This prevents new audio callbacks and module updates
     clock.stop();
-    if (masterAudioOut) {
-        // AudioOutput manages its own soundStream_, but we should stop it
-        // The soundStream_ is closed automatically when AudioOutput is destroyed
+    
+    // Step 2: Auto-save session FIRST (before any modifications)
+    // This ensures the session is saved with the current volume, not muted
+    try {
+        if (sessionManager.saveSession("session.json")) {
+            ofLogNotice("ofApp") << "Session saved to file";
+        }
+    } catch (...) {
+        ofLogWarning("ofApp") << "Error saving session during exit";
     }
+    
+    // Step 3: Close audio stream explicitly BEFORE module destruction
+    // This prevents the audio callback thread from blocking shutdown
+    if (masterAudioOut) {
+        try {
+            if (masterAudioOut->getSoundStream().getNumOutputChannels() > 0) {
+                masterAudioOut->getSoundStream().close();
+                ofLogNotice("ofApp") << "Audio stream closed";
+            }
+        } catch (...) {
+            ofLogWarning("ofApp") << "Error closing audio stream during exit";
+        }
+    }
+    
+    // Step 4: Cleanup ImGui (wrapper handles ImPlot and ImGui cleanup)
+    // Do this before destroying modules to ensure GUI resources are released
+    try {
+        gui.shutdown();
+        ofLogNotice("ofApp") << "ImGui shutdown complete";
+    } catch (...) {
+        ofLogWarning("ofApp") << "Error during ImGui shutdown";
+    }
+    
+    // Step 5: Clear module registry to trigger cleanup of all modules
+    // This will trigger MediaConverter and CommandExecutor destruction
+    // Their destructors will properly join their background threads
+    try {
+        // Disconnect all connections first
+        connectionManager.clear();
+        // Clear registry (modules will be destroyed)
+        // MediaConverter and CommandExecutor destructors will join threads
+        moduleRegistry.clear();
+        ofLogNotice("ofApp") << "Module registry cleared";
+    } catch (...) {
+        ofLogWarning("ofApp") << "Error clearing module registry";
+    }
+    
+    // Step 6: Background threads (CommandExecutor, MediaConverter) are joined
+    // in their destructors, which are called when ofApp members are destroyed
+    // This happens automatically after exit() returns
+    
+    ofLogNotice("ofApp") << "Exit cleanup complete";
 }
 
 //--------------------------------------------------------------

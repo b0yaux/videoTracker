@@ -1,5 +1,7 @@
 #include "ModuleGUI.h"
 #include "core/ModuleRegistry.h"
+#include "core/ConnectionManager.h"
+#include "gui/GUIManager.h"
 #include "ParameterCell.h"
 #include "modules/Module.h"
 #include "GUIConstants.h"
@@ -23,6 +25,9 @@ ModuleGUI::ModuleGUI() {
         loadDefaultLayouts();
         layoutsLoaded = true;
     }
+    
+    // Initialize rename buffer with empty string
+    renameBuffer_[0] = '\0';
 }
 
 void ModuleGUI::syncEnabledState() {
@@ -132,8 +137,322 @@ void ModuleGUI::drawTitleBarToggle() {
     }
 }
 
+void ModuleGUI::drawTitleBarMenuIcon() {
+    // Draw menu icon (☰) button in title bar, positioned to the left of ON/OFF toggle
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (!window || window->SkipItems) return;
+    
+    // Skip drawing when window is collapsed
+    if (ImGui::IsWindowCollapsed()) return;
+    
+    // Get title bar rectangle
+    ImRect titleBarRect = window->TitleBarRect();
+    if (titleBarRect.GetHeight() < 1.0f) return;
+    
+    ImGuiStyle& style = ImGui::GetStyle();
+    
+    // Calculate menu icon
+    std::string menuIcon = "☰";  // Three horizontal lines (hamburger menu)
+    ImVec2 iconSizeVec = ImGui::CalcTextSize(menuIcon.c_str());
+    
+    // Position menu icon to the left of the ON/OFF toggle
+    // We need to calculate where the toggle starts, then position menu icon before it
+    float checkboxSize = titleBarRect.GetHeight() * 0.6f;
+    std::string toggleLabel = enabled_ ? "ON" : "OFF";
+    ImVec2 labelSize = ImGui::CalcTextSize(toggleLabel.c_str());
+    float spacing = style.ItemSpacing.x;
+    float padding = style.WindowPadding.x;
+    float toggleWidth = labelSize.x + spacing + checkboxSize;
+    float toggleStartX = titleBarRect.Max.x - toggleWidth - padding;
+    
+    // Position menu icon to the left of toggle with some spacing
+    float menuIconX = toggleStartX - spacing - iconSizeVec.x;
+    ImVec2 menuIconPos = ImVec2(menuIconX,
+                                titleBarRect.Min.y + (titleBarRect.GetHeight() - iconSizeVec.y) * 0.5f);
+    
+    // Handle click detection
+    ImVec2 mousePos = ImGui::GetIO().MousePos;
+    ImRect menuIconRect(menuIconPos, ImVec2(menuIconPos.x + iconSizeVec.x, menuIconPos.y + iconSizeVec.y));
+    bool mouseInIcon = menuIconRect.Contains(mousePos);
+    bool mouseClicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    bool hovered = mouseInIcon;
+    bool clicked = mouseInIcon && mouseClicked;
+    
+    // Open popup on click
+    if (clicked && !ImGui::IsWindowCollapsed()) {
+        // Initialize rename buffer with current instance name
+        strncpy(renameBuffer_, instanceName.c_str(), sizeof(renameBuffer_) - 1);
+        renameBuffer_[sizeof(renameBuffer_) - 1] = '\0';
+        
+        // Open popup
+        std::string popupId = "ModuleMenu_" + instanceName;
+        ImGui::OpenPopup(popupId.c_str());
+    }
+    
+    // Use foreground draw list to draw on top of title bar
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+    
+    // Draw menu icon with hover color
+    ImU32 iconColor = hovered ? 
+        ImGui::GetColorU32(ImGuiCol_Text) : 
+        ImGui::GetColorU32(ImGuiCol_Text, 0.7f);
+    drawList->AddText(menuIconPos, iconColor, menuIcon.c_str());
+}
+
+void ModuleGUI::drawModulePopup() {
+    std::string popupId = "ModuleMenu_" + instanceName;
+    ImGui::SetNextWindowPos(ImGui::GetMousePos(), ImGuiCond_Appearing);
+    
+    if (ImGui::BeginPopup(popupId.c_str())) {
+        // Instance name editor
+        ImGui::Text("Instance name:");
+        ImGui::SetNextItemWidth(200.0f);
+        bool enterPressed = ImGui::InputText("##rename", renameBuffer_, sizeof(renameBuffer_), 
+                            ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+        ImGui::SameLine();
+        bool applyPressed = ImGui::Button("Apply");
+        
+        // Apply rename
+        if ((enterPressed || applyPressed) && registry) {
+            std::string newName(renameBuffer_);
+            if (!newName.empty() && newName != instanceName) {
+                if (registry->renameModule(instanceName, newName)) {
+                    if (guiManager) {
+                        guiManager->renameInstance(instanceName, newName);
+                    }
+                    instanceName = newName;
+                } else {
+                    strncpy(renameBuffer_, instanceName.c_str(), sizeof(renameBuffer_) - 1);
+                    renameBuffer_[sizeof(renameBuffer_) - 1] = '\0';
+                }
+            }
+        }
+        
+        ImGui::Separator();
+        
+        // Connections
+        if (connectionManager && registry) {
+            // Helper to get connection type string
+            auto getTypeString = [](ConnectionManager::ConnectionType type) -> const char* {
+                switch (type) {
+                    case ConnectionManager::ConnectionType::AUDIO: return "AUDIO";
+                    case ConnectionManager::ConnectionType::VIDEO: return "VIDEO";
+                    case ConnectionManager::ConnectionType::PARAMETER: return "PARAMETER";
+                    case ConnectionManager::ConnectionType::EVENT: return "EVENT";
+                    default: return "UNKNOWN";
+                }
+            };
+            
+            // Helper to disconnect
+            auto disconnectConnection = [this](const ConnectionManager::Connection& conn, bool isInput) {
+                switch (conn.type) {
+                    case ConnectionManager::ConnectionType::AUDIO:
+                        connectionManager->disconnectAudio(
+                            isInput ? conn.sourceModule : instanceName,
+                            isInput ? instanceName : conn.targetModule);
+                        break;
+                    case ConnectionManager::ConnectionType::VIDEO:
+                        connectionManager->disconnectVideo(
+                            isInput ? conn.sourceModule : instanceName,
+                            isInput ? instanceName : conn.targetModule);
+                        break;
+                    case ConnectionManager::ConnectionType::PARAMETER:
+                        if (!conn.sourcePath.empty()) {
+                            connectionManager->disconnectParameter(conn.sourcePath);
+                        }
+                        break;
+                    case ConnectionManager::ConnectionType::EVENT:
+                        connectionManager->unsubscribeEvent(
+                            isInput ? conn.sourceModule : instanceName,
+                            conn.eventName,
+                            isInput ? instanceName : conn.targetModule,
+                            conn.handlerName);
+                        break;
+                }
+            };
+            
+            // Inputs section
+            auto inputs = connectionManager->getConnectionsTo(instanceName);
+            if (!inputs.empty()) {
+                ImGui::Text("Inputs:");
+                for (const auto& conn : inputs) {
+                    ImGui::BulletText("%s (%s)", conn.sourceModule.c_str(), getTypeString(conn.type));
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(("X##input_" + conn.sourceModule + "_" + std::to_string(static_cast<int>(conn.type))).c_str())) {
+                        disconnectConnection(conn, true);
+                    }
+                }
+            }
+            
+            // Outputs section
+            auto outputs = connectionManager->getConnectionsFrom(instanceName);
+            if (!outputs.empty()) {
+                ImGui::Text("Outputs:");
+                for (const auto& conn : outputs) {
+                    ImGui::BulletText("%s (%s)", conn.targetModule.c_str(), getTypeString(conn.type));
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(("X##output_" + conn.targetModule + "_" + std::to_string(static_cast<int>(conn.type))).c_str())) {
+                        disconnectConnection(conn, false);
+                    }
+                }
+            }
+            
+            // Add new connection
+            ImGui::Separator();
+            ImGui::Text("Add connection:");
+            
+            // Check which connection types have compatible modules
+            ConnectionManager::ConnectionType allTypes[] = {
+                ConnectionManager::ConnectionType::AUDIO,
+                ConnectionManager::ConnectionType::VIDEO,
+                ConnectionManager::ConnectionType::EVENT,
+                ConnectionManager::ConnectionType::PARAMETER
+            };
+            const char* allTypeNames[] = { "AUDIO", "VIDEO", "EVENT", "PARAMETER" };
+            
+            // Build list of available connection types (only those with compatible modules)
+            std::vector<int> availableTypeIndices;
+            std::vector<const char*> availableTypeNames;
+            std::vector<ConnectionManager::ConnectionType> availableTypes;
+            
+            for (int i = 0; i < 4; i++) {
+                auto compatible = connectionManager->findCompatibleModules(instanceName, allTypes[i]);
+                if (!compatible.empty()) {
+                    availableTypeIndices.push_back(i);
+                    availableTypeNames.push_back(allTypeNames[i]);
+                    availableTypes.push_back(allTypes[i]);
+                }
+            }
+            
+            // Use per-instance storage to avoid conflicts between different module popups
+            static std::map<std::string, int> selectedConnectionTypeMap; // instanceName -> selectedType (index in availableTypes)
+            static std::map<std::string, int> selectedModuleIndexMap;     // instanceName -> selectedIndex
+            
+            // Initialize or get selected connection type for this instance
+            int& selectedConnectionType = selectedConnectionTypeMap[instanceName];
+            int& selectedModuleIndex = selectedModuleIndexMap[instanceName];
+            
+            // On popup open, select first available connection type
+            if (ImGui::IsWindowAppearing()) {
+                selectedConnectionType = 0;
+                selectedModuleIndex = 0;
+            }
+            
+            // Ensure selected index is valid
+            if (selectedConnectionType >= static_cast<int>(availableTypeIndices.size())) {
+                selectedConnectionType = 0;
+            }
+            
+            if (!availableTypeNames.empty()) {
+                ImGui::SetNextItemWidth(120.0f);
+                bool typeChanged = ImGui::Combo("##connection_type", &selectedConnectionType, 
+                                               availableTypeNames.data(), static_cast<int>(availableTypeNames.size()));
+                
+                // Get compatible modules based on selected connection type
+                ConnectionManager::ConnectionType connType = availableTypes[selectedConnectionType];
+                std::vector<std::string> compatibleModules = connectionManager->findCompatibleModules(instanceName, connType);
+                
+                // Reset module selection when connection type changes or if invalid
+                if (typeChanged || selectedModuleIndex >= static_cast<int>(compatibleModules.size())) {
+                    selectedModuleIndex = 0;
+                }
+                
+                if (!compatibleModules.empty()) {
+                    ImGui::SameLine();
+                    
+                    // Target module dropdown (only shows compatible modules)
+                    if (ImGui::BeginCombo("##target_module", 
+                                         selectedModuleIndex < static_cast<int>(compatibleModules.size()) ? 
+                                         compatibleModules[selectedModuleIndex].c_str() : "")) {
+                        for (int i = 0; i < static_cast<int>(compatibleModules.size()); i++) {
+                            bool isSelected = (selectedModuleIndex == i);
+                            if (ImGui::Selectable(compatibleModules[i].c_str(), isSelected)) {
+                                selectedModuleIndex = i;
+                            }
+                            if (isSelected) {
+                                ImGui::SetItemDefaultFocus();
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    
+                    ImGui::SameLine();
+                    
+                    // Connect button
+                    if (ImGui::Button("Connect")) {
+                        std::string targetModule = compatibleModules[selectedModuleIndex];
+                        bool success = false;
+                        
+                        // Get source module for metadata
+                        auto sourceModule = registry->getModule(instanceName);
+                        auto targetModulePtr = registry->getModule(targetModule);
+                        
+                        if (!sourceModule || !targetModulePtr) {
+                            ofLogError("ModuleGUI") << "Failed to get module for connection";
+                        } else {
+                            // Get the actual connection type index from available types
+                            int actualTypeIndex = availableTypeIndices[selectedConnectionType];
+                            
+                            switch (actualTypeIndex) {
+                                case 0: // AUDIO
+                                    success = connectionManager->connectAudio(instanceName, targetModule);
+                                    break;
+                                case 1: // VIDEO
+                                    success = connectionManager->connectVideo(instanceName, targetModule);
+                                    break;
+                                case 2: { // EVENT
+                                    auto sourceMetadata = sourceModule->getMetadata();
+                                    auto targetMetadata = targetModulePtr->getMetadata();
+                                    if (!sourceMetadata.eventNames.empty() && !targetMetadata.eventNames.empty()) {
+                                        std::string eventName = sourceMetadata.eventNames[0];
+                                        std::string handlerName = targetMetadata.eventNames[0];
+                                        success = connectionManager->subscribeEvent(instanceName, eventName, targetModule, handlerName);
+                                    } else {
+                                        ofLogWarning("ModuleGUI") << "Missing event names for EVENT connection";
+                                    }
+                                    break;
+                                }
+                                case 3: { // PARAMETER
+                                    auto sourceMetadata = sourceModule->getMetadata();
+                                    auto targetMetadata = targetModulePtr->getMetadata();
+                                    if (!sourceMetadata.parameterNames.empty() && !targetMetadata.parameterNames.empty()) {
+                                        std::string sourceParam = sourceMetadata.parameterNames[0];
+                                        std::string targetParam = targetMetadata.parameterNames[0];
+                                        success = connectionManager->connectParameterDirect(instanceName, sourceParam, targetModule, targetParam);
+                                    } else {
+                                        ofLogWarning("ModuleGUI") << "Missing parameter names for PARAMETER connection";
+                                    }
+                                    break;
+                                }
+                            }
+                            
+                            if (success) {
+                                ofLogNotice("ModuleGUI") << "Connected " << instanceName << " -> " << targetModule 
+                                                         << " (" << availableTypeNames[selectedConnectionType] << ")";
+                            }
+                        }
+                    }
+                } else {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("No compatible modules for %s", availableTypeNames[selectedConnectionType]);
+                }
+            } else {
+                ImGui::TextDisabled("No connection types available");
+            }
+            
+            if (inputs.empty() && outputs.empty()) {
+                ImGui::TextDisabled("No connections");
+            }
+        } else {
+            ImGui::TextDisabled("ConnectionManager not available");
+        }
+        
+        ImGui::EndPopup();
+    }
+}
+
 void ModuleGUI::draw() {
-    // Title bar toggle is drawn by ViewManager using drawTitleBarToggle()
+    // Title bar toggle and popup menu are drawn by ViewManager
     // Just draw content here
     
     if (enabled_) {

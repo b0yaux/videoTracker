@@ -46,9 +46,14 @@ AudioOutput::~AudioOutput() noexcept {
     connectionAudioLevels_.clear();
     
     // Cleanup audio stream
-    // Check if stream is set up by checking if it has output channels
+    // Check if stream is set up and not already closed
+    // getNumOutputChannels() returns 0 if stream is closed or not set up
     if (soundStream_.getNumOutputChannels() > 0) {
-        soundStream_.close();
+        try {
+            soundStream_.close();
+        } catch (...) {
+            // Stream might already be closed, ignore
+        }
     }
 }
 

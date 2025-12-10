@@ -61,16 +61,17 @@ void GUIManager::setConnectionManager(ConnectionManager* manager) {
     connectionManager = manager;
     ofLogNotice("GUIManager") << "setConnectionManager called with valid pointer: " << (void*)manager;
     
-    // Update all existing GUIs with the ConnectionManager
+    // Update all existing GUIs with the ConnectionManager and GUIManager
     int updatedCount = 0;
     for (auto& pair : allGUIs) {
         if (pair.second) {
             pair.second->setConnectionManager(connectionManager);
+            pair.second->setGUIManager(this);  // Also set GUIManager reference
             updatedCount++;
         }
     }
     if (updatedCount > 0) {
-        ofLogNotice("GUIManager") << "Updated " << updatedCount << " existing GUIs with ConnectionManager";
+        ofLogNotice("GUIManager") << "Updated " << updatedCount << " existing GUIs with ConnectionManager and GUIManager";
     } else {
         ofLogNotice("GUIManager") << "setConnectionManager: No existing GUIs to update (will be set on new GUIs)";
     }
@@ -114,6 +115,7 @@ void GUIManager::syncWithRegistry() {
                     gui->setRegistry(registry);
                     gui->setParameterRouter(parameterRouter);
                     gui->setConnectionManager(connectionManager);
+                    gui->setGUIManager(this);  // Set GUIManager reference for rename operations
                     if (!connectionManager) {
                         ofLogWarning("GUIManager") << "WARNING: Creating GUI for " << name << " but ConnectionManager is null!";
                     }
@@ -146,6 +148,35 @@ void GUIManager::syncWithRegistry() {
 }
 
 // Old sync methods removed (Phase 12.8) - replaced by unified syncWithRegistry()
+
+bool GUIManager::renameInstance(const std::string& oldName, const std::string& newName) {
+    // Find GUI with old name
+    auto it = allGUIs.find(oldName);
+    if (it == allGUIs.end()) {
+        ofLogWarning("GUIManager") << "Cannot rename: GUI not found for instance: " << oldName;
+        return false;
+    }
+    
+    // Update visibility set
+    bool wasVisible = visibleInstances.find(oldName) != visibleInstances.end();
+    if (wasVisible) {
+        visibleInstances.erase(oldName);
+        visibleInstances.insert(newName);
+    }
+    
+    // Move GUI to new name in map
+    auto gui = std::move(it->second);
+    allGUIs.erase(it);
+    allGUIs[newName] = std::move(gui);
+    
+    // Update GUI's instance name
+    if (allGUIs[newName]) {
+        allGUIs[newName]->setInstanceName(newName);
+    }
+    
+    ofLogNotice("GUIManager") << "Renamed GUI instance: " << oldName << " -> " << newName;
+    return true;
+}
 
 void GUIManager::removeGUI(const std::string& instanceName) {
     // Remove from visible instances first

@@ -410,10 +410,8 @@ void Spectrogram::process(ofFbo& input, ofFbo& output) {
 }
 
 void Spectrogram::update() {
-    // Called from main thread - safe to update texture here
-    if (isEnabled()) {
-        updateTexture();
-    }
+    // Called from main thread - texture update now handled in renderSpectrogram()
+    // when dirty flag is set, avoiding unnecessary updates every frame
 }
 
 // setEnabled() is inherited from Module base class
@@ -429,6 +427,7 @@ void Spectrogram::setFftSize(int fftSize) {
     if (power != fftSize_) {
         fftSize_ = power;
         setupFft();
+        textureDirty_ = true;  // FFT size change requires texture regeneration
     }
 }
 
@@ -436,6 +435,7 @@ void Spectrogram::setWindowType(fftWindowType windowType) {
     if (windowType_ != windowType) {
         windowType_ = windowType;
         setupFft();
+        textureDirty_ = true;  // Window type change requires texture regeneration
     }
 }
 
@@ -462,10 +462,14 @@ float Spectrogram::getVolumeStop(int stopIndex) const {
 void Spectrogram::setSpeed(float speed) {
     speed_ = std::max(0.1f, std::min(5.0f, speed));
     updateHistorySize();
+    textureDirty_ = true;  // Speed change affects history size and texture dimensions
 }
 
 void Spectrogram::setFftScale(FftScale scale) {
-    fftScale_ = scale;
+    if (fftScale_ != scale) {
+        fftScale_ = scale;
+        textureDirty_ = true;  // Scale change requires texture regeneration
+    }
 }
 
 void Spectrogram::setupFft() {
@@ -486,9 +490,19 @@ void Spectrogram::processFft() {
     
     // Copy frequency bins to history
     std::vector<float> frequencyBins(binSize);
+    float sliceMax = 0.0f;
     for (int i = 0; i < binSize; i++) {
         frequencyBins[i] = amplitudes[i];
+        sliceMax = std::max(sliceMax, amplitudes[i]);
     }
+    
+    // Update rolling max incrementally (fast rise, slow decay)
+    if (sliceMax > rollingMaxMagnitude_) {
+        rollingMaxMagnitude_ = sliceMax;
+    } else {
+        rollingMaxMagnitude_ = rollingMaxMagnitude_ * 0.995f + sliceMax * 0.005f;
+    }
+    if (rollingMaxMagnitude_ < 0.0001f) rollingMaxMagnitude_ = 1.0f;
     
     // Add to history (new data on the right)
     frequencyHistory_.push_back(frequencyBins);
@@ -497,6 +511,9 @@ void Spectrogram::processFft() {
     while (frequencyHistory_.size() > maxHistorySize_) {
         frequencyHistory_.pop_front();
     }
+    
+    // Mark texture as dirty - new data arrived
+    textureDirty_ = true;
 }
 
 void Spectrogram::updateHistorySize() {
@@ -523,6 +540,8 @@ void Spectrogram::updateHistorySize() {
                 frequencyHistory_.pop_front();
             }
         }
+        
+        textureDirty_ = true;  // History size change affects texture dimensions
     }
 }
 
@@ -537,6 +556,7 @@ void Spectrogram::ensureOutputFbo(int width, int height) {
         outputFbo_.allocate(settings);
         fboWidth_ = width;
         fboHeight_ = height;
+        textureDirty_ = true;  // FBO dimension change affects texture width
     }
 }
 
@@ -639,6 +659,11 @@ void main() {
 }
 
 void Spectrogram::updateTexture() {
+    // Only update if texture is dirty (new FFT data arrived)
+    if (!textureDirty_) {
+        return;
+    }
+    
     // Copy frequency history (with lock)
     std::deque<std::vector<float>> history;
     {
@@ -649,6 +674,7 @@ void Spectrogram::updateTexture() {
     if (!fft_) {
         textureWidth_ = 0;
         textureHeight_ = 0;
+        textureDirty_ = false;
         return;
     }
     
@@ -656,6 +682,7 @@ void Spectrogram::updateTexture() {
     if (binSize == 0) {
         textureWidth_ = 0;
         textureHeight_ = 0;
+        textureDirty_ = false;
         return;
     }
     
@@ -664,22 +691,8 @@ void Spectrogram::updateTexture() {
     int targetWidth = fboWidth_ > 0 ? fboWidth_ : 1024;
     int targetHeight = static_cast<int>(maxHistorySize_);
     
-    // Find maximum magnitude for stable normalization (prevents color shifts)
-    static float rollingMaxMagnitude = 1.0f;
-    float currentMaxMagnitude = 0.0f;
-    for (const auto& slice : history) {
-        for (size_t i = 0; i < slice.size() && i < static_cast<size_t>(binSize); i++) {
-            currentMaxMagnitude = std::max(currentMaxMagnitude, slice[i]);
-        }
-    }
-    // Update rolling max: fast rise, slow decay (prevents sudden color shifts)
-    if (currentMaxMagnitude > rollingMaxMagnitude) {
-        rollingMaxMagnitude = currentMaxMagnitude;
-    } else {
-        rollingMaxMagnitude = rollingMaxMagnitude * 0.995f + currentMaxMagnitude * 0.005f;
-    }
-    if (rollingMaxMagnitude < 0.0001f) rollingMaxMagnitude = 1.0f;
-    float maxMagnitude = rollingMaxMagnitude;
+    // Use incrementally tracked max magnitude (updated in processFft())
+    float maxMagnitude = rollingMaxMagnitude_;
     
     // Resize texture if dimensions changed
     if (textureWidth_ != targetWidth || textureHeight_ != targetHeight) {
@@ -721,6 +734,9 @@ void Spectrogram::updateTexture() {
     }
     
     frequencyTexture_.loadData(textureData_.data(), textureWidth_, textureHeight_, GL_LUMINANCE);
+    
+    // Clear dirty flag after successful update
+    textureDirty_ = false;
 }
 
 void Spectrogram::renderSpectrogram() {
@@ -742,8 +758,10 @@ void Spectrogram::renderSpectrogram() {
         loadShaders();
     }
     
-    // Update texture with latest frequency data
-    updateTexture();
+    // Update texture only if dirty (new FFT data arrived)
+    if (textureDirty_) {
+        updateTexture();
+    }
     
     if (!shaderLoaded_ || textureWidth_ == 0 || textureHeight_ == 0 || !frequencyTexture_.isAllocated()) {
         // No data or shader failed - clear FBO
