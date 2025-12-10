@@ -350,6 +350,9 @@ void ofApp::update() {
     assetLibrary.update();
     float assetTime = (ofGetElapsedTimef() - assetStartTime) * 1000.0f;
     
+    // Update command executor (processes background download messages and imports)
+    commandExecutor.update();
+    
     // Update all modules (MediaPool, TrackerSequencer, etc.)
     // This is critical for MediaPool to process its event queue
     float modulesStartTime = ofGetElapsedTimef();

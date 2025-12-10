@@ -4,6 +4,10 @@
 #include <vector>
 #include <functional>
 #include <sstream>
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <atomic>
 
 class ModuleRegistry;
 class GUIManager;
@@ -29,7 +33,7 @@ class ofDirectory;
 class CommandExecutor {
 public:
     CommandExecutor();
-    ~CommandExecutor() = default;
+    ~CommandExecutor();
     
     // Setup with dependencies
     void setup(
@@ -48,6 +52,9 @@ public:
     
     // Execute a command string (parses and executes)
     void executeCommand(const std::string& command);
+    
+    // Update method - call from main thread to process background download messages
+    void update();
     
     // Command handlers (can be called directly or via executeCommand)
     void cmdList();
@@ -85,5 +92,31 @@ private:
     // Helper functions for import command
     std::string findDownloadedFile(const std::string& ytdlpOutput, const std::string& tempDir, ofDirectory& dir);
     void handleDownloadError(const std::string& result, int status);
+    
+    // Background download system
+    struct DownloadJob {
+        std::string url;
+        std::string ytdlpPath;
+        std::string tempDir;
+        bool isActive = true;
+    };
+    
+    struct ImportJob {
+        std::string filePath;
+    };
+    
+    std::thread downloadThread_;
+    std::atomic<bool> shouldStopDownloadThread_;
+    std::mutex downloadMutex_;
+    std::condition_variable downloadCondition_;
+    std::queue<DownloadJob> downloadQueue_;
+    std::mutex messageMutex_;
+    std::queue<std::string> messageQueue_;
+    std::mutex importMutex_;
+    std::queue<ImportJob> importQueue_;
+    
+    void downloadThreadFunction();
+    void processDownload(const DownloadJob& job);
+    void queueMessage(const std::string& message);
 };
 

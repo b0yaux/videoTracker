@@ -2,8 +2,8 @@
 #include "ModuleRegistry.h"
 #include "ConnectionManager.h"
 #include "gui/GUIManager.h"
-#include "modules/Module.h"
-#include "utils/AssetLibrary.h"
+#include "Module.h"
+#include "AssetLibrary.h"
 #include "ofLog.h"
 #include "ofFileUtils.h"
 #include "ofSystemUtils.h"
@@ -14,8 +14,25 @@
 #include <cstdlib>
 #include <ctime>
 #include <unistd.h>  // for usleep
+#include <cstdlib>  // for getenv
+#include <sys/wait.h>  // for WIFEXITED, WEXITSTATUS
+#include <condition_variable>
+#include <sstream>
 
-CommandExecutor::CommandExecutor() {
+CommandExecutor::CommandExecutor() 
+    : shouldStopDownloadThread_(false) {
+    // Start download thread
+    downloadThread_ = std::thread(&CommandExecutor::downloadThreadFunction, this);
+}
+
+CommandExecutor::~CommandExecutor() {
+    // Signal download thread to stop
+    shouldStopDownloadThread_ = true;
+    
+    // Wait for thread to finish
+    if (downloadThread_.joinable()) {
+        downloadThread_.join();
+    }
 }
 
 void CommandExecutor::setup(
@@ -468,6 +485,48 @@ void CommandExecutor::cmdConnections(const std::string& args) {
     output("Total: %zu connections", connections.size());
 }
 
+static std::string findYtDlpPath() {
+    // Common installation paths for yt-dlp
+    std::vector<std::string> commonPaths = {
+        "/usr/local/bin/yt-dlp",
+        "/opt/homebrew/bin/yt-dlp",
+        "/usr/bin/yt-dlp",
+        "~/Library/Python/3.11/bin/yt-dlp",
+        "~/Library/Python/3.10/bin/yt-dlp",
+        "~/Library/Python/3.9/bin/yt-dlp",
+        "~/.local/bin/yt-dlp"
+    };
+    
+    // First, try to find via 'which' command
+    FILE* whichPipe = popen("which yt-dlp 2>/dev/null", "r");
+    if (whichPipe) {
+        char buffer[512];
+        if (fgets(buffer, sizeof(buffer), whichPipe) != nullptr) {
+            std::string path = CommandExecutor::trim(std::string(buffer));
+            pclose(whichPipe);
+            if (!path.empty() && ofFile::doesFileExist(path)) {
+                return path;
+            }
+        } else {
+            pclose(whichPipe);
+        }
+    }
+    
+    // Try common paths
+    for (const auto& path : commonPaths) {
+        std::string expandedPath = path;
+        // Expand ~ to home directory
+        if (expandedPath[0] == '~') {
+            expandedPath = std::string(getenv("HOME")) + expandedPath.substr(1);
+        }
+        if (ofFile::doesFileExist(expandedPath)) {
+            return expandedPath;
+        }
+    }
+    
+    return ""; // Not found
+}
+
 void CommandExecutor::cmdImport(const std::string& args) {
     if (args.empty()) {
         output("Usage: import <url_or_path>");
@@ -489,8 +548,21 @@ void CommandExecutor::cmdImport(const std::string& args) {
     bool isURL = (input.find("http://") == 0 || input.find("https://") == 0);
     
     if (isURL) {
+        // Find yt-dlp executable
+        std::string ytdlpPath = findYtDlpPath();
+        if (ytdlpPath.empty()) {
+            output("Error: yt-dlp not found. Please install it:");
+            output("  macOS: brew install yt-dlp");
+            output("  Or: pip3 install yt-dlp");
+            output("  Or: pip install yt-dlp");
+            output("");
+            output("After installation, ensure it's in your PATH or restart the application.");
+            return;
+        }
+        
         output("Downloading from URL: %s", input.c_str());
-        output("Starting download...");  // Immediate feedback to reduce perceived freeze
+        output("Using yt-dlp: %s", ytdlpPath.c_str());
+        output("Starting download in background...");
         
         // Setup temp directory
         std::string tempDir = ofToDataPath("temp_downloads", true);
@@ -499,110 +571,17 @@ void CommandExecutor::cmdImport(const std::string& args) {
             dir.create(true);
         }
         
-        // Build output template - yt-dlp will substitute %(title)s and %(ext)s
-        std::string outputTemplate = ofFilePath::join(tempDir, "%(title)s.%(ext)s");
+        // Queue download job for background processing
+        DownloadJob job;
+        job.url = input;
+        job.ytdlpPath = ytdlpPath;
+        job.tempDir = tempDir;
+        job.isActive = true;
         
-        // Escape single quotes for shell (but NOT % - needed for yt-dlp template substitution)
-        std::string escapedTemplate;
-        for (char c : outputTemplate) {
-            if (c == '\'') {
-                escapedTemplate += "'\\''";  // Escape single quote in shell
-            } else {
-                escapedTemplate += c;
-            }
-        }
-        
-        // Try multiple download strategies (Android -> iOS -> Web with EJS)
-        std::vector<std::string> strategies = {
-            // Strategy 1: Android client (most reliable, no EJS needed)
-            "yt-dlp --user-agent \"com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip\" "
-            "--retries 3 --fragment-retries 3 "
-            "--extractor-args \"youtube:player_client=android\" "
-            "-f \"bestvideo+bestaudio/best\" -o '" + escapedTemplate + "' \"" + input + "\" 2>&1",
-            
-            // Strategy 2: iOS client (fallback)
-            "yt-dlp --user-agent \"com.google.ios.youtube/19.09.3 (iPhone14,1; U; CPU iOS 15_6 like Mac OS X)\" "
-            "--retries 3 --fragment-retries 3 "
-            "--extractor-args \"youtube:player_client=ios\" "
-            "-f \"bestvideo+bestaudio/best\" -o '" + escapedTemplate + "' \"" + input + "\" 2>&1",
-            
-            // Strategy 3: Web client with EJS (requires deno)
-            "yt-dlp --user-agent \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\" "
-            "--retries 3 --fragment-retries 3 "
-            "--remote-components ejs:github "
-            "--extractor-args \"youtube:player_client=web\" "
-            "-f \"bestvideo+bestaudio/best\" -o '" + escapedTemplate + "' \"" + input + "\" 2>&1"
-        };
-        
-        bool success = false;
-        std::string result;
-        
-        for (size_t i = 0; i < strategies.size() && !success; i++) {
-            if (i > 0) {
-                output("Retrying with different method...");
-            }
-            
-            // Execute command
-            FILE* pipe = popen(strategies[i].c_str(), "r");
-            
-            if (!pipe) {
-                output("Error: Failed to execute yt-dlp. Is yt-dlp installed?");
-                output("Install with: pip install yt-dlp");
-                output("Or update with: pip install --upgrade yt-dlp");
-                return;
-            }
-            
-            // Read output in real-time and show progress
-            char buffer[256];
-            result.clear();
-            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                result += buffer;
-                
-                // Show important progress messages
-                std::string line(buffer);
-                if (line.find("[download]") != std::string::npos || 
-                    line.find("ERROR") != std::string::npos ||
-                    line.find("WARNING") != std::string::npos ||
-                    line.find("[info]") != std::string::npos) {
-                    output("%s", line.c_str());
-                }
-            }
-            
-            int status = pclose(pipe);
-            
-            if (status == 0) {
-                success = true;
-                break;
-            }
-            
-            // Show error on last strategy
-            if (i == strategies.size() - 1) {
-                handleDownloadError(result, status);
-                return;
-            }
-        }
-        
-        if (!success) {
-            output("Error: All download strategies failed");
-            return;
-        }
-        
-        // Find downloaded file - parse from output or search directory
-        std::string downloadedFile = findDownloadedFile(result, tempDir, dir);
-        
-        if (downloadedFile.empty()) {
-            output("Error: Could not find downloaded file");
-            return;
-        }
-        
-        output("Downloaded: %s", ofFilePath::getFileName(downloadedFile).c_str());
-        
-        // Import the downloaded file
-        std::string assetId = assetLibrary->importFile(downloadedFile, "");
-        if (!assetId.empty()) {
-            output("Imported as asset: %s", assetId.c_str());
-        } else {
-            output("Error: Failed to import downloaded file");
+        {
+            std::lock_guard<std::mutex> lock(downloadMutex_);
+            downloadQueue_.push(job);
+            downloadCondition_.notify_one();
         }
         
     } else {
@@ -770,9 +749,22 @@ std::string CommandExecutor::findDownloadedFile(const std::string& ytdlpOutput, 
 void CommandExecutor::handleDownloadError(const std::string& result, int status) {
     output("Error: yt-dlp failed with exit code %d", status);
     
-    // Provide helpful error messages based on common issues
-    if (result.find("HTTP Error 403") != std::string::npos || 
-        result.find("403 Forbidden") != std::string::npos) {
+    // Check for common error patterns
+    if (status == 127 || status == 32512) {
+        output("");
+        output("Command not found or cannot be executed.");
+        output("This usually means:");
+        output("  1. yt-dlp is not installed");
+        output("  2. yt-dlp is not in your PATH");
+        output("  3. The executable lacks execute permissions");
+        output("");
+        output("Try:");
+        output("  brew install yt-dlp");
+        output("  Or: pip3 install yt-dlp");
+        output("  Then restart the application");
+        output("");
+    } else if (result.find("HTTP Error 403") != std::string::npos || 
+               result.find("403 Forbidden") != std::string::npos) {
         output("");
         output("YouTube blocked the download (403 Forbidden).");
         output("Try updating yt-dlp: pip install --upgrade yt-dlp");
@@ -794,6 +786,10 @@ void CommandExecutor::handleDownloadError(const std::string& result, int status)
         output("");
         output("Video is private. Cannot download.");
         output("");
+    } else if (result.find("Video unavailable") != std::string::npos) {
+        output("");
+        output("Video is unavailable or has been removed.");
+        output("");
     }
     
     // Show error output (truncated)
@@ -802,13 +798,306 @@ void CommandExecutor::handleDownloadError(const std::string& result, int status)
         std::istringstream iss(result);
         std::string line;
         int lineCount = 0;
-        while (std::getline(iss, line) && lineCount < 15) {
+        while (std::getline(iss, line) && lineCount < 20) {
+            // Show all error-related lines, not just ERROR/WARNING
             if (line.find("ERROR") != std::string::npos || 
-                line.find("WARNING") != std::string::npos) {
+                line.find("WARNING") != std::string::npos ||
+                line.find("error") != std::string::npos ||
+                line.find("Error") != std::string::npos) {
                 output("%s", line.c_str());
                 lineCount++;
             }
         }
+        // If no error lines found, show first few lines of output
+        if (lineCount == 0) {
+            iss.clear();
+            iss.seekg(0);
+            lineCount = 0;
+            while (std::getline(iss, line) && lineCount < 10) {
+                output("%s", line.c_str());
+                lineCount++;
+            }
+        }
+    } else {
+        output("No error output captured. This may indicate a shell execution problem.");
+    }
+}
+
+void CommandExecutor::update() {
+    // Process messages from background download thread
+    std::queue<std::string> messagesToProcess;
+    {
+        std::lock_guard<std::mutex> lock(messageMutex_);
+        while (!messageQueue_.empty()) {
+            messagesToProcess.push(messageQueue_.front());
+            messageQueue_.pop();
+        }
+    }
+    
+    // Output messages on main thread
+    while (!messagesToProcess.empty()) {
+        output(messagesToProcess.front());
+        messagesToProcess.pop();
+    }
+    
+    // Process import jobs on main thread (assetLibrary operations should be on main thread)
+    std::queue<ImportJob> importsToProcess;
+    {
+        std::lock_guard<std::mutex> lock(importMutex_);
+        while (!importQueue_.empty()) {
+            importsToProcess.push(importQueue_.front());
+            importQueue_.pop();
+        }
+    }
+    
+    while (!importsToProcess.empty()) {
+        const ImportJob& job = importsToProcess.front();
+        if (assetLibrary) {
+            std::string assetId = assetLibrary->importFile(job.filePath, "");
+            if (!assetId.empty()) {
+                output("Imported as asset: %s", assetId.c_str());
+            } else {
+                output("Error: Failed to import downloaded file");
+            }
+        }
+        importsToProcess.pop();
+    }
+}
+
+void CommandExecutor::queueMessage(const std::string& message) {
+    std::lock_guard<std::mutex> lock(messageMutex_);
+    messageQueue_.push(message);
+}
+
+void CommandExecutor::downloadThreadFunction() {
+    while (!shouldStopDownloadThread_) {
+        DownloadJob job;
+        bool hasJob = false;
+        
+        // Wait for download job with condition variable
+        {
+            std::unique_lock<std::mutex> lock(downloadMutex_);
+            downloadCondition_.wait(lock, [this] {
+                return !downloadQueue_.empty() || shouldStopDownloadThread_;
+            });
+            
+            if (shouldStopDownloadThread_) {
+                break;
+            }
+            
+            if (!downloadQueue_.empty()) {
+                job = downloadQueue_.front();
+                downloadQueue_.pop();
+                hasJob = true;
+            }
+        }
+        
+        if (hasJob) {
+            processDownload(job);
+        }
+    }
+}
+
+void CommandExecutor::processDownload(const DownloadJob& job) {
+    queueMessage("Starting download: " + job.url);
+    
+    // Setup temp directory
+    ofDirectory dir(job.tempDir);
+    if (!dir.exists()) {
+        dir.create(true);
+    }
+    
+    // Build output template - yt-dlp will substitute %(title)s and %(ext)s
+    std::string outputTemplate = ofFilePath::join(job.tempDir, "%(title)s.%(ext)s");
+    
+    // Escape single quotes for shell (but NOT % - needed for yt-dlp template substitution)
+    std::string escapedTemplate;
+    for (char c : outputTemplate) {
+        if (c == '\'') {
+            escapedTemplate += "'\\''";  // Escape single quote in shell
+        } else {
+            escapedTemplate += c;
+        }
+    }
+    
+    // Escape the URL for shell
+    std::string escapedUrl;
+    for (char c : job.url) {
+        if (c == '\'') {
+            escapedUrl += "'\\''";
+        } else if (c == '"') {
+            escapedUrl += "\\\"";
+        } else if (c == '\\') {
+            escapedUrl += "\\\\";
+        } else if (c == '&' || c == '|' || c == ';' || c == '<' || c == '>') {
+            escapedUrl += "\\";
+            escapedUrl += c;
+        } else {
+            escapedUrl += c;
+        }
+    }
+    
+    // Try multiple download strategies (Android -> iOS -> Web with EJS)
+    std::vector<std::string> strategies = {
+        // Strategy 1: Android client (most reliable, no EJS needed)
+        "\"" + job.ytdlpPath + "\" --user-agent \"com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip\" "
+        "--retries 3 --fragment-retries 3 "
+        "--extractor-args \"youtube:player_client=android\" "
+        "-f \"bestvideo+bestaudio/best\" -o '" + escapedTemplate + "' \"" + escapedUrl + "\" 2>&1",
+        
+        // Strategy 2: iOS client (fallback)
+        "\"" + job.ytdlpPath + "\" --user-agent \"com.google.ios.youtube/19.09.3 (iPhone14,1; U; CPU iOS 15_6 like Mac OS X)\" "
+        "--retries 3 --fragment-retries 3 "
+        "--extractor-args \"youtube:player_client=ios\" "
+        "-f \"bestvideo+bestaudio/best\" -o '" + escapedTemplate + "' \"" + escapedUrl + "\" 2>&1",
+        
+        // Strategy 3: Web client with EJS (requires deno)
+        "\"" + job.ytdlpPath + "\" --user-agent \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\" "
+        "--retries 3 --fragment-retries 3 "
+        "--remote-components ejs:github "
+        "--extractor-args \"youtube:player_client=web\" "
+        "-f \"bestvideo+bestaudio/best\" -o '" + escapedTemplate + "' \"" + escapedUrl + "\" 2>&1"
+    };
+    
+    bool success = false;
+    std::string result;
+    
+    for (size_t i = 0; i < strategies.size() && !success; i++) {
+        if (i > 0) {
+            queueMessage("Retrying with different method...");
+        }
+        
+        // Execute command with explicit shell and PATH
+        // Use /bin/bash with explicit PATH to ensure yt-dlp dependencies are found
+        // Escape single quotes in the strategy for use inside single quotes
+        std::string escapedStrategy;
+        for (char c : strategies[i]) {
+            if (c == '\'') {
+                escapedStrategy += "'\\''";  // Escape single quote: ' -> '\''
+            } else {
+                escapedStrategy += c;
+            }
+        }
+        std::string shellCmd = "PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH\" /bin/bash -c '" + escapedStrategy + "'";
+        
+        FILE* pipe = popen(shellCmd.c_str(), "r");
+        
+        if (!pipe) {
+            queueMessage("Error: Failed to execute yt-dlp command.");
+            queueMessage("This may indicate a system configuration issue.");
+            continue; // Try next strategy
+        }
+        
+        // Read output in real-time and queue progress messages
+        char buffer[256];
+        result.clear();
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            result += buffer;
+            
+            // Queue important progress messages (filter out noisy warnings)
+            std::string line(buffer);
+            std::string lowerLine = line;
+            std::transform(lowerLine.begin(), lowerLine.end(), lowerLine.begin(), ::tolower);
+            
+            bool shouldShow = false;
+            
+            // Always show download progress
+            if (line.find("[download]") != std::string::npos) {
+                shouldShow = true;
+            }
+            // Always show errors
+            else if (line.find("ERROR") != std::string::npos || line.find("error:") != std::string::npos) {
+                shouldShow = true;
+            }
+            // Filter warnings - only show critical ones, hide common non-critical ones
+            else if (line.find("WARNING") != std::string::npos) {
+                // Filter out common non-critical warnings that yt-dlp handles automatically
+                if (lowerLine.find("unable to extract yt initial data") == std::string::npos &&
+                    lowerLine.find("incomplete data received") == std::string::npos &&
+                    lowerLine.find("incomplete yt initial data") == std::string::npos &&
+                    lowerLine.find("gvs po token") == std::string::npos &&
+                    lowerLine.find("retrying") == std::string::npos &&
+                    lowerLine.find("giving up after") == std::string::npos) {
+                    shouldShow = true;
+                }
+            }
+            // Show important info, but filter playlist-related noise
+            else if (line.find("[info]") != std::string::npos) {
+                if (lowerLine.find("downloading playlist") == std::string::npos &&
+                    lowerLine.find("add --no-playlist") == std::string::npos &&
+                    lowerLine.find("downloading just video") == std::string::npos) {
+                    shouldShow = true;
+                }
+            }
+            // Show status messages, but filter webpage download noise
+            else if (line.find("Downloading") != std::string::npos) {
+                if (line.find("Downloading webpage") == std::string::npos) {
+                    shouldShow = true;
+                }
+            }
+            
+            if (shouldShow) {
+                // Trim newline for cleaner output
+                std::string trimmedLine = line;
+                if (!trimmedLine.empty() && trimmedLine.back() == '\n') {
+                    trimmedLine.pop_back();
+                }
+                queueMessage(trimmedLine);
+            }
+        }
+        
+        int status = pclose(pipe);
+        
+        // Check if command succeeded
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            success = true;
+            break;
+        }
+        
+        // Show error on last strategy
+        if (i == strategies.size() - 1) {
+            int exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : status;
+            std::string errorMsg = "Error: yt-dlp failed with exit code " + std::to_string(exitCode);
+            queueMessage(errorMsg);
+            // Queue error details (handleDownloadError logic simplified for background thread)
+            if (!result.empty()) {
+                std::istringstream iss(result);
+                std::string line;
+                int lineCount = 0;
+                while (std::getline(iss, line) && lineCount < 10) {
+                    if (line.find("ERROR") != std::string::npos || 
+                        line.find("WARNING") != std::string::npos ||
+                        line.find("error") != std::string::npos) {
+                        queueMessage(line);
+                        lineCount++;
+                    }
+                }
+            }
+            return;
+        }
+    }
+    
+    if (!success) {
+        queueMessage("Error: All download strategies failed");
+        return;
+    }
+    
+    // Find downloaded file - parse from output or search directory
+    std::string downloadedFile = findDownloadedFile(result, job.tempDir, dir);
+    
+    if (downloadedFile.empty()) {
+        queueMessage("Error: Could not find downloaded file");
+        return;
+    }
+    
+    queueMessage("Downloaded: " + ofFilePath::getFileName(downloadedFile));
+    
+    // Queue import job to be processed on main thread
+    ImportJob importJob;
+    importJob.filePath = downloadedFile;
+    {
+        std::lock_guard<std::mutex> lock(importMutex_);
+        importQueue_.push(importJob);
     }
 }
 
