@@ -701,31 +701,36 @@ void ofApp::setupGUI() {
 void ofApp::drawGUI() {
     gui.begin();
     
+    // Calculate menu bar height to reserve space at bottom
+    float menuBarHeight = ImGui::GetFrameHeight();
+    
     // Create main docking space
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->Pos);
-    ImGui::SetNextWindowSize(viewport->Size);
+    // Reduce window height by menu bar height to leave space at bottom
+    ImGui::SetNextWindowSize(ImVec2(viewport->Size.x, viewport->Size.y - menuBarHeight));
     ImGui::SetNextWindowViewport(viewport->ID);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.f));
     
-    ImGuiWindowFlags window_flags = ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | 
+    // Remove ImGuiWindowFlags_MenuBar since we're drawing menu bar separately at bottom
+    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | 
                                    ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                                    ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus |
                                    ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_DockNodeHost;
     
     if (ImGui::Begin("DockSpace", nullptr, window_flags)) {
-        // Draw menu bar inside dockspace window (so it's above the dockspace)
-        menuBar.draw();
-        
-        // Create dock space below menu bar
+        // Create dock space (reduced size to account for menu bar at bottom)
         ImGuiID dockspace_id = ImGui::GetID("MyDockSpace");
         ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
     }
     ImGui::End();
     
     ImGui::PopStyleVar(3);
+    
+    // Draw menu bar at bottom (after dockspace so it appears on top)
+    menuBar.draw();
     
     // Draw demo window if enabled
     if (showDemoWindow) {

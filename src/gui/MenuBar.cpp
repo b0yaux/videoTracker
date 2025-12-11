@@ -80,15 +80,33 @@ void MenuBar::setup(
 
 
 void MenuBar::draw() {
-    if (ImGui::BeginMainMenuBar()) {
-        drawProjectMenu();
-        drawSessionMenu();
-        drawFileMenu();
-        drawAddMenu();
-        drawViewMenu();
-        drawLayoutMenu();
-        drawHelpMenu();
-        ImGui::EndMainMenuBar();
+    // Get viewport to position menu bar at bottom
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    float menuBarHeight = ImGui::GetFrameHeight();
+    
+    // Position window at bottom of viewport
+    ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x, viewport->Pos.y + viewport->Size.y - menuBarHeight));
+    ImGui::SetNextWindowSize(ImVec2(viewport->Size.x, menuBarHeight));
+    ImGui::SetNextWindowViewport(viewport->ID);
+    
+    // Window flags to make it look like a menu bar
+    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | 
+                                   ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav |
+                                   ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_MenuBar;
+    
+    if (ImGui::Begin("##MainMenuBar", nullptr, window_flags)) {
+        if (ImGui::BeginMenuBar()) {
+            drawProjectMenu();
+            drawSessionMenu();
+            drawFileMenu();
+            drawAddMenu();
+            drawViewMenu();
+            drawLayoutMenu();
+            drawHelpMenu();
+            ImGui::EndMenuBar();
+        }
+        ImGui::End();
     }
 
     // Help popup - draw every frame if open

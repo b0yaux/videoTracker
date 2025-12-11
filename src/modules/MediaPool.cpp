@@ -1430,8 +1430,9 @@ void MediaPool::update() {
     }
     
     // CRITICAL: Validate activePlayer is still in players vector before accessing it
-    // This check is used throughout update() for boundary checking and position memory
+    // This check is used throughout update() for all modes
     bool activePlayerIsValid = false;
+    bool isPlayerPlaying = false;
     if (activePlayer && currentIndex < players.size()) {
         // Verify activePlayer is actually in the players vector
         for (const auto& player : players) {
@@ -1439,8 +1440,36 @@ void MediaPool::update() {
                 // Also verify it has media loaded
                 if (activePlayer->isAudioLoaded() || activePlayer->isVideoLoaded()) {
                     activePlayerIsValid = true;
+                    isPlayerPlaying = activePlayer->isPlaying();
                 }
                 break;
+            }
+        }
+    }
+    
+    // Check if we should transition from PLAYING to IDLE
+    // Improved logic: if no media is actually playing, transition to IDLE
+    // If events are in queue, they'll be processed next frame and will restart playback if needed
+    mode = currentMode.load(std::memory_order_relaxed);
+    if (mode == PlaybackMode::PLAYING) {
+        if (!activePlayerIsValid) {
+            // No active player - module was disabled or disconnected
+            currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+            mode = PlaybackMode::IDLE;
+            ofLogNotice("MediaPool") << "[STOP] No active player - transitioning to IDLE";
+        } else if (!isPlayerPlaying) {
+            // Player stopped - transition to IDLE since no media is playing
+            // If events are in queue, they'll be processed next frame by processEventQueue()
+            // and will restart playback, setting mode back to PLAYING
+            currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
+            mode = PlaybackMode::IDLE;
+            
+            size_t queuedEvents = eventQueue.size_approx();
+            if (queuedEvents > 0) {
+                ofLogVerbose("MediaPool") << "[STOP] Player stopped - transitioning to IDLE ("
+                                          << queuedEvents << " events in queue will be processed next frame)";
+            } else {
+                ofLogVerbose("MediaPool") << "[STOP] Player stopped and no events queued - transitioning to IDLE";
             }
         }
     }
@@ -1558,24 +1587,6 @@ void MediaPool::update() {
         ofLogError("MediaPool") << "Exception in updatePlayerConnections(): " << e.what();
     } catch (...) {
         ofLogError("MediaPool") << "Unknown exception in updatePlayerConnections()";
-    }
-    
-    // SIMPLE FINAL CHECK: Are ANY players actually playing?
-    // This is the ONLY source of truth for playback state - no complex conditions
-    // Check ALL players, not just activePlayer, to handle polyphonic mode correctly
-    bool anyPlayerPlaying = false;
-    for (const auto& player : players) {
-        if (player && player->isPlaying()) {
-            anyPlayerPlaying = true;
-            break;
-        }
-    }
-    
-    // Set mode based on actual playback state - simple and direct
-    if (anyPlayerPlaying) {
-        currentMode.store(PlaybackMode::PLAYING, std::memory_order_relaxed);
-    } else {
-        currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
     }
 }
 
