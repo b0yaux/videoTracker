@@ -60,6 +60,13 @@ private:
     // Import state
     std::string importFolderName_;  // Custom folder name for imports
     
+    // Folder rename state
+    std::string renamingFolder_;  // Currently renaming folder name
+    char renameFolderBuffer_[128] = {0};  // Buffer for rename input
+    
+    // New folder state
+    char newFolderBuffer_[128] = {0};  // Buffer for new folder input
+    
     // Player cache for tooltip previews (inspired by MediaPool pattern)
     struct CachedPlayer {
         std::string assetId;
@@ -82,6 +89,18 @@ private:
     
     // Track newly converted assets (green until hovered)
     std::set<std::string> newAssets_;
+    
+    // Auto-sync state
+    std::chrono::steady_clock::time_point lastRefreshTime_;  // Last refresh time (for rate limiting)
+    
+    // Performance caches
+    size_t cachedTotalSize_ = 0;  // Cached total library size
+    size_t cachedAssetCount_ = 0;  // Asset count when size was cached
+    bool assetGroupingDirty_ = true;  // Flag to rebuild asset grouping cache
+    std::vector<std::string> cachedAssetIds_;  // Cached asset IDs for change detection
+    std::map<std::string, std::vector<std::string>> cachedAssetsByFolder_;  // Cached asset grouping by folder
+    std::vector<std::string> cachedRootAssets_;  // Cached root assets (no folder)
+    std::vector<std::string> cachedFolderNames_;  // Cached sorted folder names
     
     // UI sections
     void drawImportControls();

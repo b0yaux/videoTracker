@@ -48,7 +48,20 @@ void ViewManager::setup(
 void ViewManager::navigateToWindow(const std::string& windowName) {
     // Generic navigation - works for ANY window by name (ALL GUI panels)
     currentFocusedWindow = windowName;
-    ImGui::SetWindowFocus(windowName.c_str());
+    
+    // Convert instance name to UUID-based window ID for focus
+    std::string windowIDToFocus = windowName;
+    if (guiManager) {
+        auto* gui = guiManager->getGUI(windowName);
+        if (gui && gui->getRegistry()) {
+            std::string uuid = gui->getRegistry()->getUUID(windowName);
+            if (!uuid.empty()) {
+                windowIDToFocus = windowName + "###" + uuid;
+            }
+        }
+    }
+    
+    ImGui::SetWindowFocus(windowIDToFocus.c_str());
     ofLogNotice("ViewManager") << "Navigated to window: " << windowName;
 }
 
@@ -147,7 +160,19 @@ std::string ViewManager::findWindowInDirection(const std::string& currentWindow,
     auto windows = getAvailableWindows();
     if (windows.empty()) return "";
 
-    ImGuiWindow* current = ImGui::FindWindowByName(currentWindow.c_str());
+    // Convert instance name to UUID-based window ID for lookup
+    std::string windowIDToFind = currentWindow;
+    if (guiManager) {
+        auto* gui = guiManager->getGUI(currentWindow);
+        if (gui && gui->getRegistry()) {
+            std::string uuid = gui->getRegistry()->getUUID(currentWindow);
+            if (!uuid.empty()) {
+                windowIDToFind = currentWindow + "###" + uuid;
+            }
+        }
+    }
+    
+    ImGuiWindow* current = ImGui::FindWindowByName(windowIDToFind.c_str());
     if (!current) return "";
 
     ImGuiWindow* closest = nullptr;
@@ -155,7 +180,18 @@ std::string ViewManager::findWindowInDirection(const std::string& currentWindow,
 
     for (const auto& name : windows) {
         if (name == currentWindow) continue;
-        ImGuiWindow* w = ImGui::FindWindowByName(name.c_str());
+        // Convert instance name to UUID-based window ID for lookup
+        std::string windowIDToFind = name;
+        if (guiManager) {
+            auto* gui = guiManager->getGUI(name);
+            if (gui && gui->getRegistry()) {
+                std::string uuid = gui->getRegistry()->getUUID(name);
+                if (!uuid.empty()) {
+                    windowIDToFind = name + "###" + uuid;
+                }
+            }
+        }
+        ImGuiWindow* w = ImGui::FindWindowByName(windowIDToFind.c_str());
         if (!w || !w->Active) continue;
 
         float dx = w->Pos.x - current->Pos.x;
@@ -185,14 +221,31 @@ std::string ViewManager::findWindowInDirection(const std::string& currentWindow,
         }
     }
 
-    return closest ? closest->Name : "";
+    // Convert UUID-based window name back to instance name
+    std::string result = closest ? closest->Name : "";
+    if (!result.empty() && result.find("###") != std::string::npos) {
+        result = result.substr(0, result.find("###"));
+    }
+    return result;
 }
 
 std::string ViewManager::findAlignedCycleWindow(const std::string& currentWindow, int direction) const {
     auto windows = getAvailableWindows();
     if (windows.empty()) return "";
 
-    ImGuiWindow* current = ImGui::FindWindowByName(currentWindow.c_str());
+    // Convert instance name to UUID-based window ID for lookup
+    std::string windowIDToFind = currentWindow;
+    if (guiManager) {
+        auto* gui = guiManager->getGUI(currentWindow);
+        if (gui && gui->getRegistry()) {
+            std::string uuid = gui->getRegistry()->getUUID(currentWindow);
+            if (!uuid.empty()) {
+                windowIDToFind = currentWindow + "###" + uuid;
+            }
+        }
+    }
+    
+    ImGuiWindow* current = ImGui::FindWindowByName(windowIDToFind.c_str());
     if (!current) return "";
 
     ImGuiWindow* best = nullptr;
@@ -200,7 +253,18 @@ std::string ViewManager::findAlignedCycleWindow(const std::string& currentWindow
 
     for (const auto& name : windows) {
         if (name == currentWindow) continue;
-        ImGuiWindow* w = ImGui::FindWindowByName(name.c_str());
+        // Convert instance name to UUID-based window ID for lookup
+        std::string windowIDToFind = name;
+        if (guiManager) {
+            auto* gui = guiManager->getGUI(name);
+            if (gui && gui->getRegistry()) {
+                std::string uuid = gui->getRegistry()->getUUID(name);
+                if (!uuid.empty()) {
+                    windowIDToFind = name + "###" + uuid;
+                }
+            }
+        }
+        ImGuiWindow* w = ImGui::FindWindowByName(windowIDToFind.c_str());
         if (!w || !w->Active) continue;
 
         // Calculate alignment distance (how well aligned the windows are)
@@ -222,7 +286,12 @@ std::string ViewManager::findAlignedCycleWindow(const std::string& currentWindow
         }
     }
 
-    return best ? best->Name : "";
+    // Convert UUID-based window name back to instance name
+    std::string result = best ? best->Name : "";
+    if (!result.empty() && result.find("###") != std::string::npos) {
+        result = result.substr(0, result.find("###"));
+    }
+    return result;
 }
 
 void ViewManager::handleMouseClick(int x, int y) {

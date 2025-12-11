@@ -71,7 +71,6 @@ public:
     bool sendToModule(const std::string& assetId, const std::string& moduleInstanceName);
     std::vector<std::string> getModuleTargets() const;
     void update();
-    void draw();
     bool handleDrop(const std::vector<std::string>& filePaths);
     bool canAcceptDrop(const std::vector<std::string>& filePaths) const;
     
@@ -79,6 +78,7 @@ public:
     bool deleteAsset(const std::string& assetId);
     bool moveAsset(const std::string& assetId, const std::string& newFolder);
     bool createFolder(const std::string& folderPath);
+    bool renameFolder(const std::string& oldFolderName, const std::string& newFolderName);
     bool deleteFolder(const std::string& folderName);
     std::string getAssetsDirectory() const;
     
@@ -91,6 +91,12 @@ public:
     
     // Refresh asset list by scanning directory and updating index
     void refreshAssetList();
+    
+    // Request async refresh (non-blocking, processes in background thread)
+    void requestAsyncRefresh();
+    
+    // Check if async refresh is in progress
+    bool isRefreshInProgress() const;
     
     // Generate waveform for asset from audio buffer (caller provides buffer from file or player)
     void generateWaveformForAsset(AssetInfo& asset, const ofSoundBuffer& buffer);
@@ -111,11 +117,17 @@ private:
     std::string getAssetStoragePath(const std::string& assetId, bool isVideo, const std::string& assetFolder) const;
     void loadAssetIndex();
     void processConversionUpdates();
-    void scanDirectoryForAssets(const std::string& dirPath, const std::string& relativeFolder, std::map<std::string, std::pair<std::string, std::string>>& foundFiles);
+    void scanDirectoryForAssets(const std::string& dirPath, const std::string& relativeFolder, std::map<std::string, std::map<std::string, std::pair<std::string, std::string>>>& filesByBaseName);
+    void scanDirectoryForFolders(const std::string& dirPath, const std::string& relativeFolder, std::set<std::string>& foundFolders);
     bool isVideoFile(const std::string& filePath) const;
     bool isAudioFile(const std::string& filePath) const;
     bool isHAPCodec(const std::string& filePath) const;
-    void drawAssetList();
-    void drawContextMenu(const std::string& assetId);
-    void drawImportControls();
+    
+    // Async refresh system (background thread)
+    void refreshThreadFunction();
+    std::thread refreshThread_;
+    std::atomic<bool> shouldStopRefreshThread_;
+    std::atomic<bool> refreshInProgress_;
+    std::atomic<bool> refreshRequested_;
+    mutable std::mutex assetsMutex_;  // Protects assets_ and assetFolders_ for thread-safe access
 };

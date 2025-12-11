@@ -22,7 +22,7 @@ static std::string g_dragFilesPayload;
 
 //--------------------------------------------------------------
 AssetLibraryGUI::AssetLibraryGUI(AssetLibrary* assetLibrary)
-    : assetLibrary_(assetLibrary) {
+    : assetLibrary_(assetLibrary), lastRefreshTime_(std::chrono::steady_clock::now()) {
     if (!assetLibrary_) {
         ofLogError("AssetLibraryGUI") << "AssetLibraryGUI initialized with null AssetLibrary";
     }
@@ -35,13 +35,61 @@ void AssetLibraryGUI::draw() {
         return;
     }
     
+    // Auto-sync: lightweight change detection with async refresh (non-blocking)
+    // Uses file size check (<0.1ms) and triggers async refresh in background thread
+    std::string assetsDir = assetLibrary_->getAssetsDirectory();
+    if (!assetsDir.empty()) {
+        std::string indexPath = ofFilePath::join(assetsDir, ".assetindex.json");
+        ofFile indexFile(indexPath);
+        
+        static size_t lastIndexSize = 0;
+        bool shouldRequestRefresh = false;
+        
+        if (indexFile.exists()) {
+            size_t currentSize = indexFile.getSize();
+            if (currentSize != lastIndexSize) {
+                shouldRequestRefresh = true;
+            }
+            lastIndexSize = currentSize;
+        } else if (lastIndexSize > 0) {
+            // Index file was deleted
+            shouldRequestRefresh = true;
+            lastIndexSize = 0;
+        }
+        
+        // Request async refresh if change detected or periodic check (rate limited)
+        auto now = std::chrono::steady_clock::now();
+        auto timeSinceLastRefresh = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - lastRefreshTime_).count();
+        
+        bool rateLimitPassed = timeSinceLastRefresh > 2000;
+        bool periodicCheck = timeSinceLastRefresh > 60000;
+        
+        if ((shouldRequestRefresh || periodicCheck) && rateLimitPassed && !assetLibrary_->isRefreshInProgress()) {
+            assetLibrary_->requestAsyncRefresh();
+            lastRefreshTime_ = now;
+        }
+    }
+    
+    // Invalidate caches when async refresh completes
+    static bool wasRefreshing = false;
+    bool isRefreshing = assetLibrary_->isRefreshInProgress();
+    if (wasRefreshing && !isRefreshing) {
+        cachedTotalSize_ = 0;
+        assetGroupingDirty_ = true;
+    }
+    wasRefreshing = isRefreshing;
+    
     // Check for newly completed conversions
     auto completedAssetIds = assetLibrary_->getNewAssets();
-    for (const auto& assetId : completedAssetIds) {
-        newAssets_.insert(assetId);
-    }
     if (!completedAssetIds.empty()) {
+        for (const auto& assetId : completedAssetIds) {
+            newAssets_.insert(assetId);
+        }
         assetLibrary_->clearNewAssets();
+        // Invalidate size cache when new assets are added
+        cachedTotalSize_ = 0;
+        assetGroupingDirty_ = true;
     }
     
     // Update preview player if playing
@@ -67,10 +115,28 @@ void AssetLibraryGUI::draw() {
             }
         }
     }
+      
+    // Refresh button
+    if (ImGui::Button("Refresh")) {
+        assetLibrary_->refreshAssetList();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Re-scan project directory for assets and sync with folder structure");
+    }
+    
+    ImGui::SameLine();
+    
+    // Show asset count and total size (cache total size to avoid expensive calculation every frame)
+    size_t totalAssets = assetLibrary_->getAllAssetIds().size();
+    if (cachedTotalSize_ == 0 || totalAssets != cachedAssetCount_) {
+        cachedTotalSize_ = assetLibrary_->getTotalLibrarySize();
+        cachedAssetCount_ = totalAssets;
+    }
+    ImGui::TextDisabled("(%zu assets, %s)", totalAssets, formatFileSize(cachedTotalSize_).c_str());
     
     // Import controls at top
     drawImportControls();
-    
+
     ImGui::Separator();
     ImGui::Spacing();
     
@@ -112,17 +178,11 @@ void AssetLibraryGUI::drawImportControls() {
             assetLibrary_->importFolder(result.filePath, folderName);
         }
     }
-    
-    // Show asset count and total size inline
-    ImGui::SameLine();
-    size_t totalAssets = assetLibrary_->getAllAssetIds().size();
-    size_t totalSize = assetLibrary_->getTotalLibrarySize();
-    ImGui::TextDisabled("(%zu assets, %s)", totalAssets, formatFileSize(totalSize).c_str());
 }
 
 //--------------------------------------------------------------
 void AssetLibraryGUI::drawAssetList() {
-    // Get all assets and group by folder
+    // Get all assets and group by folder (cache grouping to avoid recalculation every frame)
     auto allAssetIds = assetLibrary_->getAllAssetIds();
     
     if (allAssetIds.empty()) {
@@ -130,19 +190,31 @@ void AssetLibraryGUI::drawAssetList() {
         return;
     }
     
-    // Group assets by folder
-    std::map<std::string, std::vector<std::string>> assetsByFolder;
-    std::vector<std::string> rootAssets;  // Assets with no folder
-    
-    for (const auto& assetId : allAssetIds) {
-        const AssetInfo* asset = assetLibrary_->getAssetInfo(assetId);
-        if (!asset) continue;
+    // Rebuild cached grouping only when assets change or cache is dirty
+    if (assetGroupingDirty_ || cachedAssetIds_.size() != allAssetIds.size()) {
+        cachedAssetIds_ = allAssetIds;
+        cachedAssetsByFolder_.clear();
+        cachedRootAssets_.clear();
         
-        if (asset->assetFolder.empty()) {
-            rootAssets.push_back(assetId);
-        } else {
-            assetsByFolder[asset->assetFolder].push_back(assetId);
+        for (const auto& assetId : allAssetIds) {
+            const AssetInfo* asset = assetLibrary_->getAssetInfo(assetId);
+            if (!asset) continue;
+            
+            if (asset->assetFolder.empty()) {
+                cachedRootAssets_.push_back(assetId);
+            } else {
+                cachedAssetsByFolder_[asset->assetFolder].push_back(assetId);
+            }
         }
+        
+        // Sort folder names once
+        cachedFolderNames_.clear();
+        for (const auto& pair : cachedAssetsByFolder_) {
+            cachedFolderNames_.push_back(pair.first);
+        }
+        std::sort(cachedFolderNames_.begin(), cachedFolderNames_.end());
+        
+        assetGroupingDirty_ = false;
     }
     
     // Simplified table - just Name column with badges and inline conversion status
@@ -152,19 +224,14 @@ void AssetLibraryGUI::drawAssetList() {
         ImGui::TableHeadersRow();
         
         // Draw root assets (no folder) first - always visible, no collapsible root
-        for (const auto& assetId : rootAssets) {
+        for (const auto& assetId : cachedRootAssets_) {
             drawAssetRow(assetId);
         }
         
-        // Draw folders with their assets (sorted alphabetically)
-        std::vector<std::string> folderNames;
-        for (const auto& pair : assetsByFolder) {
-            folderNames.push_back(pair.first);
-        }
-        std::sort(folderNames.begin(), folderNames.end());
+        // Draw folders with their assets (using cached sorted folder names)
         
-        for (const auto& folderName : folderNames) {
-            const auto& folderAssets = assetsByFolder[folderName];
+        for (const auto& folderName : cachedFolderNames_) {
+            const auto& folderAssets = cachedAssetsByFolder_[folderName];
             
             // Check if folder is expanded (persist state across frames)
             bool isExpanded = expandedFolders_.find(folderName) != expandedFolders_.end();
@@ -189,10 +256,32 @@ void AssetLibraryGUI::drawAssetList() {
                 }
             }
             
+            // Keyboard navigation: Ctrl+Enter (Cmd+Enter on macOS) to open context menu
+            bool folderItemActive = ImGui::IsItemFocused() || ImGui::IsItemActive();
+            if (folderItemActive) {
+                ImGuiIO& io = ImGui::GetIO();
+                bool cmdOrCtrlPressed = io.KeySuper || io.KeyCtrl; // Cmd on macOS, Ctrl on others
+                
+                if (cmdOrCtrlPressed && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))) {
+                    // Ctrl+Enter: open context menu
+                    ImGui::OpenPopup(("FolderContext_" + folderName).c_str());
+                }
+            }
+            
             // Folder context menu
             if (ImGui::BeginPopupContextItem(("FolderContext_" + folderName).c_str())) {
                 if (ImGui::MenuItem("Rename Folder...")) {
-                    // TODO: Implement folder rename
+                    // Open rename popup
+                    renamingFolder_ = folderName;
+                    strncpy(renameFolderBuffer_, folderName.c_str(), sizeof(renameFolderBuffer_) - 1);
+                    renameFolderBuffer_[sizeof(renameFolderBuffer_) - 1] = '\0';
+                    ImGui::OpenPopup("RenameFolderPopup");
+                }
+                if (ImGui::MenuItem("New Folder...")) {
+                    // Open create folder popup
+                    strncpy(newFolderBuffer_, "", sizeof(newFolderBuffer_) - 1);
+                    newFolderBuffer_[sizeof(newFolderBuffer_) - 1] = '\0';
+                    ImGui::OpenPopup("CreateFolderPopup");
                 }
                 if (ImGui::MenuItem("Delete Folder")) {
                     if (assetLibrary_->deleteFolder(folderName)) {
@@ -200,6 +289,41 @@ void AssetLibraryGUI::drawAssetList() {
                         expandedFolders_.erase(folderName);
                     }
                 }
+                ImGui::Separator();
+                
+                // Send all assets in folder to module
+                if (ImGui::BeginMenu("Send All to Module")) {
+                    auto modules = assetLibrary_->getModuleTargets();
+                    if (modules.empty()) {
+                        ImGui::TextDisabled("No modules available");
+                    } else {
+                        for (const auto& moduleName : modules) {
+                            if (ImGui::MenuItem(moduleName.c_str())) {
+                                // Get all assets in this folder and send them to the module
+                                auto folderAssets = assetLibrary_->getAssetsByFolder(folderName);
+                                for (const auto& assetId : folderAssets) {
+                                    assetLibrary_->sendToModule(assetId, moduleName);
+                                }
+                            }
+                        }
+                    }
+                    ImGui::EndMenu();
+                }
+                
+                ImGui::Separator();
+                if (ImGui::MenuItem("Open in Finder")) {
+                    std::string assetsDir = assetLibrary_->getAssetsDirectory();
+                    if (!assetsDir.empty()) {
+                        std::string folderPath = ofFilePath::join(assetsDir, folderName);
+                        ofDirectory dir(folderPath);
+                        if (dir.exists()) {
+                            ofSystem("open \"" + folderPath + "\"");
+                        } else {
+                            ofLogWarning("AssetLibraryGUI") << "Folder does not exist: " << folderPath;
+                        }
+                    }
+                }
+             
                 ImGui::EndPopup();
             }
             
@@ -363,30 +487,29 @@ void AssetLibraryGUI::drawAssetRow(const std::string& assetId, int indentLevel) 
     }
             
             // Build display name - show converted file name if available, otherwise original
-            std::string displayName;
-            std::string fileType;
+            // Optimize: cache display names to avoid repeated path operations
+            std::string displayText;
+            displayText.reserve(128);  // Pre-allocate to avoid reallocations
+            displayText = badge;
             
             if (asset->conversionStatus == ConversionStatus::COMPLETE) {
                 // Show converted file name
                 if (asset->isVideo && !asset->convertedVideoPath.empty()) {
-                    displayName = ofFilePath::getBaseName(asset->convertedVideoPath);
-                    fileType = ".mov";
+                    displayText += ofFilePath::getBaseName(asset->convertedVideoPath);
+                    displayText += ".mov";
                 } else if (!asset->convertedAudioPath.empty()) {
-                    displayName = ofFilePath::getBaseName(asset->convertedAudioPath);
-                    fileType = ".wav";
+                    displayText += ofFilePath::getBaseName(asset->convertedAudioPath);
+                    displayText += ".wav";
                 } else {
                     // Fallback to original if no converted path
-                    displayName = ofFilePath::getBaseName(asset->originalPath);
-                    fileType = ofFilePath::getFileExt(asset->originalPath);
+                    displayText += ofFilePath::getBaseName(asset->originalPath);
+                    displayText += ofFilePath::getFileExt(asset->originalPath);
                 }
             } else {
                 // Show original file name while converting
-                displayName = ofFilePath::getBaseName(asset->originalPath);
-                fileType = ofFilePath::getFileExt(asset->originalPath);
+                displayText += ofFilePath::getBaseName(asset->originalPath);
+                displayText += ofFilePath::getFileExt(asset->originalPath);
             }
-            
-    // Build display string with badge
-    std::string displayText = badge + displayName + fileType;
     
     // Show inline conversion status only when converting
     if (asset->conversionStatus == ConversionStatus::CONVERTING) {
@@ -818,7 +941,8 @@ void AssetLibraryGUI::drawContextMenu(const std::string& assetId, const AssetInf
             
             // Create new folder option
             if (ImGui::MenuItem("New Folder...")) {
-                static char folderNameBuffer[128] = {0};
+                strncpy(newFolderBuffer_, "", sizeof(newFolderBuffer_) - 1);
+                newFolderBuffer_[sizeof(newFolderBuffer_) - 1] = '\0';
                 ImGui::OpenPopup("CreateFolderPopup");
             }
         } else {
@@ -853,24 +977,52 @@ void AssetLibraryGUI::drawContextMenu(const std::string& assetId, const AssetInf
         }
     }
     
-    // Create folder popup
+    // Create folder popup (can be opened from asset context menu or folder context menu)
     if (ImGui::BeginPopup("CreateFolderPopup")) {
-        static char folderNameBuffer[128] = {0};
-        ImGui::InputText("Folder Name", folderNameBuffer, sizeof(folderNameBuffer));
+        ImGui::InputText("Folder Name", newFolderBuffer_, sizeof(newFolderBuffer_));
         if (ImGui::Button("Create")) {
-            std::string folderName(folderNameBuffer);
+            std::string folderName(newFolderBuffer_);
             if (!folderName.empty()) {
                 if (assetLibrary_->createFolder(folderName)) {
-                    // Move asset to new folder
-                    assetLibrary_->moveAsset(assetId, folderName);
-                    folderNameBuffer[0] = '\0';
+                    // If opened from asset context menu, move asset to new folder
+                    if (!assetId.empty()) {
+                        assetLibrary_->moveAsset(assetId, folderName);
+                    }
+                    newFolderBuffer_[0] = '\0';
                     ImGui::CloseCurrentPopup();
                 }
             }
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) {
-            folderNameBuffer[0] = '\0';
+            newFolderBuffer_[0] = '\0';
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    
+    // Rename folder popup
+    if (ImGui::BeginPopup("RenameFolderPopup")) {
+        ImGui::InputText("Folder Name", renameFolderBuffer_, sizeof(renameFolderBuffer_));
+        if (ImGui::Button("Rename")) {
+            std::string newFolderName(renameFolderBuffer_);
+            if (!newFolderName.empty() && !renamingFolder_.empty() && newFolderName != renamingFolder_) {
+                if (assetLibrary_->renameFolder(renamingFolder_, newFolderName)) {
+                    // Update expanded folders if the renamed folder was expanded
+                    if (expandedFolders_.find(renamingFolder_) != expandedFolders_.end()) {
+                        expandedFolders_.erase(renamingFolder_);
+                        expandedFolders_.insert(newFolderName);
+                    }
+                    renamingFolder_.clear();
+                    renameFolderBuffer_[0] = '\0';
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            renamingFolder_.clear();
+            renameFolderBuffer_[0] = '\0';
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
@@ -1208,23 +1360,58 @@ MediaPlayer* AssetLibraryGUI::getOrLoadPlayer(const std::string& assetId, const 
     cached.player = std::make_unique<MediaPlayer>();
     
     try {
+        bool loaded = false;
         if (asset.isVideo && !videoPath.empty() && ofFile::doesFileExist(videoPath)) {
             if (asset.isAudio && !audioPath.empty() && ofFile::doesFileExist(audioPath)) {
-                cached.player->load(audioPath, videoPath);
+                loaded = cached.player->load(audioPath, videoPath);
+                if (!loaded) {
+                    ofLogWarning("AssetLibraryGUI") << "Failed to load paired AV: " << audioPath << " + " << videoPath;
+                }
             } else {
-                cached.player->loadVideo(videoPath);
+                loaded = cached.player->loadVideo(videoPath);
+                if (!loaded) {
+                    ofLogWarning("AssetLibraryGUI") << "Failed to load video: " << videoPath;
+                }
             }
-            // Seek to 10% for good frame
-            cached.player->setPosition(0.1f);
+            if (loaded) {
+                // Seek to 10% for good frame
+                cached.player->setPosition(0.1f);
+            }
         } else if (asset.isAudio && !asset.isVideo && !audioPath.empty() && ofFile::doesFileExist(audioPath)) {
-            cached.player->loadAudio(audioPath);
+            loaded = cached.player->loadAudio(audioPath);
+            if (!loaded) {
+                ofLogWarning("AssetLibraryGUI") << "Failed to load audio: " << audioPath;
+            }
+        } else {
+            // Paths don't exist or are invalid
+            if (asset.isVideo && videoPath.empty()) {
+                ofLogWarning("AssetLibraryGUI") << "Video path is empty for asset: " << assetId;
+            } else if (asset.isVideo && !ofFile::doesFileExist(videoPath)) {
+                ofLogWarning("AssetLibraryGUI") << "Video file does not exist: " << videoPath;
+            }
+            if (asset.isAudio && audioPath.empty()) {
+                ofLogWarning("AssetLibraryGUI") << "Audio path is empty for asset: " << assetId;
+            } else if (asset.isAudio && !audioPath.empty() && !ofFile::doesFileExist(audioPath)) {
+                ofLogWarning("AssetLibraryGUI") << "Audio file does not exist: " << audioPath;
+            }
         }
         
-        cached.lastUsed = std::chrono::steady_clock::now();
-        playerCache_[assetId] = std::move(cached);
-        return playerCache_[assetId].player.get();
+        if (loaded) {
+            cached.lastUsed = std::chrono::steady_clock::now();
+            playerCache_[assetId] = std::move(cached);
+            return playerCache_[assetId].player.get();
+        } else {
+            // Failed to load - don't cache
+            ofLogWarning("AssetLibraryGUI") << "Failed to load player for asset: " << assetId;
+            return nullptr;
+        }
+    } catch (const std::exception& e) {
+        // Failed to load - don't cache
+        ofLogError("AssetLibraryGUI") << "Exception loading player for asset " << assetId << ": " << e.what();
+        return nullptr;
     } catch (...) {
         // Failed to load - don't cache
+        ofLogError("AssetLibraryGUI") << "Unknown exception loading player for asset: " << assetId;
         return nullptr;
     }
 }

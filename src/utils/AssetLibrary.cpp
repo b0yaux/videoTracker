@@ -9,23 +9,35 @@
 #include "ofLog.h"
 #include "ofFileUtils.h"
 #include "ofJson.h"
-#include "ofImage.h"
-#include <imgui.h>
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
 #include <ctime>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 //--------------------------------------------------------------
 AssetLibrary::AssetLibrary(
     ProjectManager* projectManager,
     MediaConverter* mediaConverter,
     ModuleRegistry* moduleRegistry
-) : projectManager_(projectManager), mediaConverter_(mediaConverter), moduleRegistry_(moduleRegistry) {
+) : projectManager_(projectManager), mediaConverter_(mediaConverter), moduleRegistry_(moduleRegistry),
+    shouldStopRefreshThread_(false), refreshInProgress_(false), refreshRequested_(false) {
+    refreshThread_ = std::thread(&AssetLibrary::refreshThreadFunction, this);
 }
 
 //--------------------------------------------------------------
 AssetLibrary::~AssetLibrary() {
+    // Signal refresh thread to stop
+    shouldStopRefreshThread_ = true;
+    refreshRequested_ = true;  // Wake up thread if sleeping
+    
+    // Wait for thread to finish
+    if (refreshThread_.joinable()) {
+        refreshThread_.join();
+    }
+    
     if (!assetIndexPath_.empty()) {
         saveAssetIndex();
     }
@@ -44,6 +56,9 @@ void AssetLibrary::initialize() {
     if (mediaConverter_) {
         mediaConverter_->setOutputDirectory(projectManager_->getAssetsDirectory());
     }
+    
+    // Refresh asset list to sync with project directory (handles manually added files and folder reorganization)
+    refreshAssetList();
     
     ofLogNotice("AssetLibrary") << "AssetLibrary initialized for project: " << projectManager_->getProjectName();
 }
@@ -241,8 +256,7 @@ std::string AssetLibrary::importFile(const std::string& filePath, const std::str
     asset.thumbnailPath = "";
     ofLogVerbose("AssetLibrary") << "Thumbnail extraction deferred for: " << ofFilePath::getFileName(filePath);
     
-    // TODO: Implement background worker thread to process deferred thumbnails/waveforms
-    // For now, these will be generated on-demand when viewing assets in the GUI
+    // Thumbnails and waveforms are generated on-demand when viewing assets in the GUI
     
     assets_[assetId] = asset;
     if (!assetFolder.empty()) {
@@ -318,12 +332,14 @@ bool AssetLibrary::needsConversion(const std::string& filePath) const {
 
 //--------------------------------------------------------------
 const AssetInfo* AssetLibrary::getAssetInfo(const std::string& assetId) const {
+    std::lock_guard<std::mutex> lock(assetsMutex_);
     auto it = assets_.find(assetId);
     return (it != assets_.end()) ? &it->second : nullptr;
 }
 
 //--------------------------------------------------------------
 std::vector<std::string> AssetLibrary::getAllAssetIds() const {
+    std::lock_guard<std::mutex> lock(assetsMutex_);
     std::vector<std::string> ids;
     ids.reserve(assets_.size());
     for (const auto& pair : assets_) {
@@ -334,6 +350,7 @@ std::vector<std::string> AssetLibrary::getAllAssetIds() const {
 
 //--------------------------------------------------------------
 std::vector<std::string> AssetLibrary::getAssetsByFolder(const std::string& folderName) const {
+    std::lock_guard<std::mutex> lock(assetsMutex_);
     std::vector<std::string> ids;
     for (const auto& pair : assets_) {
         if (pair.second.assetFolder == folderName) {
@@ -365,8 +382,7 @@ std::string AssetLibrary::getAssetPath(const std::string& assetId, bool preferVi
 
 //--------------------------------------------------------------
 bool AssetLibrary::sendToModule(const std::string& assetId, const std::string& moduleInstanceName) {
-    std::string assetPath = getAssetPath(assetId);
-    if (assetPath.empty() || !moduleRegistry_) {
+    if (!moduleRegistry_) {
         return false;
     }
     
@@ -377,13 +393,57 @@ bool AssetLibrary::sendToModule(const std::string& assetId, const std::string& m
     }
     
     auto mediaPool = std::dynamic_pointer_cast<MediaPool>(module);
-    if (mediaPool) {
-        if (mediaPool->addMediaFile(assetPath)) {
-            ofLogNotice("AssetLibrary") << "Sent asset " << assetId << " to MediaPool: " << moduleInstanceName;
-            return true;
+    if (!mediaPool) {
+        return false;
+    }
+    
+    // Get asset info to check if it has both video and audio
+    const AssetInfo* asset = getAssetInfo(assetId);
+    if (!asset) {
+        return false;
+    }
+    
+    bool success = false;
+    
+    // For [AV] assets, add audio first, then video - MediaPool will pair them into one player
+    if (asset->conversionStatus == ConversionStatus::COMPLETE) {
+        bool hasVideo = !asset->convertedVideoPath.empty() && ofFile(asset->convertedVideoPath).exists();
+        bool hasAudio = !asset->convertedAudioPath.empty() && ofFile(asset->convertedAudioPath).exists();
+        
+        if (hasVideo && hasAudio) {
+            // For [AV] assets: use addMediaFiles with both paths (audio first, then video)
+            // MediaPool will pair them automatically into one [AV] player
+            std::vector<std::string> paths = {asset->convertedAudioPath, asset->convertedVideoPath};
+            mediaPool->addMediaFiles(paths);
+            success = true;  // addMediaFiles doesn't return a value, assume success if we got here
+            if (success) {
+                ofLogNotice("AssetLibrary") << "Sent [AV] asset " << assetId << " to MediaPool: " << moduleInstanceName;
+            }
+        } else if (hasVideo) {
+            success = mediaPool->addMediaFile(asset->convertedVideoPath);
+            if (success) {
+                ofLogNotice("AssetLibrary") << "Sent [V] asset " << assetId << " to MediaPool: " << moduleInstanceName;
+            }
+        } else if (hasAudio) {
+            success = mediaPool->addMediaFile(asset->convertedAudioPath);
+            if (success) {
+                ofLogNotice("AssetLibrary") << "Sent [A] asset " << assetId << " to MediaPool: " << moduleInstanceName;
+            }
         }
     }
-    return false;
+    
+    // Fallback to original path if converted paths don't exist
+    if (!success) {
+        std::string assetPath = getAssetPath(assetId);
+        if (!assetPath.empty()) {
+            success = mediaPool->addMediaFile(assetPath);
+            if (success) {
+                ofLogNotice("AssetLibrary") << "Sent asset " << assetId << " to MediaPool: " << moduleInstanceName;
+            }
+        }
+    }
+    
+    return success;
 }
 
 //--------------------------------------------------------------
@@ -404,12 +464,6 @@ std::vector<std::string> AssetLibrary::getModuleTargets() const {
 //--------------------------------------------------------------
 void AssetLibrary::update() {
     processConversionUpdates();
-}
-
-//--------------------------------------------------------------
-void AssetLibrary::draw() {
-    ImGui::Text("AssetLibrary (GUI coming soon)");
-    ImGui::Text("Assets: %zu", assets_.size());
 }
 
 //--------------------------------------------------------------
@@ -663,6 +717,78 @@ bool AssetLibrary::createFolder(const std::string& folderName) {
         ofLogError("AssetLibrary") << "Failed to create folder: " << folderPath;
         return false;
     }
+}
+
+//--------------------------------------------------------------
+bool AssetLibrary::renameFolder(const std::string& oldFolderName, const std::string& newFolderName) {
+    if (oldFolderName.empty() || newFolderName.empty()) {
+        ofLogError("AssetLibrary") << "Cannot rename folder: folder name is empty";
+        return false;
+    }
+    
+    if (oldFolderName == newFolderName) {
+        return true;  // No change needed
+    }
+    
+    std::string assetsDir = getAssetsDirectory();
+    if (assetsDir.empty()) {
+        ofLogError("AssetLibrary") << "Cannot rename folder: no assets directory";
+        return false;
+    }
+    
+    std::string oldPath = ofFilePath::join(assetsDir, oldFolderName);
+    std::string newPath = ofFilePath::join(assetsDir, newFolderName);
+    
+    ofDirectory oldDir(oldPath);
+    ofDirectory newDir(newPath);
+    
+    // Check if old folder exists
+    if (!oldDir.exists()) {
+        ofLogError("AssetLibrary") << "Cannot rename folder: old folder does not exist: " << oldPath;
+        return false;
+    }
+    
+    // Check if new folder name already exists
+    if (newDir.exists()) {
+        ofLogError("AssetLibrary") << "Cannot rename folder: new folder name already exists: " << newPath;
+        return false;
+    }
+    
+    // Rename the directory on disk
+    if (!oldDir.renameTo(newPath)) {
+        ofLogError("AssetLibrary") << "Failed to rename folder directory: " << oldPath << " to " << newPath;
+        return false;
+    }
+    
+    // Update all assets in this folder to use the new folder name
+    std::vector<std::string> assetsInFolder = getAssetsByFolder(oldFolderName);
+    for (const auto& assetId : assetsInFolder) {
+        auto it = assets_.find(assetId);
+        if (it != assets_.end()) {
+            AssetInfo& asset = it->second;
+            
+            // Update asset folder reference
+            asset.assetFolder = newFolderName;
+            
+            // Update converted paths to reflect new folder
+            if (!asset.convertedVideoPath.empty()) {
+                asset.convertedVideoPath = getAssetStoragePath(assetId, true, newFolderName);
+            }
+            if (!asset.convertedAudioPath.empty()) {
+                asset.convertedAudioPath = getAssetStoragePath(assetId, false, newFolderName);
+            }
+        }
+    }
+    
+    // Update folder tracking
+    assetFolders_.erase(oldFolderName);
+    assetFolders_.insert(newFolderName);
+    
+    // Save updated index
+    saveAssetIndex();
+    
+    ofLogNotice("AssetLibrary") << "Renamed folder: " << oldFolderName << " to " << newFolderName;
+    return true;
 }
 
 //--------------------------------------------------------------
@@ -1022,21 +1148,6 @@ bool AssetLibrary::isHAPCodec(const std::string& filePath) const {
 }
 
 //--------------------------------------------------------------
-void AssetLibrary::drawAssetList() {
-    // Deprecated - use AssetLibraryGUI
-}
-
-//--------------------------------------------------------------
-void AssetLibrary::drawContextMenu(const std::string& assetId) {
-    // Deprecated - use AssetLibraryGUI
-}
-
-//--------------------------------------------------------------
-void AssetLibrary::drawImportControls() {
-    // Deprecated - use AssetLibraryGUI
-}
-
-//--------------------------------------------------------------
 std::vector<std::string> AssetLibrary::getNewAssets() {
     return newAssets_;
 }
@@ -1048,6 +1159,7 @@ void AssetLibrary::clearNewAssets() {
 
 //--------------------------------------------------------------
 size_t AssetLibrary::getTotalLibrarySize() const {
+    std::lock_guard<std::mutex> lock(assetsMutex_);
     size_t totalSize = 0;
     for (const auto& pair : assets_) {
         const AssetInfo& asset = pair.second;
@@ -1084,9 +1196,10 @@ void AssetLibrary::refreshAssetList() {
     
     ofLogNotice("AssetLibrary") << "Refreshing asset list from: " << assetsDir;
     
-    // Scan directory recursively - map: assetId -> (filePath, folder)
-    std::map<std::string, std::pair<std::string, std::string>> foundFiles;
-    scanDirectoryForAssets(assetsDir, "", foundFiles);
+    // Scan directory recursively - collect all files grouped by base name
+    // This allows us to properly pair .mov and .wav files with the same base name
+    std::map<std::string, std::map<std::string, std::pair<std::string, std::string>>> filesByBaseName;
+    scanDirectoryForAssets(assetsDir, "", filesByBaseName);
     
     // Track what we found
     std::set<std::string> foundAssetIds;
@@ -1094,41 +1207,77 @@ void AssetLibrary::refreshAssetList() {
     int updatedCount = 0;
     int removedCount = 0;
     
-    // Process found files
-    for (const auto& pair : foundFiles) {
-        const std::string& assetId = pair.first;
-        const std::string& filePath = pair.second.first;
-        const std::string& folder = pair.second.second;
+    // Lock assets map for thread-safe updates
+    std::lock_guard<std::mutex> lock(assetsMutex_);
+    
+    // Process found files - group by base name to handle AV pairs
+    for (const auto& baseNamePair : filesByBaseName) {
+        const std::string& baseName = baseNamePair.first;
+        const auto& extensions = baseNamePair.second;
+        
+        // Generate assetId from base name (consistent for both .mov and .wav)
+        std::string assetId = baseName;
         foundAssetIds.insert(assetId);
+        
+        // Find video and audio files for this asset
+        std::string videoPath;
+        std::string audioPath;
+        std::string folder;
+        
+        for (const auto& extPair : extensions) {
+            const std::string& filePath = extPair.second.first;
+            folder = extPair.second.second; // Use folder from any file (should be same for paired files)
+            
+            if (isVideoFile(filePath)) {
+                videoPath = filePath;
+            }
+            if (isAudioFile(filePath)) {
+                audioPath = filePath;
+            }
+        }
+        
+        // Determine asset type
+        bool isVideo = !videoPath.empty();
+        bool isAudio = !audioPath.empty();
         
         auto it = assets_.find(assetId);
         if (it == assets_.end()) {
-            // New file - add to library
+            // New asset - add to library
             AssetInfo asset;
             asset.assetId = assetId;
-            asset.originalPath = filePath; // For manually added files, originalPath = convertedPath
+            // Use video path as original if available, otherwise audio
+            asset.originalPath = !videoPath.empty() ? videoPath : audioPath;
             asset.assetFolder = folder;
-            asset.isVideo = isVideoFile(filePath);
-            asset.isAudio = isAudioFile(filePath);
+            asset.isVideo = isVideo;
+            asset.isAudio = isAudio;
             asset.needsConversion = false; // Assume already converted if in assets directory
             asset.conversionStatus = ConversionStatus::COMPLETE;
             
-            // Set converted paths (files in assets directory are considered converted)
-            if (asset.isVideo) {
-                asset.convertedVideoPath = filePath;
+            // Set converted paths properly
+            if (isVideo) {
+                asset.convertedVideoPath = videoPath;
             }
-            if (asset.isAudio || asset.isVideo) {
-                asset.convertedAudioPath = filePath;
+            if (isAudio) {
+                asset.convertedAudioPath = audioPath;
             }
             
-            // Get file size
-            ofFile file(filePath);
-            if (file.exists()) {
-                asset.fileSize = file.getSize();
+            // Get file size (sum of both video and audio if both exist)
+            asset.fileSize = 0;
+            if (!videoPath.empty()) {
+                ofFile videoFile(videoPath);
+                if (videoFile.exists()) {
+                    asset.fileSize += videoFile.getSize();
+                }
+            }
+            if (!audioPath.empty() && audioPath != videoPath) { // Don't double-count if same file
+                ofFile audioFile(audioPath);
+                if (audioFile.exists()) {
+                    asset.fileSize += audioFile.getSize();
+                }
             }
             
             // Generate waveform for audio files
-            if (asset.isAudio && !asset.isVideo && !asset.convertedAudioPath.empty() && !asset.waveformCached) {
+            if (asset.isAudio && !asset.convertedAudioPath.empty() && !asset.waveformCached) {
                 MediaPlayer tempPlayer;
                 if (tempPlayer.loadAudio(asset.convertedAudioPath) && tempPlayer.isAudioLoaded()) {
                     try {
@@ -1148,25 +1297,31 @@ void AssetLibrary::refreshAssetList() {
             }
             newAssets_.push_back(assetId);
             newCount++;
-            ofLogNotice("AssetLibrary") << "Added new asset from scan: " << assetId;
+            ofLogNotice("AssetLibrary") << "Added new asset from scan: " << assetId 
+                                       << " (video: " << (isVideo ? "yes" : "no")
+                                       << ", audio: " << (isAudio ? "yes" : "no") << ")";
         } else {
-            // Existing asset - check if path or folder changed
+            // Existing asset - check if paths or folder changed
             AssetInfo& asset = it->second;
             bool pathChanged = false;
             
             // Update video path if changed
-            if (asset.isVideo && asset.convertedVideoPath != filePath) {
-                asset.convertedVideoPath = filePath;
+            if (isVideo && asset.convertedVideoPath != videoPath) {
+                asset.convertedVideoPath = videoPath;
                 pathChanged = true;
             }
             
-            // Update audio path if changed (for audio-only or AV files)
-            if ((asset.isAudio || asset.isVideo) && asset.convertedAudioPath != filePath) {
-                // Only update if this is the audio file (not video)
-                if (!asset.isVideo || (asset.isVideo && asset.isAudio && !asset.convertedVideoPath.empty() && asset.convertedVideoPath != filePath)) {
-                    asset.convertedAudioPath = filePath;
-                    pathChanged = true;
-                }
+            // Update audio path if changed
+            if (isAudio && asset.convertedAudioPath != audioPath) {
+                asset.convertedAudioPath = audioPath;
+                pathChanged = true;
+            }
+            
+            // Update asset type flags if they changed
+            if (asset.isVideo != isVideo || asset.isAudio != isAudio) {
+                asset.isVideo = isVideo;
+                asset.isAudio = isAudio;
+                pathChanged = true;
             }
             
             // Update folder if changed
@@ -1195,16 +1350,72 @@ void AssetLibrary::refreshAssetList() {
         }
     }
     
+    // Sync folder tracking with actual directory structure
+    // Scan for all folders (including empty ones) and update assetFolders_
+    std::set<std::string> foundFolders;
+    scanDirectoryForFolders(assetsDir, "", foundFolders);
+    
+    // Update assetFolders_ to match what actually exists on disk
+    int foldersAdded = 0;
+    int foldersRemoved = 0;
+    
+    // Add folders that exist on disk but aren't tracked
+    for (const auto& folder : foundFolders) {
+        if (assetFolders_.find(folder) == assetFolders_.end()) {
+            assetFolders_.insert(folder);
+            foldersAdded++;
+            ofLogNotice("AssetLibrary") << "Added folder from directory scan: " << folder;
+        }
+    }
+    
+    // Remove folders that no longer exist on disk
+    for (auto it = assetFolders_.begin(); it != assetFolders_.end();) {
+        if (foundFolders.find(*it) == foundFolders.end()) {
+            ofLogNotice("AssetLibrary") << "Removing folder that no longer exists: " << *it;
+            it = assetFolders_.erase(it);
+            foldersRemoved++;
+        } else {
+            ++it;
+        }
+    }
+    
     // Save updated index
     saveAssetIndex();
     
     ofLogNotice("AssetLibrary") << "Refresh complete: " << newCount << " new, " 
-                                 << updatedCount << " updated, " << removedCount << " removed";
+                                 << updatedCount << " updated, " << removedCount << " removed, "
+                                 << foldersAdded << " folders added, " << foldersRemoved << " folders removed";
+}
+
+//--------------------------------------------------------------
+void AssetLibrary::requestAsyncRefresh() {
+    refreshRequested_ = true;
+}
+
+//--------------------------------------------------------------
+bool AssetLibrary::isRefreshInProgress() const {
+    return refreshInProgress_.load();
+}
+
+//--------------------------------------------------------------
+void AssetLibrary::refreshThreadFunction() {
+    while (!shouldStopRefreshThread_) {
+        if (refreshRequested_.load()) {
+            refreshRequested_ = false;
+            refreshInProgress_ = true;
+            
+            refreshAssetList();
+            
+            refreshInProgress_ = false;
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
 //--------------------------------------------------------------
 void AssetLibrary::scanDirectoryForAssets(const std::string& dirPath, const std::string& relativeFolder, 
-                                           std::map<std::string, std::pair<std::string, std::string>>& foundFiles) {
+                                           std::map<std::string, std::map<std::string, std::pair<std::string, std::string>>>& filesByBaseName) {
     ofDirectory dir(dirPath);
     if (!dir.exists() || !dir.isDirectory()) {
         return;
@@ -1221,13 +1432,42 @@ void AssetLibrary::scanDirectoryForAssets(const std::string& dirPath, const std:
             // Skip hidden/system folders
             if (folderName[0] != '.' && folderName != "__MACOSX") {
                 std::string newRelativeFolder = relativeFolder.empty() ? folderName : ofFilePath::join(relativeFolder, folderName);
-                scanDirectoryForAssets(path, newRelativeFolder, foundFiles);
+                scanDirectoryForAssets(path, newRelativeFolder, filesByBaseName);
             }
         } else {
             // Check if it's a media file
             if (isVideoFile(path) || isAudioFile(path)) {
-                std::string assetId = generateAssetId(path);
-                foundFiles[assetId] = std::make_pair(path, relativeFolder);
+                // Group by base name to allow pairing .mov and .wav files
+                std::string baseName = ofFilePath::getBaseName(path);
+                std::string extension = ofToLower(ofFilePath::getFileExt(path));
+                filesByBaseName[baseName][extension] = std::make_pair(path, relativeFolder);
+            }
+        }
+    }
+}
+
+//--------------------------------------------------------------
+void AssetLibrary::scanDirectoryForFolders(const std::string& dirPath, const std::string& relativeFolder, 
+                                            std::set<std::string>& foundFolders) {
+    ofDirectory dir(dirPath);
+    if (!dir.exists() || !dir.isDirectory()) {
+        return;
+    }
+    
+    dir.listDir();
+    for (int i = 0; i < dir.size(); i++) {
+        std::string path = dir.getPath(i);
+        ofFile file(path);
+        
+        if (file.isDirectory()) {
+            std::string folderName = ofFilePath::getFileName(path);
+            // Skip hidden/system folders
+            if (folderName[0] != '.' && folderName != "__MACOSX") {
+                std::string newRelativeFolder = relativeFolder.empty() ? folderName : ofFilePath::join(relativeFolder, folderName);
+                // Add this folder to the set (even if empty)
+                foundFolders.insert(newRelativeFolder);
+                // Recursively scan subdirectories
+                scanDirectoryForFolders(path, newRelativeFolder, foundFolders);
             }
         }
     }
