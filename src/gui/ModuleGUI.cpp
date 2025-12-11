@@ -674,21 +674,26 @@ void ModuleGUI::setupDragDropTarget() {
 }
 
 bool ModuleGUI::hasWindowState() const {
-    if (instanceName.empty()) {
+    if (instanceName.empty() || !registry) {
         return false;
     }
     
-    // Find window by instance name (window title matches instance name)
-    ImGuiWindow* window = ImGui::FindWindowByName(instanceName.c_str());
+    // Find window by UUID-based window ID (format: "DisplayName###UUID")
+    std::string uuid = registry->getUUID(instanceName);
+    std::string windowID = !uuid.empty() ? (instanceName + "###" + uuid) : instanceName;
+    ImGuiWindow* window = ImGui::FindWindowByName(windowID.c_str());
     return window != nullptr;
 }
 
 ImVec2 ModuleGUI::getWindowPosition() const {
-    if (instanceName.empty()) {
+    if (instanceName.empty() || !registry) {
         return ImVec2(0, 0);
     }
     
-    ImGuiWindow* window = ImGui::FindWindowByName(instanceName.c_str());
+    // Find window by UUID-based window ID (format: "DisplayName###UUID")
+    std::string uuid = registry->getUUID(instanceName);
+    std::string windowID = !uuid.empty() ? (instanceName + "###" + uuid) : instanceName;
+    ImGuiWindow* window = ImGui::FindWindowByName(windowID.c_str());
     if (window) {
         return window->Pos;
     }
@@ -697,11 +702,14 @@ ImVec2 ModuleGUI::getWindowPosition() const {
 }
 
 ImVec2 ModuleGUI::getWindowSize() const {
-    if (instanceName.empty()) {
+    if (instanceName.empty() || !registry) {
         return ImVec2(0, 0);
     }
     
-    ImGuiWindow* window = ImGui::FindWindowByName(instanceName.c_str());
+    // Find window by UUID-based window ID (format: "DisplayName###UUID")
+    std::string uuid = registry->getUUID(instanceName);
+    std::string windowID = !uuid.empty() ? (instanceName + "###" + uuid) : instanceName;
+    ImGuiWindow* window = ImGui::FindWindowByName(windowID.c_str());
     if (window) {
         return window->Size;
     }
@@ -710,11 +718,14 @@ ImVec2 ModuleGUI::getWindowSize() const {
 }
 
 bool ModuleGUI::isWindowCollapsed() const {
-    if (instanceName.empty()) {
+    if (instanceName.empty() || !registry) {
         return false;
     }
     
-    ImGuiWindow* window = ImGui::FindWindowByName(instanceName.c_str());
+    // Find window by UUID-based window ID (format: "DisplayName###UUID")
+    std::string uuid = registry->getUUID(instanceName);
+    std::string windowID = !uuid.empty() ? (instanceName + "###" + uuid) : instanceName;
+    ImGuiWindow* window = ImGui::FindWindowByName(windowID.c_str());
     if (window) {
         return window->Collapsed;
     }

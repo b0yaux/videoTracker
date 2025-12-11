@@ -27,6 +27,12 @@
  * - Automatic routing of orphaned outputs
  * - Chain detection and auto-routing
  * 
+ * Design Philosophy:
+ * - AudioRouter, VideoRouter, EventRouter use UUID-based internal storage (stable across renames)
+ * - Public APIs accept module names (user-friendly, backward compatible)
+ * - ParameterRouter still uses name-based paths (may be refactored in future)
+ * - Connections persist when modules are renamed (no renameModule needed for audio/video/event)
+ * 
  * Usage:
  *   ConnectionManager manager(&registry);
  *   manager.setParameterRouter(&parameterRouter);
@@ -208,6 +214,14 @@ public:
      * Clear all connections (disconnect everything)
      */
     void clear();
+    
+    /**
+     * Update module name in all connections
+     * Called when a module is renamed to update connection references
+     * @param oldName Old module name
+     * @param newName New module name
+     */
+    void renameModule(const std::string& oldName, const std::string& newName);
     
     // ========================================================================
     // PARAMETER ROUTING (Integrates ParameterRouter)

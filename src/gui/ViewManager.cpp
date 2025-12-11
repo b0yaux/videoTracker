@@ -122,8 +122,20 @@ std::vector<std::string> ViewManager::getAvailableWindows() const {
                 continue;
             }
             
-            if (isWindowVisible(name)) {
-                windows.push_back(name);
+            // Check window visibility using UUID-based window ID format
+            // Get GUI to access registry for UUID lookup
+            auto* gui = guiManager->getGUI(name);
+            if (gui && gui->getRegistry()) {
+                std::string uuid = gui->getRegistry()->getUUID(name);
+                std::string windowID = !uuid.empty() ? (name + "###" + uuid) : name;
+                if (isWindowVisible(windowID)) {
+                    windows.push_back(name);  // Return instance name for navigation
+                }
+            } else {
+                // Fallback: check by instance name (for windows without UUID)
+                if (isWindowVisible(name)) {
+                    windows.push_back(name);
+                }
             }
         }
     }
@@ -323,15 +335,26 @@ void ViewManager::drawModulePanels() {
             continue;
         }
 
-        // Create window title with instance name
-        std::string windowTitle = instanceName;
-
         // CRITICAL: Validate module still exists before accessing it
         // This prevents crashes when MediaPool modules with audio/video ports are deleted
         auto* reg = gui->getRegistry();
         if (!reg || !reg->hasModule(instanceName)) {
             // Module was deleted - skip this GUI
             continue;
+        }
+        
+        // Get UUID for window ID (stable across renames)
+        // Use "DisplayName###UUID" format so ImGui uses UUID for window ID but displays the name
+        std::string moduleUUID = reg->getUUID(instanceName);
+        std::string windowID;
+        if (!moduleUUID.empty()) {
+            // Use UUID as window ID, instanceName as display title
+            // Format: "Display Title###UniqueID" - ImGui uses part after ### as the unique ID
+            windowID = instanceName + "###" + moduleUUID;
+        } else {
+            // Fallback: use instanceName if UUID not found (shouldn't happen)
+            windowID = instanceName;
+            ofLogWarning("ViewManager") << "Could not get UUID for module: " << instanceName;
         }
 
         // Setup window properties (applies default size if saved)
@@ -343,9 +366,10 @@ void ViewManager::drawModulePanels() {
             continue;
         }
 
-        // Check if this window should be focused (by name match - works for ALL modules)
-        bool shouldFocus = (windowTitle == currentFocusedWindow);
-        bool focusChanged = (shouldFocus && windowTitle != lastFocusedWindow);
+        // Check if this window should be focused (by instance name match - works for ALL modules)
+        // Note: currentFocusedWindow uses instance name, not UUID
+        bool shouldFocus = (instanceName == currentFocusedWindow);
+        bool focusChanged = (shouldFocus && instanceName != lastFocusedWindow);
 
         // Set focus when window changes
         if (focusChanged) {
@@ -368,7 +392,9 @@ void ViewManager::drawModulePanels() {
         ImGui::SetNextWindowClass(&windowClass);
 
         // ImGui::Begin() returns false when window is collapsed
-        if (ImGui::Begin(windowTitle.c_str(), nullptr, windowFlags)) {
+        // windowID uses "DisplayName###UUID" format so UUID is used for window ID (position storage)
+        // but human-readable name is displayed in title bar
+        if (ImGui::Begin(windowID.c_str(), nullptr, windowFlags)) {
             if (!ImGui::IsWindowCollapsed()) {
                 // Draw menu icon button in ImGui's native title bar
                 try {
@@ -390,7 +416,7 @@ void ViewManager::drawModulePanels() {
 
                 // Handle navigation on click - navigate to this window (works for ALL modules)
                 if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                    navigateToWindow(windowTitle);
+                    navigateToWindow(instanceName);  // Use instanceName for navigation (not UUID)
                     // Clear cell focus for modules that support it (e.g., TrackerSequencer)
                     try {
                         gui->clearCellFocus();
@@ -405,7 +431,7 @@ void ViewManager::drawModulePanels() {
                     float guiTime = (ofGetElapsedTimef() - guiStartTime) * 1000.0f;
                     // Log slow GUI windows (> 1ms)
                     if (guiTime > 1.0f) {
-                        ofLogNotice("ViewManager") << "[PERF] Window '" << windowTitle << "' GUI: " 
+                        ofLogNotice("ViewManager") << "[PERF] Window '" << instanceName << "' GUI: " 
                                                    << std::fixed << std::setprecision(2) << guiTime << "ms";
                     }
                 } catch (...) {
@@ -418,8 +444,9 @@ void ViewManager::drawModulePanels() {
                 // Save layout if window was resized
                 ImVec2 currentSize = ImGui::GetWindowSize();
                 static std::map<std::string, ImVec2> previousSizes;
-                std::string windowId = windowTitle;
-                auto it = previousSizes.find(windowId);
+                // Use UUID for window size tracking (consistent with window ID)
+                std::string sizeTrackingId = !moduleUUID.empty() ? moduleUUID : instanceName;
+                auto it = previousSizes.find(sizeTrackingId);
                 if (it == previousSizes.end() || it->second.x != currentSize.x || it->second.y != currentSize.y) {
                     if (it != previousSizes.end()) {
                         try {
@@ -427,7 +454,7 @@ void ViewManager::drawModulePanels() {
                         } catch (...) {
                         }
                     }
-                    previousSizes[windowId] = currentSize;
+                    previousSizes[sizeTrackingId] = currentSize;
                 }
             }
         } else {

@@ -185,6 +185,22 @@ std::string AssetLibrary::importFile(const std::string& filePath, const std::str
             asset.conversionStatus = ConversionStatus::COMPLETE;
             // Track newly completed asset for GUI highlighting
             newAssets_.push_back(assetId);
+            
+            // Generate waveform for audio-only files that don't need conversion
+            if (asset.isAudio && !asset.isVideo && !asset.convertedAudioPath.empty() && 
+                ofFile::doesFileExist(asset.convertedAudioPath) && !asset.waveformCached) {
+                MediaPlayer tempPlayer;
+                if (tempPlayer.loadAudio(asset.convertedAudioPath) && tempPlayer.isAudioLoaded()) {
+                    try {
+                        ofSoundBuffer buffer = tempPlayer.getAudioPlayer().getBuffer();
+                        generateWaveformForAsset(asset, buffer);
+                    } catch (...) {
+                        // Silently fail
+                    }
+                }
+                tempPlayer.stop();
+                tempPlayer.reset();
+            }
         } else {
             asset.conversionStatus = ConversionStatus::FAILED;
             asset.errorMessage = "Failed to copy file to project directory";
@@ -885,35 +901,9 @@ void AssetLibrary::processConversionUpdates() {
                                 if (tempPlayer.loadAudio(job->outputAudioPath) && tempPlayer.isAudioLoaded()) {
                                     try {
                                         ofSoundBuffer buffer = tempPlayer.getAudioPlayer().getBuffer();
-                                        int numFrames = buffer.getNumFrames();
-                                        int numChannels = buffer.getNumChannels();
-                                        
-                                        if (numFrames > 0 && numChannels > 0) {
-                                            const int maxPoints = 600;
-                                            int stepSize = std::max(1, numFrames / maxPoints);
-                                            int actualPoints = std::min(maxPoints, numFrames / stepSize);
-                                            
-                                            if (actualPoints >= 2) {
-                                                asset.waveformData.resize(actualPoints);
-                                                for (int i = 0; i < actualPoints; i++) {
-                                                    int sampleIndex = i * stepSize;
-                                                    sampleIndex = std::max(0, std::min(numFrames - 1, sampleIndex));
-                                                    float sample = buffer.getSample(sampleIndex, 0);
-                                                    if (numChannels > 1) {
-                                                        float sum = sample;
-                                                        for (int ch = 1; ch < numChannels; ch++) {
-                                                            sum += buffer.getSample(sampleIndex, ch);
-                                                        }
-                                                        sample = sum / numChannels;
-                                                    }
-                                                    asset.waveformData[i] = sample;
-                                                }
-                                                asset.waveformCached = true;
-                                                ofLogVerbose("AssetLibrary") << "Cached waveform after conversion for: " << asset.assetId;
-                                            }
-                                        }
+                                        generateWaveformForAsset(asset, buffer);
                                     } catch (...) {
-                                        // Silently fail - waveform is optional
+                                        // Silently fail
                                     }
                                 }
                                 tempPlayer.stop();
@@ -943,6 +933,40 @@ void AssetLibrary::processConversionUpdates() {
     if (statusChanged) {
         saveAssetIndex();
     }
+}
+
+//--------------------------------------------------------------
+void AssetLibrary::generateWaveformForAsset(AssetInfo& asset, const ofSoundBuffer& buffer) {
+    int numFrames = buffer.getNumFrames();
+    int numChannels = buffer.getNumChannels();
+    
+    if (numFrames <= 0 || numChannels <= 0) {
+        return;
+    }
+    
+    const int maxPoints = 600;
+    int stepSize = std::max(1, numFrames / maxPoints);
+    int actualPoints = std::min(maxPoints, numFrames / stepSize);
+    
+    if (actualPoints < 2) {
+        return;
+    }
+    
+    asset.waveformData.resize(actualPoints);
+    for (int i = 0; i < actualPoints; i++) {
+        int sampleIndex = i * stepSize;
+        sampleIndex = std::max(0, std::min(numFrames - 1, sampleIndex));
+        float sample = buffer.getSample(sampleIndex, 0);
+        if (numChannels > 1) {
+            float sum = sample;
+            for (int ch = 1; ch < numChannels; ch++) {
+                sum += buffer.getSample(sampleIndex, ch);
+            }
+            sample = sum / numChannels;
+        }
+        asset.waveformData[i] = sample;
+    }
+    asset.waveformCached = true;
 }
 
 //--------------------------------------------------------------
@@ -1020,4 +1044,191 @@ std::vector<std::string> AssetLibrary::getNewAssets() {
 //--------------------------------------------------------------
 void AssetLibrary::clearNewAssets() {
     newAssets_.clear();
+}
+
+//--------------------------------------------------------------
+size_t AssetLibrary::getTotalLibrarySize() const {
+    size_t totalSize = 0;
+    for (const auto& pair : assets_) {
+        const AssetInfo& asset = pair.second;
+        
+        // Use converted file sizes if available, otherwise original
+        if (asset.conversionStatus == ConversionStatus::COMPLETE) {
+            if (!asset.convertedVideoPath.empty() && ofFile::doesFileExist(asset.convertedVideoPath)) {
+                ofFile videoFile(asset.convertedVideoPath);
+                if (videoFile.exists()) {
+                    totalSize += videoFile.getSize();
+                }
+            }
+            if (!asset.convertedAudioPath.empty() && ofFile::doesFileExist(asset.convertedAudioPath)) {
+                ofFile audioFile(asset.convertedAudioPath);
+                if (audioFile.exists()) {
+                    totalSize += audioFile.getSize();
+                }
+            }
+        } else if (asset.fileSize > 0) {
+            // Fallback to original file size if not converted yet
+            totalSize += asset.fileSize;
+        }
+    }
+    return totalSize;
+}
+
+//--------------------------------------------------------------
+void AssetLibrary::refreshAssetList() {
+    std::string assetsDir = getAssetsDirectory();
+    if (assetsDir.empty()) {
+        ofLogWarning("AssetLibrary") << "Cannot refresh: no assets directory";
+        return;
+    }
+    
+    ofLogNotice("AssetLibrary") << "Refreshing asset list from: " << assetsDir;
+    
+    // Scan directory recursively - map: assetId -> (filePath, folder)
+    std::map<std::string, std::pair<std::string, std::string>> foundFiles;
+    scanDirectoryForAssets(assetsDir, "", foundFiles);
+    
+    // Track what we found
+    std::set<std::string> foundAssetIds;
+    int newCount = 0;
+    int updatedCount = 0;
+    int removedCount = 0;
+    
+    // Process found files
+    for (const auto& pair : foundFiles) {
+        const std::string& assetId = pair.first;
+        const std::string& filePath = pair.second.first;
+        const std::string& folder = pair.second.second;
+        foundAssetIds.insert(assetId);
+        
+        auto it = assets_.find(assetId);
+        if (it == assets_.end()) {
+            // New file - add to library
+            AssetInfo asset;
+            asset.assetId = assetId;
+            asset.originalPath = filePath; // For manually added files, originalPath = convertedPath
+            asset.assetFolder = folder;
+            asset.isVideo = isVideoFile(filePath);
+            asset.isAudio = isAudioFile(filePath);
+            asset.needsConversion = false; // Assume already converted if in assets directory
+            asset.conversionStatus = ConversionStatus::COMPLETE;
+            
+            // Set converted paths (files in assets directory are considered converted)
+            if (asset.isVideo) {
+                asset.convertedVideoPath = filePath;
+            }
+            if (asset.isAudio || asset.isVideo) {
+                asset.convertedAudioPath = filePath;
+            }
+            
+            // Get file size
+            ofFile file(filePath);
+            if (file.exists()) {
+                asset.fileSize = file.getSize();
+            }
+            
+            // Generate waveform for audio files
+            if (asset.isAudio && !asset.isVideo && !asset.convertedAudioPath.empty() && !asset.waveformCached) {
+                MediaPlayer tempPlayer;
+                if (tempPlayer.loadAudio(asset.convertedAudioPath) && tempPlayer.isAudioLoaded()) {
+                    try {
+                        ofSoundBuffer buffer = tempPlayer.getAudioPlayer().getBuffer();
+                        generateWaveformForAsset(asset, buffer);
+                    } catch (...) {
+                        // Silently fail
+                    }
+                }
+                tempPlayer.stop();
+                tempPlayer.reset();
+            }
+            
+            assets_[assetId] = asset;
+            if (!folder.empty()) {
+                assetFolders_.insert(folder);
+            }
+            newAssets_.push_back(assetId);
+            newCount++;
+            ofLogNotice("AssetLibrary") << "Added new asset from scan: " << assetId;
+        } else {
+            // Existing asset - check if path or folder changed
+            AssetInfo& asset = it->second;
+            bool pathChanged = false;
+            
+            // Update video path if changed
+            if (asset.isVideo && asset.convertedVideoPath != filePath) {
+                asset.convertedVideoPath = filePath;
+                pathChanged = true;
+            }
+            
+            // Update audio path if changed (for audio-only or AV files)
+            if ((asset.isAudio || asset.isVideo) && asset.convertedAudioPath != filePath) {
+                // Only update if this is the audio file (not video)
+                if (!asset.isVideo || (asset.isVideo && asset.isAudio && !asset.convertedVideoPath.empty() && asset.convertedVideoPath != filePath)) {
+                    asset.convertedAudioPath = filePath;
+                    pathChanged = true;
+                }
+            }
+            
+            // Update folder if changed
+            if (asset.assetFolder != folder) {
+                asset.assetFolder = folder;
+                pathChanged = true;
+            }
+            
+            if (pathChanged) {
+                updatedCount++;
+                ofLogNotice("AssetLibrary") << "Updated asset path/folder: " << assetId;
+            }
+        }
+    }
+    
+    // Remove assets that are no longer on disk
+    for (auto it = assets_.begin(); it != assets_.end();) {
+        const std::string& assetId = it->first;
+        if (foundAssetIds.find(assetId) == foundAssetIds.end()) {
+            // Asset not found on disk - remove it
+            ofLogNotice("AssetLibrary") << "Removing missing asset: " << assetId;
+            it = assets_.erase(it);
+            removedCount++;
+        } else {
+            ++it;
+        }
+    }
+    
+    // Save updated index
+    saveAssetIndex();
+    
+    ofLogNotice("AssetLibrary") << "Refresh complete: " << newCount << " new, " 
+                                 << updatedCount << " updated, " << removedCount << " removed";
+}
+
+//--------------------------------------------------------------
+void AssetLibrary::scanDirectoryForAssets(const std::string& dirPath, const std::string& relativeFolder, 
+                                           std::map<std::string, std::pair<std::string, std::string>>& foundFiles) {
+    ofDirectory dir(dirPath);
+    if (!dir.exists() || !dir.isDirectory()) {
+        return;
+    }
+    
+    dir.listDir();
+    for (int i = 0; i < dir.size(); i++) {
+        std::string path = dir.getPath(i);
+        ofFile file(path);
+        
+        if (file.isDirectory()) {
+            // Recursively scan subdirectories
+            std::string folderName = ofFilePath::getFileName(path);
+            // Skip hidden/system folders
+            if (folderName[0] != '.' && folderName != "__MACOSX") {
+                std::string newRelativeFolder = relativeFolder.empty() ? folderName : ofFilePath::join(relativeFolder, folderName);
+                scanDirectoryForAssets(path, newRelativeFolder, foundFiles);
+            }
+        } else {
+            // Check if it's a media file
+            if (isVideoFile(path) || isAudioFile(path)) {
+                std::string assetId = generateAssetId(path);
+                foundFiles[assetId] = std::make_pair(path, relativeFolder);
+            }
+        }
+    }
 }

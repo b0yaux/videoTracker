@@ -219,6 +219,26 @@ namespace GUIConstants {
     
     namespace Header {
         constexpr ImVec4 Default = ImVec4(0.1f, 0.1f, 0.1f, 0.8f);
+        constexpr ImVec4 Hovered = ImVec4(0.2f, 0.2f, 0.2f, 0.9f);
+        constexpr ImVec4 Active = ImVec4(0.3f, 0.3f, 0.3f, 1.0f);
+    }
+    
+    // ============================================================================
+    // CHECKBOX/TOGGLE COLORS
+    // ============================================================================
+    
+    namespace Checkbox {
+        constexpr ImVec4 CheckMark = ImVec4(0.0f, 0.0f, 1.0f, 1.0f); // Red checkmark to match theme
+    }
+    
+    // ============================================================================
+    // NAVIGATION/FOCUS COLORS
+    // ============================================================================
+    
+    namespace Nav {
+        constexpr ImVec4 Highlight = ImVec4(1.0f, 0.0f, 0.0f, 0.8f); // Red highlight for focused items
+        constexpr ImVec4 WindowingHighlight = ImVec4(1.0f, 0.0f, 0.0f, 0.6f); // Red for window switching highlight
+        constexpr ImVec4 WindowingDimBg = ImVec4(0.0f, 0.0f, 0.0f, 0.4f); // Dim background for window switching
     }
     
     // ============================================================================

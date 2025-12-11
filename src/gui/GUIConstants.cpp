@@ -67,6 +67,16 @@ namespace GUIConstants {
         
         // Headers
         style.Colors[ImGuiCol_Header] = Header::Default;
+        style.Colors[ImGuiCol_HeaderHovered] = Header::Hovered;
+        style.Colors[ImGuiCol_HeaderActive] = Header::Active;
+        
+        // Checkbox/Toggle
+        style.Colors[ImGuiCol_CheckMark] = Checkbox::CheckMark;
+        
+        // Navigation/Focus
+        style.Colors[ImGuiCol_NavHighlight] = Nav::Highlight;
+        style.Colors[ImGuiCol_NavWindowingHighlight] = Nav::WindowingHighlight;
+        style.Colors[ImGuiCol_NavWindowingDimBg] = Nav::WindowingDimBg;
         
         // Buttons
         style.Colors[ImGuiCol_Button] = Button::Default;

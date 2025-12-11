@@ -56,7 +56,7 @@ public:
     ModuleMetadata getMetadata() const override;
     
     // Serialization
-    ofJson toJson() const override;
+    ofJson toJson(class ModuleRegistry* registry = nullptr) const override;
     void fromJson(const ofJson& json) override;
     
     // Video processing (from ofxVisualObject)

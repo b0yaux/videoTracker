@@ -78,6 +78,13 @@ public:
     bool disconnect(const ParameterPath& sourcePath);
     
     /**
+     * Update module name in all parameter connections
+     * @param oldName Old module name
+     * @param newName New module name
+     */
+    void renameModule(const std::string& oldName, const std::string& newName);
+    
+    /**
      * Disconnect all connections
      */
     void clear();

@@ -138,7 +138,7 @@ std::vector<Port> Oscilloscope::getOutputPorts() const {
     return ports;
 }
 
-ofJson Oscilloscope::toJson() const {
+ofJson Oscilloscope::toJson(class ModuleRegistry* registry) const {
     ofJson json;
     json["type"] = "Oscilloscope";
     json["name"] = getName();

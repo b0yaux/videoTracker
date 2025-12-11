@@ -258,13 +258,14 @@ void ModuleRegistry::clear() {
 ofJson ModuleRegistry::toJson() const {
     ofJson json = ofJson::array();
     
-    forEachModule([&json](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
+    forEachModule([&json, this](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
         if (module) {
             ofJson moduleJson;
             moduleJson["uuid"] = uuid;
             moduleJson["name"] = name;
             moduleJson["type"] = module->getTypeName();
-            moduleJson["data"] = module->toJson();
+            // Pass registry context so modules can look up UUIDs/names for connected modules
+            moduleJson["data"] = module->toJson(const_cast<ModuleRegistry*>(this));
             json.push_back(moduleJson);
         }
     });

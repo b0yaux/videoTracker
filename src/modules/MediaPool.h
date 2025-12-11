@@ -131,7 +131,7 @@ public:
     void setEnabled(bool enabled) override;
     
     // Module serialization interface
-    ofJson toJson() const override;
+    ofJson toJson(class ModuleRegistry* registry = nullptr) const override;
     void fromJson(const ofJson& json) override;
     // getTypeName() uses default implementation from Module base class
     

@@ -312,7 +312,8 @@ public:
     
     // Serialization interface
     // Each module implements its own serialization logic
-    virtual ofJson toJson() const = 0;
+    // registry parameter is optional - provided when serializing from ModuleRegistry for UUID/name lookup
+    virtual ofJson toJson(class ModuleRegistry* registry = nullptr) const = 0;
     virtual void fromJson(const ofJson& json) = 0;
     
     /**

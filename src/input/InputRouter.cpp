@@ -122,7 +122,19 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
     bool cmdPressed = keyEvent.hasModifier(OF_KEY_COMMAND);
     bool altPressed = keyEvent.hasModifier(OF_KEY_ALT);
 
-
+    // Priority 0.25: CTRL+TAB for window switching (let ImGui handle it)
+    // On macOS, CTRL key maps to Super in ImGui, but window switcher expects Ctrl+TAB
+    // We manually inject it as Ctrl+TAB so ImGui's window switcher works
+    if (ctrlPressed && (key == OF_KEY_TAB || key == '\t')) {
+        ImGuiIO& io = ImGui::GetIO();
+        if (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) {
+            // On macOS, physical CTRL should be reported as Super, which ImGui swaps to Ctrl
+            io.AddKeyEvent(ImGuiKey_LeftSuper, true);  // Physical CTRL on macOS
+            io.AddKeyEvent(ImGuiKey_Tab, true);        // Press Tab
+            // Return false so the event also passes through to ImGuiIntegration naturally
+            return false;
+        }
+    }
 
     // Priority 0: File menu shortcuts (Cmd+S, Cmd+Shift+S, Cmd+O, Cmd+Shift+O)
     if (cmdPressed) {

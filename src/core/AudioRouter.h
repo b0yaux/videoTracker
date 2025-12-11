@@ -21,6 +21,12 @@ class AudioMixer;
  * - Module to AudioMixer connections
  * - Direct module-to-module audio chaining
  * 
+ * Design Philosophy:
+ * - Public APIs accept module names (user-friendly, backward compatible)
+ * - Internal storage uses UUIDs (stable across renames, no renameModule needed)
+ * - Serialization saves both UUIDs (primary) and names (readability)
+ * - This separation ensures connections persist when modules are renamed
+ * 
  * Usage:
  *   AudioRouter router(&registry);
  *   router.connect("pool1", "masterAudioMixer");
@@ -115,11 +121,15 @@ public:
 private:
     ModuleRegistry* registry_;
     
-    // Port-based connection tracking: "module.port" -> {"targetModule.targetPort", ...}
+    // Port-based connection tracking: "uuid.port" -> {"targetUuid.targetPort", ...}
+    // Uses UUIDs internally to avoid needing renameModule when modules are renamed
     std::map<std::string, std::set<std::string>> portConnections_;
     
     // Helper methods
-    std::shared_ptr<Module> getModule(const std::string& moduleName) const;
+    std::shared_ptr<Module> getModule(const std::string& identifier) const;
+    
+    // Convert module name to UUID (returns UUID if identifier is already UUID)
+    std::string getNameToUUID(const std::string& identifier) const;
     
     // Internal connection methods
     bool connectInternal(const std::string& from, const std::string& to);

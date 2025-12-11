@@ -143,18 +143,26 @@ bool AudioRouter::connect(const std::string& fromModule, const std::string& toMo
 
 bool AudioRouter::disconnect(const std::string& fromModule, const std::string& toModule) {
     if (toModule.empty()) {
-        // Disconnect from all - find all port connections from this module
-        std::string prefix = fromModule + ".";
+        if (!registry_) {
+            return false;
+        }
+        
+        // Disconnect from all - find all port connections from this module (by UUID)
+        std::string fromUUID = getNameToUUID(fromModule);
+        std::string prefix = fromUUID + ".";
         std::vector<std::pair<std::string, std::string>> toDisconnect;
         
         for (const auto& [sourcePath, targetPaths] : portConnections_) {
-            if (sourcePath.find(prefix) == 0) {  // Starts with "fromModule."
+            if (sourcePath.find(prefix) == 0) {  // Starts with "fromUUID."
                 for (const auto& targetPath : targetPaths) {
-                    // Extract target module name
+                    // Extract target UUID and convert to name
                     size_t dotPos = targetPath.find('.');
                     if (dotPos != std::string::npos) {
-                        std::string targetModule = targetPath.substr(0, dotPos);
-                        toDisconnect.push_back({fromModule, targetModule});
+                        std::string targetUUID = targetPath.substr(0, dotPos);
+                        std::string targetName = registry_->getName(targetUUID);
+                        if (!targetName.empty()) {
+                            toDisconnect.push_back({fromModule, targetName});
+                        }
                     }
                 }
             }
@@ -174,25 +182,31 @@ bool AudioRouter::disconnect(const std::string& fromModule, const std::string& t
 }
 
 bool AudioRouter::disconnectAll(const std::string& moduleName) {
-    if (moduleName.empty()) {
-        ofLogWarning("AudioRouter") << "Cannot disconnectAll with empty module name";
+    if (moduleName.empty() || !registry_) {
+        ofLogWarning("AudioRouter") << "Cannot disconnectAll with empty module name or no registry";
         return false;
     }
     
-    bool disconnected = false;
-    std::string prefix = moduleName + ".";
+    // Convert name to UUID (connections are stored by UUID)
+    std::string moduleUUID = getNameToUUID(moduleName);
+    std::string prefix = moduleUUID + ".";
     
     // Collect all connections to disconnect (from and to this module)
+    // Store as UUIDs for lookup, but we'll need names for disconnectInternal
     std::vector<std::pair<std::string, std::string>> toDisconnect;
     
     // Find connections FROM this module
     for (const auto& [sourcePath, targetPaths] : portConnections_) {
-        if (sourcePath.find(prefix) == 0) {  // Starts with "moduleName."
+        if (sourcePath.find(prefix) == 0) {  // Starts with "moduleUUID."
             for (const auto& targetPath : targetPaths) {
                 size_t dotPos = targetPath.find('.');
                 if (dotPos != std::string::npos) {
-                    std::string targetModule = targetPath.substr(0, dotPos);
-                    toDisconnect.push_back({moduleName, targetModule});
+                    std::string targetUUID = targetPath.substr(0, dotPos);
+                    // Convert UUID to name for disconnectInternal
+                    std::string targetName = registry_->getName(targetUUID);
+                    if (!targetName.empty()) {
+                        toDisconnect.push_back({moduleName, targetName});
+                    }
                 }
             }
         }
@@ -201,17 +215,22 @@ bool AudioRouter::disconnectAll(const std::string& moduleName) {
     // Find connections TO this module
     for (const auto& [sourcePath, targetPaths] : portConnections_) {
         for (const auto& targetPath : targetPaths) {
-            if (targetPath.find(prefix) == 0) {  // Starts with "moduleName."
+            if (targetPath.find(prefix) == 0) {  // Starts with "moduleUUID."
                 size_t dotPos = sourcePath.find('.');
                 if (dotPos != std::string::npos) {
-                    std::string sourceModule = sourcePath.substr(0, dotPos);
-                    toDisconnect.push_back({sourceModule, moduleName});
+                    std::string sourceUUID = sourcePath.substr(0, dotPos);
+                    // Convert UUID to name for disconnectInternal
+                    std::string sourceName = registry_->getName(sourceUUID);
+                    if (!sourceName.empty()) {
+                        toDisconnect.push_back({sourceName, moduleName});
+                    }
                 }
             }
         }
     }
     
     // Disconnect all found connections
+    bool disconnected = false;
     for (const auto& [from, to] : toDisconnect) {
         if (disconnectInternal(from, to)) {
             disconnected = true;
@@ -221,15 +240,25 @@ bool AudioRouter::disconnectAll(const std::string& moduleName) {
     return disconnected;
 }
 
+// renameModule removed - connections are now UUID-based, so renaming doesn't affect them
+
 bool AudioRouter::hasConnection(const std::string& fromModule, const std::string& toModule) const {
-    std::string prefix = fromModule + ".";
-    std::string targetPrefix = toModule + ".";
+    if (!registry_) {
+        return false;
+    }
+    
+    // Convert names to UUIDs (connections are stored by UUID)
+    std::string fromUUID = getNameToUUID(fromModule);
+    std::string toUUID = getNameToUUID(toModule);
+    
+    std::string prefix = fromUUID + ".";
+    std::string targetPrefix = toUUID + ".";
     
     // Check if any port from fromModule connects to any port in toModule
     for (const auto& [sourcePath, targetPaths] : portConnections_) {
-        if (sourcePath.find(prefix) == 0) {  // Starts with "fromModule."
+        if (sourcePath.find(prefix) == 0) {  // Starts with "fromUUID."
             for (const auto& targetPath : targetPaths) {
-                if (targetPath.find(targetPrefix) == 0) {  // Starts with "toModule."
+                if (targetPath.find(targetPrefix) == 0) {  // Starts with "toUUID."
                     return true;
                 }
             }
@@ -240,16 +269,27 @@ bool AudioRouter::hasConnection(const std::string& fromModule, const std::string
 
 std::set<std::string> AudioRouter::getTargets(const std::string& fromModule) const {
     std::set<std::string> targets;
-    std::string prefix = fromModule + ".";
+    if (!registry_) {
+        return targets;
+    }
     
-    // Extract target module names from portConnections_
+    // Convert name to UUID (connections are stored by UUID)
+    std::string fromUUID = getNameToUUID(fromModule);
+    std::string prefix = fromUUID + ".";
+    
+    // Extract target UUIDs from portConnections_, then convert to names
     for (const auto& [sourcePath, targetPaths] : portConnections_) {
-        if (sourcePath.find(prefix) == 0) {  // Starts with "fromModule."
+        if (sourcePath.find(prefix) == 0) {  // Starts with "fromUUID."
             for (const auto& targetPath : targetPaths) {
-                // Extract module name from "targetModule.targetPort"
+                // Extract UUID from "targetUUID.targetPort"
                 size_t dotPos = targetPath.find('.');
                 if (dotPos != std::string::npos) {
-                    targets.insert(targetPath.substr(0, dotPos));
+                    std::string targetUUID = targetPath.substr(0, dotPos);
+                    // Convert UUID to name for return value
+                    std::string targetName = registry_->getName(targetUUID);
+                    if (!targetName.empty()) {
+                        targets.insert(targetName);
+                    }
                 }
             }
         }
@@ -259,16 +299,27 @@ std::set<std::string> AudioRouter::getTargets(const std::string& fromModule) con
 
 std::set<std::string> AudioRouter::getSources(const std::string& toModule) const {
     std::set<std::string> sources;
-    std::string prefix = toModule + ".";
+    if (!registry_) {
+        return sources;
+    }
     
-    // Extract source module names from portConnections_
+    // Convert name to UUID (connections are stored by UUID)
+    std::string toUUID = getNameToUUID(toModule);
+    std::string prefix = toUUID + ".";
+    
+    // Extract source UUIDs from portConnections_, then convert to names
     for (const auto& [sourcePath, targetPaths] : portConnections_) {
         for (const auto& targetPath : targetPaths) {
-            if (targetPath.find(prefix) == 0) {  // Starts with "toModule."
-                // Extract module name from "sourceModule.sourcePort"
+            if (targetPath.find(prefix) == 0) {  // Starts with "toUUID."
+                // Extract UUID from "sourceUUID.sourcePort"
                 size_t dotPos = sourcePath.find('.');
                 if (dotPos != std::string::npos) {
-                    sources.insert(sourcePath.substr(0, dotPos));
+                    std::string sourceUUID = sourcePath.substr(0, dotPos);
+                    // Convert UUID to name for return value
+                    std::string sourceName = registry_->getName(sourceUUID);
+                    if (!sourceName.empty()) {
+                        sources.insert(sourceName);
+                    }
                 }
             }
         }
@@ -286,21 +337,32 @@ int AudioRouter::getConnectionCount() const {
 
 ofJson AudioRouter::toJson() const {
     ofJson json = ofJson::array();
+    if (!registry_) {
+        return json;
+    }
+    
     for (const auto& [sourcePath, targetPaths] : portConnections_) {
         for (const auto& targetPath : targetPaths) {
             ofJson conn;
-            // Parse "module.port" format
+            // Parse "uuid.port" format
             size_t sourceDot = sourcePath.find('.');
             size_t targetDot = targetPath.find('.');
             if (sourceDot != std::string::npos && targetDot != std::string::npos) {
-                conn["fromModule"] = sourcePath.substr(0, sourceDot);
+                std::string fromUUID = sourcePath.substr(0, sourceDot);
+                std::string toUUID = targetPath.substr(0, targetDot);
+                
+                // Store UUIDs (for reliability) and names (for readability)
+                conn["fromUUID"] = fromUUID;
+                conn["fromModule"] = registry_->getName(fromUUID);
                 conn["fromPort"] = sourcePath.substr(sourceDot + 1);
-                conn["toModule"] = targetPath.substr(0, targetDot);
+                conn["toUUID"] = toUUID;
+                conn["toModule"] = registry_->getName(toUUID);
                 conn["toPort"] = targetPath.substr(targetDot + 1);
                 conn["type"] = "audio";
                 json.push_back(conn);
             } else {
-                // Legacy format support: if no port info, use module-to-module
+                // Error case: malformed internal storage (shouldn't happen)
+                // Fallback to basic format for safety
                 conn["from"] = sourcePath;
                 conn["to"] = targetPath;
                 conn["type"] = "audio";
@@ -327,31 +389,29 @@ bool AudioRouter::fromJson(const ofJson& json) {
     int restoredCount = 0;
     for (const auto& connJson : json) {
         if (connJson.contains("type") && connJson["type"] == "audio") {
-            // New format: port-based
-            if (connJson.contains("fromModule") && connJson.contains("fromPort") &&
-                connJson.contains("toModule") && connJson.contains("toPort")) {
-                std::string fromModule = connJson["fromModule"].get<std::string>();
+            // UUID-based format with port info
+            if (connJson.contains("fromUUID") && connJson.contains("fromPort") &&
+                connJson.contains("toUUID") && connJson.contains("toPort")) {
+                std::string fromUUID = connJson["fromUUID"].get<std::string>();
                 std::string fromPort = connJson["fromPort"].get<std::string>();
-                std::string toModule = connJson["toModule"].get<std::string>();
+                std::string toUUID = connJson["toUUID"].get<std::string>();
                 std::string toPort = connJson["toPort"].get<std::string>();
-                if (connectPort(fromModule, fromPort, toModule, toPort)) {
-                    restoredCount++;
-                    ofLogNotice("AudioRouter") << "Restored connection: " << fromModule << "." << fromPort 
-                                             << " -> " << toModule << "." << toPort;
-                } else {
-                    ofLogWarning("AudioRouter") << "Failed to restore connection: " << fromModule << "." << fromPort 
-                                               << " -> " << toModule << "." << toPort;
-                }
-            }
-            // Legacy format: module-to-module (auto-select ports)
-            else if (connJson.contains("from") && connJson.contains("to")) {
-                std::string from = connJson["from"].get<std::string>();
-                std::string to = connJson["to"].get<std::string>();
-                if (connect(from, to)) {
-                    restoredCount++;
-                    ofLogNotice("AudioRouter") << "Restored connection: " << from << " -> " << to;
-                } else {
-                    ofLogWarning("AudioRouter") << "Failed to restore connection: " << from << " -> " << to;
+                
+                // Convert UUIDs to names for connectPort (public API accepts names for consistency)
+                // Note: connectPort will convert back to UUIDs internally - this keeps the API clean
+                if (registry_) {
+                    std::string fromModule = registry_->getName(fromUUID);
+                    std::string toModule = registry_->getName(toUUID);
+                    if (!fromModule.empty() && !toModule.empty()) {
+                        if (connectPort(fromModule, fromPort, toModule, toPort)) {
+                            restoredCount++;
+                            ofLogNotice("AudioRouter") << "Restored connection: " << fromModule << "." << fromPort 
+                                                         << " -> " << toModule << "." << toPort;
+                        } else {
+                            ofLogWarning("AudioRouter") << "Failed to restore connection: " << fromModule << "." << fromPort 
+                                                         << " -> " << toModule << "." << toPort;
+                        }
+                    }
                 }
             }
         }
@@ -363,11 +423,32 @@ bool AudioRouter::fromJson(const ofJson& json) {
     return true;
 }
 
-std::shared_ptr<Module> AudioRouter::getModule(const std::string& moduleName) const {
+std::shared_ptr<Module> AudioRouter::getModule(const std::string& identifier) const {
     if (!registry_) {
         return nullptr;
     }
-    return registry_->getModule(moduleName);
+    return registry_->getModule(identifier);
+}
+
+std::string AudioRouter::getNameToUUID(const std::string& identifier) const {
+    if (!registry_) {
+        return identifier;
+    }
+    
+    // Try to get UUID from name (if identifier is a name, this returns UUID)
+    std::string uuid = registry_->getUUID(identifier);
+    if (!uuid.empty()) {
+        return uuid;
+    }
+    
+    // If getUUID returned empty, identifier might already be a UUID
+    // Check if module exists - if so, assume identifier is UUID
+    if (registry_->hasModule(identifier)) {
+        return identifier;
+    }
+    
+    // Fallback: return as-is
+    return identifier;
 }
 
 bool AudioRouter::connectPort(const std::string& fromModule, const std::string& fromPort,
@@ -443,9 +524,13 @@ bool AudioRouter::connectPort(const std::string& fromModule, const std::string& 
         return false;
     }
     
+    // Convert module names to UUIDs for internal storage
+    std::string fromUUID = getNameToUUID(fromModule);
+    std::string toUUID = getNameToUUID(toModule);
+    
     // Check if port already connected (for non-multi-connect ports)
     if (!targetPort->isMultiConnect) {
-        std::string targetPath = toModule + "." + toPort;
+        std::string targetPath = toUUID + "." + toPort;
         auto it = portConnections_.find(targetPath);
         if (it != portConnections_.end() && !it->second.empty()) {
             ofLogWarning("AudioRouter") << "Port already connected: " << toModule << "." << toPort;
@@ -460,9 +545,9 @@ bool AudioRouter::connectPort(const std::string& fromModule, const std::string& 
         ofLogNotice("AudioRouter") << "[CONNECT_PORT] Calling toMod->connectModule(" << fromModule << ")";
         int connectionIndex = toMod->connectModule(fromMod);
         if (connectionIndex >= 0) {
-            // Module managed the connection - track in router for querying
-            std::string sourcePath = fromModule + "." + fromPort;
-            std::string targetPath = toModule + "." + toPort;
+            // Module managed the connection - track in router using UUIDs
+            std::string sourcePath = fromUUID + "." + fromPort;
+            std::string targetPath = toUUID + "." + toPort;
             portConnections_[sourcePath].insert(targetPath);
             
             int totalConnections = getConnectionCount();
@@ -499,9 +584,9 @@ bool AudioRouter::connectPort(const std::string& fromModule, const std::string& 
                 ofLogNotice("AudioRouter") << "[MONITORING] Detected monitoring connection: " << fromModule 
                                           << " -> " << toModule;
                 if (audioOutput->addMonitoringConnection(toMod)) {
-                    // Track connection in router
-                    std::string sourcePath = fromModule + "." + fromPort;
-                    std::string targetPath = toModule + "." + toPort;
+                    // Track connection in router using UUIDs
+                    std::string sourcePath = fromUUID + "." + fromPort;
+                    std::string targetPath = toUUID + "." + toPort;
                     portConnections_[sourcePath].insert(targetPath);
                     
                     ofLogNotice("AudioRouter") << "Connected monitoring audio port: " << fromModule << "." << fromPort 
@@ -517,9 +602,9 @@ bool AudioRouter::connectPort(const std::string& fromModule, const std::string& 
             try {
                 sourceObj->connectTo(*targetObj);
                 
-                // Track connection
-                std::string sourcePath = fromModule + "." + fromPort;
-                std::string targetPath = toModule + "." + toPort;
+                // Track connection using UUIDs
+                std::string sourcePath = fromUUID + "." + fromPort;
+                std::string targetPath = toUUID + "." + toPort;
                 portConnections_[sourcePath].insert(targetPath);
                 
                 ofLogNotice("AudioRouter") << "Connected audio port (direct): " << fromModule << "." << fromPort 
@@ -576,9 +661,13 @@ bool AudioRouter::disconnectInternal(const std::string& from, const std::string&
     auto fromModule = getModule(from);
     auto toModule = getModule(to);
     
-    // Port-based disconnection: Find all connected port pairs between these modules
-    std::string fromPrefix = from + ".";
-    std::string toPrefix = to + ".";
+    // Convert names to UUIDs for finding connections (connections are stored by UUID)
+    std::string fromUUID = getNameToUUID(from);
+    std::string toUUID = getNameToUUID(to);
+    
+    // Port-based disconnection: Find all connected port pairs between these modules (by UUID)
+    std::string fromPrefix = fromUUID + ".";
+    std::string toPrefix = toUUID + ".";
     
     // Collect port pairs to disconnect BEFORE modifying portConnections_
     // This allows us to disconnect actual objects while modules still exist

@@ -157,20 +157,30 @@ Module::ModuleMetadata AudioOutput::getMetadata() const {
     return metadata;
 }
 
-ofJson AudioOutput::toJson() const {
+ofJson AudioOutput::toJson(class ModuleRegistry* registry) const {
     ofJson json;
     json["type"] = "AudioOutput";
     json["name"] = getName();
     json["masterVolume"] = getMasterVolume();
     json["audioDevice"] = getAudioDevice();
     
-    // Serialize connections
+    // Serialize connections - use UUIDs for reliability (consistent with router system)
     std::lock_guard<std::mutex> lock(connectionMutex_);
     ofJson connectionsJson = ofJson::array();
     for (size_t i = 0; i < connectedModules_.size(); i++) {
         if (auto module = connectedModules_[i].lock()) {
             ofJson connJson;
-            connJson["moduleName"] = module->getName();
+            
+            // Registry is always provided by ModuleRegistry::toJson()
+            std::string instanceName = registry->getName(module);
+            std::string uuid = registry->getUUID(instanceName);
+            if (!uuid.empty()) {
+                connJson["moduleUUID"] = uuid;
+            }
+            if (!instanceName.empty()) {
+                connJson["moduleName"] = instanceName;  // For readability
+            }
+            
             connJson["volume"] = (i < connectionVolumes_.size()) ? connectionVolumes_[i] : 1.0f;
             connectionsJson.push_back(connJson);
         }
@@ -235,50 +245,48 @@ void AudioOutput::restoreConnections(const ofJson& connectionsJson, ModuleRegist
     ofLogNotice("AudioOutput") << "[" << getDebugTimestamp() << "] [RESTORE] Before restore - mixer: " << mixerBefore 
                                << ", internal: " << internalBefore;
     
-    // CRITICAL: Match connections by finding the actual connected module
-    // We saved type names ("MediaPool") but need to match to instance names ("mediaPool1", "mediaPool2")
-    // ConnectionManager connects modules in the same order as saved, so we can match by index
-    // BUT we need to verify the match is correct by checking the module type
-    
-    size_t connectionIndex = 0;
+    // Match connections by UUID (preferred) or instance name (fallback)
+    // This is more reliable than index-based matching and works even if connection order changes
     for (const auto& connJson : connectionsJson) {
-        if (!connJson.is_object() || !connJson.contains("moduleName")) {
+        if (!connJson.is_object()) {
             ofLogWarning("AudioOutput") << "[" << getDebugTimestamp() << "] [RESTORE] Skipping invalid connection JSON";
             continue;
         }
         
-        std::string savedModuleName = connJson["moduleName"].get<std::string>(); // Type name like "MediaPool"
-        float volume = connJson.contains("volume") ? connJson["volume"].get<float>() : 1.0f;
-        
-        // Match by index - ConnectionManager connects in the same order as saved
-        // Verify the match by checking if the connected module's type matches the saved type name
-        // Use getConnectionModule() which handles locking internally
-        if (auto module = getConnectionModule(connectionIndex)) {
-            std::string connectedModuleType = module->getName(); // This returns type name
-            
-            // Verify type matches
-            bool typeMatches = (savedModuleName == connectedModuleType);
-            
-            if (typeMatches) {
-                setConnectionVolume(connectionIndex, volume); // This method handles its own locking
-                float restoredVolume = getConnectionVolume(connectionIndex); // This method handles its own locking
-                
-                // Get instance name from registry for logging
-                std::string instanceName = registry ? registry->getName(module) : "";
-                ofLogNotice("AudioOutput") << "[" << getDebugTimestamp() << "] [RESTORE] ✓ Restored volume for connection " 
-                                          << connectionIndex << " (" << instanceName << ", type: " << savedModuleName 
-                                          << ") to " << volume << " (verified: " << restoredVolume << ")";
-            } else {
-                ofLogWarning("AudioOutput") << "[" << getDebugTimestamp() << "] [RESTORE] Type mismatch at index " 
-                                           << connectionIndex << ": saved '" << savedModuleName 
-                                           << "' but found '" << connectedModuleType << "' - skipping";
-            }
+        // Try UUID first, then instance name (both are UUID-based identifiers)
+        std::string moduleIdentifier;
+        if (connJson.contains("moduleUUID")) {
+            moduleIdentifier = connJson["moduleUUID"].get<std::string>();
+        } else if (connJson.contains("moduleName")) {
+            moduleIdentifier = connJson["moduleName"].get<std::string>();
         } else {
-            ofLogWarning("AudioOutput") << "[" << getDebugTimestamp() << "] [RESTORE] Connection " << connectionIndex 
-                                       << " not found or expired";
+            ofLogWarning("AudioOutput") << "[" << getDebugTimestamp() << "] [RESTORE] Connection JSON missing module identifier";
+            continue;
         }
         
-        connectionIndex++;
+        float volume = connJson.contains("volume") ? connJson["volume"].get<float>() : 1.0f;
+        
+        // Find the connected module by UUID or name
+        std::shared_ptr<Module> targetModule = registry->getModule(moduleIdentifier);
+        if (!targetModule) {
+            ofLogWarning("AudioOutput") << "[" << getDebugTimestamp() << "] [RESTORE] Module not found: " << moduleIdentifier;
+            continue;
+        }
+        
+        // Find the connection index for this module
+        int connectionIndex = getConnectionIndex(targetModule);
+        if (connectionIndex < 0) {
+            ofLogWarning("AudioOutput") << "[" << getDebugTimestamp() << "] [RESTORE] Module " << moduleIdentifier 
+                                       << " is not connected to this output";
+            continue;
+        }
+        
+        // Restore volume
+        setConnectionVolume(connectionIndex, volume);
+        
+        std::string instanceName = registry->getName(targetModule);
+        ofLogNotice("AudioOutput") << "[" << getDebugTimestamp() << "] [RESTORE] ✓ Restored volume for connection " 
+                                  << connectionIndex << " (" << instanceName << ") to " << volume;
     }
     
     size_t mixerAfter = soundMixer_.getNumConnections();

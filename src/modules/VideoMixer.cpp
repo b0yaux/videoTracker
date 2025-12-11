@@ -150,7 +150,7 @@ Module::ModuleMetadata VideoMixer::getMetadata() const {
     return metadata;
 }
 
-ofJson VideoMixer::toJson() const {
+ofJson VideoMixer::toJson(class ModuleRegistry* registry) const {
     ofJson json;
     json["type"] = "VideoMixer";
     json["name"] = getName();

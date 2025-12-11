@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+struct ImVec2;  // Forward declaration for ImGui types
 
 // Forward declarations
 class ParameterRouter;

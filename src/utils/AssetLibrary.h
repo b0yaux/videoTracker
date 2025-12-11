@@ -86,6 +86,18 @@ public:
     std::vector<std::string> getNewAssets();
     void clearNewAssets();
     
+    // Get total size of all assets in library
+    size_t getTotalLibrarySize() const;
+    
+    // Refresh asset list by scanning directory and updating index
+    void refreshAssetList();
+    
+    // Generate waveform for asset from audio buffer (caller provides buffer from file or player)
+    void generateWaveformForAsset(AssetInfo& asset, const ofSoundBuffer& buffer);
+    
+    // Save asset index to disk (public for GUI to call after on-demand waveform generation)
+    void saveAssetIndex();
+    
 private:
     ProjectManager* projectManager_;
     MediaConverter* mediaConverter_;
@@ -98,8 +110,8 @@ private:
     std::string generateAssetId(const std::string& filePath) const;
     std::string getAssetStoragePath(const std::string& assetId, bool isVideo, const std::string& assetFolder) const;
     void loadAssetIndex();
-    void saveAssetIndex();
     void processConversionUpdates();
+    void scanDirectoryForAssets(const std::string& dirPath, const std::string& relativeFolder, std::map<std::string, std::pair<std::string, std::string>>& foundFiles);
     bool isVideoFile(const std::string& filePath) const;
     bool isAudioFile(const std::string& filePath) const;
     bool isHAPCodec(const std::string& filePath) const;

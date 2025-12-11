@@ -208,7 +208,7 @@ std::vector<Port> Spectrogram::getOutputPorts() const {
     return ports;
 }
 
-ofJson Spectrogram::toJson() const {
+ofJson Spectrogram::toJson(class ModuleRegistry* registry) const {
     ofJson json;
     json["type"] = "Spectrogram";
     json["name"] = getName();

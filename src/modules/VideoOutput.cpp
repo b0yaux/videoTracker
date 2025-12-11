@@ -169,7 +169,7 @@ Module::ModuleMetadata VideoOutput::getMetadata() const {
     return metadata;
 }
 
-ofJson VideoOutput::toJson() const {
+ofJson VideoOutput::toJson(class ModuleRegistry* registry) const {
     ofJson json;
     json["type"] = "VideoOutput";
     json["name"] = getName();
@@ -185,13 +185,23 @@ ofJson VideoOutput::toJson() const {
     
     json["autoNormalize"] = getAutoNormalize();
     
-    // Serialize connections
+    // Serialize connections - use UUIDs for reliability (consistent with router system)
     std::lock_guard<std::mutex> lock(connectionMutex_);
     ofJson connectionsJson = ofJson::array();
     for (size_t i = 0; i < connectedModules_.size(); i++) {
         if (auto module = connectedModules_[i].lock()) {
             ofJson connJson;
-            connJson["moduleName"] = module->getName();
+            
+            // Registry is always provided by ModuleRegistry::toJson()
+            std::string instanceName = registry->getName(module);
+            std::string uuid = registry->getUUID(instanceName);
+            if (!uuid.empty()) {
+                connJson["moduleUUID"] = uuid;
+            }
+            if (!instanceName.empty()) {
+                connJson["moduleName"] = instanceName;  // For readability
+            }
+            
             connJson["opacity"] = (i < sourceOpacities_.size()) ? sourceOpacities_[i] : 1.0f;
             
             ofBlendMode mode = (i < sourceBlendModes_.size()) ? sourceBlendModes_[i] : getBlendMode();
@@ -245,19 +255,44 @@ void VideoOutput::restoreConnections(const ofJson& connectionsJson, ModuleRegist
                                << (connectionsJson.is_array() ? connectionsJson.size() : 0) << " connections"
                                << " (current sources: " << sourcesBefore << ")";
     
-    // CRITICAL: Match connections by finding the actual connected module
-    // We saved type names ("MediaPool") but need to match to instance names ("mediaPool1", "mediaPool2")
-    // ConnectionManager connects modules in the same order as saved, so we can match by index
-    // BUT we need to verify the match is correct by checking the module type
+    // Restore parameters and track desired order in one pass
+    // JSON array index = desired layer position (0 = bottom, last = top)
+    std::vector<std::pair<std::shared_ptr<Module>, size_t>> orderMap; // (module, desiredIndex)
     
-    size_t sourceIndex = 0;
-    for (const auto& connJson : connectionsJson) {
-        if (!connJson.is_object() || !connJson.contains("moduleName")) {
+    for (size_t desiredIndex = 0; desiredIndex < connectionsJson.size(); desiredIndex++) {
+        const auto& connJson = connectionsJson[desiredIndex];
+        if (!connJson.is_object()) {
             ofLogWarning("VideoOutput") << "[RESTORE] Skipping invalid connection JSON";
             continue;
         }
         
-        std::string savedModuleName = connJson["moduleName"].get<std::string>(); // Type name like "MediaPool"
+        // Try UUID first, then instance name (both are UUID-based identifiers)
+        std::string moduleIdentifier;
+        if (connJson.contains("moduleUUID")) {
+            moduleIdentifier = connJson["moduleUUID"].get<std::string>();
+        } else if (connJson.contains("moduleName")) {
+            moduleIdentifier = connJson["moduleName"].get<std::string>();
+        } else {
+            ofLogWarning("VideoOutput") << "[RESTORE] Connection JSON missing module identifier";
+            continue;
+        }
+        
+        // Find the connected module by UUID or name
+        std::shared_ptr<Module> targetModule = registry->getModule(moduleIdentifier);
+        if (!targetModule) {
+            ofLogWarning("VideoOutput") << "[RESTORE] Module not found: " << moduleIdentifier;
+            continue;
+        }
+        
+        // Find the connection index for this module
+        int sourceIndex = getConnectionIndex(targetModule);
+        if (sourceIndex < 0) {
+            ofLogWarning("VideoOutput") << "[RESTORE] Module " << moduleIdentifier 
+                                       << " is not connected to this output";
+            continue;
+        }
+        
+        // Restore opacity and blend mode
         float opacity = connJson.contains("opacity") ? connJson["opacity"].get<float>() : 1.0f;
         int blendModeIndex = connJson.contains("blendMode") ? connJson["blendMode"].get<int>() : 0;
         
@@ -266,42 +301,23 @@ void VideoOutput::restoreConnections(const ofJson& connectionsJson, ModuleRegist
         else if (blendModeIndex == 1) blendMode = OF_BLENDMODE_MULTIPLY;
         else if (blendModeIndex == 2) blendMode = OF_BLENDMODE_ALPHA;
         
-        // Match by index - ConnectionManager connects in the same order as saved
-        // Verify the match by checking if the connected module's type matches the saved type name
-        // Use getSourceModule() which handles locking internally
-        if (auto module = getSourceModule(sourceIndex)) {
-            std::string connectedModuleType = module->getName(); // This returns type name
-            
-            // Verify type matches
-            bool typeMatches = (savedModuleName == connectedModuleType);
-            
-            if (typeMatches) {
-                setSourceOpacity(sourceIndex, opacity); // This method handles its own locking
-                setSourceBlendMode(sourceIndex, blendMode); // This method handles its own locking
-                
-                // Verify values were set correctly
-                float restoredOpacity = getSourceOpacity(sourceIndex); // This method handles its own locking
-                ofBlendMode restoredBlendMode = getSourceBlendMode(sourceIndex); // This method handles its own locking
-                
-                // Get instance name from registry for logging
-                std::string instanceName = registry ? registry->getName(module) : "";
-                ofLogNotice("VideoOutput") << "[RESTORE] ✓ Restored opacity " << opacity 
-                                        << " (verified: " << restoredOpacity << ")"
-                                        << " and blend mode " << blendModeIndex 
-                                        << " (verified: " << (int)restoredBlendMode << ")"
-                                        << " for connection " << sourceIndex 
-                                        << " (" << instanceName << ", type: " << savedModuleName << ")";
-            } else {
-                ofLogWarning("VideoOutput") << "[RESTORE] Type mismatch at index " << sourceIndex 
-                                           << ": saved '" << savedModuleName 
-                                           << "' but found '" << connectedModuleType << "' - skipping";
-            }
-        } else {
-            ofLogWarning("VideoOutput") << "[RESTORE] Connection " << sourceIndex 
-                                       << " not found or expired";
-        }
+        setSourceOpacity(sourceIndex, opacity);
+        setSourceBlendMode(sourceIndex, blendMode);
         
-        sourceIndex++;
+        // Track desired order for reordering pass
+        orderMap.push_back({targetModule, desiredIndex});
+    }
+    
+    // Restore connection order: move each connection to its desired position
+    for (const auto& [targetModule, desiredIndex] : orderMap) {
+        int currentIndex = getConnectionIndex(targetModule);
+        if (currentIndex < 0 || currentIndex == static_cast<int>(desiredIndex)) continue;
+        
+        if (reorderSource(currentIndex, desiredIndex)) {
+            std::string instanceName = registry->getName(targetModule);
+            ofLogNotice("VideoOutput") << "[RESTORE] ✓ Reordered " << instanceName 
+                                    << " from " << currentIndex << " to " << desiredIndex;
+        }
     }
     
     size_t sourcesAfter = getNumConnections();

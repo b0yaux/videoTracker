@@ -13,13 +13,19 @@ EventRouter::~EventRouter() {
 }
 
 void EventRouter::clear() {
-    // Unsubscribe all before clearing
-    auto subscriptionsCopy = subscriptions_;
-    for (const auto& sub : subscriptionsCopy) {
-        try {
-            unsubscribe(sub.sourceModule, sub.eventName, sub.targetModule, sub.handlerName);
-        } catch (...) {
-            // Silently handle any unsubscription errors during cleanup
+    // Unsubscribe all before clearing (convert UUIDs to names for unsubscribe)
+    if (registry_) {
+        auto subscriptionsCopy = subscriptions_;
+        for (const auto& sub : subscriptionsCopy) {
+            try {
+                std::string sourceName = registry_->getName(sub.sourceUUID);
+                std::string targetName = registry_->getName(sub.targetUUID);
+                if (!sourceName.empty() && !targetName.empty()) {
+                    unsubscribe(sourceName, sub.eventName, targetName, sub.handlerName);
+                }
+            } catch (...) {
+                // Silently handle any unsubscription errors during cleanup
+            }
         }
     }
     subscriptions_.clear();
@@ -46,8 +52,12 @@ bool EventRouter::subscribe(const std::string& sourceModule, const std::string& 
         return false;
     }
     
-    // Check if subscription already exists
-    Subscription sub(sourceModule, eventName, targetModule, handlerName);
+    // Convert names to UUIDs for internal storage
+    std::string sourceUUID = getNameToUUID(sourceModule);
+    std::string targetUUID = getNameToUUID(targetModule);
+    
+    // Check if subscription already exists (using UUIDs)
+    Subscription sub(sourceUUID, eventName, targetUUID, handlerName);
     if (hasSubscription(sourceModule, eventName, targetModule, handlerName)) {
         ofLogNotice("EventRouter") << "Event subscription already exists: " 
                                     << sourceModule << "." << eventName 
@@ -55,7 +65,7 @@ bool EventRouter::subscribe(const std::string& sourceModule, const std::string& 
         return true;
     }
     
-    // Get modules
+    // Get modules (using names for actual module access)
     auto source = getModule(sourceModule);
     if (!source) {
         ofLogError("EventRouter") << "Source module not found: " << sourceModule;
@@ -127,12 +137,17 @@ bool EventRouter::unsubscribe(const std::string& sourceModule, const std::string
         return false;
     }
     
+    // Convert names to UUIDs for lookup (subscriptions are stored by UUID)
+    std::string sourceUUID = getNameToUUID(sourceModule);
+    std::string targetUUID = getNameToUUID(targetModule);
+    Subscription sub(sourceUUID, eventName, targetUUID, handlerName);
+    
     // Check if subscription exists
-    if (!hasSubscription(sourceModule, eventName, targetModule, handlerName)) {
+    if (subscriptions_.find(sub) == subscriptions_.end()) {
         return false;
     }
     
-    // Get modules
+    // Get modules (using names for actual module access)
     auto source = getModule(sourceModule);
     auto target = getModule(targetModule);
     
@@ -141,8 +156,7 @@ bool EventRouter::unsubscribe(const std::string& sourceModule, const std::string
         if (eventName == "triggerEvent" && handlerName == "onTrigger") {
             ofEvent<TriggerEvent>* event = source->getEvent(eventName);
             if (event) {
-                // Find and remove the stored wrapper
-                Subscription sub(sourceModule, eventName, targetModule, handlerName);
+                // Find and remove the stored wrapper (using UUID-based subscription)
                 auto it = eventWrappers_.find(sub);
                 if (it != eventWrappers_.end()) {
                     // Remove using member function pointer
@@ -156,8 +170,7 @@ bool EventRouter::unsubscribe(const std::string& sourceModule, const std::string
         }
     }
     
-    // Remove from tracking
-    Subscription sub(sourceModule, eventName, targetModule, handlerName);
+    // Remove from tracking (using UUID-based subscription)
     subscriptions_.erase(sub);
     
     ofLogVerbose("EventRouter") << "Unsubscribed from event: " 
@@ -168,42 +181,70 @@ bool EventRouter::unsubscribe(const std::string& sourceModule, const std::string
 }
 
 bool EventRouter::unsubscribeAll(const std::string& moduleName) {
-    if (moduleName.empty()) {
-        ofLogWarning("EventRouter") << "Cannot unsubscribeAll with empty module name";
+    if (moduleName.empty() || !registry_) {
+        ofLogWarning("EventRouter") << "Cannot unsubscribeAll with empty module name or no registry";
         return false;
     }
     
+    // Convert name to UUID (subscriptions are stored by UUID)
+    std::string moduleUUID = getNameToUUID(moduleName);
+    
     bool unsubscribed = false;
     
-    // Find all subscriptions involving this module (as source or target)
+    // Find all subscriptions involving this module (as source or target, by UUID)
     std::vector<Subscription> toRemove;
     for (const auto& sub : subscriptions_) {
-        if (sub.sourceModule == moduleName || sub.targetModule == moduleName) {
+        if (sub.sourceUUID == moduleUUID || sub.targetUUID == moduleUUID) {
             toRemove.push_back(sub);
         }
     }
     
-    // Unsubscribe them
+    // Unsubscribe them (convert UUIDs back to names for unsubscribe)
     for (const auto& sub : toRemove) {
-        if (unsubscribe(sub.sourceModule, sub.eventName, sub.targetModule, sub.handlerName)) {
-            unsubscribed = true;
+        std::string sourceName = registry_->getName(sub.sourceUUID);
+        std::string targetName = registry_->getName(sub.targetUUID);
+        if (!sourceName.empty() && !targetName.empty()) {
+            if (unsubscribe(sourceName, sub.eventName, targetName, sub.handlerName)) {
+                unsubscribed = true;
+            }
         }
     }
     
     return unsubscribed;
 }
 
+// renameModule removed - subscriptions are now UUID-based, so renaming doesn't affect them
+
 bool EventRouter::hasSubscription(const std::string& sourceModule, const std::string& eventName,
                                  const std::string& targetModule, const std::string& handlerName) const {
-    Subscription sub(sourceModule, eventName, targetModule, handlerName);
+    if (!registry_) {
+        return false;
+    }
+    
+    // Convert names to UUIDs (subscriptions are stored by UUID)
+    std::string sourceUUID = getNameToUUID(sourceModule);
+    std::string targetUUID = getNameToUUID(targetModule);
+    Subscription sub(sourceUUID, eventName, targetUUID, handlerName);
     return subscriptions_.find(sub) != subscriptions_.end();
 }
 
 std::vector<EventRouter::Subscription> EventRouter::getSubscriptionsFrom(const std::string& sourceModule) const {
     std::vector<Subscription> result;
+    if (!registry_) {
+        return result;
+    }
+    
+    // Convert name to UUID (subscriptions are stored by UUID)
+    std::string sourceUUID = getNameToUUID(sourceModule);
     for (const auto& sub : subscriptions_) {
-        if (sub.sourceModule == sourceModule) {
-            result.push_back(sub);
+        if (sub.sourceUUID == sourceUUID) {
+            // Return subscription with names for compatibility (create temporary Subscription with names)
+            Subscription namedSub;
+            namedSub.sourceUUID = sub.sourceUUID;
+            namedSub.eventName = sub.eventName;
+            namedSub.targetUUID = sub.targetUUID;
+            namedSub.handlerName = sub.handlerName;
+            result.push_back(namedSub);
         }
     }
     return result;
@@ -211,9 +252,21 @@ std::vector<EventRouter::Subscription> EventRouter::getSubscriptionsFrom(const s
 
 std::vector<EventRouter::Subscription> EventRouter::getSubscriptionsTo(const std::string& targetModule) const {
     std::vector<Subscription> result;
+    if (!registry_) {
+        return result;
+    }
+    
+    // Convert name to UUID (subscriptions are stored by UUID)
+    std::string targetUUID = getNameToUUID(targetModule);
     for (const auto& sub : subscriptions_) {
-        if (sub.targetModule == targetModule) {
-            result.push_back(sub);
+        if (sub.targetUUID == targetUUID) {
+            // Return subscription with names for compatibility (create temporary Subscription with names)
+            Subscription namedSub;
+            namedSub.sourceUUID = sub.sourceUUID;
+            namedSub.eventName = sub.eventName;
+            namedSub.targetUUID = sub.targetUUID;
+            namedSub.handlerName = sub.handlerName;
+            result.push_back(namedSub);
         }
     }
     return result;
@@ -225,11 +278,18 @@ int EventRouter::getSubscriptionCount() const {
 
 ofJson EventRouter::toJson() const {
     ofJson json = ofJson::array();
+    if (!registry_) {
+        return json;
+    }
+    
     for (const auto& sub : subscriptions_) {
         ofJson subJson;
-        subJson["sourceModule"] = sub.sourceModule;
+        // Store UUIDs (for reliability) and names (for readability)
+        subJson["sourceUUID"] = sub.sourceUUID;
+        subJson["sourceModule"] = registry_->getName(sub.sourceUUID);
         subJson["eventName"] = sub.eventName;
-        subJson["targetModule"] = sub.targetModule;
+        subJson["targetUUID"] = sub.targetUUID;
+        subJson["targetModule"] = registry_->getName(sub.targetUUID);
         subJson["handlerName"] = sub.handlerName;
         subJson["type"] = "event";
         json.push_back(subJson);
@@ -246,24 +306,56 @@ bool EventRouter::fromJson(const ofJson& json) {
     clear();
     
     for (const auto& subJson : json) {
-        if (subJson.contains("sourceModule") && subJson.contains("eventName") &&
-            subJson.contains("targetModule") && subJson.contains("handlerName") &&
-            subJson.contains("type") && subJson["type"] == "event") {
-            std::string source = subJson["sourceModule"].get<std::string>();
-            std::string event = subJson["eventName"].get<std::string>();
-            std::string target = subJson["targetModule"].get<std::string>();
-            std::string handler = subJson["handlerName"].get<std::string>();
-            subscribe(source, event, target, handler);
+        if (subJson.contains("type") && subJson["type"] == "event") {
+            // UUID-based format
+            if (subJson.contains("sourceUUID") && subJson.contains("eventName") &&
+                subJson.contains("targetUUID") && subJson.contains("handlerName")) {
+                std::string sourceUUID = subJson["sourceUUID"].get<std::string>();
+                std::string event = subJson["eventName"].get<std::string>();
+                std::string targetUUID = subJson["targetUUID"].get<std::string>();
+                std::string handler = subJson["handlerName"].get<std::string>();
+                
+                // Convert UUIDs to names for subscribe (public API accepts names for consistency)
+                // Note: subscribe will convert back to UUIDs internally - this keeps the API clean
+                if (registry_) {
+                    std::string source = registry_->getName(sourceUUID);
+                    std::string target = registry_->getName(targetUUID);
+                    if (!source.empty() && !target.empty()) {
+                        subscribe(source, event, target, handler);
+                    }
+                }
+            }
         }
     }
     
     return true;
 }
 
-std::shared_ptr<Module> EventRouter::getModule(const std::string& moduleName) const {
+std::shared_ptr<Module> EventRouter::getModule(const std::string& identifier) const {
     if (!registry_) {
         return nullptr;
     }
-    return registry_->getModule(moduleName);
+    return registry_->getModule(identifier);
+}
+
+std::string EventRouter::getNameToUUID(const std::string& identifier) const {
+    if (!registry_) {
+        return identifier;
+    }
+    
+    // Try to get UUID from name (if identifier is a name, this returns UUID)
+    std::string uuid = registry_->getUUID(identifier);
+    if (!uuid.empty()) {
+        return uuid;
+    }
+    
+    // If getUUID returned empty, identifier might already be a UUID
+    // Check if module exists - if so, assume identifier is UUID
+    if (registry_->hasModule(identifier)) {
+        return identifier;
+    }
+    
+    // Fallback: return as-is
+    return identifier;
 }
 

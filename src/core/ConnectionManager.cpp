@@ -34,6 +34,20 @@ void ConnectionManager::clear() {
     ofLogNotice("ConnectionManager") << "Cleared all connections";
 }
 
+void ConnectionManager::renameModule(const std::string& oldName, const std::string& newName) {
+    if (oldName == newName || oldName.empty() || newName.empty()) {
+        return;
+    }
+    
+    // Note: AudioRouter, VideoRouter, and EventRouter now use UUID-based connections, so renaming doesn't affect them
+    // Only ParameterRouter still uses name-based paths, so update it
+    if (parameterRouter_) {
+        parameterRouter_->renameModule(oldName, newName);
+    }
+    
+    ofLogNotice("ConnectionManager") << "Renamed module (audio/video/event connections are UUID-based, no router updates needed): " << oldName << " -> " << newName;
+}
+
 bool ConnectionManager::disconnectAll(const std::string& moduleName) {
     if (moduleName.empty()) {
         ofLogWarning("ConnectionManager") << "Cannot disconnectAll with empty module name";
@@ -264,8 +278,12 @@ bool ConnectionManager::unsubscribeEvent(const std::string& sourceModule, const 
         // If handlerName not provided, unsubscribe all matching subscriptions
         auto subscriptions = eventRouter_.getSubscriptionsFrom(sourceModule);
         for (const auto& sub : subscriptions) {
-            if (sub.eventName == eventName && sub.targetModule == targetModule) {
-                if (eventRouter_.unsubscribe(sub.sourceModule, sub.eventName, sub.targetModule, sub.handlerName)) {
+            // Convert UUIDs to names for comparison and unsubscribe
+            if (!registry_) continue;
+            std::string subSourceName = registry_->getName(sub.sourceUUID);
+            std::string subTargetName = registry_->getName(sub.targetUUID);
+            if (sub.eventName == eventName && subTargetName == targetModule) {
+                if (eventRouter_.unsubscribe(subSourceName, sub.eventName, subTargetName, sub.handlerName)) {
                     unsubscribed = true;
                 }
             }
@@ -449,10 +467,16 @@ std::vector<ConnectionManager::Connection> ConnectionManager::getConnections() c
     for (const auto& moduleName : allModules) {
         auto subs = eventRouter_.getSubscriptionsFrom(moduleName);
         for (const auto& sub : subs) {
-            Connection conn(sub.sourceModule, sub.targetModule, ConnectionType::EVENT);
-            conn.eventName = sub.eventName;
-            conn.handlerName = sub.handlerName;
-            connections.push_back(conn);
+            // Convert UUIDs to names for Connection object
+            if (!registry_) continue;
+            std::string sourceName = registry_->getName(sub.sourceUUID);
+            std::string targetName = registry_->getName(sub.targetUUID);
+            if (!sourceName.empty() && !targetName.empty()) {
+                Connection conn(sourceName, targetName, ConnectionType::EVENT);
+                conn.eventName = sub.eventName;
+                conn.handlerName = sub.handlerName;
+                connections.push_back(conn);
+            }
         }
     }
     
@@ -498,10 +522,16 @@ std::vector<ConnectionManager::Connection> ConnectionManager::getConnectionsFrom
     // Query event subscriptions directly
     auto subs = eventRouter_.getSubscriptionsFrom(moduleName);
     for (const auto& sub : subs) {
-        Connection conn(sub.sourceModule, sub.targetModule, ConnectionType::EVENT);
-        conn.eventName = sub.eventName;
-        conn.handlerName = sub.handlerName;
-        result.push_back(conn);
+        // Convert UUIDs to names for Connection object
+        if (!registry_) continue;
+        std::string sourceName = registry_->getName(sub.sourceUUID);
+        std::string targetName = registry_->getName(sub.targetUUID);
+        if (!sourceName.empty() && !targetName.empty()) {
+            Connection conn(sourceName, targetName, ConnectionType::EVENT);
+            conn.eventName = sub.eventName;
+            conn.handlerName = sub.handlerName;
+            result.push_back(conn);
+        }
     }
     
     return result;
@@ -548,11 +578,16 @@ std::vector<ConnectionManager::Connection> ConnectionManager::getConnectionsTo(c
     for (const auto& sourceName : allModules) {
         auto subs = eventRouter_.getSubscriptionsFrom(sourceName);
         for (const auto& sub : subs) {
-            if (sub.targetModule == moduleName) {
-                Connection conn(sub.sourceModule, sub.targetModule, ConnectionType::EVENT);
-                conn.eventName = sub.eventName;
-                conn.handlerName = sub.handlerName;
-                result.push_back(conn);
+            // Convert UUIDs to names for comparison and Connection object
+            std::string targetName = registry_->getName(sub.targetUUID);
+            if (targetName == moduleName) {
+                std::string sourceNameFromSub = registry_->getName(sub.sourceUUID);
+                if (!sourceNameFromSub.empty()) {
+                    Connection conn(sourceNameFromSub, targetName, ConnectionType::EVENT);
+                    conn.eventName = sub.eventName;
+                    conn.handlerName = sub.handlerName;
+                    result.push_back(conn);
+                }
             }
         }
     }
@@ -608,10 +643,15 @@ std::vector<ConnectionManager::Connection> ConnectionManager::getConnectionsByTy
             for (const auto& moduleName : allModules) {
                 auto subs = eventRouter_.getSubscriptionsFrom(moduleName);
                 for (const auto& sub : subs) {
-                    Connection conn(sub.sourceModule, sub.targetModule, ConnectionType::EVENT);
-                    conn.eventName = sub.eventName;
-                    conn.handlerName = sub.handlerName;
-                    result.push_back(conn);
+                    // Convert UUIDs to names for Connection object
+                    std::string sourceName = registry_->getName(sub.sourceUUID);
+                    std::string targetName = registry_->getName(sub.targetUUID);
+                    if (!sourceName.empty() && !targetName.empty()) {
+                        Connection conn(sourceName, targetName, ConnectionType::EVENT);
+                        conn.eventName = sub.eventName;
+                        conn.handlerName = sub.handlerName;
+                        result.push_back(conn);
+                    }
                 }
             }
             break;
@@ -631,10 +671,13 @@ bool ConnectionManager::hasConnection(const std::string& fromModule, const std::
         case ConnectionType::EVENT: {
             auto subs = eventRouter_.getSubscriptionsFrom(fromModule);
             for (const auto& sub : subs) {
-                if (sub.targetModule == toModule) {
+                // Convert UUID to name for comparison
+                if (!registry_) return false;
+                std::string targetName = registry_->getName(sub.targetUUID);
+                if (targetName == toModule) {
                     return true;
-        }
-    }
+                }
+            }
             return false;
         }
         case ConnectionType::PARAMETER: {
@@ -732,26 +775,10 @@ bool ConnectionManager::fromJson(const ofJson& json) {
     }
     
     // Load event subscriptions via EventRouter
+    // EventRouter::fromJson() handles both UUID-based (new) and name-based (legacy) formats
     if (json.contains("eventSubscriptions")) {
         if (!eventRouter_.fromJson(json["eventSubscriptions"])) {
             ofLogWarning("ConnectionManager") << "Failed to restore event subscriptions";
-        }
-    }
-    
-    // Legacy format support (for backward compatibility)
-    if (json.contains("eventSubscriptions") && json["eventSubscriptions"].is_array()) {
-        for (const auto& sub : json["eventSubscriptions"]) {
-            if (sub.contains("sourceModule") && sub.contains("eventName") &&
-                sub.contains("targetModule") && sub.contains("handlerName")) {
-                std::string source = sub["sourceModule"].get<std::string>();
-                std::string event = sub["eventName"].get<std::string>();
-                std::string target = sub["targetModule"].get<std::string>();
-                std::string handler = sub["handlerName"].get<std::string>();
-                if (!subscribeEvent(source, event, target, handler)) {
-                    ofLogWarning("ConnectionManager") << "Failed to restore event subscription: " 
-                                                      << source << "." << event << " -> " << target;
-                }
-            }
         }
     }
     

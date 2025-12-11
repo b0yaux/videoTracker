@@ -132,6 +132,24 @@ bool ParameterRouter::disconnect(const ParameterPath& sourcePath) {
     return true;
 }
 
+void ParameterRouter::renameModule(const std::string& oldName, const std::string& newName) {
+    if (oldName == newName || oldName.empty() || newName.empty()) {
+        return;
+    }
+    
+    // Update all connections where source or target instance name matches oldName
+    for (auto& conn : connections) {
+        if (conn.sourcePath.getInstanceName() == oldName) {
+            conn.sourcePath.setInstanceName(newName);
+        }
+        if (conn.targetPath.getInstanceName() == oldName) {
+            conn.targetPath.setInstanceName(newName);
+        }
+    }
+    
+    ofLogNotice("ParameterRouter") << "Renamed module in parameter connections: " << oldName << " -> " << newName;
+}
+
 void ParameterRouter::clear() {
     size_t count = connections.size();
     connections.clear();

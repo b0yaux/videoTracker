@@ -99,7 +99,7 @@ Module::ModuleMetadata AudioMixer::getMetadata() const {
     return metadata;
 }
 
-ofJson AudioMixer::toJson() const {
+ofJson AudioMixer::toJson(class ModuleRegistry* registry) const {
     ofJson json;
     json["type"] = "AudioMixer";
     json["name"] = getName();

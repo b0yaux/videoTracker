@@ -157,6 +157,9 @@ bool GUIManager::renameInstance(const std::string& oldName, const std::string& n
         return false;
     }
     
+    // Note: Window position is now preserved automatically via UUID-based window IDs
+    // (ViewManager uses "DisplayName###UUID" format, so UUID stays constant across renames)
+    
     // Update visibility set
     bool wasVisible = visibleInstances.find(oldName) != visibleInstances.end();
     if (wasVisible) {

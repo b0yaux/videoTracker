@@ -42,6 +42,12 @@ private:
  * Extracted from ConnectionManager to provide focused event routing functionality.
  * Manages ofEvent subscriptions for trigger events and other module events.
  * 
+ * Design Philosophy:
+ * - Public APIs accept module names (user-friendly, backward compatible)
+ * - Internal storage uses UUIDs (stable across renames, no renameModule needed)
+ * - Serialization saves both UUIDs (primary) and names (readability)
+ * - This separation ensures subscriptions persist when modules are renamed
+ * 
  * Usage:
  *   EventRouter router(&registry);
  *   router.subscribe("tracker1", "triggerEvent", "pool1", "onTrigger");
@@ -51,23 +57,24 @@ class EventRouter {
 public:
     /**
      * Event subscription information
+     * Stores UUIDs internally to avoid needing renameModule when modules are renamed
      */
     struct Subscription {
-        std::string sourceModule;
+        std::string sourceUUID;  // UUID of source module
         std::string eventName;
-        std::string targetModule;
+        std::string targetUUID;  // UUID of target module
         std::string handlerName;
         
         Subscription() {}
-        Subscription(const std::string& source, const std::string& event,
-                    const std::string& target, const std::string& handler)
-            : sourceModule(source), eventName(event),
-              targetModule(target), handlerName(handler) {}
+        Subscription(const std::string& sourceUUID, const std::string& event,
+                    const std::string& targetUUID, const std::string& handler)
+            : sourceUUID(sourceUUID), eventName(event),
+              targetUUID(targetUUID), handlerName(handler) {}
         
         bool operator<(const Subscription& other) const {
-            if (sourceModule != other.sourceModule) return sourceModule < other.sourceModule;
+            if (sourceUUID != other.sourceUUID) return sourceUUID < other.sourceUUID;
             if (eventName != other.eventName) return eventName < other.eventName;
-            if (targetModule != other.targetModule) return targetModule < other.targetModule;
+            if (targetUUID != other.targetUUID) return targetUUID < other.targetUUID;
             return handlerName < other.handlerName;
         }
     };
@@ -165,6 +172,9 @@ private:
     std::map<Subscription, std::shared_ptr<ModuleEventWrapper>> eventWrappers_;
     
     // Helper methods
-    std::shared_ptr<Module> getModule(const std::string& moduleName) const;
+    std::shared_ptr<Module> getModule(const std::string& identifier) const;
+    
+    // Convert module name to UUID (returns UUID if identifier is already UUID)
+    std::string getNameToUUID(const std::string& identifier) const;
 };
 

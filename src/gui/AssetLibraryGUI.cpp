@@ -113,10 +113,11 @@ void AssetLibraryGUI::drawImportControls() {
         }
     }
     
-    // Show asset count inline
+    // Show asset count and total size inline
     ImGui::SameLine();
     size_t totalAssets = assetLibrary_->getAllAssetIds().size();
-    ImGui::TextDisabled("(%zu assets)", totalAssets);
+    size_t totalSize = assetLibrary_->getTotalLibrarySize();
+    ImGui::TextDisabled("(%zu assets, %s)", totalAssets, formatFileSize(totalSize).c_str());
 }
 
 //--------------------------------------------------------------
@@ -418,48 +419,71 @@ void AssetLibraryGUI::drawAssetRow(const std::string& assetId, int indentLevel) 
     // Remove indentation
     if (indentLevel > 0) {
         ImGui::Unindent(20.0f * indentLevel);
-}
-            
-            // Handle click-to-preview (only if not dragging)
-            // Use IsItemClicked(0) to detect left-click, and check if mouse was released without dragging
-            if (ImGui::IsItemClicked(0)) {
-                // Check if mouse was dragged (drag distance threshold)
-                ImVec2 mouseDragDelta = ImGui::GetMouseDragDelta(0);
-                float dragDistance = sqrtf(mouseDragDelta.x * mouseDragDelta.x + mouseDragDelta.y * mouseDragDelta.y);
-                
-                // If drag distance is small (< 5 pixels), treat as click for preview
-                if (dragDistance < 5.0f) {
-                    // Toggle preview: if already previewing this asset, stop it; otherwise start preview
-                    if (previewPlayer_ && previewingAssetId_ == assetId && previewPlayer_->isPlaying()) {
-                        // Already playing this asset - stop preview
-                        stopAssetPreview();
-                    } else {
-                        // Not playing or different asset - start preview
-                        playAssetPreview(assetId, *asset);
-                    }
+    }
+    
+    // Keyboard navigation: Enter to preview, Cmd+Enter for context menu
+    // Check if this item is selected or focused, and handle keyboard input
+    bool itemActive = isSelected || ImGui::IsItemFocused() || ImGui::IsItemActive();
+    if (itemActive) {
+        ImGuiIO& io = ImGui::GetIO();
+        bool cmdOrCtrlPressed = io.KeySuper || io.KeyCtrl; // Cmd on macOS, Ctrl on others
+        
+        // Enter key: start/stop preview
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
+            if (!cmdOrCtrlPressed) {
+                // Regular Enter: toggle preview
+                if (previewPlayer_ && previewingAssetId_ == assetId && previewPlayer_->isPlaying()) {
+                    stopAssetPreview();
                 } else {
-                    // Large drag distance - handle as selection only (drag & drop)
-                    if (ImGui::GetIO().KeyCtrl) {
-                        // Toggle selection
-                        if (isSelected) {
-                            selectedAssets_.erase(assetId);
-                        } else {
-                            selectedAssets_.insert(assetId);
-                        }
-                    } else {
-                        // Single selection
-                        selectedAssets_.clear();
-                        selectedAssets_.insert(assetId);
-                    }
+                    playAssetPreview(assetId, *asset);
                 }
+            } else {
+                // Cmd+Enter: open context menu
+                ImGui::OpenPopup(("AssetContext_" + assetId).c_str());
             }
-            
+        }
+    }
+    
+    // Handle click-to-preview (only if not dragging)
+    // Use IsItemClicked(0) to detect left-click, and check if mouse was released without dragging
+    if (ImGui::IsItemClicked(0)) {
+        // Check if mouse was dragged (drag distance threshold)
+        ImVec2 mouseDragDelta = ImGui::GetMouseDragDelta(0);
+        float dragDistance = sqrtf(mouseDragDelta.x * mouseDragDelta.x + mouseDragDelta.y * mouseDragDelta.y);
+        
+        // If drag distance is small (< 5 pixels), treat as click for preview
+        if (dragDistance < 5.0f) {
+            // Toggle preview: if already previewing this asset, stop it; otherwise start preview
+            if (previewPlayer_ && previewingAssetId_ == assetId && previewPlayer_->isPlaying()) {
+                // Already playing this asset - stop preview
+                stopAssetPreview();
+            } else {
+                // Not playing or different asset - start preview
+                playAssetPreview(assetId, *asset);
+            }
+        } else {
+            // Large drag distance - handle as selection only (drag & drop)
+            if (ImGui::GetIO().KeyCtrl) {
+                // Toggle selection
+                if (isSelected) {
+                    selectedAssets_.erase(assetId);
+                } else {
+                    selectedAssets_.insert(assetId);
+                }
+            } else {
+                // Single selection
+                selectedAssets_.clear();
+                selectedAssets_.insert(assetId);
+            }
+        }
+    }
+    
     // Context menu - use BeginPopupContextItem for proper right-click handling
     // The popup ID must be unique per item, so we use the asset ID
     if (ImGui::BeginPopupContextItem(("AssetContext_" + assetId).c_str())) {
         drawContextMenu(assetId, *asset);
         ImGui::EndPopup();
-            }
+    }
             
     // Track hover state for debouncing
     if (ImGui::IsItemHovered()) {
@@ -581,12 +605,71 @@ void AssetLibraryGUI::drawAssetTooltip(const std::string& assetId, const AssetIn
             }
         }
     }
-    // Audio-only: use cached waveform
+    // Audio-only: use cached waveform OR lazy-load and generate on-demand
     else if (asset.isAudio && !asset.isVideo) {
         if (hasCachedWaveform) {
             MediaPreview::drawWaveformPreview(asset.waveformData, 160.0f, 60.0f);
         } else {
-            ImGui::TextDisabled("Waveform not cached (will be generated on re-import)");
+            // Lazy-load player and generate waveform on-demand (same pattern as AV assets)
+            MediaPlayer* cachedPlayer = nullptr;
+            auto cacheIt = playerCache_.find(assetId);
+            if (cacheIt != playerCache_.end() && cacheIt->second.player) {
+                cachedPlayer = cacheIt->second.player.get();
+                cacheIt->second.lastUsed = std::chrono::steady_clock::now();
+            }
+            
+            // If player is cached and has audio, extract waveform from it
+            if (cachedPlayer && cachedPlayer->isAudioLoaded()) {
+                try {
+                    ofSoundBuffer buffer = cachedPlayer->getAudioPlayer().getBuffer();
+                    AssetInfo* mutableAsset = const_cast<AssetInfo*>(assetLibrary_->getAssetInfo(assetId));
+                    if (mutableAsset && !mutableAsset->waveformCached) {
+                        assetLibrary_->generateWaveformForAsset(*mutableAsset, buffer);
+                        assetLibrary_->saveAssetIndex();
+                    }
+                } catch (...) {
+                    // Silently fail
+                }
+                // Re-fetch asset to get updated waveform
+                const AssetInfo* updatedAsset = assetLibrary_->getAssetInfo(assetId);
+                if (updatedAsset && updatedAsset->waveformCached && !updatedAsset->waveformData.empty()) {
+                    MediaPreview::drawWaveformPreview(updatedAsset->waveformData, 160.0f, 60.0f);
+                }
+            }
+            // Player not cached - debounce before loading
+            else {
+                auto now = std::chrono::steady_clock::now();
+                auto hoverDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - hoverStartTime_).count();
+                
+                // Debounce: only load after 20ms of hovering
+                if (hoverDuration > 20 && hoveredAssetId_ == assetId) {
+                    MediaPlayer* player = getOrLoadPlayer(assetId, asset);
+                    if (player && player->isAudioLoaded()) {
+                        try {
+                            ofSoundBuffer buffer = player->getAudioPlayer().getBuffer();
+                            AssetInfo* mutableAsset = const_cast<AssetInfo*>(assetLibrary_->getAssetInfo(assetId));
+                            if (mutableAsset && !mutableAsset->waveformCached) {
+                                assetLibrary_->generateWaveformForAsset(*mutableAsset, buffer);
+                                assetLibrary_->saveAssetIndex();
+                            }
+                        } catch (...) {
+                            // Silently fail
+                        }
+                        // Re-fetch asset to get updated waveform
+                        const AssetInfo* updatedAsset = assetLibrary_->getAssetInfo(assetId);
+                        if (updatedAsset && updatedAsset->waveformCached && !updatedAsset->waveformData.empty()) {
+                            MediaPreview::drawWaveformPreview(updatedAsset->waveformData, 160.0f, 60.0f);
+                        } else {
+                            ImGui::TextDisabled("Loading...");
+                        }
+                    } else {
+                        ImGui::TextDisabled("Loading...");
+                    }
+                } else {
+                    ImGui::TextDisabled("Loading...");
+                }
+            }
         }
     }
     
@@ -692,146 +775,108 @@ void AssetLibraryGUI::drawAssetTooltip(const std::string& assetId, const AssetIn
 //--------------------------------------------------------------
 void AssetLibraryGUI::drawContextMenu(const std::string& assetId, const AssetInfo& asset) {
     // Note: This is called from BeginPopupContextItem, so we don't need BeginPopup here
-        // Send to module
-        if (ImGui::BeginMenu("Send to Module")) {
-            auto modules = assetLibrary_->getModuleTargets();
-            if (modules.empty()) {
-                ImGui::TextDisabled("No modules available");
-            } else {
-                for (const auto& moduleName : modules) {
-                    if (ImGui::MenuItem(moduleName.c_str())) {
-                        assetLibrary_->sendToModule(assetId, moduleName);
-                    }
+    
+    // Send to module
+    if (ImGui::BeginMenu("Send to Module")) {
+        auto modules = assetLibrary_->getModuleTargets();
+        if (modules.empty()) {
+            ImGui::TextDisabled("No modules available");
+        } else {
+            for (const auto& moduleName : modules) {
+                if (ImGui::MenuItem(moduleName.c_str())) {
+                    assetLibrary_->sendToModule(assetId, moduleName);
                 }
             }
-            ImGui::EndMenu();
         }
-        
-        ImGui::Separator();
-        
-        // Conversion options
-        if (asset.needsConversion || asset.conversionStatus == ConversionStatus::FAILED) {
-            if (ImGui::MenuItem("Convert to HAP")) {
-                // TODO: Queue conversion
-                ofLogNotice("AssetLibraryGUI") << "Convert to HAP: " << assetId;
+        ImGui::EndMenu();
+    }
+    
+    // Move to folder - simplified: root, existing folders, and new folder in one list
+    if (ImGui::BeginMenu("Move to Folder")) {
+        std::string assetsDir = assetLibrary_->getAssetsDirectory();
+        if (!assetsDir.empty()) {
+            // Root folder option
+            bool isRoot = asset.assetFolder.empty();
+            if (ImGui::MenuItem("Assets (root)", nullptr, isRoot)) {
+                assetLibrary_->moveAsset(assetId, "");
             }
-            if (ImGui::MenuItem("Extract Audio to WAV")) {
-                // TODO: Queue audio extraction
-                ofLogNotice("AssetLibraryGUI") << "Extract Audio: " << assetId;
-            }
+            
             ImGui::Separator();
-        }
-        
-        // File operations
-        if (ImGui::MenuItem("Show in Finder")) {
-            std::string path = assetLibrary_->getAssetPath(assetId);
-            if (!path.empty()) {
-                ofSystem("open -R \"" + path + "\"");
-            }
-        }
-        
-        ImGui::Separator();
-        
-        // Delete asset
-        if (ImGui::MenuItem("Delete Asset")) {
-            if (assetLibrary_->deleteAsset(assetId)) {
-                // Remove from selection if selected
-                selectedAssets_.erase(assetId);
-            }
-        }
-        
-        // Move to folder
-        if (ImGui::BeginMenu("Move to Folder")) {
-            std::string assetsDir = assetLibrary_->getAssetsDirectory();
-            if (!assetsDir.empty()) {
-                // Root folder option
-                bool isRoot = asset.assetFolder.empty();
-                if (ImGui::MenuItem("Assets (root)", nullptr, isRoot)) {
-                    assetLibrary_->moveAsset(assetId, "");
+            
+            // List existing folders directly (no nested submenu)
+            std::vector<std::string> folders = getFoldersInDirectory(assetsDir);
+            for (const auto& folder : folders) {
+                bool isCurrent = (asset.assetFolder == folder);
+                if (ImGui::MenuItem(folder.c_str(), nullptr, isCurrent)) {
+                    assetLibrary_->moveAsset(assetId, folder);
                 }
-                
-                if (ImGui::BeginMenu("Existing Folders")) {
-                    // List existing folders
-                    std::vector<std::string> folders = getFoldersInDirectory(assetsDir);
-                    for (const auto& folder : folders) {
-                        bool isCurrent = (asset.assetFolder == folder);
-                        if (ImGui::MenuItem(folder.c_str(), nullptr, isCurrent)) {
-                            assetLibrary_->moveAsset(assetId, folder);
-                        }
-                    }
-                    ImGui::EndMenu();
-                }
-                
-                if (ImGui::MenuItem("Create New Folder...")) {
-                    // Simple input dialog - in a real implementation, you might want a proper dialog
-                    static char folderNameBuffer[128] = {0};
-                    ImGui::OpenPopup("CreateFolderPopup");
-                }
-            } else {
-                ImGui::TextDisabled("No project open");
             }
-            ImGui::EndMenu();
-        }
-        
-        // Create folder with selected assets (if multiple selected)
-        if (selectedAssets_.size() > 1 && selectedAssets_.find(assetId) != selectedAssets_.end()) {
-            if (ImGui::MenuItem("Create Folder with Selected")) {
+            
+            if (!folders.empty()) {
+                ImGui::Separator();
+            }
+            
+            // Create new folder option
+            if (ImGui::MenuItem("New Folder...")) {
                 static char folderNameBuffer[128] = {0};
-                ImGui::OpenPopup("CreateFolderWithSelectedPopup");
+                ImGui::OpenPopup("CreateFolderPopup");
             }
+        } else {
+            ImGui::TextDisabled("No project open");
         }
-        
-        // Create folder popup
-        if (ImGui::BeginPopup("CreateFolderPopup")) {
-            static char folderNameBuffer[128] = {0};
-            ImGui::InputText("Folder Name", folderNameBuffer, sizeof(folderNameBuffer));
-            if (ImGui::Button("Create")) {
-                std::string folderName(folderNameBuffer);
-                if (!folderName.empty()) {
-                    if (assetLibrary_->createFolder(folderName)) {
-                        // Move asset to new folder
-                        assetLibrary_->moveAsset(assetId, folderName);
-                        folderNameBuffer[0] = '\0';
-                        ImGui::CloseCurrentPopup();
-                    }
+        ImGui::EndMenu();
+    }
+    
+    // Show in Finder
+    if (ImGui::MenuItem("Show in Finder")) {
+        std::string path = assetLibrary_->getAssetPath(assetId);
+        if (!path.empty()) {
+            ofSystem("open -R \"" + path + "\"");
+        }
+    }
+    
+    // Extract Audio to WAV (for video files with audio)
+    if (asset.isVideo && asset.isAudio) {
+        if (ImGui::MenuItem("Extract Audio to WAV")) {
+            // TODO: Queue audio extraction
+            ofLogNotice("AssetLibraryGUI") << "Extract Audio: " << assetId;
+        }
+    }
+    
+    ImGui::Separator();
+    
+    // Delete asset
+    if (ImGui::MenuItem("Delete Asset")) {
+        if (assetLibrary_->deleteAsset(assetId)) {
+            // Remove from selection if selected
+            selectedAssets_.erase(assetId);
+        }
+    }
+    
+    // Create folder popup
+    if (ImGui::BeginPopup("CreateFolderPopup")) {
+        static char folderNameBuffer[128] = {0};
+        ImGui::InputText("Folder Name", folderNameBuffer, sizeof(folderNameBuffer));
+        if (ImGui::Button("Create")) {
+            std::string folderName(folderNameBuffer);
+            if (!folderName.empty()) {
+                if (assetLibrary_->createFolder(folderName)) {
+                    // Move asset to new folder
+                    assetLibrary_->moveAsset(assetId, folderName);
+                    folderNameBuffer[0] = '\0';
+                    ImGui::CloseCurrentPopup();
                 }
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel")) {
-                folderNameBuffer[0] = '\0';
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::EndPopup();
         }
-        
-        // Create folder with selected popup
-        if (ImGui::BeginPopup("CreateFolderWithSelectedPopup")) {
-            static char folderNameBuffer[128] = {0};
-            ImGui::Text("Create folder and move %zu selected assets", selectedAssets_.size());
-            ImGui::InputText("Folder Name", folderNameBuffer, sizeof(folderNameBuffer));
-            if (ImGui::Button("Create")) {
-                std::string folderName(folderNameBuffer);
-                if (!folderName.empty()) {
-                    if (assetLibrary_->createFolder(folderName)) {
-                        // Move all selected assets to new folder
-                        for (const auto& selectedId : selectedAssets_) {
-                            assetLibrary_->moveAsset(selectedId, folderName);
-                        }
-                        selectedAssets_.clear();
-                        folderNameBuffer[0] = '\0';
-                        ImGui::CloseCurrentPopup();
-                    }
-                }
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel")) {
-                folderNameBuffer[0] = '\0';
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::EndPopup();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            folderNameBuffer[0] = '\0';
+            ImGui::CloseCurrentPopup();
         }
-        
-        // Note: EndPopup is called by the caller (BeginPopupContextItem)
+        ImGui::EndPopup();
+    }
+    
+    // Note: EndPopup is called by the caller (BeginPopupContextItem)
 }
 
 //--------------------------------------------------------------
@@ -860,7 +905,12 @@ void AssetLibraryGUI::drawConversionProgress(const AssetInfo& asset) {
 std::string AssetLibraryGUI::formatFileSize(size_t bytes) const {
     if (bytes < 1024) return std::to_string(bytes) + " B";
     if (bytes < 1024 * 1024) return std::to_string(bytes / 1024) + " KB";
-    return std::to_string(bytes / (1024 * 1024)) + " MB";
+    if (bytes < 1024ULL * 1024 * 1024) return std::to_string(bytes / (1024 * 1024)) + " MB";
+    // Handle GB with one decimal place for precision
+    double gb = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%.1f GB", gb);
+    return std::string(buffer);
 }
 
 //--------------------------------------------------------------

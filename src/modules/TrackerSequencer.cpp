@@ -732,7 +732,7 @@ void TrackerSequencer::setCurrentStep(int step) {
     }
 }
 
-ofJson TrackerSequencer::toJson() const {
+ofJson TrackerSequencer::toJson(class ModuleRegistry* registry) const {
     ofJson json;
     json["currentStep"] = playbackState.playbackStep;  // Save playback step for backward compatibility
     // Note: GUI state (editStep, etc.) no longer saved here - managed by TrackerSequencerGUI

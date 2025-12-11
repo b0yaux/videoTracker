@@ -680,12 +680,18 @@ void MediaPoolGUI::drawParameters() {
             }
             
             // Check if active and playing
+            // Button should be green only when:
+            // 1. This player is the active player
+            // 2. MediaPool is in PLAYING mode (pool->isPlaying())
+            // MediaPool's transition logic ensures isPlaying() accurately reflects playback state
             bool isActive = false;
             auto activePlayer = pool->getActivePlayer();
             if (activePlayer != nullptr && currentIndex < numPlayers) {
                 auto currentPlayer = pool->getMediaPlayer(currentIndex);
                 if (currentPlayer == activePlayer) {
-                    isActive = pool->isPlaying() && currentPlayer->isPlaying();
+                    // Rely on MediaPool's authoritative state - it handles all edge cases
+                    // including when media finishes naturally and transitions to IDLE
+                    isActive = pool->isPlaying();
                 }
             }
             
