@@ -132,6 +132,10 @@ public:
     int getColumnCount() const;
     const std::vector<ColumnConfig>& getColumnConfiguration() const { return columnConfig; }
     
+    // Steps per beat (per-pattern timing)
+    float getStepsPerBeat() const { return stepsPerBeat; }
+    void setStepsPerBeat(float steps);
+    
     // Serialization
     ofJson toJson() const;
     void fromJson(const ofJson& json);
@@ -140,6 +144,7 @@ private:
     std::vector<Step> steps;  // Step data for each row in the pattern
     std::vector<ColumnConfig> columnConfig;  // Per-pattern column configuration
     std::vector<Step> overflowSteps;  // Store steps that were cut off when reducing step count
+    float stepsPerBeat = 4.0f;  // Steps per beat for this pattern (supports fractional values and negative for backward reading)
     
     bool isValidStep(int stepIndex) const {
         return stepIndex >= 0 && stepIndex < (int)steps.size();

@@ -665,7 +665,8 @@ void TrackerSequencer::processAudioBuffer(ofSoundBuffer& buffer) {
     
     float beatsPerSecond = bpm / 60.0f;
     float samplesPerBeat = sampleRate / beatsPerSecond;
-    float samplesPerStep = samplesPerBeat / std::abs(stepsPerBeat);  // Use absolute value for timing calculation
+    float patternSPB = getCurrentPattern().getStepsPerBeat();
+    float samplesPerStep = samplesPerBeat / std::abs(patternSPB);  // Use absolute value for timing calculation
     
     // Sample-accurate step detection
     int numFrames = buffer.getNumFrames();
@@ -690,22 +691,18 @@ void TrackerSequencer::onTimeEvent(TimeEvent& data) {
 
 //--------------------------------------------------------------
 void TrackerSequencer::setStepsPerBeat(float steps) {
-    // Support fractional values (1/2, 1/4, 1/8) and negative for backward reading
-    // Clamp to reasonable range: -96 to 96, excluding 0
-    if (steps == 0.0f) {
-        steps = 4.0f;  // Default fallback if 0
-    }
-    stepsPerBeat = std::max(-96.0f, std::min(96.0f, steps));
+    // Set stepsPerBeat for current pattern only (per-pattern timing)
+    getCurrentPattern().setStepsPerBeat(steps);
     updateStepInterval();
-    // Note: stepsPerBeat is now per-instance, no Clock coupling needed
+    // Note: stepsPerBeat is now per-pattern, not per-instance
 }
 
 void TrackerSequencer::updateStepInterval() {
     if (!clock) return;
     
-    // Get steps per beat from pattern sequencer (single source of truth)
+    // Get steps per beat from current pattern (per-pattern timing)
     // Use absolute value for timing calculations (direction only affects step advancement)
-    float spb = std::abs(stepsPerBeat);
+    float spb = std::abs(getCurrentPattern().getStepsPerBeat());
     
     // Calculate time between sequencer steps based on BPM and steps per beat
     // For example: 120 BPM with 4 steps per beat = 16th notes
@@ -757,8 +754,9 @@ ofJson TrackerSequencer::toJson(class ModuleRegistry* registry) const {
     // Save enabled state
     json["enabled"] = isEnabled();
     
-    // Save stepsPerBeat (per-instance step timing)
-    json["stepsPerBeat"] = stepsPerBeat;
+    // Note: stepsPerBeat is now saved per-pattern (in Pattern::toJson)
+    // Keep sequencer-level stepsPerBeat for backward compatibility only (legacy files)
+    json["stepsPerBeat"] = stepsPerBeat;  // Legacy: keep for backward compatibility
     
     // Column configuration is now saved per-pattern (in Pattern::toJson)
     // No need to save it here - each pattern saves its own columnConfig
@@ -811,7 +809,8 @@ void TrackerSequencer::fromJson(const ofJson& json) {
     }
     // Note: GUI state (editStep, etc.) no longer loaded here - managed by TrackerSequencerGUI
     
-    // Load stepsPerBeat (default to 4.0 if not present)
+    // Load stepsPerBeat (backward compatibility: if sequencer-level exists, apply to all patterns)
+    // New format: each pattern saves its own stepsPerBeat in Pattern::toJson/fromJson
     if (json.contains("stepsPerBeat")) {
         // Support both int (legacy) and float (new) formats
         if (json["stepsPerBeat"].is_number_float()) {
@@ -826,8 +825,22 @@ void TrackerSequencer::fromJson(const ofJson& json) {
             stepsPerBeat = 4.0f;
         }
         stepsPerBeat = std::max(-96.0f, std::min(96.0f, stepsPerBeat));
+        
+        // Backward compatibility: apply sequencer-level value to all patterns that don't have their own
+        for (auto& pattern : patterns) {
+            // Only set if pattern doesn't already have a value (from Pattern::fromJson)
+            // Patterns loaded from JSON will have their own stepsPerBeat, so this only affects new patterns
+            if (pattern.getStepsPerBeat() == 4.0f && patterns.size() > 0 && &pattern != &patterns[0]) {
+                // This is a newly created pattern (not loaded from JSON), apply legacy value
+                pattern.setStepsPerBeat(stepsPerBeat);
+            }
+        }
+        // Also apply to first pattern if it was created before loading (backward compatibility)
+        if (!patterns.empty() && patterns[0].getStepsPerBeat() == 4.0f) {
+            patterns[0].setStepsPerBeat(stepsPerBeat);
+        }
     } else {
-        stepsPerBeat = 4.0f;  // Default fallback
+        stepsPerBeat = 4.0f;  // Default fallback (kept for backward compatibility)
     }
     
     // Column configuration is now per-pattern (loaded in Pattern::fromJson)
@@ -930,9 +943,10 @@ void TrackerSequencer::advanceStep() {
     // Support backward reading when stepsPerBeat is negative
     int stepCount = getCurrentPattern().getStepCount();
     int previousStep = playbackState.playbackStep;
+    float currentSPB = getCurrentPattern().getStepsPerBeat();
     
     bool patternFinished;
-    if (stepsPerBeat < 0.0f) {
+    if (currentSPB < 0.0f) {
         // Backward reading: decrement step
         playbackState.playbackStep = (playbackState.playbackStep - 1 + stepCount) % stepCount;
         // Check if we wrapped around (pattern finished - went from 0 to stepCount-1)
@@ -1028,7 +1042,8 @@ void TrackerSequencer::triggerStep(int step) {
     // All trigger conditions passed - proceed with triggering
     // Calculate duration in seconds (same for both manual and playback)
     float stepLength = stepData.index >= 0 ? (float)stepData.length : 1.0f;
-    float duration = (stepLength * 60.0f) / (bpm * std::abs(stepsPerBeat));  // Use absolute value for duration calculation
+    float currentSPB = getCurrentPattern().getStepsPerBeat();
+    float duration = (stepLength * 60.0f) / (bpm * std::abs(currentSPB));  // Use absolute value for duration calculation
     
     // Set timing for ALL triggers (unified for manual and playback)
     // Only set currentPlayingStep if step actually triggered (all conditions passed)
@@ -1353,8 +1368,9 @@ void TrackerSequencer::notifyStepEvent(int step, float stepLength) {
     const Step& stepData = getStep(step - 1);
     float bpm = clock ? clock->getBPM() : 120.0f;
     
-    // Calculate duration in seconds using patternSequencer's stepsPerBeat
-    float spb = std::abs(stepsPerBeat);  // Use absolute value for duration calculation
+    // Calculate duration in seconds using current pattern's stepsPerBeat
+    float currentSPB = getCurrentPattern().getStepsPerBeat();
+    float spb = std::abs(currentSPB);  // Use absolute value for duration calculation
     float stepDuration = (60.0f / bpm) / spb;  // Duration of ONE step
     float noteDuration = stepDuration * stepLength;     // Duration for THIS note
     
@@ -1509,12 +1525,14 @@ void TrackerSequencer::setCurrentPatternIndex(int index) {
 }
 
 int TrackerSequencer::addPattern() {
-    // New pattern uses same step count as current pattern
+    // New pattern uses same step count and stepsPerBeat as current pattern
     int stepCount = getCurrentPattern().getStepCount();
+    float currentSPB = getCurrentPattern().getStepsPerBeat();
     Pattern newPattern(stepCount);
+    newPattern.setStepsPerBeat(currentSPB);  // Copy stepsPerBeat from current pattern
     patterns.push_back(newPattern);
     int newIndex = (int)patterns.size() - 1;
-    ofLogNotice("TrackerSequencer") << "Added new pattern at index " << newIndex << " with " << stepCount << " steps";
+    ofLogNotice("TrackerSequencer") << "Added new pattern at index " << newIndex << " with " << stepCount << " steps, SPB=" << currentSPB;
     return newIndex;
 }
 

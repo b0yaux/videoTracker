@@ -16,6 +16,7 @@
 #include <unistd.h>  // for usleep
 #include <cstdlib>  // for getenv
 #include <sys/wait.h>  // for WIFEXITED, WEXITSTATUS
+#include <sys/stat.h>  // for stat, st_mtime
 #include <condition_variable>
 #include <sstream>
 
@@ -686,6 +687,8 @@ std::string CommandExecutor::findDownloadedFile(const std::string& ytdlpOutput, 
     // Try to parse filename from yt-dlp output
     std::istringstream stream(ytdlpOutput);
     std::string line;
+    std::string candidateFromOutput;
+    
     while (std::getline(stream, line)) {
         // Look for "[download] Destination:" line
         size_t destPos = line.find("[download] Destination:");
@@ -707,9 +710,58 @@ std::string CommandExecutor::findDownloadedFile(const std::string& ytdlpOutput, 
                 }
             }
         }
+        
+        // Also look for "[download]" lines that show the filename (even if already downloaded)
+        // Format: "[download] filename.mp4 has already been downloaded"
+        // or: "[download] 100% of size filename.mp4"
+        size_t downloadPos = line.find("[download]");
+        if (downloadPos != std::string::npos) {
+            // Extract potential filename from the line
+            // Look for common patterns: "filename.mp4", "filename.mov", etc.
+            std::string lowerLine = ofToLower(line);
+            static const std::vector<std::string> mediaExts = {
+                ".mp4", ".mov", ".webm", ".mkv", ".wav", ".mp3", ".m4a", ".aiff", ".flac", ".aif"
+            };
+            
+            for (const auto& ext : mediaExts) {
+                size_t extPos = lowerLine.find(ext);
+                if (extPos != std::string::npos) {
+                    // Find the start of the filename (look backwards for space or path separator)
+                    size_t start = extPos;
+                    while (start > 0 && line[start - 1] != ' ' && line[start - 1] != '/' && line[start - 1] != '\\') {
+                        start--;
+                    }
+                    // Extract filename
+                    std::string filename = line.substr(start, extPos + ext.length() - start);
+                    // Trim whitespace
+                    size_t first = filename.find_first_not_of(" \t");
+                    size_t last = filename.find_last_not_of(" \t\n\r");
+                    if (first != std::string::npos && last != std::string::npos) {
+                        filename = filename.substr(first, last - first + 1);
+                        // Check if it's a full path or just filename
+                        std::string fullPath;
+                        if (ofFilePath::isAbsolute(filename)) {
+                            fullPath = filename;
+                        } else {
+                            fullPath = ofFilePath::join(tempDir, filename);
+                        }
+                        if (ofFile::doesFileExist(fullPath)) {
+                            candidateFromOutput = fullPath;
+                            // Don't return yet - continue to find the best match
+                        }
+                    }
+                }
+            }
+        }
     }
     
-    // Fallback: search for largest media file in temp directory
+    // If we found a candidate from output, use it
+    if (!candidateFromOutput.empty()) {
+        return candidateFromOutput;
+    }
+    
+    // Fallback: search for most recently modified media file in temp directory
+    // This is more reliable than largest file when multiple files exist
     // Wait a bit for file system to sync, then retry
     for (int retry = 0; retry < 5; retry++) {
         if (retry > 0) {
@@ -717,8 +769,8 @@ std::string CommandExecutor::findDownloadedFile(const std::string& ytdlpOutput, 
         }
         
         dir.listDir();
-        std::string largestFile;
-        size_t largestSize = 0;
+        std::string newestFile;
+        std::time_t newestTime = 0;
         
         // Media file extensions
         static const std::vector<std::string> mediaExts = {
@@ -732,17 +784,21 @@ std::string CommandExecutor::findDownloadedFile(const std::string& ytdlpOutput, 
                 bool isMediaFile = std::find(mediaExts.begin(), mediaExts.end(), ext) != mediaExts.end();
                 
                 if (isMediaFile) {
-                    size_t fileSize = file.getSize();
-                    if (fileSize > largestSize) {
-                        largestSize = fileSize;
-                        largestFile = file.path();
+                    // Get modification time using stat (POSIX)
+                    struct stat fileInfo;
+                    if (stat(file.path().c_str(), &fileInfo) == 0) {
+                        std::time_t modTime = fileInfo.st_mtime;
+                        if (modTime > newestTime) {
+                            newestTime = modTime;
+                            newestFile = file.path();
+                        }
                     }
                 }
             }
         }
         
-        if (!largestFile.empty() && ofFile::doesFileExist(largestFile)) {
-            return largestFile;
+        if (!newestFile.empty() && ofFile::doesFileExist(newestFile)) {
+            return newestFile;
         }
     }
     

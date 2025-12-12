@@ -131,6 +131,8 @@ void AssetLibraryGUI::draw() {
     if (cachedTotalSize_ == 0 || totalAssets != cachedAssetCount_) {
         cachedTotalSize_ = assetLibrary_->getTotalLibrarySize();
         cachedAssetCount_ = totalAssets;
+        // Invalidate grouping cache when asset count changes to ensure new assets appear immediately
+        assetGroupingDirty_ = true;
     }
     ImGui::TextDisabled("(%zu assets, %s)", totalAssets, formatFileSize(cachedTotalSize_).c_str());
     

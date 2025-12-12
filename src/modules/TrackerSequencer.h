@@ -248,7 +248,7 @@ public:
     // Update step active state (clears manually triggered steps when duration expires)
     void updateStepActiveState();
     float getCurrentBpm() const;
-    float getStepsPerBeat() const { return stepsPerBeat; }
+    float getStepsPerBeat() const { return getCurrentPattern().getStepsPerBeat(); }
     
     // Setters
     void setStepsPerBeat(float steps);  // Supports fractional values (1/2, 1/4, 1/8) and negative for backward reading

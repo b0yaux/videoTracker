@@ -1,7 +1,7 @@
 #include "Pattern.h"
 #include "ofLog.h"
 #include "ofUtils.h"
-#include <algorithm>  // For std::min
+#include <algorithm>  // For std::min, std::max
 
 // Step implementation
 //--------------------------------------------------------------
@@ -154,6 +154,7 @@ std::string Step::toString() const {
 Pattern::Pattern(int stepCount) {
     setStepCount(stepCount);
     initializeDefaultColumns();
+    stepsPerBeat = 4.0f;  // Default steps per beat
 }
 
 Step& Pattern::getStep(int stepIndex) {
@@ -372,6 +373,9 @@ ofJson Pattern::toJson() const {
     }
     json["columnConfig"] = columnArray;
     
+    // Save stepsPerBeat (per-pattern)
+    json["stepsPerBeat"] = stepsPerBeat;
+    
     return json;
 }
 
@@ -446,6 +450,25 @@ void Pattern::fromJson(const ofJson& json) {
         } else {
             // No column config in JSON - initialize defaults
             initializeDefaultColumns();
+        }
+        
+        // Load stepsPerBeat (per-pattern, default to 4.0 if not present)
+        if (json.contains("stepsPerBeat") && json["stepsPerBeat"].is_number()) {
+            // Support both int (legacy) and float (new) formats
+            if (json["stepsPerBeat"].is_number_float()) {
+                stepsPerBeat = json["stepsPerBeat"];
+            } else if (json["stepsPerBeat"].is_number_integer()) {
+                stepsPerBeat = static_cast<float>(json["stepsPerBeat"]);
+            } else {
+                stepsPerBeat = 4.0f;  // Default fallback
+            }
+            // Clamp to valid range: -96 to 96, excluding 0
+            if (stepsPerBeat == 0.0f) {
+                stepsPerBeat = 4.0f;
+            }
+            stepsPerBeat = std::max(-96.0f, std::min(96.0f, stepsPerBeat));
+        } else {
+            stepsPerBeat = 4.0f;  // Default fallback
         }
     } else {
         ofLogError("Pattern") << "Invalid JSON format: expected array or object";
@@ -535,9 +558,20 @@ void Pattern::fromJson(const ofJson& json) {
     }
 }
 
-// Column configuration methods
-//--------------------------------------------------------------
-void Pattern::initializeDefaultColumns() {
+    // Steps per beat methods
+    //--------------------------------------------------------------
+    void Pattern::setStepsPerBeat(float steps) {
+        // Support fractional values (1/2, 1/4, 1/8) and negative for backward reading
+        // Clamp to reasonable range: -96 to 96, excluding 0
+        if (steps == 0.0f) {
+            steps = 4.0f;  // Default fallback if 0
+        }
+        stepsPerBeat = std::max(-96.0f, std::min(96.0f, steps));
+    }
+    
+    // Column configuration methods
+    //--------------------------------------------------------------
+    void Pattern::initializeDefaultColumns() {
     columnConfig.clear();
     // TRIGGER COLUMNS (Required - what to play)
     columnConfig.push_back(ColumnConfig("index", ColumnCategory::TRIGGER, true, 0));

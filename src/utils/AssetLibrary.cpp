@@ -264,6 +264,12 @@ std::string AssetLibrary::importFile(const std::string& filePath, const std::str
     }
     saveAssetIndex();
     
+    // Request async refresh to update GUI immediately after import
+    // This ensures the newly imported asset appears in the Asset Library GUI without manual refresh
+    // Note: The GUI will detect the asset count change via getAllAssetIds() size comparison
+    // and automatically invalidate its cache, so the new asset will appear immediately
+    requestAsyncRefresh();
+    
     ofLogNotice("AssetLibrary") << "Imported asset: " << assetId << " from " << filePath;
     return assetId;
 }
@@ -1215,18 +1221,18 @@ void AssetLibrary::refreshAssetList() {
         const std::string& baseName = baseNamePair.first;
         const auto& extensions = baseNamePair.second;
         
-        // Generate assetId from base name (consistent for both .mov and .wav)
-        std::string assetId = baseName;
-        foundAssetIds.insert(assetId);
-        
-        // Find video and audio files for this asset
+        // Find video and audio files for this asset first (needed to generate assetId)
         std::string videoPath;
         std::string audioPath;
         std::string folder;
+        std::string firstFilePath; // Get any file path to use with generateAssetId()
         
         for (const auto& extPair : extensions) {
             const std::string& filePath = extPair.second.first;
             folder = extPair.second.second; // Use folder from any file (should be same for paired files)
+            if (firstFilePath.empty()) {
+                firstFilePath = filePath; // Use first file found for assetId generation
+            }
             
             if (isVideoFile(filePath)) {
                 videoPath = filePath;
@@ -1235,6 +1241,11 @@ void AssetLibrary::refreshAssetList() {
                 audioPath = filePath;
             }
         }
+        
+        // Generate assetId using the same sanitization logic as importFile()
+        // This ensures consistency between import and refresh operations
+        std::string assetId = generateAssetId(firstFilePath);
+        foundAssetIds.insert(assetId);
         
         // Determine asset type
         bool isVideo = !videoPath.empty();
@@ -1340,7 +1351,8 @@ void AssetLibrary::refreshAssetList() {
     // Remove assets that are no longer on disk
     for (auto it = assets_.begin(); it != assets_.end();) {
         const std::string& assetId = it->first;
-        if (foundAssetIds.find(assetId) == foundAssetIds.end()) {
+        bool found = (foundAssetIds.find(assetId) != foundAssetIds.end());
+        if (!found) {
             // Asset not found on disk - remove it
             ofLogNotice("AssetLibrary") << "Removing missing asset: " << assetId;
             it = assets_.erase(it);

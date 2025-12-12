@@ -253,8 +253,9 @@ std::string MediaConverter::generateOutputPath(const std::string& sourcePath, bo
     
     std::string baseName = ofFilePath::getBaseName(sourcePath);
     std::string extension = isVideo ? ".mov" : ".wav";
+    std::string outputPath = ofFilePath::join(outputDirectory_, baseName + extension);
     
-    return ofFilePath::join(outputDirectory_, baseName + extension);
+    return outputPath;
 }
 
 //--------------------------------------------------------------
