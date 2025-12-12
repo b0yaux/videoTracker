@@ -17,7 +17,7 @@
 // TrackerSequencer implementation
 //--------------------------------------------------------------
 TrackerSequencer::TrackerSequencer() 
-    : clock(nullptr), stepsPerBeat(4), gatingEnabled(true),
+    : clock(nullptr), stepsPerBeat(4.0f), gatingEnabled(true),
       currentPatternIndex(0),
       draggingStep(-1), draggingColumn(-1), lastDragValue(0.0f), dragStartY(0.0f), dragStartX(0.0f),
       connectionManager_(nullptr) {
@@ -166,15 +166,22 @@ int TrackerSequencer::getIndexRange() const {
                 auto params = targetModule->getParameters();
                 for (const auto& param : params) {
                     if (param.name == "index" || param.name == "note") {
-                        // Found connected module with index parameter - return range
-                        return static_cast<int>(param.maxValue) + 1;  // maxValue is inclusive, range is count
+                        // Found connected module with index parameter
+                        // maxValue is inclusive, range is count
+                        int indexCount = static_cast<int>(param.maxValue) + 1;
+                        // Only use connected module's count if > 0, otherwise use default
+                        if (indexCount > 0) {
+                            return indexCount;
+                        }
+                        // If count is 0, fall through to default
+                        break;
                     }
                 }
             }
         }
     }
     
-    // No connected module found - return default
+    // No connected module found or connected module has 0 items - return default
     return 127;  // Default MIDI range
 }
 
@@ -403,7 +410,8 @@ void TrackerSequencer::randomizePattern() {
                 volumeRange.first + volumeRangeSize * 0.25f,
                 volumeRange.first + volumeRangeSize * 0.75f
             ));
-            step.length = ofRandom(1, stepCount);
+            const int MAX_STEP_LENGTH = 64;
+            step.length = ofRandom(1, MAX_STEP_LENGTH + 1);
         } else {
             step.clear(); // Empty/rest step
         }
@@ -451,10 +459,11 @@ void TrackerSequencer::randomizeColumn(int columnIndex) {
         ofLogNotice("TrackerSequencer") << "Index column randomized";
     } else if (colConfig.parameterName == "length") {
         // Randomize length column
+        const int MAX_STEP_LENGTH = 64;
         int stepCount = getCurrentPattern().getStepCount();
         for (int i = 0; i < stepCount; i++) {
             if (getCurrentPattern()[i].index >= 0) { // Only randomize if step has a media item
-                getCurrentPattern()[i].length = ofRandom(1, stepCount + 1);
+                getCurrentPattern()[i].length = ofRandom(1, MAX_STEP_LENGTH + 1);
             }
         }
         ofLogNotice("TrackerSequencer") << "Length column randomized";
@@ -500,12 +509,14 @@ void TrackerSequencer::applyLegato() {
             }
             
             if (foundNext) {
-                // Set length to reach the next step (clamp to max 16)
-                getCurrentPattern()[i].length = std::min(16, stepsToNext);
+                // Set length to reach the next step (clamp to max 64)
+                const int MAX_STEP_LENGTH = 64;
+                getCurrentPattern()[i].length = std::min(MAX_STEP_LENGTH, stepsToNext);
             } else {
                 // No next step found - keep current length or set to remaining steps
                 int remainingSteps = stepCount - i;
-                getCurrentPattern()[i].length = std::min(16, remainingSteps);
+                const int MAX_STEP_LENGTH = 64;
+                getCurrentPattern()[i].length = std::min(MAX_STEP_LENGTH, remainingSteps);
             }
         }
     }
@@ -654,7 +665,7 @@ void TrackerSequencer::processAudioBuffer(ofSoundBuffer& buffer) {
     
     float beatsPerSecond = bpm / 60.0f;
     float samplesPerBeat = sampleRate / beatsPerSecond;
-    float samplesPerStep = samplesPerBeat / stepsPerBeat;
+    float samplesPerStep = samplesPerBeat / std::abs(stepsPerBeat);  // Use absolute value for timing calculation
     
     // Sample-accurate step detection
     int numFrames = buffer.getNumFrames();
@@ -678,8 +689,13 @@ void TrackerSequencer::onTimeEvent(TimeEvent& data) {
 }
 
 //--------------------------------------------------------------
-void TrackerSequencer::setStepsPerBeat(int steps) {
-    stepsPerBeat = std::max(1, std::min(96, steps));
+void TrackerSequencer::setStepsPerBeat(float steps) {
+    // Support fractional values (1/2, 1/4, 1/8) and negative for backward reading
+    // Clamp to reasonable range: -96 to 96, excluding 0
+    if (steps == 0.0f) {
+        steps = 4.0f;  // Default fallback if 0
+    }
+    stepsPerBeat = std::max(-96.0f, std::min(96.0f, steps));
     updateStepInterval();
     // Note: stepsPerBeat is now per-instance, no Clock coupling needed
 }
@@ -688,7 +704,8 @@ void TrackerSequencer::updateStepInterval() {
     if (!clock) return;
     
     // Get steps per beat from pattern sequencer (single source of truth)
-    int spb = stepsPerBeat;
+    // Use absolute value for timing calculations (direction only affects step advancement)
+    float spb = std::abs(stepsPerBeat);
     
     // Calculate time between sequencer steps based on BPM and steps per beat
     // For example: 120 BPM with 4 steps per beat = 16th notes
@@ -786,12 +803,23 @@ void TrackerSequencer::fromJson(const ofJson& json) {
     }
     // Note: GUI state (editStep, etc.) no longer loaded here - managed by TrackerSequencerGUI
     
-    // Load stepsPerBeat (default to 4 if not present)
+    // Load stepsPerBeat (default to 4.0 if not present)
     if (json.contains("stepsPerBeat")) {
-        int spb = json["stepsPerBeat"];
-        stepsPerBeat = std::max(1, std::min(96, spb));  // Clamp to valid range
+        // Support both int (legacy) and float (new) formats
+        if (json["stepsPerBeat"].is_number_float()) {
+            stepsPerBeat = json["stepsPerBeat"];
+        } else if (json["stepsPerBeat"].is_number_integer()) {
+            stepsPerBeat = static_cast<float>(json["stepsPerBeat"]);
+        } else {
+            stepsPerBeat = 4.0f;  // Default fallback
+        }
+        // Clamp to valid range: -96 to 96, excluding 0
+        if (stepsPerBeat == 0.0f) {
+            stepsPerBeat = 4.0f;
+        }
+        stepsPerBeat = std::max(-96.0f, std::min(96.0f, stepsPerBeat));
     } else {
-        stepsPerBeat = 4;  // Default fallback
+        stepsPerBeat = 4.0f;  // Default fallback
     }
     
     // Column configuration is now per-pattern (loaded in Pattern::fromJson)
@@ -891,12 +919,22 @@ void TrackerSequencer::advanceStep() {
     }
     
     // Always advance playback step (for visual indicator)
+    // Support backward reading when stepsPerBeat is negative
     int stepCount = getCurrentPattern().getStepCount();
     int previousStep = playbackState.playbackStep;
-    playbackState.playbackStep = (playbackState.playbackStep + 1) % stepCount;
     
-    // Check if we wrapped around (pattern finished)
-    bool patternFinished = (playbackState.playbackStep == 0 && previousStep == stepCount - 1);
+    bool patternFinished;
+    if (stepsPerBeat < 0.0f) {
+        // Backward reading: decrement step
+        playbackState.playbackStep = (playbackState.playbackStep - 1 + stepCount) % stepCount;
+        // Check if we wrapped around (pattern finished - went from 0 to stepCount-1)
+        patternFinished = (playbackState.playbackStep == stepCount - 1 && previousStep == 0);
+    } else {
+        // Forward reading: increment step
+        playbackState.playbackStep = (playbackState.playbackStep + 1) % stepCount;
+        // Check if we wrapped around (pattern finished - went from stepCount-1 to 0)
+        patternFinished = (playbackState.playbackStep == 0 && previousStep == stepCount - 1);
+    }
     
     // Increment pattern cycle count when pattern wraps (one pattern repeat = one cycle)
     if (patternFinished) {
@@ -941,11 +979,51 @@ void TrackerSequencer::triggerStep(int step) {
     
     playbackState.playbackStep = step;
     
+    // Check ratio parameter (internal) - only trigger if current cycle matches ratio
+    // Ratio is A:B format, where A is which cycle to trigger (1-based) and B is total cycles
+    // Default is 1:1 (always trigger)
+    // Use direct field access for performance (ratioA/ratioB are now direct fields)
+    if (stepData.index >= 0) {  // Only check ratio if step has a trigger
+        int ratioA = std::max(1, std::min(16, stepData.ratioA)); // Clamp to 1-16
+        int ratioB = std::max(1, std::min(16, stepData.ratioB)); // Clamp to 1-16
+        
+        // Calculate current cycle position in ratio loop (1-based)
+        // patternCycleCount is 0-based, so add 1 for 1-based cycle position
+        int currentCycle = playbackState.patternCycleCount + 1;
+        int cycleInLoop = ((currentCycle - 1) % ratioB) + 1;  // 1-based position in loop
+        
+        if (cycleInLoop != ratioA) {
+            // Ratio condition failed - don't trigger this step
+            // Clear playing state since step didn't trigger
+            playbackState.clearPlayingStep();
+            return;
+        }
+    }
+    
+    // Check chance parameter (internal) - only trigger if random roll succeeds
+    // Chance is 0-100, default 100 (always trigger)
+    // Use direct field access for performance (chance is now a direct field)
+    int chance = stepData.chance;
+    chance = std::max(0, std::min(100, chance)); // Clamp to 0-100 (safety check)
+    
+    // Roll for chance (0-100)
+    if (chance < 100) {
+        int roll = (int)(ofRandom(0.0f, 100.0f));
+        if (roll >= chance) {
+            // Chance failed - don't trigger this step
+            // Clear playing state since step didn't trigger
+            playbackState.clearPlayingStep();
+            return;
+        }
+    }
+    
+    // All trigger conditions passed - proceed with triggering
     // Calculate duration in seconds (same for both manual and playback)
     float stepLength = stepData.index >= 0 ? (float)stepData.length : 1.0f;
-    float duration = (stepLength * 60.0f) / (bpm * stepsPerBeat);
+    float duration = (stepLength * 60.0f) / (bpm * std::abs(stepsPerBeat));  // Use absolute value for duration calculation
     
     // Set timing for ALL triggers (unified for manual and playback)
+    // Only set currentPlayingStep if step actually triggered (all conditions passed)
     if (stepData.index >= 0) {
         float currentTime = ofGetElapsedTimef();
         playbackState.stepStartTime = currentTime;
@@ -962,40 +1040,6 @@ void TrackerSequencer::triggerStep(int step) {
     TriggerEvent triggerEvt;
     triggerEvt.duration = duration;
     triggerEvt.step = step;  // Include step number for position memory modes
-    
-    // Check ratio parameter (internal) - only trigger if current cycle matches ratio
-    // Ratio is A:B format, where A is which cycle to trigger (1-based) and B is total cycles
-    // Default is 1:1 (always trigger)
-    // Use direct field access for performance (ratioA/ratioB are now direct fields)
-    if (stepData.index >= 0) {  // Only check ratio if step has a trigger
-        int ratioA = std::max(1, std::min(16, stepData.ratioA)); // Clamp to 1-16
-        int ratioB = std::max(1, std::min(16, stepData.ratioB)); // Clamp to 1-16
-        
-        // Calculate current cycle position in ratio loop (1-based)
-        // patternCycleCount is 0-based, so add 1 for 1-based cycle position
-        int currentCycle = playbackState.patternCycleCount + 1;
-        int cycleInLoop = ((currentCycle - 1) % ratioB) + 1;  // 1-based position in loop
-        
-        if (cycleInLoop != ratioA) {
-            // Ratio condition failed - don't trigger this step
-            return;
-        }
-    }
-    
-    // Check chance parameter (internal) - only trigger if random roll succeeds
-    // Chance is 0-100, default 100 (always trigger)
-    // Use direct field access for performance (chance is now a direct field)
-    int chance = stepData.chance;
-    chance = std::max(0, std::min(100, chance)); // Clamp to 0-100 (safety check)
-    
-    // Roll for chance (0-100)
-    if (chance < 100) {
-        int roll = (int)(ofRandom(0.0f, 100.0f));
-        if (roll >= chance) {
-            // Chance failed - don't trigger this step
-            return;
-        }
-    }
     
     // Map Step parameters to TrackerSequencer parameters
     // "note" is the sequencer's parameter name (maps to stepData.index for MediaPool)
@@ -1196,9 +1240,9 @@ std::vector<ParameterDescriptor> TrackerSequencer::getTrackerParameters() const 
     // Note: MIDI note (0-127, can replace or work alongside index column)
     params.push_back(ParameterDescriptor("note", ParameterType::INT, 0.0f, 127.0f, 60.0f, "Note"));
     
-    // Length: step length (dynamic range based on pattern size)
-    int maxLength = getCurrentPattern().getStepCount();
-    params.push_back(ParameterDescriptor("length", ParameterType::INT, 1.0f, (float)maxLength, 1.0f, "Length"));
+    // Length: step length (fixed maximum of 64, can exceed pattern length)
+    const int MAX_STEP_LENGTH = 64;
+    params.push_back(ParameterDescriptor("length", ParameterType::INT, 1.0f, (float)MAX_STEP_LENGTH, 1.0f, "Length"));
     
     // Chance: trigger probability (0-100, controls whether step triggers)
     params.push_back(ParameterDescriptor("chance", ParameterType::INT, 0.0f, 100.0f, 100.0f, "Chance"));
@@ -1217,7 +1261,7 @@ ParameterDescriptor TrackerSequencer::getTrackerParameterDescriptor(const std::s
     } else if (paramName == "note") {
         return ParameterDescriptor("note", ParameterType::INT, 0.0f, 127.0f, 60.0f, "Note");
     } else if (paramName == "length") {
-        return ParameterDescriptor("length", ParameterType::INT, 1.0f, 16.0f, 1.0f, "Length");
+        return ParameterDescriptor("length", ParameterType::INT, 1.0f, 64.0f, 1.0f, "Length");
     } else if (paramName == "chance") {
         return ParameterDescriptor("chance", ParameterType::INT, 0.0f, 100.0f, 100.0f, "Chance");
     } else if (paramName == "ratio") {
@@ -1302,7 +1346,7 @@ void TrackerSequencer::notifyStepEvent(int step, float stepLength) {
     float bpm = clock ? clock->getBPM() : 120.0f;
     
     // Calculate duration in seconds using patternSequencer's stepsPerBeat
-    int spb = stepsPerBeat;
+    float spb = std::abs(stepsPerBeat);  // Use absolute value for duration calculation
     float stepDuration = (60.0f / bpm) / spb;  // Duration of ONE step
     float noteDuration = stepDuration * stepLength;     // Duration for THIS note
     

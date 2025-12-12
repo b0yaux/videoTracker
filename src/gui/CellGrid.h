@@ -229,6 +229,10 @@ private:
     // Auto-scroll state
     int lastFocusedRowForScroll;
     
+    // Cached focused row per frame (performance optimization - avoids calling expensive callbacks for every row)
+    int cachedFocusedRow;
+    int cachedFocusedRowFrame;
+    
     // Internal state
     bool tableStarted;
     int currentRow;

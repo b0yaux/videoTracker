@@ -39,7 +39,8 @@ static void syncPlaybackToEditIfPaused(TrackerSequencer& sequencer, int newStep,
 }
 
 TrackerSequencerGUI::TrackerSequencerGUI() 
-    : lastPatternIndex(-1), lastTriggeredStepWhenPaused(-1) {
+    : lastPatternIndex(-1), lastTriggeredStepWhenPaused(-1),
+      cachedTableWindowFocused(false), cachedTableWindowFocusedFrame(-1) {
     // cellFocusState and callbacksState are initialized by default constructors
     pendingRowOutline.shouldDraw = false;
     pendingRowOutline.step = -1;
@@ -341,23 +342,7 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
 }
 
 void TrackerSequencerGUI::drawPatternControls(TrackerSequencer& sequencer) {
-    // Action buttons row
-    if (ImGui::Button("Clear Pattern")) {
-        sequencer.clearPattern();
-    }
-    ImGui::SameLine();
-    
-    // 'D' button to double steps (duplicate all steps to double pattern length)
-    if (ImGui::Button("D", ImVec2(20, 20))) {
-        sequencer.getCurrentPattern().doubleSteps();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Double pattern length (duplicate all steps)");
-    }
-    
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
+    // Action buttons row removed - 'Clear Pattern' and 'D' buttons removed per requirements
     
     // Pattern parameters table using CellGrid (similar to MediaPool's drawParameters)
     // Reset focus tracking at start of frame
@@ -404,17 +389,90 @@ void TrackerSequencerGUI::drawPatternControls(TrackerSequencer& sequencer) {
             widget.isRemovable = false;  // Pattern params are not removable (different from pattern grid columns)
             return widget;
         } else if (paramName == "stepsPerBeat") {
-            ParameterDescriptor spbParam("stepsPerBeat", ParameterType::INT, 1, 96, 4, "Steps Per Beat");
+            ParameterDescriptor spbParam("stepsPerBeat", ParameterType::FLOAT, -96.0f, 96.0f, 4.0f, "Steps Per Beat");
             CellWidget widget = createCellWidget(
                 spbParam,
                 [&sequencer]() -> float {
-                    return (float)sequencer.getStepsPerBeat();
+                    return sequencer.getStepsPerBeat();
                 },
                 [&sequencer](float value) {
-                    sequencer.setStepsPerBeat((int)value);
+                    sequencer.setStepsPerBeat(value);
                 }
             );
             widget.isRemovable = false;  // Pattern params are not removable (different from pattern grid columns)
+            widget.isInteger = false;  // Allow fractional values
+            
+            // Custom parsing for fractional values (1/2, 1/4, 1/8) and negative values
+            widget.parseValue = [](const std::string& str) -> float {
+                if (str.empty() || str == "--") {
+                    return std::numeric_limits<float>::quiet_NaN();
+                }
+                
+                // Handle negative sign
+                bool isNegative = (str[0] == '-');
+                std::string parseStr = isNegative ? str.substr(1) : str;
+                
+                // Try parsing as fraction (e.g., "1/2", "1/4", "1/8")
+                size_t slashPos = parseStr.find('/');
+                if (slashPos != std::string::npos && slashPos > 0 && slashPos < parseStr.length() - 1) {
+                    try {
+                        float numerator = std::stof(parseStr.substr(0, slashPos));
+                        float denominator = std::stof(parseStr.substr(slashPos + 1));
+                        if (denominator == 0.0f) {
+                            return std::numeric_limits<float>::quiet_NaN();
+                        }
+                        float result = numerator / denominator;
+                        return isNegative ? -result : result;
+                    } catch (...) {
+                        return std::numeric_limits<float>::quiet_NaN();
+                    }
+                }
+                
+                // Try parsing as regular float
+                try {
+                    float result = std::stof(parseStr);
+                    return isNegative ? -result : result;
+                } catch (...) {
+                    return std::numeric_limits<float>::quiet_NaN();
+                }
+            };
+            
+            // Custom formatting to display fractions nicely
+            widget.formatValue = [](float value) -> std::string {
+                if (std::isnan(value)) {
+                    return "--";
+                }
+                
+                bool isNegative = (value < 0.0f);
+                float absValue = std::abs(value);
+                
+                // Check for common fractions
+                const float EPSILON = 0.001f;
+                if (std::abs(absValue - 0.5f) < EPSILON) {
+                    return isNegative ? "-1/2" : "1/2";
+                } else if (std::abs(absValue - 0.25f) < EPSILON) {
+                    return isNegative ? "-1/4" : "1/4";
+                } else if (std::abs(absValue - 0.125f) < EPSILON) {
+                    return isNegative ? "-1/8" : "1/8";
+                } else if (std::abs(absValue - std::round(absValue)) < EPSILON) {
+                    // Integer value
+                    return std::to_string((int)(isNegative ? -std::round(absValue) : std::round(absValue)));
+                } else {
+                    // Regular float - show with limited decimals
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%.3f", isNegative ? -absValue : absValue);
+                    // Remove trailing zeros
+                    std::string result = buf;
+                    while (result.back() == '0' && result.find('.') != std::string::npos) {
+                        result.pop_back();
+                    }
+                    if (result.back() == '.') {
+                        result.pop_back();
+                    }
+                    return result;
+                }
+            };
+            
             return widget;
         }
         
@@ -428,7 +486,7 @@ void TrackerSequencerGUI::drawPatternControls(TrackerSequencer& sequencer) {
         if (paramName == "steps") {
             return (float)sequencer.getCurrentPattern().getStepCount();
         } else if (paramName == "stepsPerBeat") {
-            return (float)sequencer.getStepsPerBeat();
+            return sequencer.getStepsPerBeat();
         }
         
         return 0.0f;
@@ -441,7 +499,7 @@ void TrackerSequencerGUI::drawPatternControls(TrackerSequencer& sequencer) {
         if (paramName == "steps") {
             sequencer.getCurrentPattern().setStepCount((int)value);
         } else if (paramName == "stepsPerBeat") {
-            sequencer.setStepsPerBeat((int)value);
+            sequencer.setStepsPerBeat(value);
         }
     };
     
@@ -516,13 +574,8 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     int currentPlayingStep = sequencer.getCurrentPlayingStep();
     int playbackStep = sequencer.getPlaybackStepIndex();
     
-    // Calculate exact table height to fit all rows (no extra space)
-    // Height = header row + (numRows * row height) + borders
+    // Get number of rows for the table
     int numRows = sequencer.getCurrentPattern().getStepCount();
-    float headerHeight = ImGui::GetFrameHeightWithSpacing(); // Header row height
-    float rowHeight = ImGui::GetFrameHeightWithSpacing(); // Each data row height
-    float borderHeight = 2.0f; // Top and bottom borders (1px each)
-    float exactHeight = headerHeight + (numRows * rowHeight) + borderHeight;
     
     // Configure CellGrid using unified helper
     // Use SizingFixedFit for mixed column sizing (fixed + stretch columns)
@@ -533,7 +586,7 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
                             ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable |
                             ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollY;
     gridConfig.enableScrolling = true;
-    gridConfig.scrollHeight = exactHeight;
+    gridConfig.scrollHeight = 0.0f;  // 0.0f means auto-calculate from available content region (adapts to window size)
     gridConfig.scrollbarSize = SCROLLBAR_SIZE;
     configureCellGrid(cellGrid, gridConfig);
     
@@ -593,10 +646,11 @@ void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
     setupStateSyncCallbacks(callbacks, sequencer);
     setupRowCallbacks(callbacks, sequencer, currentPlayingStep);
     cellGrid.setCallbacks(callbacks);
+    // Only enable auto-scroll if user is not editing
+    // Auto-scroll will be disabled during editing via getFocusedRow callback returning -1
     cellGrid.enableAutoScroll(true);
     
     // Begin table (CellGrid handles ImGui::BeginTable internally)
-    // numRows already calculated above for height calculation
     cellGrid.beginTable(numRows, 1); // 1 fixed column (step number)
     cellGrid.setupFixedColumn(0, "##", STEP_NUMBER_COLUMN_WIDTH, false, 1.0f);
     
@@ -1582,10 +1636,10 @@ void TrackerSequencerGUI::setupCellValueCallbacks(CellGridCallbacks& callbacks, 
             int indexValue = (int)std::round(value);
             step.index = (indexValue == 0) ? -1 : (indexValue - 1);
         }
-        // Length parameter - range is 1 to pattern stepCount
+        // Length parameter - range is 1 to 64 (fixed maximum, can exceed pattern length)
         else if (paramName == "length") {
-            int maxLength = sequencer.getStepCount();
-            step.length = std::max(MIN_LENGTH_VALUE, std::min(maxLength, (int)std::round(value)));
+            const int MAX_STEP_LENGTH = 64;
+            step.length = std::max(MIN_LENGTH_VALUE, std::min(MAX_STEP_LENGTH, (int)std::round(value)));
         }
         // Ratio parameter - decode from encoded value (A * 1000 + B)
         else if (paramName == "ratio") {
@@ -1615,6 +1669,47 @@ void TrackerSequencerGUI::setupCellValueCallbacks(CellGridCallbacks& callbacks, 
 void TrackerSequencerGUI::setupStateSyncCallbacks(CellGridCallbacks& callbacks, TrackerSequencer& sequencer) {
     // PHASE 2: TRUST IMGUI FOCUS - Remove parallel focus tracking
     // Let CellWidget manage focus naturally, only handle TrackerSequencer-specific playback syncing
+    
+    // Auto-scroll callback: determines which row should be scrolled into view
+    // Priority order:
+    // 1. Never auto-scroll when user is editing (typing in a cell)
+    // 2. Follow user focus if user has focus in a data row
+    // 3. Disable auto-scroll when user is navigating header row
+    // 4. Follow playback step if sequencer is playing and user has no focus
+    callbacks.getFocusedRow = [this, &sequencer]() -> int {
+        // Never auto-scroll when user is editing - this interferes with typing
+        if (cellFocusState.isEditing) {
+            return -1;
+        }
+        
+        // User has focus in a data row - follow user focus
+        if (cellFocusState.row >= 0) {
+            return cellFocusState.row;
+        }
+        
+        // When row < 0, distinguish between header navigation and no focus
+        if (cellFocusState.row < 0) {
+            // Performance optimization: Cache window focus check per frame to avoid expensive ImGui calls
+            int currentFrame = ImGui::GetFrameCount();
+            if (cachedTableWindowFocusedFrame != currentFrame) {
+                cachedTableWindowFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
+                cachedTableWindowFocusedFrame = currentFrame;
+            }
+            
+            // Disable auto-scroll when navigating header (window focused but no cell focused)
+            if (cachedTableWindowFocused || callbacksState.headerClickedThisFrame || cellFocusState.column >= 0) {
+                return -1;
+            }
+            
+            // User has no focus - allow playback auto-scroll if sequencer is playing
+            if (sequencer.isPlaying()) {
+                return sequencer.getPlaybackStepIndex();
+            }
+            return -1;
+        }
+        
+        return -1;
+    };
     
     // Simple focus callback for playback syncing only (no parallel focus state tracking)
     callbacks.onCellFocusChanged = [this, &sequencer](int row, int col) {
@@ -1848,9 +1943,9 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             int indexValue = (int)std::round(value);
             stepData.index = (indexValue == 0) ? -1 : (indexValue - 1);
         } else if (isRequiredCol && requiredTypeCol == "length") {
-            // Length: clamp to 1 to pattern stepCount (dynamic)
-            int maxLength = sequencer.getStepCount();
-            stepData.length = std::max(1, std::min(maxLength, (int)std::round(value)));
+            // Length: clamp to 1 to 64 (fixed maximum, can exceed pattern length)
+            const int MAX_STEP_LENGTH = 64;
+            stepData.length = std::max(1, std::min(MAX_STEP_LENGTH, (int)std::round(value)));
         } else if (paramName == "note") {
             // Note: store -1 for empty (NaN), otherwise store the note value
             // Use direct field access for performance (note is now a direct field)
@@ -1929,14 +2024,14 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             return std::string(buf);
         };
     } else if (isRequiredCol && requiredTypeCol == "length") {
-        // Length column: 1 to pattern stepCount range (dynamic), formatted as "02", NaN = not set
-        int maxLength = sequencer.getStepCount();
-        cell.formatValue = [maxLength](float value) -> std::string {
+        // Length column: 1 to 64 range (fixed maximum, can exceed pattern length), formatted as "02", NaN = not set
+        const int MAX_STEP_LENGTH = 64;
+        cell.formatValue = [MAX_STEP_LENGTH](float value) -> std::string {
             if (std::isnan(value)) {
                 return "--"; // Show "--" for NaN (empty/not set)
             }
             int lengthVal = (int)std::round(value);
-            lengthVal = std::max(MIN_LENGTH_VALUE, std::min(maxLength, lengthVal)); // Clamp to valid range
+            lengthVal = std::max(MIN_LENGTH_VALUE, std::min(MAX_STEP_LENGTH, lengthVal)); // Clamp to valid range
             char buf[BUFFER_SIZE];
             snprintf(buf, sizeof(buf), "%02d", lengthVal); // Zero-padded to 2 digits
             return std::string(buf);
@@ -2050,15 +2145,15 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             }
         };
     } else if (isRequiredCol && requiredTypeCol == "length") {
-        // Length: parse as integer (1 to pattern stepCount, dynamic), handle "--" as NaN
-        int maxLength = sequencer.getStepCount();
-        cell.parseValue = [maxLength](const std::string& str) -> float {
+        // Length: parse as integer (1 to 64, fixed maximum, can exceed pattern length), handle "--" as NaN
+        const int MAX_STEP_LENGTH = 64;
+        cell.parseValue = [MAX_STEP_LENGTH](const std::string& str) -> float {
             if (str == "--" || str.empty()) {
                 return std::numeric_limits<float>::quiet_NaN();
             }
             try {
                 int val = std::stoi(str);
-                val = std::max(MIN_LENGTH_VALUE, std::min(maxLength, val)); // Clamp to valid range
+                val = std::max(MIN_LENGTH_VALUE, std::min(MAX_STEP_LENGTH, val)); // Clamp to valid range
                 return (float)val;
             } catch (...) {
                 return std::numeric_limits<float>::quiet_NaN();

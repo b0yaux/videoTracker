@@ -248,10 +248,10 @@ public:
     // Update step active state (clears manually triggered steps when duration expires)
     void updateStepActiveState();
     float getCurrentBpm() const;
-    int getStepsPerBeat() const { return stepsPerBeat; }
+    float getStepsPerBeat() const { return stepsPerBeat; }
     
     // Setters
-    void setStepsPerBeat(int steps);
+    void setStepsPerBeat(float steps);  // Supports fractional values (1/2, 1/4, 1/8) and negative for backward reading
     
     // Parameter synchronization methods (for ParameterRouter system)
     // Get position parameter from current edit step (for sync)
@@ -305,7 +305,7 @@ private:
     Clock* clock;
     
     // Pattern sequencer state (app-specific)
-    int stepsPerBeat = 4;
+    float stepsPerBeat = 4.0f;  // Supports fractional values (1/2, 1/4, 1/8) and negative for backward reading
     bool gatingEnabled = true;
     
     // Multi-pattern support

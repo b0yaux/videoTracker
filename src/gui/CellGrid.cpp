@@ -17,6 +17,8 @@ CellGrid::CellGrid()
     , reorderingEnabled(false)
     , autoScrollEnabled(false)
     , lastFocusedRowForScroll(-1)
+    , cachedFocusedRow(-1)
+    , cachedFocusedRowFrame(-1)
     , tableStarted(false)
     , currentRow(-1)
     , numRows(0)
@@ -150,10 +152,18 @@ void CellGrid::beginTable(int numRows, int numFixedColumns) {
             ImVec2 contentRegion = ImGui::GetContentRegionAvail();
             tableHeight = std::max(200.0f, contentRegion.y);
         }
+        // Use outerSize to constrain table height and enable scrolling
+        // Width = 0 means use available width, Height = tableHeight constrains vertical size
         outerSize = ImVec2(0.0f, tableHeight);
         
         // Make scrollbar thinner
         ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, scrollbarSize);
+        
+        // Ensure ScrollY flag is set for proper scrolling
+        tableFlags |= ImGuiTableFlags_ScrollY;
+    } else {
+        // Disable scrolling - remove ScrollY flag if present
+        tableFlags &= ~ImGuiTableFlags_ScrollY;
     }
     
     int totalColumns = numFixedColumns + (int)columnConfig.size();
@@ -375,18 +385,29 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
     ImGui::TableNextRow();
     
     // Auto-scroll to focused row when it changes
-    // Use internal state if available, otherwise fall back to callback
-    int focusedRow = callbacks.getFocusedRow ? callbacks.getFocusedRow() : -1;
-    if (autoScrollEnabled && focusedRow >= 0) {
-        if (focusedRow == row && focusedRow != lastFocusedRowForScroll) {
-            // Use SetScrollHereY to scroll the focused row into view
-            // 0.3f means scroll to position the row at 30% from top (leaving some space above)
-            ImGui::SetScrollHereY(0.3f);
-            lastFocusedRowForScroll = focusedRow;
-        } else if (focusedRow < 0 && lastFocusedRowForScroll >= 0) {
-            // Reset scroll tracking when focus is cleared
-            lastFocusedRowForScroll = -1;
-        }
+    // Conditions for auto-scroll:
+    // 1. Auto-scroll is enabled
+    // 2. We have a valid focused row
+    // 3. The focused row matches the current row being drawn
+    // 4. The focused row has changed since last scroll
+    // 5. User is not actively editing (checked in getFocusedRow callback)
+    
+    // Performance optimization: Cache focused row per frame to avoid calling expensive callbacks for every row
+    int currentFrame = ImGui::GetFrameCount();
+    if (cachedFocusedRowFrame != currentFrame) {
+        cachedFocusedRow = callbacks.getFocusedRow ? callbacks.getFocusedRow() : -1;
+        cachedFocusedRowFrame = currentFrame;
+    }
+    
+    int focusedRow = cachedFocusedRow;
+    if (autoScrollEnabled && focusedRow >= 0 && focusedRow == row && focusedRow != lastFocusedRowForScroll) {
+        // Scroll position: 0.4f positions the row at 40% from top (smoother and less aggressive than center)
+        // This only scrolls when the focused row changes, allowing manual scrolling to work
+        ImGui::SetScrollHereY(0.6f);
+        lastFocusedRowForScroll = focusedRow;
+    } else if (focusedRow < 0 && lastFocusedRowForScroll >= 0) {
+        // Reset scroll tracking when focus is cleared or editing starts
+        lastFocusedRowForScroll = -1;
     }
     
     // Call row start callback

@@ -90,6 +90,10 @@ private:
     // Unified callback state tracking
     CellGridCallbacksState callbacksState;
     
+    // Cached window focus state (updated once per frame to avoid expensive ImGui calls)
+    bool cachedTableWindowFocused;
+    int cachedTableWindowFocusedFrame;
+    
     // Track pattern index to detect pattern switches
     int lastPatternIndex;
     
