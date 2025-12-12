@@ -437,21 +437,18 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
         // This ensures proper callback setup and input handling
         bool handledBySpecialRenderer = false;
         if (callbacks.drawSpecialColumn) {
-            // Try special renderer - it should return true if it handled the column
-            // For now, we check if it's a button column by checking if drawSpecialColumn
-            // actually draws something (we can't return bool from callback, so we check
-            // if the column was handled by checking if it's a known button column)
-            // Actually, we need to let drawSpecialColumn handle button columns,
-            // but for regular parameter columns, we should use default rendering
-            // The issue is that drawSpecialColumn is called for ALL columns when set
-            // Solution: drawSpecialColumn should only be called for columns it needs to handle
-            // For now, we'll check if it's a button column by parameter name
+            // Check if it's a special column that needs custom rendering:
+            // - Button columns (mediaIndex, playStyle, polyphonyMode)
+            // - Pattern chain columns (parameterName starts with "pattern_")
+            // - Buttons column (for pattern chain D/+/− buttons)
             bool isButtonColumn = (colConfig.parameterName == "mediaIndex" || 
                                    colConfig.parameterName == "playStyle" || 
                                    colConfig.parameterName == "polyphonyMode");
+            bool isPatternChainColumn = (colConfig.parameterName.find("pattern_") == 0);
+            bool isButtonsColumn = (colConfig.parameterName == "buttons");
             
-            if (isButtonColumn) {
-                // Button columns: use special renderer
+            if (isButtonColumn || isPatternChainColumn || isButtonsColumn) {
+                // Special columns: use special renderer
                 callbacks.drawSpecialColumn(row, absoluteCol, colConfig);
                 handledBySpecialRenderer = true;
             } else {

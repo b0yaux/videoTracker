@@ -1873,6 +1873,9 @@ void MediaPool::setEnabled(bool enabled) {
 ofJson MediaPool::toJson(class ModuleRegistry* registry) const {
     ofJson json;
     
+    // Save enabled state
+    json["enabled"] = isEnabled();
+    
     // Save active player index
     json["activePlayerIndex"] = currentIndex;
     
@@ -1937,6 +1940,11 @@ ofJson MediaPool::toJson(class ModuleRegistry* registry) const {
 }
 
 void MediaPool::fromJson(const ofJson& json) {
+    // Load enabled state
+    if (json.contains("enabled")) {
+        setEnabled(json["enabled"].get<bool>());
+    }
+    
     // Load play style first (before loading players)
     if (json.contains("playStyle")) {
         int styleInt = json["playStyle"];

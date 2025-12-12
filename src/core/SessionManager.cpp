@@ -98,6 +98,7 @@ ofJson SessionManager::serializeAll() const {
         json["gui"]["viewState"]["consoleVisible"] = viewManager_->isConsoleVisible();
         json["gui"]["viewState"]["assetLibraryVisible"] = viewManager_->isAssetLibraryVisible();
         json["gui"]["viewState"]["currentFocusedWindow"] = viewManager_->getCurrentFocusedWindow();
+        json["gui"]["viewState"]["masterModulesVisible"] = viewManager_->isMasterModulesVisible();
     }
     
     // Module instance visibility state
@@ -327,6 +328,9 @@ bool SessionManager::deserializeAll(const ofJson& json) {
                 }
                 if (viewState.contains("assetLibraryVisible")) {
                     viewManager_->setAssetLibraryVisible(viewState["assetLibraryVisible"].get<bool>());
+                }
+                if (viewState.contains("masterModulesVisible")) {
+                    viewManager_->setMasterModulesVisible(viewState["masterModulesVisible"].get<bool>());
                 }
                 if (viewState.contains("currentPanel")) {
                     int panelIndex = viewState["currentPanel"].get<int>();

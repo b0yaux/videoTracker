@@ -173,6 +173,7 @@ ofJson VideoOutput::toJson(class ModuleRegistry* registry) const {
     ofJson json;
     json["type"] = "VideoOutput";
     json["name"] = getName();
+    json["enabled"] = isEnabled();
     json["masterOpacity"] = getMasterOpacity();
     
     // Serialize blend mode
@@ -219,6 +220,11 @@ ofJson VideoOutput::toJson(class ModuleRegistry* registry) const {
 }
 
 void VideoOutput::fromJson(const ofJson& json) {
+    // Load enabled state
+    if (json.contains("enabled")) {
+        setEnabled(json["enabled"].get<bool>());
+    }
+    
     // Load master opacity
     if (json.contains("masterOpacity")) {
         setMasterOpacity(json["masterOpacity"].get<float>());

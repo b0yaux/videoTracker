@@ -154,6 +154,9 @@ private:
     // CellGrid instance for pattern parameters (Steps, SPB)
     CellGrid patternParametersGrid;
     
+    // CellGrid instance for pattern chain
+    CellGrid patternChainGrid;
+    
     // Focus state for pattern parameters grid
     CellFocusState patternParamsFocusState;
     
@@ -162,6 +165,9 @@ private:
     
     // Track last column configuration for pattern parameters grid
     std::vector<CellGridColumnConfig> lastPatternParamsColumnConfig;
+    
+    // Track last column configuration for pattern chain grid
+    std::vector<CellGridColumnConfig> lastPatternChainColumnConfig;
     
     // Drawing methods
     void drawPatternChain(TrackerSequencer& sequencer);

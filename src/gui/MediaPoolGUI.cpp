@@ -402,8 +402,8 @@ void MediaPoolGUI::drawParameters() {
     tableColumnConfig.push_back(CellGridColumnConfig("polyphonyMode", "Polyphony", false, 2, false));
     // Add all editable parameters (all removable), skipping polyphonyMode since it's already added
     for (const auto& paramDesc : editableParams) {
-        // Skip polyphonyMode since it's already added as a fixed column
-        if (paramDesc.name == "polyphonyMode") {
+        // Skip polyphonyMode and index since they're already added as fixed columns
+        if (paramDesc.name == "polyphonyMode" || paramDesc.name == "index") {
             continue;
         }
         tableColumnConfig.push_back(CellGridColumnConfig(

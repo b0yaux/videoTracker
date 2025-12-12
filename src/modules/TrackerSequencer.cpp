@@ -754,6 +754,9 @@ ofJson TrackerSequencer::toJson(class ModuleRegistry* registry) const {
     json["currentStep"] = playbackState.playbackStep;  // Save playback step for backward compatibility
     // Note: GUI state (editStep, etc.) no longer saved here - managed by TrackerSequencerGUI
     
+    // Save enabled state
+    json["enabled"] = isEnabled();
+    
     // Save stepsPerBeat (per-instance step timing)
     json["stepsPerBeat"] = stepsPerBeat;
     
@@ -797,6 +800,11 @@ bool TrackerSequencer::saveState(const std::string& filename) const {
 }
 
 void TrackerSequencer::fromJson(const ofJson& json) {
+    // Load enabled state
+    if (json.contains("enabled")) {
+        setEnabled(json["enabled"].get<bool>());
+    }
+    
     // Load basic properties
     if (json.contains("currentStep")) {
         playbackState.playbackStep = json["currentStep"];

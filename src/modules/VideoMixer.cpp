@@ -154,6 +154,7 @@ ofJson VideoMixer::toJson(class ModuleRegistry* registry) const {
     ofJson json;
     json["type"] = "VideoMixer";
     json["name"] = getName();
+    json["enabled"] = isEnabled();
     json["masterOpacity"] = getMasterOpacity();
     
     // Serialize blend mode
@@ -183,6 +184,11 @@ ofJson VideoMixer::toJson(class ModuleRegistry* registry) const {
 }
 
 void VideoMixer::fromJson(const ofJson& json) {
+    // Load enabled state
+    if (json.contains("enabled")) {
+        setEnabled(json["enabled"].get<bool>());
+    }
+    
     // Load master opacity
     if (json.contains("masterOpacity")) {
         setMasterOpacity(json["masterOpacity"].get<float>());

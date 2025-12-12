@@ -119,220 +119,368 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
     ImGui::SameLine();
     // Pattern chain header with toggle
     ImGui::Text("Pattern Chain");
-    ImGui::SameLine();
-
     
     ImGui::Spacing();
     
-    // Pattern chain visual list (horizontal layout, Renoise-style)
+    // Get chain data
     const auto& chain = sequencer.getPatternChain();
     int currentChainIndex = sequencer.getCurrentChainIndex();
     int currentPatternIndex = sequencer.getCurrentPatternIndex();
     bool isPlaying = sequencer.isPlaying();
+    int numPatterns = sequencer.getNumPatterns();
     
-    // Compact styling for pattern chain
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 2));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4, 2));
-    
-    // Store starting Y position to align buttons with pattern cells
-    const float buttonsStartY = ImGui::GetCursorPosY();
-    
-    // Draw pattern chain entries (top row)
+    // Build column configuration (one column per chain entry + buttons column at end)
+    std::vector<CellGridColumnConfig> chainColumnConfig;
     for (size_t i = 0; i < chain.size(); i++) {
         int patternIdx = chain[i];
-        bool isCurrentChainEntry = ((int)i == currentChainIndex);
-        bool isCurrentPattern = (patternIdx == currentPatternIndex);
-        bool isDisabled = sequencer.isPatternChainEntryDisabled((int)i);
+        char patternName[32];
+        snprintf(patternName, sizeof(patternName), "Pattern %02d", patternIdx);
+        chainColumnConfig.push_back(CellGridColumnConfig(
+            "pattern_" + std::to_string(i),  // parameterName: unique ID for this chain position
+            patternName,                      // displayName: shows pattern index
+            false,                            // isRemovable: columns are not removable (use - button instead)
+            (int)i,                           // columnIndex
+            true                              // isDraggable: allow reordering
+        ));
+    }
+    // Add buttons column at the end (not draggable, fixed width)
+    chainColumnConfig.push_back(CellGridColumnConfig(
+        "buttons",                           // parameterName: special identifier for buttons column
+        "##buttons",                         // displayName: empty header
+        false,                                // isRemovable: buttons column is not removable
+        (int)chain.size(),                   // columnIndex
+        false                                // isDraggable: buttons column should not be reorderable
+    ));
+    
+    // Update column configuration if changed
+    if (chainColumnConfig != lastPatternChainColumnConfig) {
+        patternChainGrid.setColumnConfiguration(chainColumnConfig);
+        lastPatternChainColumnConfig = chainColumnConfig;
+    }
+    
+    // Configure CellGrid
+    patternChainGrid.setTableId("PatternChainTable");
+    patternChainGrid.setTableFlags(ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                   ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp |
+                                   ImGuiTableFlags_Reorderable);
+    patternChainGrid.enableReordering(true);
+    patternChainGrid.setCellPadding(ImVec2(4, 2));
+    patternChainGrid.setItemSpacing(ImVec2(2, 2));
+    
+    // Setup callbacks
+    CellGridCallbacks callbacks;
+    
+    // Setup column widths (stretched width for pattern chain columns, fixed width for buttons)
+    callbacks.setupParameterColumn = [](int colIndex, const CellGridColumnConfig& colConfig, int absoluteColIndex) -> bool {
+        if (colConfig.parameterName == "buttons") {
+            // Buttons column: fixed width
+            float buttonColumnWidth = (BUTTON_HEIGHT * 3) + (ImGui::GetStyle().ItemSpacing.x * 2); // 3 buttons + spacing
+            ImGui::TableSetupColumn(colConfig.displayName.c_str(), 
+                                    ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoReorder, 
+                                    buttonColumnWidth);
+        } else {
+            // Pattern columns: stretched width
+            ImGui::TableSetupColumn(colConfig.displayName.c_str(), 
+                                    ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoHide, 
+                                    1.0f); // Stretch weight
+        }
+        return true;
+    };
+    
+    // Custom header rendering with HeaderPopup for pattern selection
+    // Note: col is parameter column index (0-based within parameter columns)
+    callbacks.drawCustomHeader = [this, &sequencer, numPatterns, chain]
+                                 (int col, const CellGridColumnConfig& colConfig, ImVec2 cellStartPos, float columnWidth, float cellMinY) -> bool {
+        // Buttons column: empty header
+        if (colConfig.parameterName == "buttons") {
+            return true; // Header drawn (empty)
+        }
         
-        ImGui::PushID((int)i);
+        // Get chain index for this column (col is parameter column index)
+        if (col < 0 || col >= (int)chain.size()) return false;
         
-        // Pattern cell - clickable to select pattern (Renoise-style)
-        ImVec2 cellSize(PATTERN_CELL_WIDTH, PATTERN_CELL_HEIGHT);
+        int chainIndex = col;
+        int patternIdx = chain[chainIndex];
+        int currentChainIndex = sequencer.getCurrentChainIndex();
+        int currentPatternIndex = sequencer.getCurrentPatternIndex();
+        bool isPlaying = sequencer.isPlaying();
+        bool isDisabled = sequencer.isPatternChainEntryDisabled(chainIndex);
         
-        // Color coding: blue for current pattern, gray for current chain position, dark for others, red tint if disabled
+        // Style header background with color coding using ImGui's header color system
         ImU32 bgColor;
         if (isDisabled) {
             bgColor = GUIConstants::toU32(GUIConstants::Outline::DisabledBg);
-        } else if (isCurrentPattern && isPlaying) {
+        } else if (patternIdx == currentPatternIndex && isPlaying) {
             bgColor = GUIConstants::toU32(GUIConstants::Active::PatternPlaying);
-        } else if (isCurrentPattern) {
+        } else if (patternIdx == currentPatternIndex) {
             bgColor = GUIConstants::toU32(GUIConstants::Active::Pattern);
-        } else if (isCurrentChainEntry) {
+        } else if (chainIndex == currentChainIndex) {
             bgColor = GUIConstants::toU32(GUIConstants::Active::ChainEntry);
         } else {
             bgColor = GUIConstants::toU32(GUIConstants::Active::ChainEntryInactive);
         }
         
-        ImDrawList* drawList = ImGui::GetWindowDrawList();
-        ImVec2 cursorPos = ImGui::GetCursorScreenPos();
+        // Style TableHeader to use our custom background color and look like a plain header
+        ImVec4 bgColorVec = ImGui::ColorConvertU32ToFloat4(bgColor);
+        // Make button colors match background to avoid button-like appearance
+        ImGui::PushStyleColor(ImGuiCol_Header, bgColorVec);
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, bgColorVec);
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, bgColorVec);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0)); // Transparent
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bgColorVec);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, bgColorVec);
         
-        // Draw background
-        drawList->AddRectFilled(cursorPos, ImVec2(cursorPos.x + cellSize.x, cursorPos.y + cellSize.y), bgColor);
+        // Use TableHeader for proper table integration (required for column reordering)
+        char patternName[32];
+        snprintf(patternName, sizeof(patternName), "Pattern %02d", patternIdx);
+        ImGui::TableHeader(patternName);
         
-        // Draw border for current chain entry
-        if (isCurrentChainEntry) {
-            ImU32 borderColor = GUIConstants::toU32(GUIConstants::Active::ChainEntryBorder);
-            drawList->AddRect(cursorPos, ImVec2(cursorPos.x + cellSize.x, cursorPos.y + cellSize.y), borderColor, 0.0f, 0, 1.5f);
-        }
-        
-        // Draw diagonal line if disabled
+        // Draw disabled line after TableHeader (overlay on top)
+        // Note: Removed border for current chain entry per user request
         if (isDisabled) {
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            float headerHeight = ImGui::GetFrameHeight();
+            ImVec2 headerEndPos(cellStartPos.x + columnWidth, cellStartPos.y + headerHeight);
             ImU32 lineColor = GUIConstants::toU32(GUIConstants::Outline::Disabled);
-            drawList->AddLine(cursorPos, ImVec2(cursorPos.x + cellSize.x, cursorPos.y + cellSize.y), lineColor, OUTLINE_THICKNESS);
+            drawList->AddLine(cellStartPos, headerEndPos, lineColor, OUTLINE_THICKNESS);
         }
         
-        // Pattern number text (2-digit format: 01, 02, 03, etc.)
-        // Display chain position (1-based) instead of actual pattern index for sequential numbering
-        char patternLabel[BUFFER_SIZE];
-        snprintf(patternLabel, sizeof(patternLabel), "%02d", (int)i + 1);
-        ImVec2 textSize = ImGui::CalcTextSize(patternLabel);
-        ImVec2 textPos(cursorPos.x + (cellSize.x - textSize.x) * 0.5f, cursorPos.y + (cellSize.y - textSize.y) * 0.5f);
-        drawList->AddText(textPos, IM_COL32_WHITE, patternLabel);
+        // Pop style colors
+        ImGui::PopStyleColor(6);
         
-        // Make it clickable and navigable with keyboard
-        ImGui::InvisibleButton("pattern", cellSize, ImGuiButtonFlags_EnableNav);
+        // Handle header click - open HeaderPopup for pattern selection
         if (ImGui::IsItemClicked(0)) {
-            if (isPlaying && useChain) {
-                // During playback with chain enabled: toggle disable state
-                sequencer.setPatternChainEntryDisabled((int)i, !isDisabled);
+            std::string popupId = "PatternChainPopup_" + std::to_string(col);
+            ImGui::OpenPopup(popupId.c_str());
+        }
+        
+        // Draw HeaderPopup with all available patterns
+        std::string popupId = "PatternChainPopup_" + std::to_string(col);
+        std::vector<HeaderPopup::PopupItem> items;
+        for (int i = 0; i < numPatterns; i++) {
+            char itemName[32];
+            snprintf(itemName, sizeof(itemName), "Pattern %02d", i);
+            items.push_back(HeaderPopup::PopupItem(std::to_string(i), itemName));
+        }
+        
+        HeaderPopup::draw(popupId, items, columnWidth, cellStartPos,
+                         [&sequencer, chainIndex](const std::string& patternIdStr) {
+                             try {
+                                 int newPatternIdx = std::stoi(patternIdStr);
+                                 sequencer.setPatternChainEntry(chainIndex, newPatternIdx);
+                             } catch (...) {
+                                 // Invalid pattern ID, ignore
+                             }
+                         });
+        
+        return true; // Header was drawn
+    };
+    
+    // Row 0: Fixed position numbers (01, 02, etc.) - these never move when columns are reordered
+    // Row 1: Editable repeat counts
+    // Note: col is absolute column index (0+ = pattern columns, buttons column at end)
+    callbacks.drawSpecialColumn = [this, &sequencer, chain, currentChainIndex, currentPatternIndex, isPlaying, useChain]
+                                  (int row, int col, const CellGridColumnConfig& colConfig) {
+        // Check if this is the buttons column (last column)
+        if (colConfig.parameterName == "buttons") {
+            if (row == 0) {
+                // Row 0: Draw D/+/− buttons (aligned with chain position buttons)
+                // 'D' button for duplicate current pattern
+                if (ImGui::Button("D", ImVec2(BUTTON_HEIGHT, BUTTON_HEIGHT))) {
+                    int currentPattern = sequencer.getCurrentPatternIndex();
+                    sequencer.duplicatePattern(currentPattern);
+                    int newPatternIndex = sequencer.getNumPatterns() - 1;
+                    sequencer.addToPatternChain(newPatternIndex);
+                    if (!(isPlaying && useChain)) {
+                        sequencer.setCurrentPatternIndex(newPatternIndex);
+                        sequencer.setCurrentChainIndex(sequencer.getPatternChainSize() - 1);
+                    }
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Duplicate current pattern");
+                }
+                
+                ImGui::SameLine();
+                
+                // '+' button to add new pattern
+                if (ImGui::Button("+", ImVec2(BUTTON_HEIGHT, BUTTON_HEIGHT))) {
+                    int newPatternIndex = sequencer.addPattern();
+                    sequencer.addToPatternChain(newPatternIndex);
+                    if (!(isPlaying && useChain)) {
+                        sequencer.setCurrentPatternIndex(newPatternIndex);
+                        sequencer.setCurrentChainIndex(sequencer.getPatternChainSize() - 1);
+                    }
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Add new pattern");
+                }
+                
+                ImGui::SameLine();
+                
+                // '-' button to remove currently selected pattern from chain
+                bool canRemove = sequencer.getPatternChainSize() > 1;
+                if (!canRemove) {
+                    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f);
+                }
+                if (ImGui::Button("-", ImVec2(BUTTON_HEIGHT, BUTTON_HEIGHT)) && canRemove) {
+                    int chainSize = sequencer.getPatternChainSize();
+                    int currentIndex = sequencer.getCurrentChainIndex();
+                    if (chainSize > 1 && currentIndex >= 0 && currentIndex < chainSize) {
+                        sequencer.removeFromPatternChain(currentIndex);
+                    }
+                }
+                if (ImGui::IsItemHovered() && canRemove) {
+                    ImGui::SetTooltip("Remove currently selected pattern from chain");
+                }
+                if (!canRemove) {
+                    ImGui::PopStyleVar();
+                }
+            }
+            // Row 1: empty for buttons column
+            return;
+        }
+        
+        // Pattern columns only
+        // col is absolute, pattern columns are at indices 0 to chain.size()-1
+        if (col < 0 || col >= (int)chain.size()) return;
+        
+        int chainIndex = col;
+        int patternIdx = chain[chainIndex];
+        bool isCurrentChainEntry = (chainIndex == currentChainIndex);
+        bool isCurrentPattern = (patternIdx == currentPatternIndex);
+        bool isDisabled = sequencer.isPatternChainEntryDisabled(chainIndex);
+        
+        if (row == 0) {
+            // Row 0: Position numbers (01, 02, etc.) - fixed display, never moves
+            ImVec2 cellSize = ImGui::GetContentRegionAvail();
+            cellSize.y = PATTERN_CELL_HEIGHT;
+            
+            // Color coding: same as header
+            ImU32 bgColor;
+            if (isDisabled) {
+                bgColor = GUIConstants::toU32(GUIConstants::Outline::DisabledBg);
+            } else if (isCurrentPattern && isPlaying) {
+                bgColor = GUIConstants::toU32(GUIConstants::Active::PatternPlaying);
+            } else if (isCurrentPattern) {
+                bgColor = GUIConstants::toU32(GUIConstants::Active::Pattern);
+            } else if (isCurrentChainEntry) {
+                bgColor = GUIConstants::toU32(GUIConstants::Active::ChainEntry);
             } else {
-                // Normal behavior: select pattern
-                sequencer.setCurrentPatternIndex(patternIdx);
-                sequencer.setCurrentChainIndex((int)i);
+                bgColor = GUIConstants::toU32(GUIConstants::Active::ChainEntryInactive);
             }
-        }
-        
-        if (ImGui::IsItemHovered()) {
-            if (isPlaying && useChain) {
-                ImGui::SetTooltip("Chain position %02d (Pattern %02d)\nLeft-click: Toggle disable\nRight-click: Remove from chain", (int)i + 1, patternIdx);
-            } else {
-                ImGui::SetTooltip("Chain position %02d (Pattern %02d)\nLeft-click: Select", (int)i + 1, patternIdx);
+            
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            ImVec2 cursorPos = ImGui::GetCursorScreenPos();
+            ImVec2 cellEndPos(cursorPos.x + cellSize.x, cursorPos.y + cellSize.y);
+            
+            // Draw background
+            drawList->AddRectFilled(cursorPos, cellEndPos, bgColor);
+            
+            // Draw border for current chain entry
+            if (isCurrentChainEntry) {
+                ImU32 borderColor = GUIConstants::toU32(GUIConstants::Active::ChainEntryBorder);
+                drawList->AddRect(cursorPos, cellEndPos, borderColor, 0.0f, 0, 1.5f);
             }
-        }
-        
-        ImGui::SameLine();
-        ImGui::PopID();
-    }
-    
-    // Small buttons for duplicate, add, and remove (same size, compact, distinct from pattern cells)
-    // Note: We keep the same style vars for buttons (they're already pushed above)
-        // Center buttons vertically relative to pattern cells
-        const float verticalOffset = (PATTERN_CELL_HEIGHT - BUTTON_HEIGHT) * 0.5f;
-        const float buttonsY = buttonsStartY + verticalOffset;
-    
-    // 'D' button for duplicate current pattern
-    ImGui::SetCursorPosY(buttonsY);
-    if (ImGui::Button("D", ImVec2(BUTTON_HEIGHT, BUTTON_HEIGHT))) {
-        int currentPattern = sequencer.getCurrentPatternIndex();
-        sequencer.duplicatePattern(currentPattern);
-        int newPatternIndex = sequencer.getNumPatterns() - 1;
-        // Add new pattern to chain
-        sequencer.addToPatternChain(newPatternIndex);
-        // Switch to new pattern if not playing with pattern chaining enabled
-        if (!(isPlaying && useChain)) {
-            sequencer.setCurrentPatternIndex(newPatternIndex);
-            sequencer.setCurrentChainIndex(sequencer.getPatternChainSize() - 1);
-        }
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Duplicate current pattern");
-    }
-    
-    ImGui::SameLine();
-    ImGui::SetCursorPosY(buttonsY);  // Set Y after SameLine() to ensure alignment
-    
-    // '+' button to add new pattern
-    if (ImGui::Button("+", ImVec2(BUTTON_HEIGHT, BUTTON_HEIGHT))) {
-        int newPatternIndex = sequencer.addPattern();
-        sequencer.addToPatternChain(newPatternIndex);
-        // Switch to new pattern if not playing with pattern chaining enabled
-        if (!(isPlaying && useChain)) {
-            sequencer.setCurrentPatternIndex(newPatternIndex);
-            sequencer.setCurrentChainIndex(sequencer.getPatternChainSize() - 1);
-        }
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Add new pattern");
-    }
-    
-    ImGui::SameLine();
-    ImGui::SetCursorPosY(buttonsY);  // Set Y after SameLine() to ensure alignment
-    
-    // '-' button to remove currently selected pattern from chain (if chain has more than one entry)
-    bool canRemove = sequencer.getPatternChainSize() > 1;
-    if (!canRemove) {
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f);
-    }
-    if (ImGui::Button("-", ImVec2(BUTTON_HEIGHT, BUTTON_HEIGHT)) && canRemove) {
-        int chainSize = sequencer.getPatternChainSize();
-        int currentIndex = sequencer.getCurrentChainIndex();
-        if (chainSize > 1 && currentIndex >= 0 && currentIndex < chainSize) {
-            // Remove the currently selected pattern
-            // removeFromPatternChain will handle adjusting currentChainIndex appropriately
-            sequencer.removeFromPatternChain(currentIndex);
-        }
-    }
-    if (ImGui::IsItemHovered() && canRemove) {
-        ImGui::SetTooltip("Remove currently selected pattern from chain");
-    }
-    if (!canRemove) {
-        ImGui::PopStyleVar();  // Pop the alpha style var
-    }
-    
-    // Pop pattern chain style vars (used for both pattern cells and buttons)
-    ImGui::PopStyleVar(2);
-    
-
-    // Draw repeat count cells below pattern cells
-    // Push style vars for repeat count cells
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 2));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4, 2));
-    
-    for (size_t i = 0; i < chain.size(); i++) {
-        ImGui::PushID((int)(i + REPEAT_COUNT_ID_OFFSET));  // Different ID range to avoid conflicts
-        
-        int repeatCount = sequencer.getPatternChainRepeatCount((int)i);
-        bool isCurrentChainEntry = ((int)i == currentChainIndex);
-        
-        ImVec2 repeatCellSize(PATTERN_CELL_WIDTH, REPEAT_CELL_HEIGHT);
-        ImGui::PushItemWidth(repeatCellSize.x);
-        
-        // Editable repeat count (small input field, similar to pattern grid cells)
-        char repeatBuf[BUFFER_SIZE];
-        snprintf(repeatBuf, sizeof(repeatBuf), "%d", repeatCount);
-        
-        // Style the repeat count cell to match pattern cell
-        if (isCurrentChainEntry) {
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, GUIConstants::Frame::ChainEntry);
-        }
-        
-        if (ImGui::InputText("##repeat", repeatBuf, sizeof(repeatBuf), 
-                             ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_EnterReturnsTrue | 
-                             ImGuiInputTextFlags_AutoSelectAll)) {
-            try {
-                int newRepeat = std::stoi(repeatBuf);
-                newRepeat = std::max(1, std::min(99, newRepeat));
-                sequencer.setPatternChainRepeatCount((int)i, newRepeat);
-            } catch (...) {
-                // Invalid input, ignore
+            
+            // Draw diagonal line if disabled
+            if (isDisabled) {
+                ImU32 lineColor = GUIConstants::toU32(GUIConstants::Outline::Disabled);
+                drawList->AddLine(cursorPos, cellEndPos, lineColor, OUTLINE_THICKNESS);
             }
+            
+            // Draw position number (01, 02, etc.) - chain position, not pattern index
+            char positionLabel[BUFFER_SIZE];
+            snprintf(positionLabel, sizeof(positionLabel), "%02d", chainIndex + 1);
+            ImVec2 textSize = ImGui::CalcTextSize(positionLabel);
+            ImVec2 textPos(cursorPos.x + (cellSize.x - textSize.x) * 0.5f, 
+                          cursorPos.y + (cellSize.y - textSize.y) * 0.5f);
+            drawList->AddText(textPos, IM_COL32_WHITE, positionLabel);
+            
+            // Make it clickable
+            ImGui::SetCursorScreenPos(cursorPos);
+            ImGui::InvisibleButton(("##pos_" + std::to_string(chainIndex)).c_str(), cellSize, ImGuiButtonFlags_EnableNav);
+            
+            if (ImGui::IsItemClicked(0)) {
+                if (isPlaying && useChain) {
+                    // During playback with chain enabled: toggle disable state
+                    sequencer.setPatternChainEntryDisabled(chainIndex, !isDisabled);
+                } else {
+                    // Normal behavior: select pattern
+                    sequencer.setCurrentPatternIndex(patternIdx);
+                    sequencer.setCurrentChainIndex(chainIndex);
+                }
+            }
+            
+            if (ImGui::IsItemHovered()) {
+                if (isPlaying && useChain) {
+                    ImGui::SetTooltip("Chain position %02d (Pattern %02d)\nLeft-click: Toggle disable", chainIndex + 1, patternIdx);
+                } else {
+                    ImGui::SetTooltip("Chain position %02d (Pattern %02d)\nLeft-click: Select", chainIndex + 1, patternIdx);
+                }
+            }
+        } else if (row == 1) {
+            // Row 1: Editable repeat count
+            int repeatCount = sequencer.getPatternChainRepeatCount(chainIndex);
+            
+            ImVec2 cellSize = ImGui::GetContentRegionAvail();
+            cellSize.y = REPEAT_CELL_HEIGHT;
+            ImGui::PushItemWidth(cellSize.x);
+            
+            // Style the repeat count cell
+            if (isCurrentChainEntry) {
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, GUIConstants::Frame::ChainEntry);
+            }
+            
+            char repeatBuf[BUFFER_SIZE];
+            snprintf(repeatBuf, sizeof(repeatBuf), "%d", repeatCount);
+            
+            if (ImGui::InputText(("##repeat_" + std::to_string(chainIndex)).c_str(), repeatBuf, sizeof(repeatBuf), 
+                                 ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_EnterReturnsTrue | 
+                                 ImGuiInputTextFlags_AutoSelectAll)) {
+                try {
+                    int newRepeat = std::stoi(repeatBuf);
+                    newRepeat = std::max(1, std::min(99, newRepeat));
+                    sequencer.setPatternChainRepeatCount(chainIndex, newRepeat);
+                } catch (...) {
+                    // Invalid input, ignore
+                }
+            }
+            
+            if (isCurrentChainEntry) {
+                ImGui::PopStyleColor();
+            }
+            
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Repeat count: %d (1-99)", repeatCount);
+            }
+            
+            ImGui::PopItemWidth();
         }
-        
-        if (isCurrentChainEntry) {
-            ImGui::PopStyleColor();
-        }
-        
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Repeat count: %d (1-99)", repeatCount);
-        }
-        
-        ImGui::PopItemWidth();
-        ImGui::SameLine();
-        ImGui::PopID();
+    };
+    
+    // Set callbacks
+    patternChainGrid.setCallbacks(callbacks);
+    
+    // TODO: Detect column reordering and update pattern chain
+    // ImGui handles visual reordering automatically when ImGuiTableFlags_Reorderable is set,
+    // but we need to detect when columns are reordered and update the pattern chain accordingly.
+    // This can be done by checking ImGui::TableGetColumnOrder() after rendering and comparing
+    // to the previous order, then calling sequencer methods to reorder chain entries.
+    
+    // Begin table (no fixed columns - buttons are a regular parameter column at the end)
+    patternChainGrid.beginTable(2, 0); // 2 rows, 0 fixed columns
+    
+    // Draw headers
+    patternChainGrid.drawHeaders(0);
+    
+    // Draw rows
+    for (int row = 0; row < 2; row++) {
+        bool isPlaybackRow = false; // Pattern chain doesn't have playback rows
+        bool isEditRow = false;
+        patternChainGrid.drawRow(row, 0, isPlaybackRow, isEditRow);
     }
     
-    // Pop repeat count style vars
-    ImGui::PopStyleVar(2);
+    patternChainGrid.endTable();
     
     ImGui::Spacing();
     ImGui::Separator();

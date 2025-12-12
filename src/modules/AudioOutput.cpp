@@ -161,6 +161,7 @@ ofJson AudioOutput::toJson(class ModuleRegistry* registry) const {
     ofJson json;
     json["type"] = "AudioOutput";
     json["name"] = getName();
+    json["enabled"] = isEnabled();
     json["masterVolume"] = getMasterVolume();
     json["audioDevice"] = getAudioDevice();
     
@@ -191,6 +192,11 @@ ofJson AudioOutput::toJson(class ModuleRegistry* registry) const {
 }
 
 void AudioOutput::fromJson(const ofJson& json) {
+    // Load enabled state
+    if (json.contains("enabled")) {
+        setEnabled(json["enabled"].get<bool>());
+    }
+    
     // Load master volume
     if (json.contains("masterVolume")) {
         setMasterVolume(json["masterVolume"].get<float>());
