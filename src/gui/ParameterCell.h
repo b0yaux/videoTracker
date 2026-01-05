@@ -1,6 +1,6 @@
 #pragma once
 
-#include "CellWidget.h"
+#include "BaseCell.h"
 #include "modules/Module.h"
 #include "core/ParameterRouter.h"
 #include "core/ParameterPath.h"
@@ -9,6 +9,12 @@
 #include <limits>
 #include <vector>
 #include <string>
+#include <memory>
+
+// Forward declarations for concrete cell types (only needed in .cpp for createCellForParameter)
+class NumCell;
+class BoolCell;
+class MenuCell;
 
 /**
  * ParameterCell - Module adapter with routing awareness
@@ -29,7 +35,7 @@
  * CellWidget widget = cell.createCellWidget();
  * widget.draw(uniqueId, isFocused, ...);
  * 
- * // With custom getter/setter (e.g., MediaPool needs activePlayer)
+ * // With custom getter/setter (e.g., MultiSampler needs activePlayer)
  * ParameterCell cell(&myModule, paramDesc, &parameterRouter);
  * CellWidget widget = cell.createCellWidget();
  * widget.getCurrentValue = [&]() { return myModule->getActivePlayer()->getValue(); };
@@ -69,24 +75,37 @@ public:
     void setValue(float value);
     
     /**
-     * Create CellWidget with all editing features
+     * Create BaseCell with all editing features
      * 
-     * Creates a fully configured CellWidget with:
-     * - Drag editing support
-     * - Keyboard input (typing, Enter, Escape, arrow keys)
-     * - Expression parsing (e.g., "1.5 + 0.3")
-     * - Edit mode management
-     * - Multi-precision (Shift for fine control)
-     * - Fill bar visualization
-     * - Standard formatting (INT -> integer, FLOAT -> 3 decimals)
+     * Creates a fully configured cell (NumCell, BoolCell, or MenuCell) based on parameter type:
+     * - NumCell: Drag editing, keyboard input, expression parsing, multi-precision
+     * - BoolCell: Toggle button with ON/OFF labels
+     * - MenuCell: Enum selection with cycling
      * 
-     * @return Configured CellWidget ready to use
+     * @return Configured BaseCell ready to use (unique_ptr for polymorphism)
      */
-    CellWidget createCellWidget();
+    std::unique_ptr<BaseCell> createCell();
+    
+    /**
+     * Static helper to create appropriate cell type based on ParameterDescriptor
+     * 
+     * This is a factory method that creates the correct cell type:
+     * - FLOAT/INT -> NumCell
+     * - BOOL -> BoolCell
+     * - ENUM -> MenuCell
+     * 
+     * @param desc Parameter descriptor
+     * @param router Optional ParameterRouter for routing awareness
+     * @return Configured BaseCell ready to use
+     */
+    static std::unique_ptr<BaseCell> createCellForParameter(
+        const ParameterDescriptor& desc,
+        ParameterRouter* router = nullptr
+    );
     
     /**
      * Set custom getter callback
-     * Overrides Module::getParameter for special cases (e.g., MediaPool activePlayer)
+     * Overrides Module::getParameter for special cases (e.g., MultiSampler activePlayer)
      * @param getter Callback that returns current value (return NaN if not available)
      */
     void setCustomGetter(std::function<float()> getter);
@@ -175,6 +194,6 @@ private:
     std::function<void()> customRemover_;
     bool isRemovable_ = true;
     
-    // Helper to set up standard formatting
-    void setupStandardFormatting(CellWidget& cell) const;
+    // Type-specific configuration methods removed - now handled by BaseCell::configure()
+    // This keeps ParameterCell decoupled from concrete cell types
 };

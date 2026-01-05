@@ -334,13 +334,13 @@ bool ModuleRegistry::fromJson(const ofJson& json, ModuleFactory& factory) {
     return true;
 }
 
-void ModuleRegistry::setupAllModules(class Clock* clock, class ModuleRegistry* registry, class ConnectionManager* connectionManager, class ParameterRouter* parameterRouter, bool isRestored) {
+void ModuleRegistry::setupAllModules(class Clock* clock, class ModuleRegistry* registry, class ConnectionManager* connectionManager, class ParameterRouter* parameterRouter, class PatternRuntime* patternRuntime, bool isRestored) {
     // Use this registry if none provided
     ModuleRegistry* reg = registry ? registry : this;
     
     for (const auto& [uuid, module] : modules) {
         if (module) {
-            module->initialize(clock, reg, connectionManager, parameterRouter, isRestored);
+            module->initialize(clock, reg, connectionManager, parameterRouter, patternRuntime, isRestored);
         }
     }
 }
@@ -352,6 +352,7 @@ std::string ModuleRegistry::addModule(
     class Clock* clock,
     class ConnectionManager* connectionManager,
     class ParameterRouter* parameterRouter,
+    class PatternRuntime* patternRuntime,
     class GUIManager* guiManager,
     const std::string& masterAudioOutName,
     const std::string& masterVideoOutName
@@ -388,7 +389,7 @@ std::string ModuleRegistry::addModule(
     }
     
     // Initialize module
-    module->initialize(clock, this, connectionManager, parameterRouter, false);
+    module->initialize(clock, this, connectionManager, parameterRouter, patternRuntime, false);
     
     // Auto-connect to master outputs
     if (connectionManager) {

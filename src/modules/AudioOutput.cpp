@@ -125,10 +125,25 @@ void AudioOutput::setParameter(const std::string& paramName, float value, bool n
         }
     } else if (paramName.find("connectionVolume_") == 0) {
         // Extract connection index from parameter name
-        size_t index = std::stoul(paramName.substr(17)); // "connectionVolume_".length() == 17
-        setConnectionVolume(index, value);
-        if (notify && parameterChangeCallback) {
-            parameterChangeCallback(paramName, value);
+        // FIX: Check if paramName is long enough before calling substr
+        if (paramName.length() <= 17) {
+            ofLogWarning("AudioOutput") << "Invalid connection volume parameter name (too short): " << paramName << " (length: " << paramName.length() << ")";
+            return;
+        }
+        
+        std::string indexStr = paramName.substr(17); // "connectionVolume_".length() == 17
+        if (indexStr.empty()) {
+            ofLogWarning("AudioOutput") << "Invalid connection volume parameter name (missing index): " << paramName;
+            return;
+        }
+        try {
+            size_t index = std::stoul(indexStr);
+            setConnectionVolume(index, value);
+            if (notify && parameterChangeCallback) {
+                parameterChangeCallback(paramName, value);
+            }
+        } catch (const std::exception& e) {
+            ofLogWarning("AudioOutput") << "Invalid connection volume parameter name: " << paramName << " (" << e.what() << ")";
         }
     }
 }
@@ -140,8 +155,24 @@ float AudioOutput::getParameter(const std::string& paramName) const {
         return static_cast<float>(getAudioDevice());
     } else if (paramName.find("connectionVolume_") == 0) {
         // Extract connection index from parameter name
-        size_t index = std::stoul(paramName.substr(17)); // "connectionVolume_".length() == 17
-        return getConnectionVolume(index);
+        // FIX: Check if paramName is long enough before calling substr
+        if (paramName.length() <= 17) {
+            ofLogWarning("AudioOutput") << "Invalid connection volume parameter name (too short): " << paramName << " (length: " << paramName.length() << ")";
+            return 0.0f;
+        }
+        
+        std::string indexStr = paramName.substr(17); // "connectionVolume_".length() == 17
+        if (indexStr.empty()) {
+            ofLogWarning("AudioOutput") << "Invalid connection volume parameter name (missing index): " << paramName;
+            return 0.0f;
+        }
+        try {
+            size_t index = std::stoul(indexStr);
+            return getConnectionVolume(index);
+        } catch (const std::exception& e) {
+            ofLogWarning("AudioOutput") << "Invalid connection volume parameter name: " << paramName << " (" << e.what() << ")";
+            return 0.0f;
+        }
     }
     // Unknown parameter - return default
     return Module::getParameter(paramName);
@@ -172,14 +203,17 @@ ofJson AudioOutput::toJson(class ModuleRegistry* registry) const {
         if (auto module = connectedModules_[i].lock()) {
             ofJson connJson;
             
-            // Registry is always provided by ModuleRegistry::toJson()
-            std::string instanceName = registry->getName(module);
-            std::string uuid = registry->getUUID(instanceName);
-            if (!uuid.empty()) {
-                connJson["moduleUUID"] = uuid;
-            }
-            if (!instanceName.empty()) {
-                connJson["moduleName"] = instanceName;  // For readability
+            // Registry may be null when called from getStateSnapshot() (via Engine::buildModuleStates)
+            // In that case, we skip UUID/name serialization but still serialize volume
+            if (registry) {
+                std::string instanceName = registry->getName(module);
+                std::string uuid = registry->getUUID(instanceName);
+                if (!uuid.empty()) {
+                    connJson["moduleUUID"] = uuid;
+                }
+                if (!instanceName.empty()) {
+                    connJson["moduleName"] = instanceName;  // For readability
+                }
             }
             
             connJson["volume"] = (i < connectionVolumes_.size()) ? connectionVolumes_[i] : 1.0f;

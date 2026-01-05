@@ -11,7 +11,7 @@ class ParameterRouter;  // Forward declaration
 class Module;  // Forward declaration
 struct ParameterDescriptor;  // Forward declaration (it's a struct, not a class)
 class ParameterCell;  // Forward declaration (internal implementation detail)
-class CellWidget;  // Forward declaration
+class BaseCell;  // Forward declaration
 class CellGrid;  // Forward declaration
 struct CellGridColumnConfig;  // Forward declaration
 struct CellGridCallbacks;  // Forward declaration
@@ -65,7 +65,7 @@ public:
     void setGUIManager(class GUIManager* manager) { this->guiManager = manager; }
     class GUIManager* getGUIManager() const { return guiManager; }
     
-    // Get module type name (e.g., "TrackerSequencer", "MediaPool")
+    // Get module type name (e.g., "TrackerSequencer", "MultiSampler")
     // Returns empty string if module not found in registry
     std::string getModuleTypeName() const;
     
@@ -185,7 +185,7 @@ protected:
      * and TrackerSequencerGUI (FocusState struct)
      */
     struct CellFocusState {
-        int row = -1;              // Focused row (-1 = none, 0 = single row for MediaPool)
+        int row = -1;              // Focused row (-1 = none, 0 = single row for MultiSampler)
         int column = -1;           // Focused column (-1 = none)
         bool isEditing = false;    // True when in edit mode (typing numeric value)
         std::string editingParameter;  // Currently editing parameter name (empty if none)
@@ -295,7 +295,7 @@ protected:
     
     /**
      * Check if a key is a typing key (numeric digits, decimal point, operators)
-     * These keys should trigger auto-enter edit mode and be delegated to CellWidget
+     * These keys should trigger auto-enter edit mode and be delegated to BaseCell
      */
     static bool isTypingKey(int key);
     
@@ -340,13 +340,13 @@ protected:
                                     std::function<bool()> additionalCondition = nullptr);
     
     /**
-     * Create a CellWidget for a module parameter
+     * Create a BaseCell for a module parameter
      * Helper method that centralizes the common pattern:
      * - Gets module from registry using instanceName
      * - Gets ParameterRouter
-     * - Creates CellWidget with routing awareness
+     * - Creates BaseCell (NumCell, BoolCell, or MenuCell) with routing awareness
      * 
-     * Subclasses can override for special cases (e.g., MediaPool activePlayer)
+     * Subclasses can override for special cases (e.g., MultiSampler activePlayer)
      * or use this directly for standard Module parameter editing.
      * 
      * @param paramDesc Parameter descriptor
@@ -355,9 +355,9 @@ protected:
      * @param customRemover Optional custom remover function (overrides default reset to defaultValue)
      * @param customFormatter Optional custom formatter function (overrides default formatting)
      * @param customParser Optional custom parser function (overrides default parsing)
-     * @return CellWidget instance configured for the parameter
+     * @return BaseCell instance configured for the parameter (unique_ptr for polymorphism)
      */
-    CellWidget createCellWidget(
+    std::unique_ptr<BaseCell> createCellWidget(
         const ParameterDescriptor& paramDesc,
         std::function<float()> customGetter = nullptr,
         std::function<void(float)> customSetter = nullptr,

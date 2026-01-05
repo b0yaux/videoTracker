@@ -130,10 +130,26 @@ void VideoOutput::setParameter(const std::string& paramName, float value, bool n
         }
     } else if (paramName.find("connectionOpacity_") == 0) {
         // Extract source index from parameter name
-        size_t index = std::stoul(paramName.substr(19)); // "connectionOpacity_".length() == 19
-        setSourceOpacity(index, value);
-        if (notify && parameterChangeCallback) {
-            parameterChangeCallback(paramName, value);
+        // FIX: Check if paramName is long enough before calling substr
+        if (paramName.length() <= 19) {
+            // Parameter name is too short - it's just "connectionOpacity_" without index
+            ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name (too short): " << paramName << " (length: " << paramName.length() << ")";
+            return;
+        }
+        
+        std::string indexStr = paramName.substr(19); // "connectionOpacity_".length() == 19
+        if (indexStr.empty()) {
+            ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name (missing index): " << paramName;
+            return;
+        }
+        try {
+            size_t index = std::stoul(indexStr);
+            setSourceOpacity(index, value);
+            if (notify && parameterChangeCallback) {
+                parameterChangeCallback(paramName, value);
+            }
+        } catch (const std::exception& e) {
+            ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name: " << paramName << " (" << e.what() << ")";
         }
     }
 }
@@ -151,8 +167,26 @@ float VideoOutput::getParameter(const std::string& paramName) const {
         return getAutoNormalize() ? 1.0f : 0.0f;
     } else if (paramName.find("connectionOpacity_") == 0) {
         // Extract connection index from parameter name
-        size_t index = std::stoul(paramName.substr(19)); // "connectionOpacity_".length() == 19
-        return getSourceOpacity(index);
+        // FIX: Check if paramName is long enough before calling substr
+        // "connectionOpacity_" is 19 chars, so we need at least 20 chars for "connectionOpacity_0"
+        if (paramName.length() <= 19) {
+            // Parameter name is too short - it's just "connectionOpacity_" without index
+            ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name (too short): " << paramName << " (length: " << paramName.length() << ")";
+            return 0.0f;
+        }
+        
+        std::string indexStr = paramName.substr(19); // "connectionOpacity_".length() == 19
+        if (indexStr.empty()) {
+            ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name (missing index): " << paramName;
+            return 0.0f;
+        }
+        try {
+            size_t index = std::stoul(indexStr);
+            return getSourceOpacity(index);
+        } catch (const std::exception& e) {
+            ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name: " << paramName << " (" << e.what() << ")";
+            return 0.0f;
+        }
     }
     // Unknown parameter - return default
     return Module::getParameter(paramName);
@@ -193,14 +227,17 @@ ofJson VideoOutput::toJson(class ModuleRegistry* registry) const {
         if (auto module = connectedModules_[i].lock()) {
             ofJson connJson;
             
-            // Registry is always provided by ModuleRegistry::toJson()
-            std::string instanceName = registry->getName(module);
-            std::string uuid = registry->getUUID(instanceName);
-            if (!uuid.empty()) {
-                connJson["moduleUUID"] = uuid;
-            }
-            if (!instanceName.empty()) {
-                connJson["moduleName"] = instanceName;  // For readability
+            // Registry may be null when called from getStateSnapshot() (via Engine::buildModuleStates)
+            // In that case, we skip UUID/name serialization but still serialize opacity/blendMode
+            if (registry) {
+                std::string instanceName = registry->getName(module);
+                std::string uuid = registry->getUUID(instanceName);
+                if (!uuid.empty()) {
+                    connJson["moduleUUID"] = uuid;
+                }
+                if (!instanceName.empty()) {
+                    connJson["moduleName"] = instanceName;  // For readability
+                }
             }
             
             connJson["opacity"] = (i < sourceOpacities_.size()) ? sourceOpacities_[i] : 1.0f;
@@ -425,11 +462,22 @@ void VideoOutput::draw() {
                                        << frameTime << "ms (mixer: " << mixerTime << "ms, draw: " << drawTime << "ms)";
         }
     } else {
-        // No connections - still track frame time
+        // No connections - clear FBO to black to prevent grey buffer artifacts
+        ensureOutputFbo(viewportWidth_, viewportHeight_);
+        outputFbo_.begin();
+        ofClear(0, 0, 0, 255);  // Clear to black
+        outputFbo_.end();
+        
+        // Draw black screen
+        if (outputFbo_.isAllocated()) {
+            ofSetColor(255, 255, 255, 255);
+            outputFbo_.draw(0, 0, currentWidth, currentHeight);
+        }
+        
+        // Track frame time
         float frameTime = (ofGetElapsedTimef() - frameStartTime) * 1000.0f;
         lastFrameTime_ = frameTime;
     }
-    // No input connected - screen already cleared by ofApp::draw()
 }
 
 void VideoOutput::handleWindowResize(int width, int height) {

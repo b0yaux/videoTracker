@@ -4,7 +4,6 @@
 #include "ofEvents.h"
 #include "Module.h"
 #include "data/Pattern.h"
-#include "gui/CellWidget.h"
 #include "data/PatternChain.h"
 #include "ofJson.h"
 #include <string>
@@ -16,6 +15,7 @@
 // Forward declarations
 class Clock;
 struct TimeEvent;
+class PatternRuntime;
 
 // TrackerSequencer: Pattern-based step sequencer for triggering media playback
 //
@@ -40,9 +40,10 @@ public:
     
     void setup(Clock* clockRef);
     
-    // New unified initialization method (Phase 2.2)
+    // Unified initialization method
     void initialize(Clock* clock, ModuleRegistry* registry, ConnectionManager* connectionManager, 
-                    ParameterRouter* parameterRouter, bool isRestored) override;
+                    ParameterRouter* parameterRouter, PatternRuntime* patternRuntime = nullptr, 
+                    bool isRestored = false) override;
     
     // React to runtime connection changes (e.g., from Console)
     void onConnectionEstablished(const std::string& targetModuleName,
@@ -53,9 +54,15 @@ public:
                                  Module::ConnectionType connectionType,
                                  ConnectionManager* connectionManager) override;
     
-    // Initialize default pattern based on connected MediaPool (Phase 8.1)
+    // Initialize default pattern based on connected MultiSampler (Phase 8.1)
     // Called after all modules are set up and connections are established
     void initializeDefaultPattern(class ModuleRegistry* registry, class ConnectionManager* connectionManager);
+    
+    // PatternRuntime integration (Phase 3: Runtime-only architecture)
+    bool bindToPattern(const std::string& patternName);  // Bind to a pattern in PatternRuntime, returns true on success
+    void onPatternRuntimeTrigger(TriggerEvent& event);    // Event handler for PatternRuntime triggers
+    void onPatternDeleted(std::string& deletedPatternName);  // Event handler for pattern deletion cleanup
+    void onSequencerBindingChanged(std::string& sequencerName);  // Event handler for immediate binding sync
     
     // Get index range from connected module (replaces callback pattern)
     // Queries connected modules directly via ConnectionManager
@@ -73,6 +80,11 @@ public:
     void onTrigger(TriggerEvent& event) override; // Sequencers don't receive triggers, but method exists for interface
     void setParameter(const std::string& paramName, float value, bool notify = true) override;
     float getParameter(const std::string& paramName) const override;
+    
+    // Indexed parameter support (for ParameterRouter step[4].position access)
+    bool supportsIndexedParameters() const override { return true; }
+    float getIndexedParameter(const std::string& paramName, int index) const override;
+    void setIndexedParameter(const std::string& paramName, int index, float value, bool notify = true) override;
     void update() override; // Update step active state (clears manually triggered steps when duration expires)
     
     // Capability interface implementation
@@ -155,37 +167,66 @@ public:
     void duplicateSteps(int fromStep, int toStep, int destinationStep);  // Duplicate range (uses duplicateRange)
     void clearStepRange(int fromStep, int toStep);  // Clear multiple steps
     
-    // Multi-pattern support
-    int getNumPatterns() const { return (int)patterns.size(); }
-    int getCurrentPatternIndex() const { return currentPatternIndex; }
-    void setCurrentPatternIndex(int index);
-    int addPattern();  // Add a new empty pattern, returns its index
-    void removePattern(int index);  // Remove a pattern (cannot remove if it's the only one)
-    void copyPattern(int sourceIndex, int destIndex);  // Copy one pattern to another
-    void duplicatePattern(int index);  // Duplicate a pattern (adds new pattern)
+    // Pattern management (Phase 3: All patterns are in PatternRuntime)
+    int getNumPatterns() const;  // Returns number of patterns in PatternRuntime
+    std::string getCurrentPatternName() const { return boundPatternName_; }  // Get bound pattern name
+    void setCurrentPatternName(const std::string& patternName);  // Bind to a different pattern
+    std::vector<std::string> getAllPatternNames() const;  // Get all pattern names from PatternRuntime
     
-    // Pattern chain (pattern chaining) support
-    int getPatternChainSize() const { return patternChain.getSize(); }
-    int getCurrentChainIndex() const { return patternChain.getCurrentIndex(); }
+    // Pattern management methods (name-based - primary API)
+    std::string addPatternByName();  // Add pattern, returns pattern name
+    void removePatternByName(const std::string& patternName);  // Remove pattern by name
+    void copyPatternByName(const std::string& sourceName, const std::string& destName);  // Copy pattern by name
+    std::string duplicatePatternByName(const std::string& patternName);  // Duplicate pattern by name, returns new pattern name
+    
+    // Helper: Get pattern name by index (for PatternChain compatibility - indices are unstable, prefer names)
+    std::string getPatternNameByIndex(int index) const;  // Get pattern name at index, returns empty if invalid
+    
+    // DEPRECATED: Index-based methods (kept for backward compatibility, will be removed)
+    // Use name-based methods instead for proper integration
+    int getCurrentPatternIndex() const;  // Returns index of bound pattern in PatternRuntime pattern list
+    void setCurrentPatternIndex(int index);  // Bind to pattern at given index
+    int addPattern();  // Add a new empty pattern to Runtime, returns index
+    void removePattern(int index);  // Remove a pattern at given index
+    void copyPattern(int sourceIndex, int destIndex);  // Copy one pattern to another by index
+    void duplicatePattern(int index);  // Duplicate a pattern by index
+    
+    // Pattern chain (pattern chaining) support (uses pattern names)
+    // Phase 2: Chains are now in PatternRuntime, accessed via sequencer bindings
+    // These methods delegate to PatternRuntime chains when bound, fallback to internal chain for backward compatibility
+    int getPatternChainSize() const;
+    int getCurrentChainIndex() const;
     void setCurrentChainIndex(int index);
-    void addToPatternChain(int patternIndex);
+    void addToPatternChain(const std::string& patternName);
     void removeFromPatternChain(int chainIndex);
-    void clearPatternChain() { patternChain.clear(); }
-    int getPatternChainEntry(int chainIndex) const { return patternChain.getEntry(chainIndex); }
-    void setPatternChainEntry(int chainIndex, int patternIndex);
-    const std::vector<int>& getPatternChain() const { return patternChain.getChain(); }
+    void clearPatternChain();
+    std::string getPatternChainEntry(int chainIndex) const;
+    void setPatternChainEntry(int chainIndex, const std::string& patternName);
+    const std::vector<std::string>& getPatternChain() const;
     
     // Pattern chain repeat counts
-    int getPatternChainRepeatCount(int chainIndex) const { return patternChain.getRepeatCount(chainIndex); }
-    void setPatternChainRepeatCount(int chainIndex, int repeatCount) { patternChain.setRepeatCount(chainIndex, repeatCount); }
+    int getPatternChainRepeatCount(int chainIndex) const;
+    void setPatternChainRepeatCount(int chainIndex, int repeatCount);
     
     // Pattern chain toggle
-    bool getUsePatternChain() const { return patternChain.isEnabled(); }
-    void setUsePatternChain(bool use) { patternChain.setEnabled(use); }
+    bool getUsePatternChain() const;
+    void setUsePatternChain(bool use);
     
     // Pattern chain disable (temporary disable during playback for performance)
-    bool isPatternChainEntryDisabled(int chainIndex) const { return patternChain.isEntryDisabled(chainIndex); }
-    void setPatternChainEntryDisabled(int chainIndex, bool disabled) { patternChain.setEntryDisabled(chainIndex, disabled); }
+    bool isPatternChainEntryDisabled(int chainIndex) const;
+    void setPatternChainEntryDisabled(int chainIndex, bool disabled);
+    
+    // Reload pattern chain from JSON (used after migration when patterns are available)
+    void reloadPatternChain(const ofJson& json, const std::vector<std::string>& availablePatternNames);
+    
+    // Chain binding (Phase 2: Use PatternRuntime chains)
+    void bindToChain(const std::string& chainName);
+    void unbindChain();
+    std::string getBoundChainName() const { return boundChainName_; }
+    
+    // Helper to get current chain (from PatternRuntime or fallback to internal)
+    PatternChain* getCurrentChain();
+    const PatternChain* getCurrentChain() const;
     
     // Helper to get current pattern (for internal use)
     Pattern& getCurrentPattern();
@@ -238,7 +279,7 @@ public:
     Step& getPatternStep(int stepIndex) { return getCurrentPattern()[stepIndex]; }
     const Step& getPatternStep(int stepIndex) const { return getCurrentPattern()[stepIndex]; }
     
-    // Drag state accessors for GUI (still needed for CellWidget interaction)
+    // Drag state accessors for GUI (still needed for BaseCell/NumCell interaction)
     float getDragStartY() const { return dragStartY; }
     float getDragStartX() const { return dragStartX; }
     float getLastDragValue() const { return lastDragValue; }
@@ -303,15 +344,14 @@ private:
     static std::string formatParameterValue(const std::string& paramName, float value); // Format based on parameter type
     
     Clock* clock;
+    bool listenersRegistered_ = false;  // Flag to prevent double listener registration
     
     // Pattern sequencer state (app-specific)
     float stepsPerBeat = 4.0f;  // Supports fractional values (1/2, 1/4, 1/8) and negative for backward reading
     bool gatingEnabled = true;
     
-    // Multi-pattern support
-    std::vector<Pattern> patterns;  // Pattern bank
-    int currentPatternIndex = 0;  // Currently active pattern
-    PatternChain patternChain;     // Pattern chain for pattern chaining (sequence of pattern indices)
+    // Pattern chaining (Phase 3: Patterns are now in PatternRuntime, chain references pattern names)
+    PatternChain patternChain;     // Pattern chain for pattern chaining (sequence of pattern names)
     
     // Note: stepCount is now per-pattern (use getCurrentPattern().getStepCount())
     
@@ -368,6 +408,11 @@ private:
     // Connection tracking: store names of modules connected via EVENT connections
     // Used to invalidate parameter cache when connections change
     std::set<std::string> connectedModuleNames_;  // Names of modules connected via EVENT
+    
+    // PatternRuntime integration (Phase 3: Runtime-only architecture)
+    PatternRuntime* patternRuntime_ = nullptr;  // Reference to PatternRuntime
+    std::string boundPatternName_;              // Name of bound pattern in PatternRuntime
+    std::string boundChainName_;                // Name of bound chain in PatternRuntime (optional)
     
     // Note: GUI state (showGUI, cell focus, etc.) is managed by TrackerSequencerGUI
     

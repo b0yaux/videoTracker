@@ -92,7 +92,7 @@ struct Step {
 // Pattern represents a complete tracker pattern (sequence of steps)
 class Pattern {
 public:
-    Pattern(int stepCount = 16);
+    Pattern(int stepCount = 4);
     
     // Step access (step = row index in pattern, 0-based)
     Step& getStep(int stepIndex);

@@ -3,9 +3,11 @@
 #include "ofJson.h"
 #include <vector>
 #include <map>
+#include <string>
 
 // PatternChain manages pattern sequencing and chaining logic
 // Encapsulates pattern chain state and advancement logic
+// Uses pattern names (stable references) instead of indices (unstable)
 class PatternChain {
 public:
     PatternChain();
@@ -15,12 +17,12 @@ public:
     int getCurrentIndex() const { return currentIndex; }
     void setCurrentIndex(int index);
     
-    void addEntry(int patternIndex);
+    void addEntry(const std::string& patternName);
     void removeEntry(int chainIndex);
     void clear();
-    int getEntry(int chainIndex) const;
-    void setEntry(int chainIndex, int patternIndex);
-    const std::vector<int>& getChain() const { return chain; }
+    std::string getEntry(int chainIndex) const;  // Returns pattern name
+    void setEntry(int chainIndex, const std::string& patternName);
+    const std::vector<std::string>& getChain() const { return chain; }
     
     // Repeat counts
     int getRepeatCount(int chainIndex) const;
@@ -35,24 +37,28 @@ public:
     
     // Chain advancement logic
     // Called when a pattern finishes (wraps around)
-    // Returns the next pattern index to use, or -1 if chain is disabled/empty
-    // Updates internal state (currentIndex, currentRepeat)
-    int advanceOnPatternFinish(int numPatterns);
+    // Advances chain state and returns the next pattern name to use
+    // Returns empty string if chain is disabled/empty or no valid pattern available
+    std::string getNextPattern();
+    
+    // Peek at next pattern without modifying chain state (thread-safe read)
+    // Returns what the next pattern would be if getNextPattern() was called
+    std::string peekNextPattern() const;
     
     // Reset chain state (called on stop/reset)
     void reset();
     
     // Serialization
     void toJson(ofJson& json) const;
-    void fromJson(const ofJson& json, int numPatterns);
+    void fromJson(const ofJson& json, const std::vector<std::string>& availablePatternNames);
     
 private:
-    std::vector<int> chain;                    // Sequence of pattern indices
+    std::vector<std::string> chain;            // Sequence of pattern names (stable references)
     std::map<int, int> repeatCounts;           // Repeat counts for each chain entry (default: 1)
     std::map<int, bool> disabled;              // Disabled state for each chain entry
     int currentIndex = 0;                      // Current position in chain
     int currentRepeat = 0;                     // Current repeat count for current chain entry
-    bool enabled = true;                       // If true, use pattern chain; if false, use direct pattern index
+    bool enabled = true;                       // If true, use pattern chain; if false, use direct pattern name
     
     bool isValidIndex(int index) const;
     int findNextEnabledIndex(int startIndex) const;

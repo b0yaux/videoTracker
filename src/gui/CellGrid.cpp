@@ -1,4 +1,5 @@
 #include "CellGrid.h"
+#include "NumCell.h"  // For dynamic_cast and fallback cell creation
 #include "gui/GUIConstants.h"
 #include "gui/HeaderPopup.h"
 #include "ofLog.h"
@@ -19,6 +20,9 @@ CellGrid::CellGrid()
     , lastFocusedRowForScroll(-1)
     , cachedFocusedRow(-1)
     , cachedFocusedRowFrame(-1)
+    , lastFocusedRow(-1)
+    , lastFocusedCol(-1)
+    , lastFocusedFrame(-1)
     , tableStarted(false)
     , currentRow(-1)
     , numRows(0)
@@ -433,7 +437,7 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
         
         // Check if there's a special column renderer
         // CRITICAL: drawSpecialColumn should only handle special cases (buttons, etc.)
-        // For regular parameter columns, we should use the default CellWidget rendering
+        // For regular parameter columns, we should use the default BaseCell rendering
         // This ensures proper callback setup and input handling
         bool handledBySpecialRenderer = false;
         if (callbacks.drawSpecialColumn) {
@@ -452,29 +456,31 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
                 callbacks.drawSpecialColumn(row, absoluteCol, colConfig);
                 handledBySpecialRenderer = true;
             } else {
-                // Regular parameter columns: use default CellWidget rendering
+                // Regular parameter columns: use default BaseCell rendering
                 // This ensures proper callback setup and input handling
                 handledBySpecialRenderer = false;
             }
         }
         
         if (!handledBySpecialRenderer) {
-            // Default: draw CellWidget using retained widget cache
+            // Default: draw BaseCell using retained widget cache
             // Get or create cell widget (retained across frames for performance)
             // Use absolute column index for widget cache key
-            CellWidget& cell = getOrCreateCell(row, absoluteCol, colConfig);
+            BaseCell& cell = getOrCreateCell(row, absoluteCol, colConfig);
             
-            // Get initial focus hint from callback (optional - CellWidget will use actual ImGui focus)
+            // Get initial focus hint from callback (optional - BaseCell will use actual ImGui focus)
             // This is just a hint for initial state; actual focus is determined by ImGui after drawing
             bool focusHint = callbacks.isCellFocused ? callbacks.isCellFocused(row, absoluteCol) : false;
                 
             // Set up callbacks (always set, even if widget was recreated - defensive programming)
             // This ensures callbacks are always properly wired even after cache clearing
-            if (callbacks.getCellValue) {
+            // For NumCell, set up numeric callbacks; for other cell types, use BaseCell string callbacks
+            NumCell* numCell = dynamic_cast<NumCell*>(&cell);
+            if (numCell && callbacks.getCellValue) {
                 int rowCapture = row;
                 int colCapture = absoluteCol;  // Use absolute column index
                 const CellGridColumnConfig colConfigCapture = colConfig;  // Capture colConfig for parameter name access
-                cell.getCurrentValue = [this, rowCapture, colCapture, colConfigCapture]() -> float {
+                numCell->getCurrentValue = [this, rowCapture, colCapture, colConfigCapture]() -> float {
                     return callbacks.getCellValue(rowCapture, colCapture, colConfigCapture);
                 };
             }
@@ -483,12 +489,26 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
                 int rowCapture = row;
                 int colCapture = absoluteCol;  // Use absolute column index
                 const CellGridColumnConfig colConfigCapture = colConfig;  // Capture colConfig for parameter name access
-                cell.onValueApplied = [this, rowCapture, colCapture, colConfigCapture](const std::string&, float value) {
-                    callbacks.setCellValue(rowCapture, colCapture, value, colConfigCapture);
+                
+                // For NumCell, use float callback for efficiency
+                if (numCell) {
+                    numCell->onValueAppliedFloat = [this, rowCapture, colCapture, colConfigCapture](const std::string&, float value) {
+                        callbacks.setCellValue(rowCapture, colCapture, value, colConfigCapture);
+                    };
+                }
+                
+                // Also set BaseCell string callback for unified interface
+                cell.onValueApplied = [this, rowCapture, colCapture, colConfigCapture](const std::string&, const std::string& valueStr) {
+                    try {
+                        float value = std::stof(valueStr);
+                        callbacks.setCellValue(rowCapture, colCapture, value, colConfigCapture);
+                    } catch (...) {
+                        // Ignore parse errors
+                    }
                 };
             }
             
-            // Set up onEditModeChanged callback (CellWidget manages editing state internally)
+            // Set up onEditModeChanged callback (BaseCell manages editing state internally)
             if (callbacks.onEditModeChanged) {
                 int rowCapture = row;
                 int colCapture = absoluteCol;  // Use absolute column index
@@ -497,29 +517,46 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
                 };
             }
             
-            // Draw cell - CellWidget manages its own state (editing, selection, buffer, drag)
-            // Pass focus hint (CellWidget will use actual ImGui focus internally)
+            // Draw cell - BaseCell manages its own state (editing, selection, buffer, drag)
+            // Pass focus hint (BaseCell will use actual ImGui focus internally)
             int uniqueId = row * 1000 + absoluteCol;  // Use absolute column index for unique ID
-            // Note: Refocus is now handled automatically by CellWidget when exiting edit mode
+            // Note: Refocus is now handled automatically by BaseCell when exiting edit mode
             
-            // Create input context (simplified - no frame tracking needed)
-            CellWidgetInputContext inputContext;
-            
-            // Draw cell - CellWidget will determine actual focus from ImGui after drawing
-            CellWidgetInteraction interaction = cell.draw(uniqueId, focusHint, false, inputContext);
+            // Draw cell - BaseCell will determine actual focus from ImGui after drawing
+            CellInteraction interaction = cell.draw(uniqueId, focusHint, false);
                 
             // Handle interactions - check actual focus state after drawing
             // ImGui::IsItemFocused() works for the last item drawn
             bool actuallyFocusedAfterDraw = ImGui::IsItemFocused();
             
-            // Notify GUI layer of focus changes (CellWidget signals this via interaction)
-            // CRITICAL: Only call onCellFocusChanged when focus is actually GAINED, not when lost
-            // This prevents the callback from incorrectly setting focus state when navigating away
-            // The callback itself checks frame-based guard to prevent infinite loops
-            // We rely solely on CellWidget's focusChanged signal as the authoritative source
-            if (interaction.focusChanged && actuallyFocusedAfterDraw && callbacks.onCellFocusChanged) {
-                ofLogNotice("CellGrid") << "[FOCUS_GAINED] Calling onCellFocusChanged (row=" << row 
-                                       << ", col=" << absoluteCol << ") - interaction.focusChanged=true, actuallyFocused=true";
+            // Notify GUI layer of focus changes
+            // CRITICAL: Detect focus changes from BOTH click/drag AND keyboard navigation
+            // BaseCell only signals focusChanged on click/drag, but keyboard navigation also moves focus
+            // We need to track last focused cell and detect when it changes via ImGui's navigation
+            int currentFrame = ImGui::GetFrameCount();
+            bool focusChangedViaKeyboard = false;
+            
+            if (actuallyFocusedAfterDraw) {
+                // Check if focus moved from a different cell (keyboard navigation detection)
+                bool isDifferentCell = (lastFocusedRow != row || lastFocusedCol != absoluteCol);
+                bool isNewFrame = (lastFocusedFrame != currentFrame);
+                
+                if (isDifferentCell && isNewFrame) {
+                    focusChangedViaKeyboard = true;
+                    lastFocusedRow = row;
+                    lastFocusedCol = absoluteCol;
+                    lastFocusedFrame = currentFrame;
+                }
+            }
+            
+            // Call onCellFocusChanged for EITHER:
+            // 1. Click/drag (interaction.focusChanged = true) when cell is focused, OR
+            // 2. Keyboard navigation moved focus to this cell from another cell
+            bool shouldCallCallback = (interaction.focusChanged || focusChangedViaKeyboard) && 
+                                       actuallyFocusedAfterDraw && 
+                                       callbacks.onCellFocusChanged;
+            
+            if (shouldCallCallback) {
                 callbacks.onCellFocusChanged(row, absoluteCol);
             }
             
@@ -527,9 +564,9 @@ void CellGrid::drawRow(int row, int numFixedColumns, bool isPlaybackRow, bool is
                 callbacks.onCellClicked(row, absoluteCol);
             }
             
-            // CellWidget manages its own state internally (editing, buffer, drag, selection)
+            // BaseCell manages its own state internally (editing, buffer, drag, selection)
             // GUI layer only needs to track which cell is focused for UI coordination
-            // No state syncing needed - CellWidget persists its own state across frames
+            // No state syncing needed - BaseCell persists its own state across frames
         }
     }
     
@@ -566,26 +603,29 @@ void CellGrid::clearCellCache() {
     cellWidgets.clear();
 }
 
-CellWidget& CellGrid::getOrCreateCell(int row, int col, const CellGridColumnConfig& colConfig) {
+BaseCell& CellGrid::getOrCreateCell(int row, int col, const CellGridColumnConfig& colConfig) {
     auto key = std::make_pair(row, col);
     auto it = cellWidgets.find(key);
     
     if (it != cellWidgets.end()) {
         // Widget exists - return reference to existing widget
-        return it->second;
+        return *(it->second);
     }
     
     // Widget doesn't exist - create new one using callback
-    if (callbacks.createCellWidget) {
-        CellWidget newCell = callbacks.createCellWidget(row, col, colConfig);
-        // Insert and return reference to newly created widget
-        auto result = cellWidgets.insert(std::make_pair(key, std::move(newCell)));
-        return result.first->second;
+    if (callbacks.createCell) {
+        auto newCell = callbacks.createCell(row, col, colConfig);
+        if (newCell) {
+            // Insert and return reference to newly created widget
+            auto result = cellWidgets.insert(std::make_pair(key, std::move(newCell)));
+            return *(result.first->second);
+        }
     }
     
-    // No callback provided - create empty widget
-    auto result = cellWidgets.insert(std::make_pair(key, CellWidget()));
-    return result.first->second;
+    // No callback provided or callback returned nullptr - create empty NumCell as fallback
+    auto fallbackCell = std::make_unique<NumCell>();
+    auto result = cellWidgets.insert(std::make_pair(key, std::move(fallbackCell)));
+    return *(result.first->second);
 }
 
 

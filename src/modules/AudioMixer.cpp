@@ -70,10 +70,25 @@ void AudioMixer::setParameter(const std::string& paramName, float value, bool no
         }
     } else if (paramName.find("connectionVolume_") == 0) {
         // Extract connection index from parameter name
-        size_t index = std::stoul(paramName.substr(17)); // "connectionVolume_".length() == 17
-        setConnectionVolume(index, value);
-        if (notify && parameterChangeCallback) {
-            parameterChangeCallback(paramName, value);
+        // FIX: Check if paramName is long enough before calling substr
+        if (paramName.length() <= 17) {
+            ofLogWarning("AudioMixer") << "Invalid connection volume parameter name (too short): " << paramName << " (length: " << paramName.length() << ")";
+            return;
+        }
+        
+        std::string indexStr = paramName.substr(17); // "connectionVolume_".length() == 17
+        if (indexStr.empty()) {
+            ofLogWarning("AudioMixer") << "Invalid connection volume parameter name (missing index): " << paramName;
+            return;
+        }
+        try {
+            size_t index = std::stoul(indexStr);
+            setConnectionVolume(index, value);
+            if (notify && parameterChangeCallback) {
+                parameterChangeCallback(paramName, value);
+            }
+        } catch (const std::exception& e) {
+            ofLogWarning("AudioMixer") << "Invalid connection volume parameter name: " << paramName << " (" << e.what() << ")";
         }
     }
 }
@@ -83,8 +98,24 @@ float AudioMixer::getParameter(const std::string& paramName) const {
         return getMasterVolume();
     } else if (paramName.find("connectionVolume_") == 0) {
         // Extract connection index from parameter name
-        size_t index = std::stoul(paramName.substr(17)); // "connectionVolume_".length() == 17
-        return getConnectionVolume(index);
+        // FIX: Check if paramName is long enough before calling substr
+        if (paramName.length() <= 17) {
+            ofLogWarning("AudioMixer") << "Invalid connection volume parameter name (too short): " << paramName << " (length: " << paramName.length() << ")";
+            return 0.0f;
+        }
+        
+        std::string indexStr = paramName.substr(17); // "connectionVolume_".length() == 17
+        if (indexStr.empty()) {
+            ofLogWarning("AudioMixer") << "Invalid connection volume parameter name (missing index): " << paramName;
+            return 0.0f;
+        }
+        try {
+            size_t index = std::stoul(indexStr);
+            return getConnectionVolume(index);
+        } catch (const std::exception& e) {
+            ofLogWarning("AudioMixer") << "Invalid connection volume parameter name: " << paramName << " (" << e.what() << ")";
+            return 0.0f;
+        }
     }
     // Unknown parameter - return default
     return Module::getParameter(paramName);

@@ -3,9 +3,10 @@
 #include "ofxSoundObjects.h"
 #include "ofxVisualObjects.h"
 #include "ofParameter.h"
+#include "ofxSingleSoundPlayer.h"  // For loadAudioFromShared access to getPlayInstance
 
 // Forward declaration
-class MediaPool;
+class MultiSampler;
 
 class MediaPlayer {
 public:
@@ -40,6 +41,7 @@ public:
     // Loading
     bool load(const std::string& audioPath, const std::string& videoPath);
     bool loadAudio(const std::string& audioPath);
+    bool loadAudioFromShared(std::shared_ptr<ofxSoundFile> sharedFile);  // Load from shared buffer (for polyphonic samplers)
     bool loadVideo(const std::string& videoPath);
     
     // Playback control
@@ -48,6 +50,7 @@ public:
     void pause();
     void resume();
     void reset();
+    void unload();  // Unload all media (for reuse with different sample)
     void setPosition(float pos);
     
     // File path getters for display purposes
@@ -78,7 +81,7 @@ public:
     
     // Position capture helper - single source of truth for position reading
     // Prioritizes: playing audio > playing video > parameter > stopped audio > stopped video
-    // Public for use by MediaPool for position memory (NEXT mode only)
+    // Public for use by MultiSampler for position memory (NEXT mode only)
     float captureCurrentPosition() const;
     
     // Setup method to initialize parameters and connections

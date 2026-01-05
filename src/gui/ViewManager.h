@@ -90,6 +90,13 @@ public:
     // Master modules visibility (Clock + master outputs)
     void setMasterModulesVisible(bool visible) { masterModulesVisible_ = visible; }
     bool isMasterModulesVisible() const { return masterModulesVisible_; }
+    
+    // Layout loading state (used to defer Clock window drawing until layout is loaded)
+    void setLayoutLoaded(bool loaded) { layoutLoaded_ = loaded; }
+    bool isLayoutLoaded() const { return layoutLoaded_; }
+    
+    // Public method to draw Clock panel (needed for re-drawing after layout load)
+    void drawClockPanel();
 
     // Mouse click detection and panel switching
     void handleMouseClick(int x, int y);
@@ -131,12 +138,9 @@ private:
     bool consoleVisible_ = false;  // Console visibility state
     bool assetLibraryVisible_ = false;  // AssetLibrary visibility state
     bool masterModulesVisible_ = true;  // Master modules visibility state (clock + master outputs)
-
-
+    bool layoutLoaded_ = false;  // Track if layout has been loaded (used to defer Clock window drawing)
 
     // Private draw methods for each window
-    void drawClockPanel();
-    
     // Generic method to draw all visible module windows (handles all module types)
     void drawModulePanels();
     void drawFileBrowserPanel();  // Draw FileBrowser window

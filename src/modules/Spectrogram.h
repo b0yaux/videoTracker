@@ -36,7 +36,7 @@ class Clock;
  * Usage:
  * ```cpp
  * auto spectrogram = std::make_shared<Spectrogram>();
- * auto audioSource = std::make_shared<MediaPool>();
+ * auto audioSource = std::make_shared<MultiSampler>();
  * 
  * // Connect audio source to spectrogram
  * spectrogram->connectAudioSource(audioSource->getAudioOutput());

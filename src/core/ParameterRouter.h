@@ -247,10 +247,17 @@ private:
     std::vector<size_t> findConnectionsForTarget(const ParameterPath& targetPath) const;
     
     /**
-     * Handle indexed parameters (e.g., step[4].position)
-     * Currently, indexing is parsed but not fully implemented.
-     * For now, we ignore the index and access the parameter directly.
-     * Future: Implement indexed parameter access for TrackerSequencer steps.
+     * Handle indexed parameters (e.g., "tracker1.position[4]")
+     * 
+     * Currently implemented for TrackerSequencer:
+     * - Format: "tracker1.position[4]" where index is step index (0-based)
+     * - Supports all step parameters: position, speed, volume, etc.
+     * - Uses getStep()/setStep() for pattern cell access
+     * 
+     * Future extensions:
+     * - Support for other module types with indexed parameters
+     * - Nested indexing for multi-dimensional data
+     * - Dynamic index resolution at runtime
      */
     float getIndexedParameterValue(std::shared_ptr<Module> module, const ParameterPath& path) const;
     void setIndexedParameterValue(std::shared_ptr<Module> module, const ParameterPath& path, float value);

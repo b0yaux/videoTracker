@@ -4,7 +4,7 @@
 #include "data/Pattern.h"
 #include "gui/ModuleGUI.h"
 #include "gui/CellGrid.h"
-#include "CellWidget.h"
+#include "gui/BaseCell.h"  // For BaseCell interface
 
 // Forward declarations for ImGui types
 typedef unsigned int ImGuiID;
@@ -12,6 +12,7 @@ typedef unsigned int ImU32;
 
 class ModuleRegistry;  // Forward declaration
 class ConnectionManager;  // Forward declaration
+class ParameterCell;  // Forward declaration
 
 // GUIState struct for passing GUI state to TrackerSequencer::handleKeyPress()
 // This is a temporary parameter struct - NOT a source of truth
@@ -100,6 +101,10 @@ private:
     // Track last step triggered when paused (to prevent repeated triggers)
     int lastTriggeredStepWhenPaused;
     
+    // Track last step that triggered in current frame (to prevent duplicate triggers from multiple cells)
+    int lastTriggeredStepThisFrame;
+    int lastTriggeredStepFrame;
+    
     // Multi-step selection state for copy/paste/cut operations
     struct SelectionState {
         int anchorStep = -1;      // Selection anchor (where shift was first pressed)
@@ -176,12 +181,12 @@ private:
     void drawStepNumber(TrackerSequencer& sequencer, int step, bool isPlaybackStep,
                        bool isPlaying, int currentPlayingStep);
     
-    // CellWidget adapter methods (moved from TrackerSequencer)
-    // Creates and configures a CellWidget for a specific step/column
-    CellWidget createParameterCellForColumn(TrackerSequencer& sequencer, int step, int column);
+    // BaseCell adapter methods (moved from TrackerSequencer)
+    // Creates and configures a BaseCell for a specific step/column
+    std::unique_ptr<BaseCell> createParameterCellForColumn(TrackerSequencer& sequencer, int step, int column);
     
-    // Configures callbacks for a CellWidget to connect to Step operations
-    void configureParameterCellCallbacks(TrackerSequencer& sequencer, CellWidget& cell, int step, int column);
+    // Configures callbacks for a ParameterCell to connect to Step operations
+    void configureParameterCellCallbacks(TrackerSequencer& sequencer, ParameterCell* paramCell, int step, int column);
     
     // Helper method to query external parameters from connected INSTRUMENT modules
     // Filters out internal parameters and returns unique parameter descriptors

@@ -1,8 +1,8 @@
 #pragma once
 
 #include "ofMain.h"
-#include "modules/Module.h"  // For ParameterDescriptor
-#include "CellWidget.h"
+#include "core/ParameterDescriptor.h"  // For ParameterDescriptor
+#include "BaseCell.h"
 #include "gui/HeaderPopup.h"
 #include <imgui.h>
 #include <string>
@@ -10,6 +10,7 @@
 #include <functional>
 #include <map>
 #include <utility>  // For std::pair
+#include <memory>
 
 // Forward declarations
 typedef unsigned int ImU32;
@@ -68,9 +69,9 @@ struct CellGridCallbacks {
     // colConfig provides parameter name for direct lookup (eliminates need for index conversion)
     std::function<void(int row, int col, float value, const CellGridColumnConfig& colConfig)> setCellValue;  // Set value for cell at (row, col)
     
-    // CellWidget creation (optional - CellGrid can create basic cells if not provided)
+    // BaseCell creation (optional - CellGrid can create basic cells if not provided)
     // col parameter is absolute column index (0-based, includes all columns in ImGui table)
-    std::function<CellWidget(int row, int col, const CellGridColumnConfig& colConfig)> createCellWidget;
+    std::function<std::unique_ptr<BaseCell>(int row, int col, const CellGridColumnConfig& colConfig)> createCell;
     
     // Row rendering callbacks
     std::function<void(int row, bool isPlaybackRow, bool isEditRow)> onRowStart;  // Called before row is drawn
@@ -147,7 +148,7 @@ struct CellGridCallbacks {
 };
 
 // CellGrid - Reusable table component for parameter grids
-// Supports both TrackerSequencer-style (multi-row) and MediaPool-style (single-row) tables
+// Supports both TrackerSequencer-style (multi-row) and MultiSampler-style (single-row) tables
 class CellGrid {
 public:
     CellGrid();
@@ -233,6 +234,11 @@ private:
     int cachedFocusedRow;
     int cachedFocusedRowFrame;
     
+    // Focus tracking for keyboard navigation (detects focus changes from arrow keys)
+    int lastFocusedRow;
+    int lastFocusedCol;
+    int lastFocusedFrame;
+    
     // Internal state
     bool tableStarted;
     int currentRow;
@@ -249,13 +255,13 @@ private:
     std::vector<FixedColumnSetup> fixedColumnSetups;
     
     // Widget cache (retained across frames for performance and state preservation)
-    // Key: (row, col) pair, Value: CellWidget instance
-    std::map<std::pair<int, int>, CellWidget> cellWidgets;
+    // Key: (row, col) pair, Value: BaseCell instance (polymorphic)
+    std::map<std::pair<int, int>, std::unique_ptr<BaseCell>> cellWidgets;
     
-    // Internal state management - REMOVED: All state managed by CellWidget itself
+    // Internal state management - REMOVED: All state managed by BaseCell itself
     
     // Helper methods
     void updateColumnIndices();
-    CellWidget& getOrCreateCell(int row, int col, const CellGridColumnConfig& colConfig);
+    BaseCell& getOrCreateCell(int row, int col, const CellGridColumnConfig& colConfig);
 };
 

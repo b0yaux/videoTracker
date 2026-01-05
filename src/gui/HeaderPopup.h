@@ -45,5 +45,6 @@ namespace HeaderPopup {
               float columnWidth,
               const ImVec2& headerPos,
               std::function<void(const std::string& itemId)> onItemSelected,
-              std::function<bool(const PopupItem&)> filter = nullptr);
+              std::function<bool(const PopupItem&)> filter = nullptr,
+              std::function<void(const std::string& itemId)> onItemDeleted = nullptr);
 }

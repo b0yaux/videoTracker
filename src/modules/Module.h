@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include "ofJson.h"
+#include "core/ParameterDescriptor.h"  // For ParameterDescriptor and ParameterType
 
 // Forward declarations for routing interface
 class ofxSoundObject;
@@ -14,35 +15,12 @@ class ofxVisualObject;
 // Forward declaration for ConnectionManager (full definition needed for ConnectionType enum)
 class ConnectionManager;
 
-// Parameter type enumeration
-enum class ParameterType {
-    FLOAT,
-    INT,
-    BOOL
-};
-
-// Describes a parameter that can be controlled by TrackerSequencer or other modules
-struct ParameterDescriptor {
-    std::string name;           // e.g., "position", "speed", "volume"
-    ParameterType type;         // FLOAT, INT, BOOL
-    float minValue;             // For FLOAT/INT parameters
-    float maxValue;             // For FLOAT/INT parameters
-    float defaultValue;         // Default value
-    std::string displayName;    // User-friendly name, e.g., "Position"
-    
-    ParameterDescriptor()
-        : name(""), type(ParameterType::FLOAT), minValue(0.0f), maxValue(1.0f), defaultValue(0.0f), displayName("") {}
-    
-    ParameterDescriptor(const std::string& n, ParameterType t, float min, float max, float def, const std::string& display)
-        : name(n), type(t), minValue(min), maxValue(max), defaultValue(def), displayName(display) {}
-};
-
 // Module type enumeration - UI/organization categories only, NOT functional constraints
 // Functionality is determined by capabilities (see ModuleCapability below)
 // A module can have any combination of capabilities regardless of its type
 enum class ModuleType {
     SEQUENCER,    // UI category: Pattern-based sequencers (e.g., TrackerSequencer)
-    INSTRUMENT,   // UI category: Sound/video sources (e.g., MediaPool, MIDIOutput)
+    INSTRUMENT,   // UI category: Sound/video sources (e.g., MultiSampler, MIDIOutput)
     EFFECT,       // UI category: Audio/video processors (future: filters, delays, etc.)
     UTILITY       // UI category: Routing, mixing, utilities (e.g., AudioMixer, VideoMixer)
 };
@@ -51,7 +29,7 @@ enum class ModuleType {
 // Used for capability-based queries instead of type-specific checks
 // Modules can have multiple capabilities (e.g., a drum machine could both emit and accept triggers)
 enum class ModuleCapability {
-    ACCEPTS_FILE_DROP,          // Module can accept file drops (e.g., MediaPool)
+    ACCEPTS_FILE_DROP,          // Module can accept file drops (e.g., MultiSampler)
     EMITS_TRIGGER_EVENTS,       // Module emits trigger events (any type can have this, not just SEQUENCER)
     ACCEPTS_TRIGGER_EVENTS      // Module accepts trigger events (any type can have this, not just INSTRUMENT)
 };
@@ -68,6 +46,10 @@ struct TriggerEvent {
     
     // Step number from sequencer (-1 for non-sequencer triggers like manual preview)
     int step = -1;
+    
+    // Pattern name for event routing (used by PatternRuntime to identify source pattern)
+    // TrackerSequencer filters events by patternName when forwarding PatternRuntime events
+    std::string patternName = "";
 };
 
 // Port-based routing system (Phase 1: Unified port system)
@@ -90,7 +72,7 @@ enum class PortType {
  * This replaces the hybrid capabilities + output methods approach with a unified system.
  * 
  * Example:
- *   MediaPool has: audio_out (AUDIO_OUT), video_out (VIDEO_OUT), trigger_in (EVENT_IN)
+ *   MultiSampler has: audio_out (AUDIO_OUT), video_out (VIDEO_OUT), trigger_in (EVENT_IN)
  *   AudioMixer has: audio_in_0, audio_in_1, ... (AUDIO_IN, multiConnect=true), audio_out (AUDIO_OUT)
  */
 struct Port {
@@ -163,6 +145,42 @@ public:
         // Default implementation: return 0.0f
         // Modules override to return actual parameter values
         return 0.0f;
+    }
+    
+    /**
+     * Optional: Check if this module supports indexed parameters
+     * @return True if module supports indexed parameter access (e.g., step[4].position)
+     * 
+     * Modules that support indexed parameters (like TrackerSequencer with step indices)
+     * should override this to return true and implement getIndexedParameter/setIndexedParameter.
+     */
+    virtual bool supportsIndexedParameters() const { return false; }
+    
+    /**
+     * Optional: Get an indexed parameter value
+     * @param paramName Parameter name (e.g., "position", "speed", "volume")
+     * @param index Index for the parameter (e.g., step index for TrackerSequencer)
+     * @return Parameter value, or 0.0f if not supported or invalid index
+     * 
+     * Modules that support indexed parameters should override this.
+     * Default implementation returns 0.0f (not supported).
+     */
+    virtual float getIndexedParameter(const std::string& paramName, int index) const {
+        return 0.0f;
+    }
+    
+    /**
+     * Optional: Set an indexed parameter value
+     * @param paramName Parameter name (e.g., "position", "speed", "volume")
+     * @param index Index for the parameter (e.g., step index for TrackerSequencer)
+     * @param value Value to set
+     * @param notify If true, notify parameter change callback (default: true)
+     * 
+     * Modules that support indexed parameters should override this.
+     * Default implementation does nothing (not supported).
+     */
+    virtual void setIndexedParameter(const std::string& paramName, int index, float value, bool notify = true) {
+        // Default: no-op - modules that support indexing override this
     }
     
     // Parameter change callback (modules can notify external systems like ParameterRouter)
@@ -316,6 +334,11 @@ public:
     virtual ofJson toJson(class ModuleRegistry* registry = nullptr) const = 0;
     virtual void fromJson(const ofJson& json) = 0;
     
+    // State snapshot for Engine (returns JSON to avoid Engine knowing about specific module types)
+    // Default implementation uses toJson() - modules only override if they need to extract
+    // specific runtime state (like current playback position, active voices, etc.)
+    virtual ofJson getStateSnapshot() const { return toJson(); }
+    
     /**
      * Unified initialization method - replaces postCreateSetup, configureSelf, and completeRestore
      * 
@@ -340,6 +363,7 @@ public:
         class ModuleRegistry* registry = nullptr,
         class ConnectionManager* connectionManager = nullptr,
         class ParameterRouter* parameterRouter = nullptr,
+        class PatternRuntime* patternRuntime = nullptr,  // PatternRuntime for modules that need pattern access
         bool isRestored = false
     ) {}
     
@@ -392,7 +416,7 @@ public:
         class ConnectionManager* connectionManager
     ) {}
     
-    // Get module type name for serialization (e.g., "TrackerSequencer", "MediaPool")
+    // Get module type name for serialization (e.g., "TrackerSequencer", "MultiSampler")
     // Default implementation returns getName() - override only if different
     virtual std::string getTypeName() const {
         return getName();
@@ -465,7 +489,7 @@ public:
     
     // Module metadata interface - modules self-describe their features
     struct ModuleMetadata {
-        std::string typeName;                    // "TrackerSequencer", "MediaPool"
+        std::string typeName;                    // "TrackerSequencer", "MultiSampler"
         std::vector<std::string> eventNames;     // ["triggerEvent"]
         std::vector<std::string> parameterNames; // ["currentStepPosition", "position"]
         std::map<std::string, std::string> parameterDisplayNames; // {"position": "Position"}
@@ -491,7 +515,7 @@ public:
      * Get all input ports this module accepts
      * @return Vector of input ports (AUDIO_IN, VIDEO_IN, PARAMETER_IN, EVENT_IN)
      * 
-     * Example for MediaPool:
+     * Example for MultiSampler:
      *   return { Port("trigger_in", PortType::EVENT_IN, false, "Trigger Input") };
      * 
      * Example for AudioMixer:
@@ -507,7 +531,7 @@ public:
      * Get all output ports this module produces
      * @return Vector of output ports (AUDIO_OUT, VIDEO_OUT, PARAMETER_OUT, EVENT_OUT)
      * 
-     * Example for MediaPool:
+     * Example for MultiSampler:
      *   return { Port("audio_out", PortType::AUDIO_OUT, false, "Audio Output", &internalAudioMixer_),
      *            Port("video_out", PortType::VIDEO_OUT, false, "Video Output", &internalVideoMixer_) };
      */

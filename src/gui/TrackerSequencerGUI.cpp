@@ -1,11 +1,10 @@
 #include "TrackerSequencerGUI.h"
 // Note: TrackerSequencer.h is already included by TrackerSequencerGUI.h
-#include "CellWidget.h"
+#include "ParameterCell.h"  // For ParameterCell in createParameterCellForColumn
 #include "core/ModuleRegistry.h"  // Needed for registry->getModule() calls
 #include "core/ConnectionManager.h"  // Needed for ConnectionManager::ConnectionType and getConnectionsFrom()
 #include "gui/HeaderPopup.h"
 #include "gui/GUIManager.h"
-// ParameterCell.h no longer needed - ParameterCell is now an implementation detail of ModuleGUI
 #include <imgui.h>
 #include "ofLog.h"
 #include "gui/GUIConstants.h"
@@ -14,32 +13,48 @@
 #include <algorithm>  // For std::max, std::min
 #include <set>
 #include <map>
+#include <chrono>
 
 // Helper to sync playback position to edit position when paused
 // Uses public methods since static functions don't have friend class access
 static void syncPlaybackToEditIfPaused(TrackerSequencer& sequencer, int newStep, bool stepChanged, bool forceTrigger, int& lastTriggeredStep) {
-    // Reset tracking when playing (not needed when playing)
+    // Don't sync when playing - playback drives the position
     if (sequencer.isPlaying()) {
         lastTriggeredStep = -1;
         return;
     }
     
-    // Trigger if:
-    // 1. Not playing AND step changed AND it's a different step, OR
-    // 2. Force trigger is true (e.g., navigating from header row back to a step)
-    // AND we haven't already triggered this step
-    if (forceTrigger || (stepChanged && newStep != sequencer.getPlaybackStep())) {
-        // Only trigger if this is a different step than the last one we triggered
-        if (newStep != lastTriggeredStep) {
-            sequencer.setCurrentStep(newStep);
+    int currentPlaybackStep = sequencer.getPlaybackStep();
+    
+    // Determine if we should trigger this step:
+    // 1. Force trigger (e.g., navigating from header row), OR
+    // 2. Moving to a different step than current playback position, OR
+    // 3. Clicking same step again (retrigger)
+    bool movingToNewStep = (newStep != currentPlaybackStep);
+    bool isRetrigger = (!movingToNewStep && newStep == lastTriggeredStep);
+    bool shouldTrigger = forceTrigger || movingToNewStep || isRetrigger;
+    
+    if (shouldTrigger) {
+        const Step& stepData = sequencer.getStep(newStep);
+        bool isEmpty = stepData.isEmpty();
+        
+        // Always update playback position
+        sequencer.setCurrentStep(newStep);
+        
+        // Only trigger sound for non-empty steps
+        // Empty steps (index < 0) just move position without triggering
+        if (!isEmpty) {
             sequencer.triggerStep(newStep);
-            lastTriggeredStep = newStep;
         }
+        
+        // Track this step as triggered to handle retrigger detection
+        lastTriggeredStep = newStep;
     }
 }
 
 TrackerSequencerGUI::TrackerSequencerGUI() 
     : lastPatternIndex(-1), lastTriggeredStepWhenPaused(-1),
+      lastTriggeredStepThisFrame(-1), lastTriggeredStepFrame(-1),
       cachedTableWindowFocused(false), cachedTableWindowFocusedFrame(-1) {
     // cellFocusState and callbacksState are initialized by default constructors
     pendingRowOutline.shouldDraw = false;
@@ -108,16 +123,7 @@ void TrackerSequencerGUI::drawContent() {
 void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
     ImGui::PushID("PatternChain");
         
-    // Pattern chain toggle checkbox
-    bool useChain = sequencer.getUsePatternChain();
-    if (ImGui::Checkbox("##chainToggle", &useChain)) {
-        sequencer.setUsePatternChain(useChain);
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Enable/disable pattern chain");
-    }
-    ImGui::SameLine();
-    // Pattern chain header with toggle
+    // Pattern chain header (no toggle - always show active pattern)
     ImGui::Text("Pattern Chain");
     
     ImGui::Spacing();
@@ -125,23 +131,40 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
     // Get chain data
     const auto& chain = sequencer.getPatternChain();
     int currentChainIndex = sequencer.getCurrentChainIndex();
-    int currentPatternIndex = sequencer.getCurrentPatternIndex();
+    std::string currentPatternName = sequencer.getCurrentPatternName();  // Use pattern name instead of index
     bool isPlaying = sequencer.isPlaying();
     int numPatterns = sequencer.getNumPatterns();
+    bool useChain = sequencer.getUsePatternChain();
     
+    // CRITICAL: Always show at least the active pattern, even if chain is empty
     // Build column configuration (one column per chain entry + buttons column at end)
     std::vector<CellGridColumnConfig> chainColumnConfig;
-    for (size_t i = 0; i < chain.size(); i++) {
-        int patternIdx = chain[i];
-        char patternName[32];
-        snprintf(patternName, sizeof(patternName), "Pattern %02d", patternIdx);
+    
+    if (chain.empty()) {
+        // Chain is empty - show active pattern as single column
+        std::string patternName = currentPatternName.empty() ? "Pattern" : currentPatternName;
         chainColumnConfig.push_back(CellGridColumnConfig(
-            "pattern_" + std::to_string(i),  // parameterName: unique ID for this chain position
-            patternName,                      // displayName: shows pattern index
+            "pattern_0",                      // parameterName: unique ID for this chain position
+            patternName,                      // displayName: shows pattern name
             false,                            // isRemovable: columns are not removable (use - button instead)
-            (int)i,                           // columnIndex
+            0,                                // columnIndex
             true                              // isDraggable: allow reordering
         ));
+    } else {
+        // Chain has entries - show all chain entries
+        for (size_t i = 0; i < chain.size(); i++) {
+            std::string patternName = chain[i];  // PatternChain now uses pattern names directly
+            if (patternName.empty()) {
+                patternName = "Pattern " + std::to_string(i);  // Fallback if name not found
+            }
+            chainColumnConfig.push_back(CellGridColumnConfig(
+                "pattern_" + std::to_string(i),  // parameterName: unique ID for this chain position
+                patternName,                      // displayName: shows pattern name
+                false,                            // isRemovable: columns are not removable (use - button instead)
+                (int)i,                           // columnIndex
+                true                              // isDraggable: allow reordering
+            ));
+        }
     }
     // Add buttons column at the end (not draggable, fixed width)
     chainColumnConfig.push_back(CellGridColumnConfig(
@@ -189,7 +212,7 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
     
     // Custom header rendering with HeaderPopup for pattern selection
     // Note: col is parameter column index (0-based within parameter columns)
-    callbacks.drawCustomHeader = [this, &sequencer, numPatterns, chain]
+    callbacks.drawCustomHeader = [this, &sequencer, numPatterns, chain, currentPatternName]
                                  (int col, const CellGridColumnConfig& colConfig, ImVec2 cellStartPos, float columnWidth, float cellMinY) -> bool {
         // Buttons column: empty header
         if (colConfig.parameterName == "buttons") {
@@ -197,22 +220,36 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
         }
         
         // Get chain index for this column (col is parameter column index)
-        if (col < 0 || col >= (int)chain.size()) return false;
-        
+        // Handle empty chain case - use active pattern
         int chainIndex = col;
-        int patternIdx = chain[chainIndex];
+        std::string patternNameStr;
+        bool isDisabled = false;
+        
+        if (chain.empty()) {
+            // Chain is empty - show active pattern
+            if (col != 0) return false;  // Only show one column when chain is empty
+            patternNameStr = currentPatternName.empty() ? "Pattern" : currentPatternName;
+            chainIndex = 0;  // Single column for active pattern
+        } else {
+            // Chain has entries
+            if (col < 0 || col >= (int)chain.size()) return false;
+            patternNameStr = chain[chainIndex];  // PatternChain now uses pattern names directly
+            if (patternNameStr.empty()) {
+                patternNameStr = "Pattern " + std::to_string(chainIndex);  // Fallback if name not found
+            }
+            isDisabled = sequencer.isPatternChainEntryDisabled(chainIndex);
+        }
+        
         int currentChainIndex = sequencer.getCurrentChainIndex();
-        int currentPatternIndex = sequencer.getCurrentPatternIndex();
         bool isPlaying = sequencer.isPlaying();
-        bool isDisabled = sequencer.isPatternChainEntryDisabled(chainIndex);
         
         // Style header background with color coding using ImGui's header color system
         ImU32 bgColor;
         if (isDisabled) {
             bgColor = GUIConstants::toU32(GUIConstants::Outline::DisabledBg);
-        } else if (patternIdx == currentPatternIndex && isPlaying) {
+        } else if (patternNameStr == currentPatternName && isPlaying) {
             bgColor = GUIConstants::toU32(GUIConstants::Active::PatternPlaying);
-        } else if (patternIdx == currentPatternIndex) {
+        } else if (patternNameStr == currentPatternName) {
             bgColor = GUIConstants::toU32(GUIConstants::Active::Pattern);
         } else if (chainIndex == currentChainIndex) {
             bgColor = GUIConstants::toU32(GUIConstants::Active::ChainEntry);
@@ -231,9 +268,7 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, bgColorVec);
         
         // Use TableHeader for proper table integration (required for column reordering)
-        char patternName[32];
-        snprintf(patternName, sizeof(patternName), "Pattern %02d", patternIdx);
-        ImGui::TableHeader(patternName);
+        ImGui::TableHeader(patternNameStr.c_str());
         
         // Draw disabled line after TableHeader (overlay on top)
         // Note: Removed border for current chain entry per user request
@@ -254,23 +289,37 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
             ImGui::OpenPopup(popupId.c_str());
         }
         
-        // Draw HeaderPopup with all available patterns
+        // Draw HeaderPopup with all available patterns (using pattern names)
         std::string popupId = "PatternChainPopup_" + std::to_string(col);
         std::vector<HeaderPopup::PopupItem> items;
-        for (int i = 0; i < numPatterns; i++) {
-            char itemName[32];
-            snprintf(itemName, sizeof(itemName), "Pattern %02d", i);
-            items.push_back(HeaderPopup::PopupItem(std::to_string(i), itemName));
+        // Get all pattern names from PatternRuntime
+        // Note: PatternChain still uses indices internally, so we need to map names to indices
+        auto patternNames = sequencer.getAllPatternNames();
+        for (size_t i = 0; i < patternNames.size(); i++) {
+            items.push_back(HeaderPopup::PopupItem(patternNames[i], patternNames[i]));
         }
         
         HeaderPopup::draw(popupId, items, columnWidth, cellStartPos,
-                         [&sequencer, chainIndex](const std::string& patternIdStr) {
-                             try {
-                                 int newPatternIdx = std::stoi(patternIdStr);
-                                 sequencer.setPatternChainEntry(chainIndex, newPatternIdx);
-                             } catch (...) {
-                                 // Invalid pattern ID, ignore
+                         [&sequencer, chainIndex, chain](const std::string& patternName) {
+                             // PatternChain now uses pattern names directly
+                             if (chain.empty()) {
+                                 // Chain is empty - add pattern to chain and bind to it
+                                 sequencer.addToPatternChain(patternName);
+                                 sequencer.setCurrentPatternName(patternName);
+                                 sequencer.setCurrentChainIndex(0);
+                             } else {
+                                 // Chain has entries - update existing entry
+                                 sequencer.setPatternChainEntry(chainIndex, patternName);
+                                 // If this is the current pattern, also update binding
+                                 if (chainIndex == sequencer.getCurrentChainIndex()) {
+                                     sequencer.setCurrentPatternName(patternName);
+                                 }
                              }
+                         },
+                         nullptr, // filter (not used)
+                         [&sequencer](const std::string& patternName) {
+                             // Delete pattern callback
+                             sequencer.removePatternByName(patternName);
                          });
         
         return true; // Header was drawn
@@ -279,21 +328,25 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
     // Row 0: Fixed position numbers (01, 02, etc.) - these never move when columns are reordered
     // Row 1: Editable repeat counts
     // Note: col is absolute column index (0+ = pattern columns, buttons column at end)
-    callbacks.drawSpecialColumn = [this, &sequencer, chain, currentChainIndex, currentPatternIndex, isPlaying, useChain]
+    callbacks.drawSpecialColumn = [this, &sequencer, chain, currentChainIndex, currentPatternName, isPlaying, useChain]
                                   (int row, int col, const CellGridColumnConfig& colConfig) {
         // Check if this is the buttons column (last column)
         if (colConfig.parameterName == "buttons") {
             if (row == 0) {
                 // Row 0: Draw D/+/− buttons (aligned with chain position buttons)
-                // 'D' button for duplicate current pattern
+                // 'D' button for duplicate current pattern (using pattern name)
                 if (ImGui::Button("D", ImVec2(BUTTON_HEIGHT, BUTTON_HEIGHT))) {
-                    int currentPattern = sequencer.getCurrentPatternIndex();
-                    sequencer.duplicatePattern(currentPattern);
-                    int newPatternIndex = sequencer.getNumPatterns() - 1;
-                    sequencer.addToPatternChain(newPatternIndex);
-                    if (!(isPlaying && useChain)) {
-                        sequencer.setCurrentPatternIndex(newPatternIndex);
-                        sequencer.setCurrentChainIndex(sequencer.getPatternChainSize() - 1);
+                    std::string currentPattern = sequencer.getCurrentPatternName();
+                    if (!currentPattern.empty()) {
+                        std::string newPatternName = sequencer.duplicatePatternByName(currentPattern);
+                        if (!newPatternName.empty()) {
+                            // Add the duplicated pattern to the chain
+                            sequencer.addToPatternChain(newPatternName);
+                            if (!(isPlaying && useChain)) {
+                                sequencer.setCurrentPatternName(newPatternName);
+                                sequencer.setCurrentChainIndex(sequencer.getPatternChainSize() - 1);
+                            }
+                        }
                     }
                 }
                 if (ImGui::IsItemHovered()) {
@@ -302,17 +355,15 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
                 
                 ImGui::SameLine();
                 
-                // '+' button to add new pattern
+                // '+' button to add current pattern to chain (duplicate entry)
                 if (ImGui::Button("+", ImVec2(BUTTON_HEIGHT, BUTTON_HEIGHT))) {
-                    int newPatternIndex = sequencer.addPattern();
-                    sequencer.addToPatternChain(newPatternIndex);
-                    if (!(isPlaying && useChain)) {
-                        sequencer.setCurrentPatternIndex(newPatternIndex);
-                        sequencer.setCurrentChainIndex(sequencer.getPatternChainSize() - 1);
+                    std::string currentPattern = sequencer.getCurrentPatternName();
+                    if (!currentPattern.empty()) {
+                        sequencer.addToPatternChain(currentPattern);
                     }
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Add new pattern");
+                    ImGui::SetTooltip("Add current pattern to chain");
                 }
                 
                 ImGui::SameLine();
@@ -341,14 +392,32 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
         }
         
         // Pattern columns only
-        // col is absolute, pattern columns are at indices 0 to chain.size()-1
-        if (col < 0 || col >= (int)chain.size()) return;
-        
+        // Handle empty chain case - show active pattern
         int chainIndex = col;
-        int patternIdx = chain[chainIndex];
-        bool isCurrentChainEntry = (chainIndex == currentChainIndex);
-        bool isCurrentPattern = (patternIdx == currentPatternIndex);
-        bool isDisabled = sequencer.isPatternChainEntryDisabled(chainIndex);
+        std::string patternNameStr;
+        bool isDisabled = false;
+        bool isCurrentChainEntry = false;
+        bool isCurrentPattern = false;
+        
+        if (chain.empty()) {
+            // Chain is empty - show active pattern
+            if (col != 0) return;  // Only show one column when chain is empty
+            patternNameStr = currentPatternName.empty() ? "Pattern" : currentPatternName;
+            chainIndex = 0;
+            isCurrentPattern = true;  // Always current when it's the only one
+            isCurrentChainEntry = true;
+        } else {
+            // Chain has entries
+            if (col < 0 || col >= (int)chain.size()) return;
+            chainIndex = col;
+            patternNameStr = chain[chainIndex];  // PatternChain now uses pattern names directly
+            if (patternNameStr.empty()) {
+                patternNameStr = "Pattern " + std::to_string(chainIndex);  // Fallback if name not found
+            }
+            isCurrentChainEntry = (chainIndex == currentChainIndex);
+            isCurrentPattern = (patternNameStr == currentPatternName);  // Compare by name
+            isDisabled = sequencer.isPatternChainEntryDisabled(chainIndex);
+        }
         
         if (row == 0) {
             // Row 0: Position numbers (01, 02, etc.) - fixed display, never moves
@@ -401,25 +470,34 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
             ImGui::InvisibleButton(("##pos_" + std::to_string(chainIndex)).c_str(), cellSize, ImGuiButtonFlags_EnableNav);
             
             if (ImGui::IsItemClicked(0)) {
-                if (isPlaying && useChain) {
+                if (isPlaying && useChain && !chain.empty()) {
                     // During playback with chain enabled: toggle disable state
                     sequencer.setPatternChainEntryDisabled(chainIndex, !isDisabled);
                 } else {
-                    // Normal behavior: select pattern
-                    sequencer.setCurrentPatternIndex(patternIdx);
+                    // Normal behavior: select pattern (using pattern name)
+                    if (chain.empty()) {
+                        // Chain is empty - add pattern to chain first
+                        sequencer.addToPatternChain(patternNameStr);
+                        sequencer.setCurrentChainIndex(0);
+                    }
+                    sequencer.setCurrentPatternName(patternNameStr);
                     sequencer.setCurrentChainIndex(chainIndex);
                 }
             }
             
             if (ImGui::IsItemHovered()) {
                 if (isPlaying && useChain) {
-                    ImGui::SetTooltip("Chain position %02d (Pattern %02d)\nLeft-click: Toggle disable", chainIndex + 1, patternIdx);
+                    ImGui::SetTooltip("Chain position %02d (%s)\nLeft-click: Toggle disable", chainIndex + 1, patternNameStr.c_str());
                 } else {
-                    ImGui::SetTooltip("Chain position %02d (Pattern %02d)\nLeft-click: Select", chainIndex + 1, patternIdx);
+                    ImGui::SetTooltip("Chain position %02d (%s)\nLeft-click: Select", chainIndex + 1, patternNameStr.c_str());
                 }
             }
         } else if (row == 1) {
-            // Row 1: Editable repeat count
+            // Row 1: Editable repeat count (only if chain is not empty)
+            if (chain.empty()) {
+                // Empty chain - show empty cell or placeholder
+                return;
+            }
             int repeatCount = sequencer.getPatternChainRepeatCount(chainIndex);
             
             ImVec2 cellSize = ImGui::GetContentRegionAvail();
@@ -492,7 +570,7 @@ void TrackerSequencerGUI::drawPatternChain(TrackerSequencer& sequencer) {
 void TrackerSequencerGUI::drawPatternControls(TrackerSequencer& sequencer) {
     // Action buttons row removed - 'Clear Pattern' and 'D' buttons removed per requirements
     
-    // Pattern parameters table using CellGrid (similar to MediaPool's drawParameters)
+    // Pattern parameters table using CellGrid (similar to MultiSampler's drawParameters)
     // Reset focus tracking at start of frame
     patternParamsCallbacksState.resetFrame();
     
@@ -520,12 +598,12 @@ void TrackerSequencerGUI::drawPatternControls(TrackerSequencer& sequencer) {
                                    patternParametersGrid, true); // true = single row
     
     // Create cell widgets for Steps and SPB
-    callbacks.createCellWidget = [this, &sequencer](int row, int col, const CellGridColumnConfig& colConfig) -> CellWidget {
+    callbacks.createCell = [this, &sequencer](int row, int col, const CellGridColumnConfig& colConfig) -> std::unique_ptr<BaseCell> {
         const std::string& paramName = colConfig.parameterName;
         
         if (paramName == "steps") {
             ParameterDescriptor stepsParam("steps", ParameterType::INT, 4, 64, 16, "Steps");
-            CellWidget widget = createCellWidget(
+            auto widget = createCellWidget(
                 stepsParam,
                 [&sequencer]() -> float {
                     return (float)sequencer.getCurrentPattern().getStepCount();
@@ -534,24 +612,15 @@ void TrackerSequencerGUI::drawPatternControls(TrackerSequencer& sequencer) {
                     sequencer.getCurrentPattern().setStepCount((int)value);
                 }
             );
-            widget.isRemovable = false;  // Pattern params are not removable (different from pattern grid columns)
+            if (widget) {
+                widget->isRemovable = false;  // Pattern params are not removable (different from pattern grid columns)
+            }
             return widget;
         } else if (paramName == "stepsPerBeat") {
             ParameterDescriptor spbParam("stepsPerBeat", ParameterType::FLOAT, -96.0f, 96.0f, 4.0f, "Steps Per Beat");
-            CellWidget widget = createCellWidget(
-                spbParam,
-                [&sequencer]() -> float {
-                    return sequencer.getStepsPerBeat();
-                },
-                [&sequencer](float value) {
-                    sequencer.setStepsPerBeat(value);
-                }
-            );
-            widget.isRemovable = false;  // Pattern params are not removable (different from pattern grid columns)
-            widget.isInteger = false;  // Allow fractional values
             
             // Custom parsing for fractional values (1/2, 1/4, 1/8) and negative values
-            widget.parseValue = [](const std::string& str) -> float {
+            auto customParser = [](const std::string& str) -> float {
                 if (str.empty() || str == "--") {
                     return std::numeric_limits<float>::quiet_NaN();
                 }
@@ -586,7 +655,7 @@ void TrackerSequencerGUI::drawPatternControls(TrackerSequencer& sequencer) {
             };
             
             // Custom formatting to display fractions nicely
-            widget.formatValue = [](float value) -> std::string {
+            auto customFormatter = [](float value) -> std::string {
                 if (std::isnan(value)) {
                     return "--";
                 }
@@ -621,10 +690,26 @@ void TrackerSequencerGUI::drawPatternControls(TrackerSequencer& sequencer) {
                 }
             };
             
-            return widget;
+            // Create widget with custom parser and formatter
+            auto spbWidget = createCellWidget(
+                spbParam,
+                [&sequencer]() -> float {
+                    return sequencer.getStepsPerBeat();
+                },
+                [&sequencer](float value) {
+                    sequencer.setStepsPerBeat(value);
+                },
+                nullptr,  // remover
+                customFormatter,
+                customParser
+            );
+            if (spbWidget) {
+                spbWidget->isRemovable = false;  // Pattern params are not removable (different from pattern grid columns)
+            }
+            return spbWidget;
         }
         
-        return CellWidget(); // Return empty cell if not found
+        return nullptr; // Return nullptr if not found
     };
     
     // Get cell values
@@ -690,11 +775,12 @@ void TrackerSequencerGUI::drawPatternControls(TrackerSequencer& sequencer) {
 }
 
 void TrackerSequencerGUI::drawPatternGrid(TrackerSequencer& sequencer) {
-    // Track pattern index changes to refresh column configuration
-    int currentPatternIndex = sequencer.getCurrentPatternIndex();
-    bool patternChanged = (currentPatternIndex != lastPatternIndex);
+    // Track pattern name changes to refresh column configuration
+    std::string currentPatternName = sequencer.getCurrentPatternName();
+    static std::string lastPatternName;
+    bool patternChanged = (currentPatternName != lastPatternName);
     if (patternChanged) {
-        lastPatternIndex = currentPatternIndex;
+        lastPatternName = currentPatternName;
         // Clear cell cache when pattern changes to force refresh
         cellGrid.clearCellCache();
     }
@@ -968,43 +1054,68 @@ void TrackerSequencerGUI::drawStepNumber(TrackerSequencer& sequencer, int step, 
     // Verify the click is within the button bounds to prevent false positives
     bool isItemClicked = ImGui::IsItemClicked(0);
     
-    if (buttonClicked && !spacebarPressed && isItemClicked) {
-        sequencer.triggerStep(step);
-        // Note: editStep/editColumn will be synced below when ImGui::IsItemFocused() is true
-        // If focus doesn't happen immediately, we still need to set it here for immediate keyboard input
+    // Track if button was clicked for use in focus handler below
+    bool stepButtonWasClicked = (buttonClicked && !spacebarPressed && isItemClicked);
+    
+    // Handle step button click - trigger step via syncPlaybackToEditIfPaused (respects empty check)
+    if (stepButtonWasClicked) {
+        callbacksState.anyCellFocusedThisFrame = true;
+        
+        // Save previous step BEFORE updating focus state
+        int previousStep = cellFocusState.row;
+        
+        // When in edit mode, prevent focus from changing to a different cell
+        if (cellFocusState.isEditing && (previousStep != step || cellFocusState.column != 0)) {
+            return;
+        }
+        
+        // Update focus state to column 0 (step number column)
         setEditCell(step, 0);
+        
+        // Trigger step via syncPlaybackToEditIfPaused (properly handles empty step check)
+        bool stepChanged = (step != sequencer.getPlaybackStep());
+        bool fromHeaderRow = (previousStep == -1);
+        syncPlaybackToEditIfPaused(sequencer, step, stepChanged, fromHeaderRow, lastTriggeredStepWhenPaused);
     }
     
-    // ONE-WAY SYNC: ImGui focus → GUI state
-    // Only sync when item was actually clicked or keyboard-navigated
+    // Handle keyboard navigation focus changes for step button (column 0)
+    // Note: onCellFocusChanged only fires for parameter columns, so we need to handle column 0 here
     bool actuallyFocused = ImGui::IsItemFocused();
-    if (actuallyFocused) {
-        bool itemWasClicked = ImGui::IsItemClicked(0);
+    if (actuallyFocused && !stepButtonWasClicked) {
         bool keyboardNavActive = (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
         
-        // Only sync if this is an intentional focus (click or keyboard nav)
-        if (itemWasClicked || keyboardNavActive) {
-            callbacksState.anyCellFocusedThisFrame = true;
-            bool cellChanged = (cellFocusState.row != step || cellFocusState.column != 0);
+        // Only handle keyboard navigation (not clicks - those are handled above)
+        if (keyboardNavActive) {
+            // Prevent duplicate triggers from multiple cells in the same frame
+            int currentFrame = ImGui::GetFrameCount();
+            bool alreadyTriggeredThisFrame = (lastTriggeredStepFrame == currentFrame && 
+                                              lastTriggeredStepThisFrame == step);
             
-            // When in edit mode, prevent focus from changing to a different cell
-            if (cellFocusState.isEditing && cellChanged) {
-                return; // Exit early - keep focus locked to editing cell
+            if (!alreadyTriggeredThisFrame) {
+                callbacksState.anyCellFocusedThisFrame = true;
+                bool cellChanged = (cellFocusState.row != step || cellFocusState.column != 0);
+                
+                // When in edit mode, prevent focus from changing to a different cell
+                if (cellFocusState.isEditing && cellChanged) {
+                    return;
+                }
+                
+                // Save previous step BEFORE updating focus state
+                int previousStep = cellFocusState.row;
+                
+                // Update focus state to column 0 (step number column)
+                setEditCell(step, 0);
+                
+                // Trigger step via syncPlaybackToEditIfPaused (properly handles empty step check)
+                // Only trigger if step actually changed (prevents re-triggering same step)
+                bool stepChanged = (step != sequencer.getPlaybackStep());
+                bool fromHeaderRow = (previousStep == -1);
+                if (fromHeaderRow || stepChanged) {
+                    syncPlaybackToEditIfPaused(sequencer, step, stepChanged, fromHeaderRow, lastTriggeredStepWhenPaused);
+                    lastTriggeredStepThisFrame = step;
+                    lastTriggeredStepFrame = currentFrame;
+                }
             }
-            
-            // Sync state to GUI
-            int previousStep = cellFocusState.row;
-            setEditCell(step, 0);
-            
-            // When paused, sync playback position and trigger step (walk through)
-            bool stepChanged = (step != sequencer.getPlaybackStep());
-            bool fromHeaderRow = (previousStep == -1);
-            if (fromHeaderRow || stepChanged) {
-                syncPlaybackToEditIfPaused(sequencer, step, stepChanged, fromHeaderRow, lastTriggeredStepWhenPaused);
-            }
-            
-            // Note: Edit mode is managed by CellWidget - it will exit edit mode when focus changes
-            // No need to manually clear edit mode here
         }
     }
     
@@ -1209,10 +1320,6 @@ bool TrackerSequencerGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPr
             }
             return false; // Nothing to duplicate
         }
-    } else if (cellFocusState.hasFocus() && cellFocusState.column != 0) {
-        // Parameter column focused - let CellWidget handle individual cell copy/paste
-        // Return false to allow CellWidget to process cmd+C/V/X
-        return false;
     }
     
     // Backspace: Clear step (when not editing cell and on step column)
@@ -1268,12 +1375,48 @@ bool TrackerSequencerGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPr
         }
     }
     
+    // Handle UP/DOWN arrow key navigation between steps when not editing
+    // Works for ALL columns - preserves the current column while navigating rows
+    // When editing, CellWidget handles arrow keys for value adjustment
+    if (!shiftPressed && !cellFocusState.isEditing && cellFocusState.hasFocus()) {
+        if (key == OF_KEY_UP || key == OF_KEY_DOWN) {
+            int currentStep = cellFocusState.row;
+            int newStep = currentStep;
+            
+            if (key == OF_KEY_UP) {
+                newStep = std::max(0, currentStep - 1);
+            } else if (key == OF_KEY_DOWN) {
+                newStep = std::min(sequencer->getStepCount() - 1, currentStep + 1);
+            }
+            
+            // Only navigate if step actually changed
+            if (newStep != currentStep) {
+                // Update focus state - preserves current column for non-column-0 navigation
+                // Don't trigger here - let ImGui move focus, then drawStepNumber (col 0) or 
+                // onCellFocusChanged (col > 0) will trigger the step
+                setEditCell(newStep, cellFocusState.column);
+                
+                // Return false to let ImGui process the arrow key and move focus
+                // This ensures the new cell appears focused and triggers properly
+                return false;
+            }
+        }
+    }
+    
+    // Parameter column focused - let CellWidget handle individual cell copy/paste
+    // But only return early for clipboard operations, not for arrow keys (handled above)
+    if (cellFocusState.hasFocus() && cellFocusState.column != 0) {
+        // Check if this is a clipboard operation that CellWidget should handle
+        bool isClipboardOp = (cmdOrCtrlPressed && (key == 'c' || key == 'C' || key == 'v' || key == 'V' || key == 'x' || key == 'X'));
+        if (isClipboardOp) {
+            // Return false to allow CellWidget to process cmd+C/V/X
+            return false;
+        }
+    }
+    
     // PHASE 1: SINGLE INPUT PATH - CellWidget is sole input processor for cells
-    // If any cell has focus (pattern params or pattern grid), let CellWidget handle remaining input
-    // BUT: We've already handled clipboard operations above, so only pass through if not handled
+    // If any cell has focus, let CellWidget handle remaining input
     if (patternParamsFocusState.hasFocus() || cellFocusState.hasFocus()) {
-        // CellWidget will handle remaining input in processInputInDraw()
-        // But we've already handled clipboard shortcuts above, so return false to let CellWidget handle other keys
         return false;
     }
     
@@ -1734,7 +1877,7 @@ void TrackerSequencerGUI::setupHeaderCallbacks(CellGridCallbacks& callbacks, boo
 }
 
 void TrackerSequencerGUI::setupCellValueCallbacks(CellGridCallbacks& callbacks, TrackerSequencer& sequencer) {
-    callbacks.createCellWidget = [this, &sequencer](int row, int col, const CellGridColumnConfig& colConfig) -> CellWidget {
+    callbacks.createCell = [this, &sequencer](int row, int col, const CellGridColumnConfig& colConfig) -> std::unique_ptr<BaseCell> {
         return createParameterCellForColumn(sequencer, row, col);
     };
     
@@ -1859,19 +2002,41 @@ void TrackerSequencerGUI::setupStateSyncCallbacks(CellGridCallbacks& callbacks, 
         return -1;
     };
     
-    // Simple focus callback for playback syncing only (no parallel focus state tracking)
+    // Focus callback for playback syncing (parameter columns only - col > 0)
+    // Note: CellGrid only calls this for parameter columns, not for fixed columns (step button)
+    // Step button focus is handled separately in drawStepNumber
     callbacks.onCellFocusChanged = [this, &sequencer](int row, int col) {
-        // TrackerSequencer-specific: Handle playback syncing only if step actually changed
         int previousStep = cellFocusState.row;
         
-        // Update minimal state needed for playback syncing
+        // Update focus state
         cellFocusState.row = row;
         cellFocusState.column = col;
         
         bool stepChanged = (previousStep != row);
         bool fromHeaderRow = (previousStep == -1);
-        if (fromHeaderRow || stepChanged) {
+        
+        // Skip if this step was just triggered by arrow key handler in handleKeyPress
+        // This prevents duplicate triggers when arrow key handler already triggered the step
+        bool wasJustTriggeredByArrowKeys = (!sequencer.isPlaying() && 
+                                            row == lastTriggeredStepWhenPaused && 
+                                            row == sequencer.getPlaybackStep());
+        
+        // Prevent duplicate triggers from multiple cells in the same frame
+        int currentFrame = ImGui::GetFrameCount();
+        bool alreadyTriggeredThisFrame = (lastTriggeredStepFrame == currentFrame && 
+                                          lastTriggeredStepThisFrame == row);
+        
+        // Only trigger when:
+        // 1. Arriving at a step (not staying on same step)
+        // 2. Not already triggered by arrow key handler
+        // 3. Not already triggered this frame
+        bool isArrivingAtStep = fromHeaderRow || stepChanged;
+        bool shouldTrigger = isArrivingAtStep && !wasJustTriggeredByArrowKeys && !alreadyTriggeredThisFrame;
+        
+        if (shouldTrigger) {
             syncPlaybackToEditIfPaused(sequencer, row, stepChanged, fromHeaderRow, lastTriggeredStepWhenPaused);
+            lastTriggeredStepThisFrame = row;
+            lastTriggeredStepFrame = currentFrame;
         }
     };
     
@@ -1941,27 +2106,27 @@ void TrackerSequencerGUI::setupRowCallbacks(CellGridCallbacks& callbacks, Tracke
 }
 
 //--------------------------------------------------------------
-// CellWidget adapter methods (moved from TrackerSequencer)
+// BaseCell adapter methods (moved from TrackerSequencer)
 //--------------------------------------------------------------
-CellWidget TrackerSequencerGUI::createParameterCellForColumn(TrackerSequencer& sequencer, int step, int column) {
+std::unique_ptr<BaseCell> TrackerSequencerGUI::createParameterCellForColumn(TrackerSequencer& sequencer, int step, int column) {
     // column is absolute column index (0=step number, 1+=parameter columns)
     // For parameter columns, convert to parameter-relative index: paramColIdx = column - 1
     if (step < 0 || step >= sequencer.getStepCount() || column <= 0) {
-        return CellWidget(); // Return empty cell for invalid step or step number column (column=0)
+        return nullptr; // Return nullptr for invalid step or step number column (column=0)
     }
     
     const auto& columnConfig = sequencer.getCurrentPattern().getColumnConfiguration();
     int paramColIdx = column - 1;  // Convert absolute column index to parameter-relative index
     if (paramColIdx < 0 || paramColIdx >= (int)columnConfig.size()) {
-        return CellWidget();
+        return nullptr;
     }
     
     const auto& col = columnConfig[paramColIdx];
-    CellWidget cell;
     
-    // Configure basic properties
-    cell.parameterName = col.parameterName;
-    cell.isRemovable = !col.isRequired; // Use isRequired (inverted)
+    // Create ParameterDescriptor based on column type
+    ParameterDescriptor paramDesc;
+    paramDesc.name = col.parameterName;
+    paramDesc.displayName = col.parameterName;  // Use parameterName as displayName (ColumnConfig doesn't have displayName)
     
     // Set value range based on column type - use unified parameter registry
     auto trackerParams = sequencer.getTrackerParameters();
@@ -1969,21 +2134,22 @@ CellWidget TrackerSequencerGUI::createParameterCellForColumn(TrackerSequencer& s
     for (const auto& trackerParam : trackerParams) {
         if (trackerParam.name == col.parameterName) {
             // Tracker parameter: use registry with dynamic ranges
+            paramDesc.type = trackerParam.type;
             if (col.parameterName == "index") {
                 // Index: allow -1 for empty state (displayed as "--")
-                cell.setValueRange(-1.0f, trackerParam.maxValue, -1.0f);
-                cell.getMaxIndex = [&sequencer]() { return sequencer.getIndexRange(); };
+                paramDesc.minValue = -1.0f;
+                paramDesc.maxValue = trackerParam.maxValue;
+                paramDesc.defaultValue = -1.0f;
             } else if (col.parameterName == "note") {
                 // Note: allow -1 for empty state (displayed as "--")
-                cell.setValueRange(-1.0f, trackerParam.maxValue, -1.0f);
-            } else if (col.parameterName == "ratio") {
-                // Ratio: use registry ranges (encoded as A * 1000 + B)
-                cell.setValueRange(trackerParam.minValue, trackerParam.maxValue, trackerParam.defaultValue);
+                paramDesc.minValue = -1.0f;
+                paramDesc.maxValue = trackerParam.maxValue;
+                paramDesc.defaultValue = -1.0f;
             } else {
-                // Length, chance: use registry ranges
-                cell.setValueRange(trackerParam.minValue, trackerParam.maxValue, trackerParam.defaultValue);
+                paramDesc.minValue = trackerParam.minValue;
+                paramDesc.maxValue = trackerParam.maxValue;
+                paramDesc.defaultValue = trackerParam.defaultValue;
             }
-            cell.isInteger = (trackerParam.type == ParameterType::INT);
             isTrackerParam = true;
             break;
         }
@@ -1993,24 +2159,30 @@ CellWidget TrackerSequencerGUI::createParameterCellForColumn(TrackerSequencer& s
         // External parameter column - use parameter ranges
         auto range = TrackerSequencer::getParameterRange(col.parameterName);
         float defaultValue = TrackerSequencer::getParameterDefault(col.parameterName);
-        cell.setValueRange(range.first, range.second, defaultValue);
-        
-        // Determine if parameter is integer or float
-        ParameterType paramType = TrackerSequencer::getParameterType(col.parameterName);
-        cell.isInteger = (paramType == ParameterType::INT);
+        paramDesc.type = TrackerSequencer::getParameterType(col.parameterName);
+        paramDesc.minValue = range.first;
+        paramDesc.maxValue = range.second;
+        paramDesc.defaultValue = defaultValue;
     }
     
-    // Calculate optimal step increment based on range and type (single source of truth)
-    // This sets stepIncrement = 1.0f for integers, 0.001f for floats
-    cell.calculateStepIncrement();
+    // Create ParameterCell and configure it with custom callbacks
+    // Note: We don't have a Module for TrackerSequencer, so we'll use ParameterCell with custom callbacks
+    ParameterCell paramCell(nullptr, paramDesc, nullptr);  // No module, no router
     
-    // Configure callbacks
-    configureParameterCellCallbacks(sequencer, cell, step, column);
+    // Set up custom getter/setter/remover callbacks
+    configureParameterCellCallbacks(sequencer, &paramCell, step, column);
+    
+    // Create the cell
+    auto cell = paramCell.createCell();
+    if (cell) {
+        cell->parameterName = col.parameterName;
+        cell->isRemovable = !col.isRequired; // Use isRequired (inverted)
+    }
     
     return cell;
 }
 
-void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequencer, CellWidget& cell, int step, int column) {
+void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequencer, ParameterCell* paramCell, int step, int column) {
     // column is absolute column index (0=step number, 1+=parameter columns)
     // For parameter columns, convert to parameter-relative index: paramColIdx = column - 1
     if (step < 0 || step >= sequencer.getStepCount() || column <= 0) {
@@ -2028,10 +2200,14 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
     bool isRequiredCol = col.isRequired; // Capture by value
     std::string requiredTypeCol = col.isRequired ? col.parameterName : ""; // Capture by value
     
+    if (!paramCell) {
+        return;  // Invalid ParameterCell
+    }
+    
     // getCurrentValue callback - returns current value from Step
     // Returns NaN to indicate empty/not set (will display as "--")
     // Unified system: all empty values (Index, Length, dynamic parameters) use NaN
-    cell.getCurrentValue = [&sequencer, step, paramName, isRequiredCol, requiredTypeCol]() -> float {
+    auto getter = [&sequencer, step, paramName, isRequiredCol, requiredTypeCol]() -> float {
         if (step < 0 || step >= sequencer.getStepCount()) {
             // Return NaN for invalid step (will display as "--")
             return std::numeric_limits<float>::quiet_NaN();
@@ -2075,9 +2251,10 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
         }
         return stepData.getParameterValue(paramName, 0.0f);
     };
+    paramCell->setCustomGetter(getter);
     
-    // onValueApplied callback - applies value to Step
-    cell.onValueApplied = [&sequencer, step, column, paramName, isRequiredCol, requiredTypeCol](const std::string&, float value) {
+    // setter callback - applies value to Step
+    auto setter = [&sequencer, step, paramName, isRequiredCol, requiredTypeCol](float value) {
         if (step < 0 || step >= sequencer.getStepCount()) return;
         
         // TODO (Task 6): Implement proper pending edit queuing for playback editing
@@ -2118,9 +2295,10 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
         }
         sequencer.setStep(step, stepData);
     };
+    paramCell->setCustomSetter(setter);
     
-    // onValueRemoved callback - removes parameter from Step
-    cell.onValueRemoved = [&sequencer, step, column, paramName, isRequiredCol, requiredTypeCol](const std::string&) {
+    // remover callback - removes parameter from Step
+    auto remover = [&sequencer, step, paramName, isRequiredCol, requiredTypeCol]() {
         if (step < 0 || step >= sequencer.getStepCount()) return;
         
         // TODO (Task 6): Implement proper pending edit queuing for playback editing
@@ -2151,15 +2329,12 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             sequencer.setStep(step, stepData);
         }
     };
+    paramCell->setCustomRemover(remover);
     
-    // onEditModeChanged callback removed - using CellGrid callback instead
-    // This prevents duplicate callbacks that could cause conflicts
-    // The callback in setupStateSyncCallbacks handles edit mode changes
-    
-    // formatValue callback - tracker-specific formatting for all columns
+    // Set custom formatters for tracker-specific formatting
     if (isRequiredCol && requiredTypeCol == "index") {
         // Index column: 1-based display (01-99), NaN = rest
-        cell.formatValue = [](float value) -> std::string {
+        auto formatter = [](float value) -> std::string {
             if (std::isnan(value)) {
                 return "--"; // Show "--" for NaN (empty/rest)
             }
@@ -2167,26 +2342,28 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             if (indexVal <= 0) {
                 return "--"; // Also handle edge case
             }
-            char buf[BUFFER_SIZE];
+            char buf[32];
             snprintf(buf, sizeof(buf), "%02d", indexVal);
             return std::string(buf);
         };
+        paramCell->setCustomFormatter(formatter);
     } else if (isRequiredCol && requiredTypeCol == "length") {
         // Length column: 1 to 64 range (fixed maximum, can exceed pattern length), formatted as "02", NaN = not set
         const int MAX_STEP_LENGTH = 64;
-        cell.formatValue = [MAX_STEP_LENGTH](float value) -> std::string {
+        auto formatter = [MAX_STEP_LENGTH](float value) -> std::string {
             if (std::isnan(value)) {
                 return "--"; // Show "--" for NaN (empty/not set)
             }
             int lengthVal = (int)std::round(value);
             lengthVal = std::max(MIN_LENGTH_VALUE, std::min(MAX_STEP_LENGTH, lengthVal)); // Clamp to valid range
-            char buf[BUFFER_SIZE];
+            char buf[32];
             snprintf(buf, sizeof(buf), "%02d", lengthVal); // Zero-padded to 2 digits
             return std::string(buf);
         };
+        paramCell->setCustomFormatter(formatter);
     } else if (paramName == "note") {
         // Note column: format as note name (C4, C#5, etc.), NaN = "--"
-        cell.formatValue = [](float value) -> std::string {
+        auto formatter = [](float value) -> std::string {
             if (std::isnan(value) || value < 0) {
                 return "--";
             }
@@ -2202,9 +2379,10 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             
             return std::string(noteNames[note]) + std::to_string(octave);
         };
+        paramCell->setCustomFormatter(formatter);
     } else if (paramName == "ratio") {
         // Ratio column: format as A:B (e.g., 2:4), NaN = "--"
-        cell.formatValue = [](float value) -> std::string {
+        auto formatter = [](float value) -> std::string {
             if (std::isnan(value)) {
                 return "--";
             }
@@ -2216,72 +2394,19 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             ratioB = std::max(1, std::min(16, ratioB));
             return std::to_string(ratioA) + ":" + std::to_string(ratioB);
         };
+        paramCell->setCustomFormatter(formatter);
     } else {
         // Dynamic parameter: use TrackerSequencer's formatting
-        cell.formatValue = [paramName](float value) -> std::string {
+        auto formatter = [paramName](float value) -> std::string {
             return TrackerSequencer::formatParameterValue(paramName, value);
         };
+        paramCell->setCustomFormatter(formatter);
     }
     
-    // Ratio cycling helpers: Convert between linear index (0-135) and ratio (A:B)
-    // Pattern: For each B (1-16), cycle A from 1 to B
-    // Total valid ratios: 1+2+3+...+16 = 136
-    auto ratioIndexToEncoded = [](int index) -> int {
-        // Clamp index to valid range [0, 135]
-        index = std::max(0, std::min(135, index));
-        int sum = 0;
-        for (int B = 1; B <= 16; B++) {
-            if (index < sum + B) {
-                int A = (index - sum) + 1;  // A ranges from 1 to B
-                return A * 1000 + B;
-            }
-            sum += B;
-        }
-        return 16016; // Fallback to 16:16
-    };
-    
-    auto ratioEncodedToIndex = [](int encoded) -> int {
-        int A = encoded / 1000;
-        int B = encoded % 1000;
-        // Clamp to valid range
-        A = std::max(1, std::min(16, A));
-        B = std::max(1, std::min(16, B));
-        // Ensure A <= B
-        if (A > B) A = B;
-        
-        int index = 0;
-        // Sum all ratios for B < current B
-        for (int b = 1; b < B; b++) {
-            index += b;
-        }
-        // Add position within current B (A ranges from 1 to B, so A-1 is the offset)
-        index += (A - 1);
-        return std::max(0, std::min(135, index));
-    };
-    
-    // Custom adjustValue callback for ratio (cycles through valid ratios)
-    if (paramName == "ratio") {
-        cell.customAdjustValue = [&sequencer, step, ratioIndexToEncoded, ratioEncodedToIndex](int delta, float) -> void {
-            if (step < 0 || step >= sequencer.getStepCount()) return;
-            
-            const Step& stepData = sequencer.getCurrentPattern()[step];
-            int currentEncoded = (int)(stepData.ratioA * 1000 + stepData.ratioB);
-            int currentIndex = ratioEncodedToIndex(currentEncoded);
-            int newIndex = currentIndex + delta;
-            int newEncoded = ratioIndexToEncoded(newIndex);
-            
-            // Apply new value
-            Step updatedStep = stepData;
-            updatedStep.ratioA = newEncoded / 1000;
-            updatedStep.ratioB = newEncoded % 1000;
-            sequencer.setStep(step, updatedStep);
-        };
-    }
-    
-    // parseValue callback - tracker-specific parsing for index/length
+    // Set custom parsers for tracker-specific parsing
     if (isRequiredCol && requiredTypeCol == "index") {
         // Index: parse as integer, handle "--" as NaN
-        cell.parseValue = [](const std::string& str) -> float {
+        auto parser = [](const std::string& str) -> float {
             if (str == "--" || str.empty()) {
                 return std::numeric_limits<float>::quiet_NaN();
             }
@@ -2292,10 +2417,11 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
                 return std::numeric_limits<float>::quiet_NaN();
             }
         };
+        paramCell->setCustomParser(parser);
     } else if (isRequiredCol && requiredTypeCol == "length") {
         // Length: parse as integer (1 to 64, fixed maximum, can exceed pattern length), handle "--" as NaN
         const int MAX_STEP_LENGTH = 64;
-        cell.parseValue = [MAX_STEP_LENGTH](const std::string& str) -> float {
+        auto parser = [MAX_STEP_LENGTH](const std::string& str) -> float {
             if (str == "--" || str.empty()) {
                 return std::numeric_limits<float>::quiet_NaN();
             }
@@ -2307,9 +2433,10 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
                 return std::numeric_limits<float>::quiet_NaN();
             }
         };
+        paramCell->setCustomParser(parser);
     } else if (paramName == "note") {
         // Note: parse note name (C4, C#5, etc.) or number, handle "--" as NaN
-        cell.parseValue = [](const std::string& str) -> float {
+        auto parser = [](const std::string& str) -> float {
             if (str == "--" || str.empty()) {
                 return std::numeric_limits<float>::quiet_NaN();
             }
@@ -2342,9 +2469,10 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             
             return std::numeric_limits<float>::quiet_NaN();
         };
+        paramCell->setCustomParser(parser);
     } else if (paramName == "ratio") {
         // Ratio: parse A:B format (e.g., "2:4"), handle "--" as NaN
-        cell.parseValue = [](const std::string& str) -> float {
+        auto parser = [](const std::string& str) -> float {
             if (str == "--" || str.empty()) {
                 return std::numeric_limits<float>::quiet_NaN();
             }
@@ -2399,8 +2527,12 @@ void TrackerSequencerGUI::configureParameterCellCallbacks(TrackerSequencer& sequ
             
             return std::numeric_limits<float>::quiet_NaN();
         };
+        paramCell->setCustomParser(parser);
     }
     // Dynamic parameters use ParameterCell's default parsing (expression evaluation)
+    
+    // Note: customAdjustValue for ratio cycling is not currently supported in BaseCell/ParameterCell
+    // This functionality may need to be re-implemented in the future if needed
 }
 
 //--------------------------------------------------------------

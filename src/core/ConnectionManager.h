@@ -129,6 +129,11 @@ public:
      */
     void setParameterRouter(ParameterRouter* router) { parameterRouter_ = router; }
     
+    /**
+     * Set PatternRuntime (required for module initialization with pattern access)
+     */
+    void setPatternRuntime(class PatternRuntime* patternRuntime) { patternRuntime_ = patternRuntime; }
+    
     // ========================================================================
     // AUDIO/VIDEO ROUTING (Module→Module and Module→Mixer)
     // ========================================================================
@@ -456,6 +461,7 @@ public:
 private:
     ModuleRegistry* registry_;
     ParameterRouter* parameterRouter_;
+    class PatternRuntime* patternRuntime_;  // PatternRuntime for module initialization
     
     // Routers for different connection types
     AudioRouter audioRouter_;

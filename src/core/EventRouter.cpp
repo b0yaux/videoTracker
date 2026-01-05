@@ -3,6 +3,7 @@
 #include "modules/Module.h"
 #include "ofLog.h"
 #include "ofEvents.h"
+#include <fstream>  // For debug logging
 
 EventRouter::EventRouter(ModuleRegistry* registry)
     : registry_(registry) {

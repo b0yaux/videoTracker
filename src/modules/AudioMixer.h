@@ -24,7 +24,7 @@ class Module;
  * Usage:
  * ```cpp
  * auto mixer = std::make_shared<AudioMixer>();
- * auto mediaPool = std::make_shared<MediaPool>();
+ * auto multiSampler = std::make_shared<MultiSampler>();
  * 
  * // Connect mediaPool to mixer
  * mixer->connectModule(mediaPool);

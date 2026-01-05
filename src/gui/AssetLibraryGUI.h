@@ -67,7 +67,7 @@ private:
     // New folder state
     char newFolderBuffer_[128] = {0};  // Buffer for new folder input
     
-    // Player cache for tooltip previews (inspired by MediaPool pattern)
+    // Player cache for tooltip previews (inspired by MultiSampler pattern)
     struct CachedPlayer {
         std::string assetId;
         std::unique_ptr<class MediaPlayer> player;

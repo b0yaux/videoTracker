@@ -320,6 +320,7 @@ void ViewManager::draw() {
     ofLogVerbose("ViewManager") << "draw() called";
 
     // Draw clock panel only if master modules are visible
+    // Note: Clock window is drawn here to register it with ImGui before layout is loaded
     if (masterModulesVisible_) {
         drawClockPanel();
     }
@@ -405,7 +406,7 @@ void ViewManager::drawModulePanels() {
         }
 
         // CRITICAL: Validate module still exists before accessing it
-        // This prevents crashes when MediaPool modules with audio/video ports are deleted
+        // This prevents crashes when MultiSampler modules with audio/video ports are deleted
         auto* reg = gui->getRegistry();
         if (!reg || !reg->hasModule(instanceName)) {
             // Module was deleted - skip this GUI
@@ -459,6 +460,18 @@ void ViewManager::drawModulePanels() {
         ImGuiWindowClass windowClass;
         windowClass.DockingAlwaysTabBar = true;
         ImGui::SetNextWindowClass(&windowClass);
+        
+        // #region agent log
+        {
+            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (logFile.is_open()) {
+                auto now = std::chrono::system_clock::now();
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+                logFile << "{\"id\":\"log_" << ms << "_module_class\",\"timestamp\":" << ms << ",\"location\":\"ViewManager.cpp:368\",\"message\":\"Module window SetNextWindowClass\",\"data\":{\"instanceName\":\"" << instanceName << "\",\"hasWindowClass\":true},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H1\"}\n";
+                logFile.close();
+            }
+        }
+        // #endregion
 
         // ImGui::Begin() returns false when window is collapsed
         // windowID uses "DisplayName###UUID" format so UUID is used for window ID (position storage)
@@ -598,6 +611,7 @@ void ViewManager::drawClockPanel() {
         bool shouldFocus = (windowName == currentFocusedWindow);
         bool focusChanged = (shouldFocus && windowName != lastFocusedWindow);
 
+
         // Set focus when window changes
         if (focusChanged) {
             ImGui::SetNextWindowFocus();
@@ -608,6 +622,15 @@ void ViewManager::drawClockPanel() {
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);  // Enable border
         ImGui::PushStyleColor(ImGuiCol_Border,
             isFocused ? GUIConstants::Outline::Focus : GUIConstants::Outline::Unfocused);
+
+        // Prevent "hide tab bar" dropdown button in docked windows
+        // This ensures tab bars always remain visible and serve as title bars
+        // CRITICAL: This is required for ImGui to properly restore docking state
+        // Without this, ImGui::Begin() will clear the docking state even if it was saved
+        ImGuiWindowClass windowClass;
+        windowClass.DockingAlwaysTabBar = true;
+        ImGui::SetNextWindowClass(&windowClass);
+
 
         // ImGui::Begin() returns false when window is collapsed
         // IMPORTANT: Always call End() even if Begin() returns false
@@ -630,6 +653,7 @@ void ViewManager::drawClockPanel() {
                 drawWindowOutline();
             }
         }
+        
         ImGui::End();  // Always call End() regardless of Begin() return value
         ImGui::PopStyleColor();  // Pop border color
         ImGui::PopStyleVar();    // Pop border size

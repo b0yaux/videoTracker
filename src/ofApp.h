@@ -10,7 +10,7 @@
 #include "ofxSoundObjects.h"
 #include "ofxVisualObjects.h"
 #include "MediaPlayer.h"
-#include "MediaPool.h"
+#include "MultiSampler.h"
 #include "TrackerSequencer.h"
 #include "Pattern.h"
 #include "Clock.h"
@@ -32,14 +32,21 @@
 #include "core/ModuleRegistry.h"
 #include "core/ParameterRouter.h"
 #include "core/ConnectionManager.h"
+#include "core/Engine.h"
 #include "core/ProjectManager.h"
 #include "core/SessionManager.h"
 #include "MediaConverter.h"
 #include "AssetLibrary.h"
+#include "shell/Shell.h"
+#include "shell/EditorShell.h"
+#include "shell/CLIShell.h"
+#include "shell/CommandShell.h"
+#include <memory>
+#include <vector>
 
 class ofApp : public ofBaseApp {
 public:
-    ofApp();  // Constructor to initialize AssetLibrary
+    ofApp();
     ~ofApp() noexcept;
     void setup();
     void update();
@@ -48,6 +55,8 @@ public:
     
     void keyPressed(ofKeyEventArgs& keyEvent);
     void mousePressed(int x, int y, int button);
+    void mouseDragged(int x, int y, int button);
+    void mouseReleased(int x, int y, int button);
     void windowResized(int w, int h);
     
     // Drag and drop support
@@ -57,25 +66,21 @@ public:
     void audioOut(ofSoundBuffer& buffer);
     
 private:
-    // Time objects
-    Clock clock;
+    // ═══════════════════════════════════════════════════════════
+    // THE ENGINE (core logic)
+    // ═══════════════════════════════════════════════════════════
+    vt::Engine engine_;
+    
+    // ═══════════════════════════════════════════════════════════
+    // SHELLS (UI interaction modes)
+    // ═══════════════════════════════════════════════════════════
+    std::vector<std::unique_ptr<vt::shell::Shell>> shells_;
+    vt::shell::Shell* activeShell_ = nullptr;
+    vt::shell::EditorShell* editorShell_ = nullptr;  // Pointer to EditorShell in shells_ vector
+    vt::shell::CommandShell* commandShell_ = nullptr;      // Pointer to CommandShell in shells_ vector
+    
+    // Time objects (for GUI)
     ClockGUI clockGUI;
-    
-    // Project and session management
-    ProjectManager projectManager;
-    MediaConverter mediaConverter;  // Background video conversion service
-    AssetLibrary assetLibrary;      // Project asset management (initialized in constructor)
-    
-    // Module management system (Phase 1: Core Architecture)
-    ModuleFactory moduleFactory;
-    ModuleRegistry moduleRegistry;
-    ParameterRouter parameterRouter;
-    ConnectionManager connectionManager;
-    SessionManager sessionManager;
-    
-    // Master outputs (created on startup, include mixer functionality internally)
-    std::shared_ptr<class AudioOutput> masterAudioOut;
-    std::shared_ptr<class VideoOutput> masterVideoOut;
     
     // GUI management (Phase 3: Multiple Instances)
     GUIManager guiManager;
@@ -94,9 +99,6 @@ private:
     
     // GUI system (using direct ImGui integration via wrapper)
     ImGuiIntegration gui;
-    
-    // Command system
-    CommandExecutor commandExecutor;  // Backend for command execution
     
     // GUI managers
     MenuBar menuBar;
@@ -126,6 +128,12 @@ private:
     float lastFpsLogTime_ = 0.0f;
     static constexpr float FPS_LOG_INTERVAL = 5.0f; // Log FPS every 5 seconds
     
+    // Layout restoration state (simplified)
+    bool layoutNeedsLoad_ = false;  // True when layout should be loaded after windows are drawn
+    bool layoutLoaded_ = false;     // True after layout has been successfully loaded
+    bool windowsDrawnOnce_ = false; // Track if windows have been drawn at least once
+    bool layoutNeedsSave_ = false; // True when layout should be saved (deferred from window resize)
+    
     // Methods
     void setupSoundObjects();  // Minimal setup - audio device management is in ViewManager
     void setupVisualObjects();
@@ -135,8 +143,10 @@ private:
     void setupDefaultLayout(bool forceReset = false);
     
     // Layout management
-    void saveLayout();
-    void loadLayout();
+    void saveLayout();              // Save current layout to imgui.ini (session layout)
+    void loadLayout();              // Load layout from imgui.ini (session layout)
+    void saveDefaultLayout();       // Save current layout to imgui.default.ini (true default)
+    void loadDefaultLayout();       // Load layout from imgui.default.ini (true default)
     
     // Module management
     void addModule(const std::string& moduleType);
@@ -149,10 +159,12 @@ private:
     void onProjectOpened();
     void onProjectClosed();
     
-    // Module instance names (for registry lookup)
-    // All instance names use camelCase for consistency
-    // Note: tracker1/pool1 are default instances but not hardcoded - use registry to access
-    static constexpr const char* MASTER_AUDIO_OUT_NAME = "masterAudioOut";
-    static constexpr const char* MASTER_VIDEO_OUT_NAME = "masterVideoOut";
+    // Shell management
+    void setupShells(const std::string& cliCommandOrFile = "");
+    void switchShell(vt::shell::Shell* shell);
+    void switchToEditor();
+    void switchToCommand();
+    bool handleShellKeyPress(int key);
+    vt::shell::Shell* findShellByName(const std::string& name);
 };
 

@@ -9,6 +9,7 @@
 ConnectionManager::ConnectionManager(ModuleRegistry* registry)
     : registry_(registry)
     , parameterRouter_(nullptr)
+    , patternRuntime_(nullptr)
     , audioRouter_(registry)
     , videoRouter_(registry)
     , eventRouter_(registry)
@@ -1169,7 +1170,9 @@ void ConnectionManager::setupDefaultConnections(Clock* clock,
     }
     
     // Setup all modules (Clock subscriptions, etc.) - generic, works for all module types
-    registry_->setupAllModules(clock, registry_, this, parameterRouter_, false);
+    // NOTE: This may re-initialize already-initialized modules, but modules check listenersRegistered_ to avoid double-registration
+    // Pass PatternRuntime if available (for TrackerSequencer pattern access)
+    registry_->setupAllModules(clock, registry_, this, parameterRouter_, patternRuntime_, false);
     
     // Auto-route unconnected outputs to master outputs
     // This will only connect modules that aren't already connected

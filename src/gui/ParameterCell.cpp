@@ -1,5 +1,7 @@
 #include "ParameterCell.h"
-#include "CellWidget.h"
+#include "NumCell.h"  // For createCellForParameter
+#include "BoolCell.h"  // For createCellForParameter
+#include "MenuCell.h"  // For createCellForParameter
 #include "modules/Module.h"
 #include "core/ParameterRouter.h"
 #include "core/ParameterPath.h"
@@ -38,24 +40,25 @@ void ParameterCell::setValue(float value) {
     }
 }
 
-CellWidget ParameterCell::createCellWidget() {
-    CellWidget cell;
+std::unique_ptr<BaseCell> ParameterCell::createCell() {
+    // Use static helper to create appropriate cell type
+    auto cell = createCellForParameter(desc_, router_);
     
-    // Basic configuration
-    cell.parameterName = desc_.name;
-    cell.isInteger = (desc_.type == ParameterType::INT);
-    cell.isRemovable = isRemovable_;
-    cell.setValueRange(desc_.minValue, desc_.maxValue, desc_.defaultValue);
-    cell.calculateStepIncrement();
+    if (!cell) {
+        return nullptr;
+    }
     
-    // Set up getter callback
+    // Create callbacks here (ParameterCell knows about Module, cells don't)
+    // This keeps cells as pure UI components, decoupled from business logic
+    
+    std::function<float()> getter;
     if (customGetter_) {
-        cell.getCurrentValue = customGetter_;
+        getter = customGetter_;
     } else {
-        // Use direct Module binding
-        Module* module = module_;  // Capture for lambda
-        std::string paramName = desc_.name;  // Capture by value
-        cell.getCurrentValue = [module, paramName]() -> float {
+        // Create default getter that calls Module
+        Module* module = module_;
+        std::string paramName = desc_.name;
+        getter = [module, paramName]() -> float {
             if (!module) {
                 return std::numeric_limits<float>::quiet_NaN();
             }
@@ -63,55 +66,75 @@ CellWidget ParameterCell::createCellWidget() {
         };
     }
     
-    // Set up setter callback
+    std::function<void(float)> setter;
     if (customSetter_) {
-        auto setter = customSetter_;  // Capture for lambda
-        cell.onValueApplied = [setter](const std::string&, float value) {
-            setter(value);
-        };
+        setter = customSetter_;
     } else {
-        // Use direct Module binding
-        Module* module = module_;  // Capture for lambda
-        std::string paramName = desc_.name;  // Capture by value
-        cell.onValueApplied = [module, paramName](const std::string&, float value) {
+        // Create default setter that calls Module
+        Module* module = module_;
+        std::string paramName = desc_.name;
+        setter = [module, paramName](float value) {
             if (module) {
                 module->setParameter(paramName, value, true);
             }
         };
     }
     
-    // Set up remover callback (reset to default)
+    std::function<void()> remover;
     if (customRemover_) {
-        auto remover = customRemover_;  // Capture for lambda
-        cell.onValueRemoved = [remover](const std::string&) {
-            remover();
-        };
+        remover = customRemover_;
     } else {
-        // Default: Reset to defaultValue via Module::setParameter
-        Module* module = module_;  // Capture for lambda
-        std::string paramName = desc_.name;  // Capture by value
-        float defaultValue = desc_.defaultValue;  // Capture by value
-        cell.onValueRemoved = [module, paramName, defaultValue](const std::string&) {
+        // Create default remover that resets to default value via Module
+        Module* module = module_;
+        std::string paramName = desc_.name;
+        float defaultValue = desc_.defaultValue;
+        remover = [module, paramName, defaultValue]() {
             if (module) {
                 module->setParameter(paramName, defaultValue, true);
             }
         };
     }
     
-    // Set up formatting
-    if (customFormatter_) {
-        cell.formatValue = customFormatter_;
-    } else {
-        setupStandardFormatting(cell);
-    }
-    
-    // Set up parser (optional - uses default if not provided)
-    if (customParser_) {
-        cell.parseValue = customParser_;
-    }
-    // Otherwise, CellWidget uses default ExpressionParser
+    // Configure the cell with callbacks only (no Module*)
+    // This keeps cells decoupled from business logic
+    cell->configure(desc_, getter, setter, remover, customFormatter_, customParser_);
+    cell->isRemovable = isRemovable_;
     
     return cell;
+}
+
+std::unique_ptr<BaseCell> ParameterCell::createCellForParameter(
+    const ParameterDescriptor& desc,
+    ParameterRouter* router
+) {
+    switch (desc.type) {
+        case ParameterType::FLOAT:
+        case ParameterType::INT: {
+            auto cell = std::make_unique<NumCell>();
+            cell->parameterName = desc.name;
+            cell->isInteger = (desc.type == ParameterType::INT);
+            cell->isRemovable = true;  // Default, can be overridden
+            cell->setValueRange(desc.minValue, desc.maxValue, desc.defaultValue);
+            cell->calculateStepIncrement();
+            return cell;
+        }
+        case ParameterType::BOOL: {
+            auto cell = std::make_unique<BoolCell>();
+            cell->parameterName = desc.name;
+            cell->isRemovable = true;  // Default, can be overridden
+            return cell;
+        }
+        case ParameterType::ENUM: {
+            auto cell = std::make_unique<MenuCell>();
+            cell->parameterName = desc.name;
+            cell->isRemovable = true;  // Default, can be overridden
+            cell->setEnumOptions(desc.enumOptions);
+            cell->setCurrentIndex(desc.defaultEnumIndex);
+            return cell;
+        }
+        default:
+            return nullptr;
+    }
 }
 
 void ParameterCell::setCustomGetter(std::function<float()> getter) {
@@ -185,16 +208,5 @@ std::string ParameterCell::getParameterPath() const {
     return module_->getName() + "." + desc_.name;
 }
 
-void ParameterCell::setupStandardFormatting(CellWidget& cell) const {
-    if (desc_.type == ParameterType::INT) {
-        // Integer parameters: no decimal places
-        cell.formatValue = [](float value) -> std::string {
-            return ofToString((int)std::round(value));
-        };
-    } else {
-        // Float parameters: 3 decimal places (0.001 precision) - unified for all float params
-        cell.formatValue = [](float value) -> std::string {
-            return ofToString(value, 3);
-        };
-    }
-}
+// Type-specific configuration methods removed - now handled by BaseCell::configure()
+// This keeps ParameterCell decoupled from concrete cell types

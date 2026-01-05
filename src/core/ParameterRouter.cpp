@@ -337,41 +337,58 @@ void ParameterRouter::setParameterValue(std::shared_ptr<Module> module, const Pa
 }
 
 float ParameterRouter::getIndexedParameterValue(std::shared_ptr<Module> module, const ParameterPath& path) const {
-    // Future: Implement indexed parameter access
-    // For TrackerSequencer: step[index].position would access pattern cell at step index
-    // For now, ignore index and access parameter directly
-    
     if (!path.hasIndex()) {
         return getParameterValue(module, path);
     }
     
-    // TODO: Implement indexed access
-    // Example for TrackerSequencer:
-    //   if (path.getParameterName() == "position" && path.hasIndex()) {
-    //       TrackerSequencer* ts = dynamic_cast<TrackerSequencer*>(module.get());
-    //       if (ts) {
-    //           int step = path.getIndex();
-    //           return ts->getStep(step).getParameterValue("position", 0.0f);
-    //       }
-    //   }
+    // Use Module interface for indexed parameter access (fully modular)
+    // Format: "tracker1.position[4]" where index is the step index (0-based)
+    // Modules that support indexing implement supportsIndexedParameters() and getIndexedParameter()
+    if (module && module->supportsIndexedParameters()) {
+        int index = path.getIndex();
+        float value = module->getIndexedParameter(path.getParameterName(), index);
+        // If module returns 0.0f, it might be invalid index or unsupported parameter
+        // We still return it as the module is responsible for validation
+        return value;
+    }
     
-    // For now, fall back to non-indexed access
+    // FUTURE EXTENSIONS:
+    // - Support nested indexing (e.g., "tracker1.step[4].position[2]" for multi-dimensional data)
+    // - Support dynamic index resolution (e.g., "tracker1.position[currentStep]" where currentStep is resolved at runtime)
+    // - Add parameter validation and range checking for indexed access
+    // - Support wildcard indices for bulk operations (e.g., "tracker1.position[*]")
+    // - Add index range queries to Module interface for validation
+    
+    // Fallback to non-indexed access for modules that don't support indexing
     ParameterPath nonIndexedPath = path;
     nonIndexedPath.clearIndex();
     return getParameterValue(module, nonIndexedPath);
 }
 
 void ParameterRouter::setIndexedParameterValue(std::shared_ptr<Module> module, const ParameterPath& path, float value) {
-    // Future: Implement indexed parameter access
-    // For now, ignore index and set parameter directly
-    
     if (!path.hasIndex()) {
         setParameterValue(module, path, value);
         return;
     }
     
-    // TODO: Implement indexed access
-    // For now, fall back to non-indexed access
+    // Use Module interface for indexed parameter access (fully modular)
+    // Format: "tracker1.position[4]" where index is the step index (0-based)
+    // Modules that support indexing implement supportsIndexedParameters() and setIndexedParameter()
+    if (module && module->supportsIndexedParameters()) {
+        int index = path.getIndex();
+        module->setIndexedParameter(path.getParameterName(), index, value, true);
+        return;
+    }
+    
+    // FUTURE EXTENSIONS:
+    // - Support batch updates (e.g., update multiple steps at once for efficiency)
+    // - Support conditional updates (e.g., only update if step is currently playing)
+    // - Add undo/redo support for indexed parameter changes
+    // - Support parameter interpolation across indices (e.g., smooth transitions between steps)
+    // - Add validation hooks for indexed parameter values (e.g., range checking per step)
+    // - Add index range queries to Module interface for validation
+    
+    // Fallback to non-indexed access for modules that don't support indexing
     ParameterPath nonIndexedPath = path;
     nonIndexedPath.clearIndex();
     setParameterValue(module, nonIndexedPath, value);

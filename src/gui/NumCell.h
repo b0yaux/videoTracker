@@ -1,5 +1,6 @@
 #pragma once
 
+#include "BaseCell.h"
 #include "ofMain.h"
 #include <string>
 #include <functional>
@@ -8,55 +9,56 @@
 typedef unsigned int ImU32;
 struct ImVec2;
 
-// CellWidget only supports SLIDER mode (numeric parameter editing)
-// Button functionality is handled directly by GUI classes using ImGui::Button()
-
-// Input context for CellWidget (simplified - no frame tracking needed)
+// Input context for NumCell (simplified - no frame tracking needed)
 // ImGui handles input state management internally
-struct CellWidgetInputContext {
+struct NumCellInputContext {
     // Empty struct - kept for API compatibility but no longer needed
     // ImGui's input system (IsKeyPressed, InputQueueCharacters) already handles
     // preventing duplicate processing within a frame
-    CellWidgetInputContext() = default;
+    NumCellInputContext() = default;
 };
 
-// Interaction result from CellWidget::draw()
-struct CellWidgetInteraction {
-    bool clicked = false;
-    bool focusChanged = false;
-    bool dragStarted = false;
-    bool dragEnded = false;
-    bool shouldExitEarly = false;
-    
-    CellWidgetInteraction() = default;
-};
-
-// CellWidget - Reusable editing widget for numeric parameter values
+// NumCell - Reusable editing widget for numeric parameter values (FLOAT and INT)
+// Inherits from BaseCell for unified cell system
 // Core responsibilities:
 //   1. Display value (formatted text, fill bar visualization)
 //   2. Handle keyboard input (typing, Enter, Escape, arrow keys, etc.)
 //   3. Handle mouse drag for value adjustment
 //   4. Call callbacks (onValueApplied, onEditModeChanged, etc.) to notify GUI layer
 // 
-// NOTE: CellWidget is a SELF-CONTAINED, REUSABLE widget that handles all input processing internally.
+// NOTE: NumCell is a SELF-CONTAINED, REUSABLE widget that handles all input processing internally.
 // GUI layers (TrackerSequencerGUI, MediaPoolGUI, etc.) only need to:
 //   - Set up callbacks (onValueApplied, onEditModeChanged) to sync state
 //   - Sync state TO cell before drawing (selection, edit mode, buffer cache)
 //   - Sync state FROM cell after drawing (buffer cache for persistence)
 // 
-// This architecture makes CellWidget reusable across all modules without duplicating input logic.
+// This architecture makes NumCell reusable across all modules without duplicating input logic.
 // 
-// Note: Focus management is handled by CellWidget itself. When exiting edit mode,
-// CellWidget immediately refocuses the cell if it's still focused, eliminating delays.
+// Note: Focus management is handled by NumCell itself. When exiting edit mode,
+// NumCell immediately refocuses the cell if it's still focused, eliminating delays.
 // 
 // Supports numeric parameter editing with:
 //   - Keyboard input (direct typing, Enter to confirm, Escape to cancel)
 //   - Drag editing (mouse drag to adjust values)
-//   - Expression evaluation (e.g., "1.5 + 0.3")
+//   - Expression evaluation (e.g., "1.5 + 0.3", "+0.3" to add to current value)
 //   - Gamepad navigation (via ImGui's built-in navigation system)
-class CellWidget {
+class NumCell : public BaseCell {
 public:
-    CellWidget();
+    NumCell();
+    
+    // BaseCell interface implementation
+    CellInteraction draw(int uniqueId, bool isFocused, bool shouldFocusFirst = false) override;
+    void enterEditMode() override;
+    void exitEditMode() override;
+    bool isEditingMode() const override { return editing_; }
+    bool isFocused() const override { return focused_; }
+    bool isDragging() const override { return dragging_; }
+    void configure(const ParameterDescriptor& desc,
+                   std::function<float()> getter,
+                   std::function<void(float)> setter,
+                   std::function<void()> remover = nullptr,
+                   std::function<std::string(float)> formatter = nullptr,
+                   std::function<float(const std::string&)> parser = nullptr) override;
     
     // Configuration
     void setValueRange(float min, float max, float defaultValue);
@@ -64,12 +66,6 @@ public:
     // Helper: Calculate optimal step increment based on parameter range and type
     // This can be called after setValueRange() to auto-configure stepIncrement
     void calculateStepIncrement();
-    
-    // Edit mode management
-    void setEditing(bool e);
-    void enterEditMode();
-    void exitEditMode();
-    bool isEditingMode() const { return editing_; }
     
     // Edit buffer management
     void setEditBuffer(const std::string& buffer);
@@ -81,6 +77,7 @@ public:
     bool handleKeyPress(int key, bool ctrlPressed = false, bool shiftPressed = false);
     
     // Unified character input handling (for direct typing)
+    // FIXED: When operator is typed as first character, prepends current value for relative operations
     bool handleCharacterInput(char c);
     
     // Manual buffer manipulation
@@ -97,12 +94,6 @@ public:
     // Display and formatting
     std::string formatDisplayText(float value) const;
     float calculateFillPercent(float value) const;
-    
-    // Drawing
-    CellWidgetInteraction draw(int uniqueId,
-                                  bool isFocused,
-                                  bool shouldFocusFirst = false,
-                                  const CellWidgetInputContext& inputContext = CellWidgetInputContext());
     
     // Drag editing
     void startDrag();
@@ -121,20 +112,15 @@ public:
     float getDragStartX() const { return dragStartX_; }
     float getLastDragValue() const { return lastDragValue_; }
     
-    // Callbacks - set these to connect to your data model
+    // Numeric-specific callbacks (for direct float access - more efficient than string conversion)
     std::function<float()> getCurrentValue;              // Get current value for display
-    std::function<void(const std::string&, float)> onValueApplied;  // Called when value is applied
-    std::function<void(const std::string&)> onValueRemoved;         // Called when parameter is removed
-    std::function<void(bool)> onEditModeChanged;        // Called when edit mode is entered (true) or exited (false)
+    std::function<void(const std::string&, float)> onValueAppliedFloat;  // Called when value is applied (float version)
     std::function<std::string(float)> formatValue;       // Optional: custom formatter
     std::function<float(const std::string&)> parseValue; // Optional: custom parser
     std::function<int()> getMaxIndex;                    // For index columns: max index value
     std::function<void(int, float)> customAdjustValue;  // Optional: custom adjustValue callback (overrides default behavior)
     
     // Configuration properties
-    std::string parameterName;  // Parameter name (e.g., "position", "speed", "volume")
-    bool isRemovable = true;    // true if parameter can be removed/deleted (default: true). false for required columns like index/length
-    bool isBool = false;        // True for boolean parameters
     bool isInteger = false;     // True for integer parameters (affects arrow key increments)
     float stepIncrement = 0.01f; // Step size for arrow key adjustments (0.001, 0.01, 0.1, or 1.0)
     
@@ -142,8 +128,6 @@ public:
     float minVal = 0.0f;
     float maxVal = 1.0f;
     float defaultValue = 0.0f;
-    
-    // Refocus is handled immediately in exitEditMode() when cell is still focused
     
 private:
     // Constants
@@ -153,9 +137,6 @@ private:
     static constexpr int INDEX_MAX_DEFAULT = 127;
     static constexpr int LENGTH_MIN = 1;
     static constexpr int LENGTH_MAX = 16;
-    
-    // Internal state
-    bool editing_ = false;
     
     // Buffer state management - simplified with single enum
     enum class EditBufferState {
@@ -194,7 +175,7 @@ private:
     void applyBufferWithFallback();  // Apply buffer if valid, fallback to original if invalid
     
     // Drawing helpers (extracted from draw() for better organization)
-    CellWidgetInteraction drawSliderMode(int uniqueId, bool isFocused, bool shouldFocusFirst, const CellWidgetInputContext& inputContext, const ImVec2& cellMin, const ImVec2& cellMax);
+    CellInteraction drawSliderMode(int uniqueId, bool isFocused, bool shouldFocusFirst, const NumCellInputContext& inputContext, const ImVec2& cellMin, const ImVec2& cellMax);
     void processInputInDraw(bool actuallyFocused);  // Process keyboard input during draw
     void drawVisualFeedback(const ImVec2& cellMin, const ImVec2& cellMax, float fillPercent);
     
@@ -221,7 +202,7 @@ private:
     void removeParameter();
     
     // Cell-level clipboard operations (for individual cell copy/paste)
-    // Static clipboard shared across all CellWidget instances
+    // Static clipboard shared across all NumCell instances
     static std::string cellClipboard;
     
     // Clipboard operations for individual cell values
@@ -233,6 +214,8 @@ private:
     ImU32 getFillBarColor() const;
     ImU32 getRedOutlineColor() const;
     ImU32 getOrangeOutlineColor() const;
+    
+    // Helper to convert float value to string for BaseCell::onValueApplied callback
+    std::string floatToString(float value) const;
 };
-
 

@@ -100,7 +100,7 @@ void CommandBar::registerCommands() {
     };
     addCmd.SubsequentCallback = [this](int selected_option) {
         if (commandExecutor) {
-            std::string moduleType = (selected_option == 0) ? "MediaPool" : "TrackerSequencer";
+            std::string moduleType = (selected_option == 0) ? "MultiSampler" : "TrackerSequencer";
             // Execute directly without console output
             commandExecutor->cmdAdd(moduleType);
             isOpen_ = false;

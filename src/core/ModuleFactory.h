@@ -48,7 +48,7 @@ public:
     /**
      * Register a module type with the factory
      * Called automatically by modules during static initialization
-     * @param typeName Module type name (e.g., "TrackerSequencer", "MediaPool")
+     * @param typeName Module type name (e.g., "TrackerSequencer", "MultiSampler")
      * @param creator Factory function that creates instances of this module type
      */
     static void registerModuleType(const std::string& typeName, ModuleCreator creator);
@@ -65,7 +65,7 @@ public:
     
     /**
      * Generic module creation - uses registration system
-     * @param typeName Module type name (e.g., "TrackerSequencer", "MediaPool", "AudioMixer")
+     * @param typeName Module type name (e.g., "TrackerSequencer", "MultiSampler", "AudioMixer")
      * @param humanName Optional human-readable name. If empty, auto-generates based on type
      * @return shared_ptr to the created module, or nullptr if type is unknown
      */

@@ -29,7 +29,7 @@ class Clock;
  * Usage:
  * ```cpp
  * auto output = std::make_shared<AudioOutput>();
- * auto mediaPool = std::make_shared<MediaPool>();
+ * auto multiSampler = std::make_shared<MultiSampler>();
  * 
  * // Connect mediaPool directly to output (mixing happens internally)
  * output->connectModule(mediaPool);

@@ -14,6 +14,8 @@ class GUIManager;
 class ConnectionManager;
 class Module;
 class AssetLibrary;
+class Clock;
+class PatternRuntime;
 class ofDirectory;
 
 /**
@@ -40,7 +42,9 @@ public:
         ModuleRegistry* registry_,
         GUIManager* guiManager_,
         ConnectionManager* connectionManager_,
-        AssetLibrary* assetLibrary_ = nullptr
+        AssetLibrary* assetLibrary_ = nullptr,
+        Clock* clock_ = nullptr,
+        PatternRuntime* patternRuntime_ = nullptr
     );
     
     // Set callbacks for module operations
@@ -49,6 +53,8 @@ public:
     
     // Set output callback (for logging results)
     void setOutputCallback(std::function<void(const std::string&)> callback) { outputCallback = callback; }
+    // Get output callback (for temporary replacement)
+    std::function<void(const std::string&)> getOutputCallback() const { return outputCallback; }
     
     // Execute a command string (parses and executes)
     void executeCommand(const std::string& command);
@@ -64,8 +70,47 @@ public:
     void cmdUnroute(const std::string& args);
     void cmdConnections(const std::string& args);
     void cmdImport(const std::string& args);
+    void cmdPlay();
+    void cmdStop();
+    void cmdBPM(const std::string& args);
+    void cmdGetParam(const std::string& args);
+    void cmdSetParam(const std::string& args);
+    void cmdInfo(const std::string& args);
     void cmdHelp();
     void cmdClear();
+    
+    // Pattern management commands
+    void cmdPatternList();
+    void cmdPatternCreate(const std::string& args);
+    void cmdPatternDelete(const std::string& args);
+    void cmdPatternPlay(const std::string& args);
+    void cmdPatternStop(const std::string& args);
+    void cmdPatternReset(const std::string& args);
+    void cmdPatternPause(const std::string& args);
+    void cmdPatternInfo(const std::string& args);
+    
+    // Chain management commands
+    void cmdChainList();
+    void cmdChainCreate(const std::string& args);
+    void cmdChainDelete(const std::string& args);
+    void cmdChainInfo(const std::string& args);
+    void cmdChainAdd(const std::string& args);
+    void cmdChainRemove(const std::string& args);
+    void cmdChainRepeat(const std::string& args);
+    void cmdChainEnable(const std::string& args);
+    void cmdChainDisable(const std::string& args);
+    void cmdChainClear(const std::string& args);
+    void cmdChainReset(const std::string& args);
+    
+    // Sequencer binding commands
+    void cmdSequencerList();
+    void cmdSequencerInfo(const std::string& args);
+    void cmdSequencerBindPattern(const std::string& args);
+    void cmdSequencerBindChain(const std::string& args);
+    void cmdSequencerUnbindPattern(const std::string& args);
+    void cmdSequencerUnbindChain(const std::string& args);
+    void cmdSequencerEnableChain(const std::string& args);
+    void cmdSequencerDisableChain(const std::string& args);
     
     // Helper methods
     static std::pair<std::string, std::string> parseCommand(const std::string& line);
@@ -80,6 +125,8 @@ private:
     GUIManager* guiManager = nullptr;
     ConnectionManager* connectionManager_ = nullptr;
     AssetLibrary* assetLibrary = nullptr;
+    Clock* clock = nullptr;
+    PatternRuntime* patternRuntime = nullptr;
     
     std::function<void(const std::string&)> onAddModule;
     std::function<void(const std::string&)> onRemoveModule;

@@ -14,7 +14,7 @@ void Step::clear() {
     ratioB = 1;     // Reset to default (always trigger)
     parameterValues.clear();
     
-    // Don't set default parameters here - defaults come from MediaPool/MediaPlayer
+    // Don't set default parameters here - defaults come from MultiSampler/MediaPlayer
     // Empty parameterValues means "use defaults/position memory" when triggering
 }
 
@@ -576,11 +576,8 @@ void Pattern::fromJson(const ofJson& json) {
     // TRIGGER COLUMNS (Required - what to play)
     columnConfig.push_back(ColumnConfig("index", ColumnCategory::TRIGGER, true, 0));
     columnConfig.push_back(ColumnConfig("length", ColumnCategory::TRIGGER, true, 1));
-    // PARAMETER COLUMNS (Optional - how to play)
-    columnConfig.push_back(ColumnConfig("position", ColumnCategory::PARAMETER, false, 2));
-    columnConfig.push_back(ColumnConfig("speed", ColumnCategory::PARAMETER, false, 3));
-    columnConfig.push_back(ColumnConfig("volume", ColumnCategory::PARAMETER, false, 4));
-    // Note: chance and ratio are CONDITION category, but not added by default (user can add them via context menu)
+    // Note: Optional parameter columns (position, speed, volume) and condition columns (chance, ratio) 
+    // are not added by default - user can add them via context menu
 }
 
 void Pattern::addColumn(const std::string& parameterName, const std::string& displayName, int position) {

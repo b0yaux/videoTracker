@@ -1,4 +1,4 @@
-#include "CellWidget.h"
+#include "NumCell.h"
 #include "utils/ExpressionParser.h"
 #include "gui/GUIConstants.h"
 #include <imgui.h>
@@ -9,19 +9,20 @@
 #include <cctype>
 #include <limits>
 
-// Static clipboard definition (shared across all CellWidget instances)
-std::string CellWidget::cellClipboard;
+// Static clipboard definition (shared across all NumCell instances)
+std::string NumCell::cellClipboard;
 
-CellWidget::CellWidget() 
-    : editing_(false), bufferState_(EditBufferState::None),
+NumCell::NumCell() 
+    : bufferState_(EditBufferState::None),
       originalValue_(NAN), shouldRefocus_(false), dragging_(false), dragStartY_(0.0f), dragStartX_(0.0f), lastDragValue_(0.0f),
       arrowKeyRepeatTimer_(0.0f), arrowKeyLastRepeatTime_(0.0f) {
+    // editing_ is initialized in BaseCell base class
 }
 
 // Helper function implementations
 // Check if string represents empty/NaN value placeholder ("--")
 // The "--" string is used to represent NaN (empty cell, no value)
-bool CellWidget::isEmpty(const std::string& str) {
+bool NumCell::isEmpty(const std::string& str) {
     if (str.empty()) return false;
     for (char c : str) {
         if (c != '-') return false;
@@ -29,32 +30,32 @@ bool CellWidget::isEmpty(const std::string& str) {
     return true;
 }
 
-std::string CellWidget::trimWhitespace(const std::string& str) {
+std::string NumCell::trimWhitespace(const std::string& str) {
     size_t first = str.find_first_not_of(" \t");
     if (first == std::string::npos) return "";
     size_t last = str.find_last_not_of(" \t");
     return str.substr(first, (last - first + 1));
 }
 
-void CellWidget::disableImGuiKeyboardNav() {
+void NumCell::disableImGuiKeyboardNav() {
     // DEPRECATED: Navigation is no longer disabled to support gamepad navigation
     // This function is kept for backward compatibility but does nothing
     // Navigation remains enabled at all times for gamepad/keyboard support
 }
 
-void CellWidget::enableImGuiKeyboardNav() {
+void NumCell::enableImGuiKeyboardNav() {
     // DEPRECATED: Navigation is no longer disabled, so no need to re-enable
     // This function is kept for backward compatibility but does nothing
     // Navigation remains enabled at all times for gamepad/keyboard support
 }
 
-void CellWidget::removeParameter() {
+void NumCell::removeParameter() {
     if (onValueRemoved) {
         onValueRemoved(parameterName);
     }
 }
 
-void CellWidget::clearCell() {
+void NumCell::clearCell() {
     // Exit edit mode if active
     if (editing_) {
         exitEditMode();
@@ -73,7 +74,7 @@ void CellWidget::clearCell() {
 //--------------------------------------------------------------
 // Cell-level clipboard operations
 //--------------------------------------------------------------
-void CellWidget::copyCellValue() {
+void NumCell::copyCellValue() {
     if (!getCurrentValue) {
         cellClipboard.clear();
         return;
@@ -89,7 +90,7 @@ void CellWidget::copyCellValue() {
     }
 }
 
-bool CellWidget::pasteCellValue() {
+bool NumCell::pasteCellValue() {
     if (cellClipboard.empty()) {
         return false;
     }
@@ -115,16 +116,19 @@ bool CellWidget::pasteCellValue() {
         value = std::round(value);
     }
     
-    // Apply value via callback
-    if (onValueApplied) {
-        onValueApplied(parameterName, value);
-        return true;
+    // Apply value via callback (both float and string versions)
+    if (onValueAppliedFloat) {
+        onValueAppliedFloat(parameterName, value);
     }
+    if (onValueApplied) {
+        onValueApplied(parameterName, floatToString(value));
+    }
+    return true;
     
     return false;
 }
 
-void CellWidget::cutCellValue() {
+void NumCell::cutCellValue() {
     // Copy first
     copyCellValue();
     
@@ -132,7 +136,7 @@ void CellWidget::cutCellValue() {
     clearCell();
 }
 
-void CellWidget::setValueRange(float min, float max, float defaultValue) {
+void NumCell::setValueRange(float min, float max, float defaultValue) {
     if (min > max) {
         ofLogWarning("CellWidget") << "Invalid range: min > max, swapping values";
         std::swap(min, max);
@@ -142,7 +146,7 @@ void CellWidget::setValueRange(float min, float max, float defaultValue) {
     this->defaultValue = std::max(min, std::min(max, defaultValue));
 }
 
-void CellWidget::calculateStepIncrement() {
+void NumCell::calculateStepIncrement() {
     // Calculate optimal step increment based on parameter type and range
     if (isInteger) {
         // Integer parameters: always use 1.0
@@ -155,15 +159,10 @@ void CellWidget::calculateStepIncrement() {
     }
 }
 
-void CellWidget::setEditing(bool e) {
-    if (e && !editing_) {
-        enterEditMode();
-    } else if (!e && editing_) {
-        exitEditMode();
-    }
-}
+// setEditing method removed - use enterEditMode()/exitEditMode() directly
+// This was a convenience method that's no longer needed
 
-void CellWidget::setEditBuffer(const std::string& buffer) {
+void NumCell::setEditBuffer(const std::string& buffer) {
     editBuffer_ = buffer;
     if (!editBuffer_.empty()) {
         // If setting a non-empty buffer, ensure we're in edit mode
@@ -180,7 +179,7 @@ void CellWidget::setEditBuffer(const std::string& buffer) {
     }
 }
 
-void CellWidget::setEditBuffer(const std::string& buffer, bool initialized) {
+void NumCell::setEditBuffer(const std::string& buffer, bool initialized) {
     editBuffer_ = buffer;
     if (!editBuffer_.empty()) {
         // If setting a non-empty buffer, ensure we're in edit mode
@@ -198,7 +197,7 @@ void CellWidget::setEditBuffer(const std::string& buffer, bool initialized) {
     }
 }
 
-void CellWidget::enterEditMode() {
+void NumCell::enterEditMode() {
     bool wasEditing = editing_;
     editing_ = true;
     
@@ -224,7 +223,7 @@ void CellWidget::enterEditMode() {
     }
 }
 
-void CellWidget::exitEditMode() {
+void NumCell::exitEditMode() {
     bool wasEditing = editing_;
     if (!wasEditing) {
         // Not in edit mode - nothing to do
@@ -253,7 +252,7 @@ void CellWidget::exitEditMode() {
     // This ensures refocus happens in the same frame without delay
 }
 
-bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
+bool NumCell::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
     // Enter key behavior
     if (key == OF_KEY_RETURN) {
         if (ctrlPressed || shiftPressed) {
@@ -363,7 +362,7 @@ bool CellWidget::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
     return false;
 }
 
-bool CellWidget::handleCharacterInput(char c) {
+bool NumCell::handleCharacterInput(char c) {
     // Unified character input handler for direct typing
     // Handles: numeric (0-9), operators (+, *, /), decimal (.), minus (-), colon (:) for ratio
     
@@ -429,6 +428,17 @@ bool CellWidget::handleCharacterInput(char c) {
         editBuffer_.clear();
     }
     
+    // OPERATOR HANDLING FIX: When operator is typed as first character, prepend current value
+    // This allows intuitive relative operations like "+0.3" to mean "add 0.3 to current value"
+    if ((c == '+' || c == '*' || c == '/' || c == '-') && editBuffer_.empty() && getCurrentValue) {
+        float currentVal = getCurrentValue();
+        if (!std::isnan(currentVal)) {
+            // Prepend current value to buffer before appending operator
+            editBuffer_ = formatDisplayText(currentVal);
+            // Now buffer contains current value, operator will be appended next
+        }
+    }
+    
     // Special validation for decimal point: only allow one per number
     if (c == '.') {
         // Find the last number in the buffer (after last operator)
@@ -484,7 +494,7 @@ bool CellWidget::handleCharacterInput(char c) {
     return true;
 }
 
-void CellWidget::appendDigit(char digit) {
+void NumCell::appendDigit(char digit) {
     if (!editing_) {
         enterEditMode();
     }
@@ -495,7 +505,7 @@ void CellWidget::appendDigit(char digit) {
     }
 }
 
-void CellWidget::appendChar(char c) {
+void NumCell::appendChar(char c) {
     if (!editing_) {
         enterEditMode();
     }
@@ -506,27 +516,27 @@ void CellWidget::appendChar(char c) {
     }
 }
 
-void CellWidget::backspace() {
+void NumCell::backspace() {
     if (editing_ && !editBuffer_.empty()) {
         editBuffer_.pop_back();
         bufferState_ = EditBufferState::UserModified;  // User modified the buffer
     }
 }
 
-void CellWidget::deleteChar() {
+void NumCell::deleteChar() {
     if (editing_) {
         editBuffer_.clear();
         bufferState_ = EditBufferState::UserModified;  // User modified the buffer
     }
 }
 
-void CellWidget::applyValue() {
+void NumCell::applyValue() {
     ofLogNotice("CellWidget") << "[ENTER_KEY] applyValue() called - calling parseAndApplyEditBuffer()";
     bool result = parseAndApplyEditBuffer();
     ofLogNotice("CellWidget") << "[ENTER_KEY] parseAndApplyEditBuffer() returned: " << (result ? "true" : "false");
 }
 
-void CellWidget::cancelEdit() {
+void NumCell::cancelEdit() {
     // Restore original value before exiting
     if (onValueApplied) {
         if (std::isnan(originalValue_)) {
@@ -534,13 +544,18 @@ void CellWidget::cancelEdit() {
             removeParameter();
         } else {
             // Original had a value - restore it
-            onValueApplied(parameterName, originalValue_);
+            if (onValueAppliedFloat) {
+                onValueAppliedFloat(parameterName, originalValue_);
+            }
+            if (onValueApplied) {
+                onValueApplied(parameterName, floatToString(originalValue_));
+            }
         }
     }
     exitEditMode();
 }
 
-void CellWidget::adjustValue(int delta, float customStepSize) {
+void NumCell::adjustValue(int delta, float customStepSize) {
     // If custom adjustValue callback is provided, use it instead of default behavior
     if (customAdjustValue) {
         customAdjustValue(delta, customStepSize);
@@ -606,7 +621,7 @@ void CellWidget::adjustValue(int delta, float customStepSize) {
     applyBufferWithFallback();
 }
 
-void CellWidget::initializeEditBuffer() {
+void NumCell::initializeEditBuffer() {
     if (!getCurrentValue) {
         editBuffer_.clear();
         return;
@@ -622,9 +637,9 @@ void CellWidget::initializeEditBuffer() {
     }
 }
 
-std::string CellWidget::formatDisplayText(float value) const {
+std::string NumCell::formatDisplayText(float value) const {
     // Check for NaN (not a number) - indicates empty/not set (show "--")
-    // This represents "none" state - let MediaPool handle the parameter
+    // This represents "none" state - let MultiSampler handle the parameter
     // Using NaN allows parameters with negative ranges (like speed -10 to 10) to distinguish
     // between "not set" (NaN/--) and explicit values like 1.0 or -1.0
     if (std::isnan(value)) {
@@ -640,7 +655,7 @@ std::string CellWidget::formatDisplayText(float value) const {
     return getDefaultFormatValue(value);
 }
 
-float CellWidget::calculateFillPercent(float value) const {
+float NumCell::calculateFillPercent(float value) const {
     // Check for NaN (not a number) - indicates empty/not set (no fill)
     // Unified system: all empty values (Index, Length, dynamic parameters) use NaN
     if (std::isnan(value)) {
@@ -655,7 +670,7 @@ float CellWidget::calculateFillPercent(float value) const {
     return 0.0f;
 }
 
-void CellWidget::applyEditValueFloat(float floatValue, bool updateBuffer) {
+void NumCell::applyEditValueFloat(float floatValue, bool updateBuffer) {
     // For integer parameters, round and clamp to integer range
     if (isInteger) {
         int intValue = (int)std::round(floatValue);
@@ -681,8 +696,11 @@ void CellWidget::applyEditValueFloat(float floatValue, bool updateBuffer) {
         // For non-removable parameters, clamp to range instead
         else {
             float clampedValue = std::max(minVal, std::min(maxVal, floatValue));
+            if (onValueAppliedFloat) {
+                onValueAppliedFloat(parameterName, clampedValue);
+            }
             if (onValueApplied) {
-                onValueApplied(parameterName, clampedValue);
+                onValueApplied(parameterName, floatToString(clampedValue));
             }
             // Update buffer only if explicitly requested (final confirmation)
             if (updateBuffer) {
@@ -695,8 +713,11 @@ void CellWidget::applyEditValueFloat(float floatValue, bool updateBuffer) {
         }
     } else {
         // Value is within range - apply it
+        if (onValueAppliedFloat) {
+            onValueAppliedFloat(parameterName, floatValue);
+        }
         if (onValueApplied) {
-            onValueApplied(parameterName, floatValue);
+            onValueApplied(parameterName, floatToString(floatValue));
         }
         // Update buffer only if explicitly requested (final confirmation)
         if (updateBuffer) {
@@ -709,10 +730,14 @@ void CellWidget::applyEditValueFloat(float floatValue, bool updateBuffer) {
     }
 }
 
-void CellWidget::applyEditValueInt(int intValue, bool updateBuffer) {
+void NumCell::applyEditValueInt(int intValue, bool updateBuffer) {
     // Apply integer value (callbacks handle formatting)
+    float floatValue = (float)intValue;
+    if (onValueAppliedFloat) {
+        onValueAppliedFloat(parameterName, floatValue);
+    }
     if (onValueApplied) {
-        onValueApplied(parameterName, (float)intValue);
+        onValueApplied(parameterName, floatToString(floatValue));
     }
     // Only update edit buffer if explicitly requested
     // This prevents overwriting the buffer during reactive editing when values are clamped
@@ -729,7 +754,7 @@ void CellWidget::applyEditValueInt(int intValue, bool updateBuffer) {
     }
 }
 
-bool CellWidget::parseAndApplyEditBuffer() {
+bool NumCell::parseAndApplyEditBuffer() {
     // Debug logging
     ofLogNotice("CellWidget") << "[ENTER_KEY] parseAndApplyEditBuffer called with buffer: '" << editBuffer_ << "'";
     
@@ -805,14 +830,19 @@ bool CellWidget::parseAndApplyEditBuffer() {
     }
 }
 
-void CellWidget::applyBufferWithFallback() {
+void NumCell::applyBufferWithFallback() {
     // Apply buffer value immediately if valid, fallback to original if invalid
     // This provides real-time feedback while maintaining a safety net
     
     if (editBuffer_.empty() || isEmpty(editBuffer_)) {
         // Empty buffer - fallback to original value
-        if (!std::isnan(originalValue_) && onValueApplied) {
-            onValueApplied(parameterName, originalValue_);
+        if (!std::isnan(originalValue_)) {
+            if (onValueAppliedFloat) {
+                onValueAppliedFloat(parameterName, originalValue_);
+            }
+            if (onValueApplied) {
+                onValueApplied(parameterName, floatToString(originalValue_));
+            }
         }
         return;
     }
@@ -829,34 +859,45 @@ void CellWidget::applyBufferWithFallback() {
         // Check if value is in valid range
         if (bufferValue >= minVal && bufferValue <= maxVal) {
             // Valid buffer value - apply it immediately
+            if (onValueAppliedFloat) {
+                onValueAppliedFloat(parameterName, bufferValue);
+            }
             if (onValueApplied) {
-                onValueApplied(parameterName, bufferValue);
+                onValueApplied(parameterName, floatToString(bufferValue));
             }
         } else {
             // Out of range - fallback to original
-            if (!std::isnan(originalValue_) && onValueApplied) {
-                onValueApplied(parameterName, originalValue_);
+            if (!std::isnan(originalValue_)) {
+                if (onValueAppliedFloat) {
+                    onValueAppliedFloat(parameterName, originalValue_);
+                }
+                if (onValueApplied) {
+                    onValueApplied(parameterName, floatToString(originalValue_));
+                }
             }
         }
     } catch (...) {
         // Invalid buffer - fallback to original
-        if (!std::isnan(originalValue_) && onValueApplied) {
-            onValueApplied(parameterName, originalValue_);
+        if (!std::isnan(originalValue_)) {
+            if (onValueAppliedFloat) {
+                onValueAppliedFloat(parameterName, originalValue_);
+            }
+            if (onValueApplied) {
+                onValueApplied(parameterName, floatToString(originalValue_));
+            }
         }
     }
 }
 
-std::string CellWidget::getDefaultFormatValue(float value) const {
-    if (isBool) {
-        return value > 0.5f ? "ON" : "OFF";
-    }
+std::string NumCell::getDefaultFormatValue(float value) const {
+    // Note: Bool parameters use BoolCell, not NumCell
     // Float value: 3 decimal places (0.001 precision) - unified for all float parameters
     char buf[16];
     snprintf(buf, sizeof(buf), "%.3f", value);
     return buf;
 }
 
-float CellWidget::getDefaultParseValue(const std::string& str) const {
+float NumCell::getDefaultParseValue(const std::string& str) const {
     try {
         // Try to evaluate as expression first (supports operations)
         return ExpressionParser::evaluate(str);
@@ -870,25 +911,22 @@ float CellWidget::getDefaultParseValue(const std::string& str) const {
     }
 }
 
-ImU32 CellWidget::getFillBarColor() const {
+ImU32 NumCell::getFillBarColor() const {
     static ImU32 color = GUIConstants::toU32(GUIConstants::CellWidget::FillBar);
     return color;
 }
 
-ImU32 CellWidget::getRedOutlineColor() const {
+ImU32 NumCell::getRedOutlineColor() const {
     static ImU32 color = GUIConstants::toU32(GUIConstants::Outline::RedDim);
     return color;
 }
 
-ImU32 CellWidget::getOrangeOutlineColor() const {
+ImU32 NumCell::getOrangeOutlineColor() const {
     static ImU32 color = GUIConstants::toU32(GUIConstants::Outline::Orange);
     return color;
 }
 
-CellWidgetInteraction CellWidget::draw(int uniqueId,
-                                            bool isFocused,
-                                            bool shouldFocusFirst,
-                                            const CellWidgetInputContext& inputContext) {
+CellInteraction NumCell::draw(int uniqueId, bool isFocused, bool shouldFocusFirst) {
     ImGui::PushID(uniqueId);
     
     // Get cell rect (before drawing)
@@ -898,13 +936,14 @@ CellWidgetInteraction CellWidget::draw(int uniqueId,
     ImVec2 cellMax = ImVec2(cellMin.x + cellWidth, cellMin.y + cellHeight);
     
     // Draw slider mode (only mode supported)
-    CellWidgetInteraction result = drawSliderMode(uniqueId, isFocused, shouldFocusFirst, inputContext, cellMin, cellMax);
+    NumCellInputContext inputContext;
+    CellInteraction result = drawSliderMode(uniqueId, isFocused, shouldFocusFirst, inputContext, cellMin, cellMax);
     ImGui::PopID();
     return result;
 }
 
-CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, bool shouldFocusFirst, const CellWidgetInputContext& inputContext, const ImVec2& cellMin, const ImVec2& cellMax) {
-    CellWidgetInteraction result;
+CellInteraction NumCell::drawSliderMode(int uniqueId, bool isFocused, bool shouldFocusFirst, const NumCellInputContext& inputContext, const ImVec2& cellMin, const ImVec2& cellMax) {
+    CellInteraction result;
     
     // SLIDER mode (original implementation)
     // Get current value for display
@@ -975,6 +1014,7 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
     // PHASE 2: TRUST IMGUI FOCUS - Use ImGui's native focus system directly
     // Remove complex parallel focus tracking that caused race conditions
     bool actuallyFocused = ImGui::IsItemFocused();
+    focused_ = actuallyFocused;  // Update BaseCell focus state
     bool isItemActive = ImGui::IsItemActive();
     
     // PHASE 2: TRUST IMGUI FOCUS - Remove defensive focus checking that causes race conditions
@@ -1005,10 +1045,7 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
         // Continue drag - update value based on mouse movement (works even if mouse left cell)
         // This handles both active drags and restored drag states
         updateDrag();
-        // Ensure we mark drag as started if it was restored (for proper state sync back to GUI)
-        if (!result.dragStarted) {
-            result.dragStarted = true;
-        }
+        result.valueChanged = true;  // Mark value as changed during drag
     } else if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
         // Start drag when cell is active and mouse is actually being dragged
         // Use IsMouseDragging(0) to require actual mouse movement before starting drag
@@ -1019,15 +1056,15 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
         // IsItemActive() is sufficient to indicate the cell was clicked
         result.focusChanged = true;
         startDrag();
-        result.dragStarted = true;
+        result.valueChanged = true;  // Mark value as changed when drag starts
     }
     
     // Check if drag ended (mouse released anywhere in window)
     // This check happens AFTER updateDrag() so we can properly detect drag end
-    // updateDrag() also checks for mouse release internally, but we need to sync the dragEnded flag
+    // updateDrag() also checks for mouse release internally
     if (dragging_ && !ImGui::IsMouseDown(0)) {
         endDrag();
-        result.dragEnded = true;
+        result.valueChanged = true;  // Mark value as changed when drag ends
     }
     
     // Simplified: no special focus locking needed - trust ImGui
@@ -1083,7 +1120,7 @@ CellWidgetInteraction CellWidget::drawSliderMode(int uniqueId, bool isFocused, b
     return result;
 }
 
-void CellWidget::drawVisualFeedback(const ImVec2& cellMin, const ImVec2& cellMax, float fillPercent) {
+void NumCell::drawVisualFeedback(const ImVec2& cellMin, const ImVec2& cellMax, float fillPercent) {
     // Draw value bar background (no cell background - using row background instead)
     if (fillPercent > 0.01f) {
         ImDrawList* drawList = ImGui::GetWindowDrawList();
@@ -1094,7 +1131,7 @@ void CellWidget::drawVisualFeedback(const ImVec2& cellMin, const ImVec2& cellMax
     }
 }
 
-void CellWidget::processInputInDraw(bool actuallyFocused) {
+void NumCell::processInputInDraw(bool actuallyFocused) {
     // Process keyboard input directly in draw() when cell is focused
     // This makes CellWidget self-contained and reusable across all modules
     
@@ -1328,7 +1365,7 @@ void CellWidget::processInputInDraw(bool actuallyFocused) {
     // Navigation is automatically disabled when typing starts (handled in handleCharacterInput)
 }
 
-void CellWidget::startDrag() {
+void NumCell::startDrag() {
     if (dragging_) return; // Already dragging
     
     // Exit edit mode when dragging starts
@@ -1361,7 +1398,7 @@ void CellWidget::startDrag() {
     // NOTE: Navigation remains enabled - drag is mouse-based and doesn't conflict with gamepad
 }
 
-void CellWidget::updateDrag() {
+void NumCell::updateDrag() {
     if (!dragging_) return;
     
     // Check if mouse is still down (allows dragging across entire window)
@@ -1418,17 +1455,18 @@ void CellWidget::updateDrag() {
     
     float dragStepIncrement;
     float rangeSize = maxVal - minVal;
+    
     if (isInteger) {
         // Integer parameters: Range-based step increment for precise control
         // This allows traversing full range in ~200 pixels, making the slider much more precise
         // For example: Index (0-127) = 0.635 per pixel, Length (1-16) = 0.075 per pixel
         if (shiftPressed) {
-            // Shift: Fine precision (rangeSize/400 per pixel) for precise integer adjustments
-            dragStepIncrement = rangeSize / 400.0f;
+            // Shift: fine precision, 1 unit per pixel
+            dragStepIncrement = 1.0f;
         } else {
-            // Standard: Practical sensitivity for full-range traversal (rangeSize/200 per pixel)
-            // This allows traversing full range in ~200 pixels while maintaining reasonable precision
-            dragStepIncrement = rangeSize / 200.0f;
+            // Standard: range-based, with sane fallback for unbounded ranges
+            float effectiveRange = (std::isfinite(rangeSize) && rangeSize > 0.0f) ? rangeSize : 1000.0f;
+            dragStepIncrement = std::max(effectiveRange / 200.0f, 1.0f);
         }
     } else {
         // Float parameters: Multi-precision based on modifier keys
@@ -1438,7 +1476,8 @@ void CellWidget::updateDrag() {
         } else {
             // Standard: Practical sensitivity for full-range traversal (rangeSize/200 per pixel)
             // This allows traversing full range in ~200 pixels while maintaining reasonable precision
-            dragStepIncrement = rangeSize / 200.0f;
+            float effectiveRange = (std::isfinite(rangeSize) && rangeSize > 0.0f) ? rangeSize : 1000.0f;
+            dragStepIncrement = std::max(effectiveRange / 200.0f, 0.001f);
         }
     }
     
@@ -1458,7 +1497,7 @@ void CellWidget::updateDrag() {
     applyDragValue(newValue);
 }
 
-void CellWidget::endDrag() {
+void NumCell::endDrag() {
     if (!dragging_) return;
     
     dragging_ = false;
@@ -1469,14 +1508,93 @@ void CellWidget::endDrag() {
     // NOTE: Navigation remains enabled - no need to re-enable
 }
 
-void CellWidget::applyDragValue(float newValue) {
-    if (!onValueApplied) return;
+void NumCell::applyDragValue(float newValue) {
+    if (!onValueAppliedFloat) return;
     
     // Clamp value to range
     float clampedValue = std::max(minVal, std::min(maxVal, newValue));
     
-    // Apply via callback
-    onValueApplied(parameterName, clampedValue);
+    // Apply via float callback (for backward compatibility)
+    onValueAppliedFloat(parameterName, clampedValue);
+    
+    // Also call BaseCell string callback for unified interface
+    if (onValueApplied) {
+        onValueApplied(parameterName, floatToString(clampedValue));
+    }
+}
+
+std::string NumCell::floatToString(float value) const {
+    if (formatValue) {
+        return formatValue(value);
+    } else {
+        return getDefaultFormatValue(value);
+    }
+}
+
+void NumCell::configure(const ParameterDescriptor& desc,
+                        std::function<float()> getter,
+                        std::function<void(float)> setter,
+                        std::function<void()> remover,
+                        std::function<std::string(float)> formatter,
+                        std::function<float(const std::string&)> parser) {
+    // Set up getter callback (always provided by ParameterCell)
+    getCurrentValue = getter;
+    
+    // Set up setter callback (both float and string versions)
+    onValueAppliedFloat = [setter](const std::string&, float value) {
+        setter(value);
+    };
+    
+    // Also set string callback for BaseCell interface
+    onValueApplied = [setter](const std::string&, const std::string& valueStr) {
+        try {
+            float value = std::stof(valueStr);
+            setter(value);
+        } catch (...) {
+            // Ignore parse errors
+        }
+    };
+    
+    // Set up remover callback
+    if (remover) {
+        onValueRemoved = [remover](const std::string&) {
+            remover();
+        };
+    } else {
+        // Default: Use setter with default value
+        float defaultValue = desc.defaultValue;
+        onValueRemoved = [setter, defaultValue](const std::string&) {
+            setter(defaultValue);
+        };
+    }
+    
+    // Set up formatting
+    if (formatter) {
+        formatValue = formatter;
+    } else {
+        // Standard formatting based on type
+        if (isInteger) {
+            // Integer parameters: no decimal places
+            formatValue = [](float value) -> std::string {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%d", (int)std::round(value));
+                return buf;
+            };
+        } else {
+            // Float parameters: 3 decimal places (0.001 precision) - unified for all float params
+            formatValue = [](float value) -> std::string {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%.3f", value);
+                return buf;
+            };
+        }
+    }
+    
+    // Set up parser (optional - uses default if not provided)
+    if (parser) {
+        parseValue = parser;
+    }
+    // Otherwise, NumCell uses default ExpressionParser
 }
 
 

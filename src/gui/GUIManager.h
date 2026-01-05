@@ -62,7 +62,7 @@ public:
     /**
      * Register a GUI type with the factory
      * Called automatically by GUI classes during static initialization
-     * @param typeName Module type name (e.g., "TrackerSequencer", "MediaPool")
+     * @param typeName Module type name (e.g., "TrackerSequencer", "MultiSampler")
      * @param creator Factory function that creates instances of this GUI type
      */
     static void registerGUIType(const std::string& typeName, GUICreator creator);

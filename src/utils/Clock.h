@@ -39,7 +39,7 @@ public:
     
     // Transport control
     // NOTE: Clock is the SINGLE SOURCE OF TRUTH for global transport state.
-    // All other components (TrackerSequencer, MediaPool, ofApp) should query
+    // All other components (TrackerSequencer, MultiSampler, ofApp) should query
     // clock.isPlaying() rather than maintaining their own transport state.
     // This follows the BespokeSynth/SunVox pattern: master transport with derived local states.
     void start();

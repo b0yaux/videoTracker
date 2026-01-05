@@ -145,9 +145,10 @@ public:
      * @param registry Pointer to ModuleRegistry (can be nullptr, defaults to this)
      * @param connectionManager Pointer to ConnectionManager (can be nullptr)
      * @param parameterRouter Pointer to ParameterRouter (can be nullptr)
+     * @param patternRuntime PatternRuntime for modules that need pattern access (can be nullptr)
      * @param isRestored Whether modules are being restored from a session (defaults to false)
      */
-    void setupAllModules(class Clock* clock, class ModuleRegistry* registry = nullptr, class ConnectionManager* connectionManager = nullptr, class ParameterRouter* parameterRouter = nullptr, bool isRestored = false);
+    void setupAllModules(class Clock* clock, class ModuleRegistry* registry = nullptr, class ConnectionManager* connectionManager = nullptr, class ParameterRouter* parameterRouter = nullptr, class PatternRuntime* patternRuntime = nullptr, bool isRestored = false);
     
     /**
      * Serialize all modules to JSON
@@ -167,7 +168,7 @@ public:
      * Add a module with full lifecycle management
      * Creates, registers, initializes, and auto-connects the module
      * @param factory ModuleFactory to create the module
-     * @param moduleType Module type name (e.g., "MediaPool", "TrackerSequencer")
+     * @param moduleType Module type name (e.g., "MultiSampler", "TrackerSequencer")
      * @param clock Clock instance for module initialization
      * @param connectionManager ConnectionManager for connections
      * @param parameterRouter ParameterRouter for parameter routing
@@ -182,6 +183,7 @@ public:
         class Clock* clock,
         class ConnectionManager* connectionManager,
         class ParameterRouter* parameterRouter,
+        class PatternRuntime* patternRuntime = nullptr,  // PatternRuntime for modules that need pattern access
         class GUIManager* guiManager = nullptr,
         const std::string& masterAudioOutName = "masterAudioOut",
         const std::string& masterVideoOutName = "masterVideoOut"

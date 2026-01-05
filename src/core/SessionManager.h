@@ -15,6 +15,7 @@ class ViewManager;
 class GUIManager;
 class ProjectManager;
 class ModuleGUI;
+class PatternRuntime;
 
 /**
  * SessionManager - Central coordinator for saving/loading complete application sessions
@@ -29,7 +30,8 @@ class ModuleGUI;
 class SessionManager {
 public:
     // Default constructor (for member initialization)
-    SessionManager() : projectManager_(nullptr), clock(nullptr), registry(nullptr), factory(nullptr), router(nullptr), connectionManager_(nullptr), viewManager_(nullptr), guiManager_(nullptr), pendingImGuiState_(""), pendingVisibilityState_(ofJson::object()), postLoadCallback_(nullptr), projectOpenedCallback_(nullptr) {}
+    // Note: Initialization order must match declaration order
+    SessionManager() : projectManager_(nullptr), clock(nullptr), registry(nullptr), factory(nullptr), router(nullptr), connectionManager_(nullptr), viewManager_(nullptr), guiManager_(nullptr), patternRuntime_(nullptr), postLoadCallback_(nullptr), projectOpenedCallback_(nullptr), pendingImGuiState_(""), originalImGuiState_(""), pendingVisibilityState_(ofJson::object()) {}
     
     // Constructor with all dependencies (including ProjectManager)
     SessionManager(
@@ -46,6 +48,11 @@ public:
      * Set ConnectionManager (can be called after construction)
      */
     void setConnectionManager(ConnectionManager* connectionManager) { connectionManager_ = connectionManager; }
+    
+    /**
+     * Set PatternRuntime (can be called after construction)
+     */
+    void setPatternRuntime(PatternRuntime* patternRuntime) { patternRuntime_ = patternRuntime; }
     
     /**
      * Save complete session to file
@@ -137,6 +144,12 @@ public:
      * This ensures newly added module windows are included when session is saved
      */
     void updateImGuiStateInSession();
+    
+    /**
+     * Check if session layout was actually loaded into ImGui
+     * @return true if layout was loaded, false otherwise
+     */
+    bool wasSessionLayoutLoaded() const { return sessionLayoutWasLoaded_; }
 
     /**
      * Initialize project and session on application startup
@@ -149,10 +162,10 @@ public:
     /**
      * Ensure default modules exist in the registry
      * Creates default module types if registry is empty
-     * @param defaultModuleTypes Vector of module type names to create (e.g., {"TrackerSequencer", "MediaPool"})
+     * @param defaultModuleTypes Vector of module type names to create (e.g., {"TrackerSequencer", "MultiSampler"})
      * @return true if modules were created or already exist, false on error
      */
-    bool ensureDefaultModules(const std::vector<std::string>& defaultModuleTypes = {"TrackerSequencer", "MediaPool"});
+    bool ensureDefaultModules(const std::vector<std::string>& defaultModuleTypes = {"TrackerSequencer", "MultiSampler"});
     
     /**
      * Setup GUI coordination
@@ -195,11 +208,14 @@ private:
     ConnectionManager* connectionManager_;  // For unified connection management
     ViewManager* viewManager_;  // For GUI state
     GUIManager* guiManager_;  // For visibility state
+    PatternRuntime* patternRuntime_;  // For pattern migration and session save/load
     std::string currentSessionName_;
     std::function<void()> postLoadCallback_;  // Called after session load completes
     std::function<void()> projectOpenedCallback_;  // Called when a project is opened
     std::string pendingImGuiState_;  // ImGui state to load after ImGui is initialized
+    std::string originalImGuiState_;  // Original ImGui state from session (preserved until Editor Shell activates)
     ofJson pendingVisibilityState_;  // Visibility state to restore after GUIs are created
+    bool sessionLayoutWasLoaded_ = false;  // Track if session layout was actually loaded into ImGui
     
     // Auto-save state
     bool autoSaveEnabled_ = false;

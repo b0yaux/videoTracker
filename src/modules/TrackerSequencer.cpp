@@ -5,6 +5,7 @@
 #include "core/ModuleRegistry.h"
 #include "core/ConnectionManager.h"
 #include "core/ParameterRouter.h"
+#include "core/PatternRuntime.h"
 #include "core/ModuleFactory.h"
 #include "ofLog.h"
 #include "ofJson.h"
@@ -13,23 +14,25 @@
 #include <limits>  // For std::numeric_limits
 #include <set>
 #include <atomic>  // For diagnostic event counter
+#include <fstream>
+#include <chrono>
 
 // TrackerSequencer implementation
 //--------------------------------------------------------------
 TrackerSequencer::TrackerSequencer() 
     : clock(nullptr), stepsPerBeat(4.0f), gatingEnabled(true),
-      currentPatternIndex(0),
       draggingStep(-1), draggingColumn(-1), lastDragValue(0.0f), dragStartY(0.0f), dragStartX(0.0f),
       connectionManager_(nullptr) {
+    // Phase 3: Patterns are created in PatternRuntime during initialize()
     // PlaybackState is initialized with default values in struct definition
-    // Initialize with one empty pattern (default 16 steps)
-    patterns.push_back(Pattern(16));
-    // Initialize pattern chain with first pattern
-    patternChain.addEntry(0);
-    patternChain.setEnabled(true);
 }
 
 TrackerSequencer::~TrackerSequencer() {
+    // Unsubscribe from PatternRuntime events
+    if (patternRuntime_) {
+        ofRemoveListener(patternRuntime_->triggerEvent, this, &TrackerSequencer::onPatternRuntimeTrigger);
+        ofRemoveListener(patternRuntime_->patternDeletedEvent, this, &TrackerSequencer::onPatternDeleted);
+    }
 }
 
 void TrackerSequencer::setup(Clock* clockRef) {
@@ -37,24 +40,13 @@ void TrackerSequencer::setup(Clock* clockRef) {
     playbackState.playbackStep = 0; // Initialize playback step
     // Note: GUI state initialization removed - managed by TrackerSequencerGUI
     
-    // Initialize patterns (ensure at least one pattern exists)
-    // Note: Constructor already creates Pattern(16), so this is just a safety check
-    if (patterns.empty()) {
-        patterns.push_back(Pattern(16));
-        currentPatternIndex = 0;
-    } else {
-        // Only set step count if pattern is empty (newly created)
-        // Don't overwrite existing pattern stepCounts (they may have been loaded from JSON)
-        if (getCurrentPattern().isEmpty()) {
-            getCurrentPattern().setStepCount(16);
-        }
-        // Otherwise preserve existing stepCount
-    }
+    // Phase 3: Patterns are in PatternRuntime, no initialization needed here
+    // Pattern creation happens in initialize() when PatternRuntime is available
     
-    // Column configuration is now per-pattern (initialized in Pattern constructor)
-            
-            // Connect to Clock's time events for beat synchronization
-    if (clock) {
+    // Register listeners ONLY if not already registered (prevents double-triggering)
+    // This flag prevents issues when setup() or initialize() is called multiple times
+    if (clock && !listenersRegistered_) {
+        // Connect to Clock's time events for beat synchronization
         ofAddListener(clock->timeEvent, this, &TrackerSequencer::onTimeEvent);
         
         // Register audio listener for sample-accurate step timing
@@ -66,6 +58,8 @@ void TrackerSequencer::setup(Clock* clockRef) {
         clock->addTransportListener([this](bool isPlaying) {
             this->onClockTransportChanged(isPlaying);
         });
+        
+        listenersRegistered_ = true;
     }
     
     ofLogNotice("TrackerSequencer") << "Setup complete with " << getCurrentPattern().getStepCount() << " steps";
@@ -75,8 +69,8 @@ void TrackerSequencer::setup(Clock* clockRef) {
 //--------------------------------------------------------------
 //--------------------------------------------------------------
 void TrackerSequencer::initialize(Clock* clock, ModuleRegistry* registry, ConnectionManager* connectionManager, 
-                                  ParameterRouter* parameterRouter, bool isRestored) {
-    // Phase 2.2: Unified initialization - combines postCreateSetup and configureSelf
+                                  ParameterRouter* parameterRouter, PatternRuntime* patternRuntime, bool isRestored) {
+    // Unified initialization - combines postCreateSetup and configureSelf
     
     // 1. Basic setup (from postCreateSetup)
     if (clock) {
@@ -86,34 +80,112 @@ void TrackerSequencer::initialize(Clock* clock, ModuleRegistry* registry, Connec
             this->clock = clock;
             playbackState.playbackStep = 0;
             
-            // Connect to Clock's time events for beat synchronization
-            ofAddListener(clock->timeEvent, this, &TrackerSequencer::onTimeEvent);
-            
-            // Register audio listener for sample-accurate step timing
-            clock->addAudioListener([this](ofSoundBuffer& buffer) {
-                this->processAudioBuffer(buffer);
-            });
-            
-            // Subscribe to Clock transport changes
-            clock->addTransportListener([this](bool isPlaying) {
-                this->onClockTransportChanged(isPlaying);
-            });
-            
-            // Ensure at least one pattern exists (should already exist from fromJson, but safety check)
-            if (patterns.empty()) {
-                patterns.push_back(Pattern(16));
-                currentPatternIndex = 0;
+            // Register listeners ONLY if not already registered (prevents double-triggering)
+            if (!listenersRegistered_) {
+                // Connect to Clock's time events for beat synchronization
+                ofAddListener(clock->timeEvent, this, &TrackerSequencer::onTimeEvent);
+                
+                // Register audio listener for sample-accurate step timing
+                clock->addAudioListener([this](ofSoundBuffer& buffer) {
+                    this->processAudioBuffer(buffer);
+                });
+                
+                // Subscribe to Clock transport changes
+                clock->addTransportListener([this](bool isPlaying) {
+                    this->onClockTransportChanged(isPlaying);
+                });
+                
+                listenersRegistered_ = true;
             }
+            
+            // Phase 3: Patterns are in PatternRuntime, no initialization needed here
         } else {
             // For new modules, setup clock connection
-            // Pattern already exists from constructor (Pattern(16))
+            // setup() will check listenersRegistered_ to avoid double-registration
             setup(clock);
         }
     }
     
+    // Store PatternRuntime reference FIRST (Phase 3: Runtime-only architecture)
+    // This must be set even if other dependencies are missing, as it's critical for pattern access
+    patternRuntime_ = patternRuntime;
+    
+    if (!patternRuntime_) {
+        ofLogWarning("TrackerSequencer") << "PatternRuntime not provided during initialization for '" << getName() 
+                                          << "'. Pattern access will be unavailable until PatternRuntime is set.";
+    }
+    
     // 2. Self-configuration (from configureSelf) - only if we have all required dependencies
     if (!registry || !connectionManager || !parameterRouter) {
+        // Even if other dependencies are missing, ensure we have a bound pattern if PatternRuntime is available
+        // BUT: Don't auto-create for restored modules - let migration handle it
+        if (patternRuntime_ && boundPatternName_.empty() && !isRestored) {
+            Pattern defaultPattern(16);
+            // Use simple pattern naming (P0, P1, P2, etc.) - let PatternRuntime generate the name
+            std::string patternName = patternRuntime_->addPattern(defaultPattern, "");
+            if (!patternName.empty()) {
+                boundPatternName_ = patternName;
+                ofLogNotice("TrackerSequencer") << "Auto-created pattern '" << patternName << "' in PatternRuntime";
+            }
+        }
         return;
+    }
+    
+    // Auto-create/bind pattern in Runtime if needed
+    if (patternRuntime_) {
+        if (boundPatternName_.empty()) {
+            // CRITICAL: Don't auto-create patterns for restored modules - let migration handle it
+            // Migration will create patterns from legacy format or bind to existing patterns
+            if (!isRestored) {
+                // No pattern bound - create default pattern (only for NEW instances, not restored)
+                Pattern defaultPattern(16);
+                // Use simple pattern naming (P0, P1, P2, etc.) - let PatternRuntime generate the name
+            std::string patternName = patternRuntime_->addPattern(defaultPattern, "");
+                if (!patternName.empty()) {
+                    boundPatternName_ = patternName;
+                    ofLogNotice("TrackerSequencer") << "Auto-created pattern '" << patternName << "' in PatternRuntime";
+                } else {
+                    ofLogError("TrackerSequencer") << "Failed to create pattern in Runtime";
+                }
+            } else {
+                // For restored modules, wait for migration to handle pattern creation/binding
+                ofLogVerbose("TrackerSequencer") << "Skipping auto-creation for restored module '" << getName() 
+                                                  << "' - migration will handle pattern binding";
+            }
+        } else if (!patternRuntime_->patternExists(boundPatternName_)) {
+            // Bound pattern doesn't exist - try to bind to first available pattern or create default
+            // But only if NOT restored (for restored, let migration handle it)
+            if (!isRestored) {
+                auto patternNames = patternRuntime_->getPatternNames();
+                if (!patternNames.empty()) {
+                    ofLogWarning("TrackerSequencer") << "Bound pattern '" << boundPatternName_ 
+                                                      << "' not found, binding to first available pattern";
+                    boundPatternName_ = patternNames[0];
+                } else {
+                    // No patterns exist - create default pattern
+                    Pattern defaultPattern(16);
+                    // Use simple pattern naming (P0, P1, P2, etc.) - let PatternRuntime generate the name
+                    std::string actualName = patternRuntime_->addPattern(defaultPattern, "");
+                    if (!actualName.empty()) {
+                        boundPatternName_ = actualName;
+                        ofLogNotice("TrackerSequencer") << "Created default pattern '" << actualName << "'";
+                    }
+                }
+            } else {
+                // For restored modules, migration will fix broken bindings
+                ofLogVerbose("TrackerSequencer") << "Bound pattern '" << boundPatternName_ 
+                                                  << "' not found for restored module - migration will fix";
+            }
+        }
+    }
+    
+    // Subscribe to PatternRuntime events for forwarding
+    if (patternRuntime_) {
+        ofAddListener(patternRuntime_->triggerEvent, this, &TrackerSequencer::onPatternRuntimeTrigger);
+        // Subscribe to pattern deletion events for cleanup
+        ofAddListener(patternRuntime_->patternDeletedEvent, this, &TrackerSequencer::onPatternDeleted);
+        // Subscribe to sequencer binding change events for immediate sync
+        ofAddListener(patternRuntime_->sequencerBindingChangedEvent, this, &TrackerSequencer::onSequencerBindingChanged);
     }
     
     // Store ConnectionManager reference for querying connections
@@ -138,6 +210,37 @@ void TrackerSequencer::initialize(Clock* clock, ModuleRegistry* registry, Connec
     // 2.3. Initialize default pattern (if needed) - only for new modules, not restored ones
     if (!isRestored) {
         initializeDefaultPattern(registry, connectionManager);
+    }
+    
+    // Phase 2: Migrate existing internal chain to PatternRuntime if not already bound
+    // Skip migration during session restoration - bindings are restored separately by SessionManager
+    if (patternRuntime_ && boundChainName_.empty() && patternChain.getSize() > 0 && !isRestored) {
+        // Create a chain in PatternRuntime for this sequencer
+        std::string chainName = getName() + "_chain";
+        if (!patternRuntime_->chainExists(chainName)) {
+            patternRuntime_->addChain(chainName);
+        }
+        
+        // Copy chain entries to PatternRuntime
+        const auto& chain = patternChain.getChain();
+        for (size_t i = 0; i < chain.size(); i++) {
+            patternRuntime_->chainAddPattern(chainName, chain[i]);
+            int repeatCount = patternChain.getRepeatCount((int)i);
+            if (repeatCount > 1) {
+                patternRuntime_->chainSetRepeat(chainName, (int)i, repeatCount);
+            }
+            if (patternChain.isEntryDisabled((int)i)) {
+                patternRuntime_->chainSetEntryDisabled(chainName, (int)i, true);
+            }
+        }
+        
+        // Set chain enabled state
+        patternRuntime_->chainSetEnabled(chainName, patternChain.isEnabled());
+        
+        // Bind sequencer to the chain
+        bindToChain(chainName);
+        
+        ofLogNotice("TrackerSequencer") << "Migrated existing chain to PatternRuntime: " << chainName;
     }
     
     // Note: Step event listeners for ofApp state tracking (lastTriggeredStep) are set up in ofApp
@@ -288,17 +391,45 @@ void TrackerSequencer::onTransportChanged(bool isPlaying) {
 
 void TrackerSequencer::onClockTransportChanged(bool isPlaying) {
     if (isPlaying) {
-        // Clock started - start the sequencer from step 1
+        // Clock started - start the sequencer
         play();
-        // Reset to step 1 and trigger it
-        playbackState.playbackStep = 0; // Start playback at step 0 (0-based internally, so step 1 is index 0)
-        playbackState.clearPlayingStep();
-        playbackState.patternCycleCount = 0; // Reset cycle counter on transport start
-        triggerStep(0);  // Trigger step 1 (0-based)
-        ofLogNotice("TrackerSequencer") << "Clock transport started - sequencer playing from step 1";
+        
+        // CRITICAL: Start pattern playback in PatternRuntime
+        // PatternRuntime will manage its own playback state (playbackStep, etc.)
+        if (patternRuntime_ && !boundPatternName_.empty()) {
+            patternRuntime_->playPattern(boundPatternName_);
+            // Sync local playback state FROM PatternRuntime (don't overwrite it)
+            PatternPlaybackState* state = patternRuntime_->getPlaybackState(boundPatternName_);
+            if (state) {
+                playbackState.playbackStep = state->playbackStep;
+                playbackState.currentPlayingStep = state->currentPlayingStep;
+                playbackState.patternCycleCount = state->patternCycleCount;
+            }
+        } else {
+            // Fallback: if PatternRuntime not available, use local state
+            playbackState.playbackStep = 0;
+            playbackState.clearPlayingStep();
+            playbackState.patternCycleCount = 0;
+        }
+        
+        // Note: triggerStep() is now handled by PatternRuntime during evaluation
+        // PatternRuntime will trigger steps as it evaluates patterns on clock ticks
+        ofLogNotice("TrackerSequencer") << "Clock transport started - sequencer playing from step " << (playbackState.playbackStep + 1);
     } else {
         // Clock stopped - pause the sequencer (don't reset step)
         pause();
+        
+        // CRITICAL: Stop pattern playback in PatternRuntime
+        if (patternRuntime_ && !boundPatternName_.empty()) {
+            patternRuntime_->stopPattern(boundPatternName_);
+            // Sync local state from PatternRuntime after stopping
+            PatternPlaybackState* state = patternRuntime_->getPlaybackState(boundPatternName_);
+            if (state) {
+                playbackState.playbackStep = state->playbackStep;
+                playbackState.currentPlayingStep = state->currentPlayingStep;
+            }
+        }
+        
         playbackState.patternCycleCount = 0; // Reset cycle counter on transport stop
         ofLogNotice("TrackerSequencer") << "Clock transport stopped - sequencer paused at step " << (playbackState.playbackStep + 1);
     }
@@ -319,25 +450,47 @@ int TrackerSequencer::getStepCount() const {
     return getCurrentPattern().getStepCount();
 }
 
-// Helper to get current pattern
+// Helper to get current pattern (Phase 3: Runtime-only)
 Pattern& TrackerSequencer::getCurrentPattern() {
-    if (patterns.empty()) {
-        // Safety: create a pattern if none exist (default 16 steps)
-        patterns.push_back(Pattern(16));
-        currentPatternIndex = 0;
+    if (patternRuntime_ && !boundPatternName_.empty()) {
+        Pattern* pattern = patternRuntime_->getPattern(boundPatternName_);
+        if (pattern) {
+            return *pattern;
+        }
+        // Pattern not found - create a default pattern
+        ofLogWarning("TrackerSequencer") << "Pattern not found in Runtime: " << boundPatternName_ << ", creating default pattern";
+        Pattern defaultPattern(16);
+        // Use simple pattern naming (P0, P1, P2, etc.) - let PatternRuntime generate the name
+        boundPatternName_ = patternRuntime_->addPattern(defaultPattern, "");
+        Pattern* newPattern = patternRuntime_->getPattern(boundPatternName_);
+        if (newPattern) {
+            return *newPattern;
+        }
     }
-    if (currentPatternIndex < 0 || currentPatternIndex >= (int)patterns.size()) {
-        currentPatternIndex = 0;
+    
+    // Fallback: return static empty pattern (should never happen if PatternRuntime is available)
+    // This can happen if PatternRuntime wasn't set during initialization or if called before initialization
+    static Pattern emptyPattern(16);
+    static std::set<std::string> loggedInstances;
+    if (loggedInstances.find(getName()) == loggedInstances.end()) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available for '" << getName() 
+                                        << "', using empty pattern. This may indicate initialization issue.";
+        loggedInstances.insert(getName());  // Only log once per instance to avoid spam
     }
-    return patterns[currentPatternIndex];
+    return emptyPattern;
 }
 
 const Pattern& TrackerSequencer::getCurrentPattern() const {
-    if (patterns.empty() || currentPatternIndex < 0 || currentPatternIndex >= (int)patterns.size()) {
-        static Pattern emptyPattern(16);
-        return emptyPattern;
+    if (patternRuntime_ && !boundPatternName_.empty()) {
+        const Pattern* pattern = patternRuntime_->getPattern(boundPatternName_);
+        if (pattern) {
+            return *pattern;
+        }
     }
-    return patterns[currentPatternIndex];
+    
+    // Fallback: return static empty pattern
+    static Pattern emptyPattern(16);
+    return emptyPattern;
 }
 
 void TrackerSequencer::setStep(int stepIndex, const Step& step) {
@@ -349,7 +502,14 @@ void TrackerSequencer::setStep(int stepIndex, const Step& step) {
     float newPosition = step.getParameterValue("position", 0.0f);
     
     // Update the pattern
-    getCurrentPattern().setStep(stepIndex, step);
+    Pattern& pattern = getCurrentPattern();
+    pattern.setStep(stepIndex, step);
+    
+    // CRITICAL: Notify PatternRuntime of pattern change
+    if (patternRuntime_ && !boundPatternName_.empty()) {
+        patternRuntime_->updatePattern(boundPatternName_, pattern);
+        patternRuntime_->notifyPatternChanged(boundPatternName_);
+    }
     
     // Notify if position changed and this is the current playback step
     // Note: Edit step checking removed - GUI state is managed by TrackerSequencerGUI
@@ -655,8 +815,66 @@ void TrackerSequencer::clearStepRange(int fromStep, int toStep) {
 
 // Timing and playback control
 void TrackerSequencer::processAudioBuffer(ofSoundBuffer& buffer) {
-    // Sample-accurate step timing based on this TrackerSequencer's own stepsPerBeat
-    if (!playbackState.isPlaying || !clock) return;
+    // Phase 3: PatternRuntime handles evaluation, TrackerSequencer only forwards events
+    // Sync sequencer binding and playback state from PatternRuntime
+    if (patternRuntime_ && !getName().empty()) {
+        PatternRuntime::SequencerBinding binding = patternRuntime_->getSequencerBinding(getName());
+        
+        // CRITICAL: Sync boundPatternName_ if PatternRuntime binding changed (e.g., from chain progression)
+        if (!binding.patternName.empty() && binding.patternName != boundPatternName_) {
+            // Pattern binding changed in PatternRuntime - sync our state
+            std::string oldPattern = boundPatternName_;
+            boundPatternName_ = binding.patternName;
+            
+            // Unsubscribe from old pattern events
+            if (!oldPattern.empty()) {
+                ofRemoveListener(patternRuntime_->triggerEvent, this, &TrackerSequencer::onPatternRuntimeTrigger);
+            }
+            
+            // Subscribe to new pattern events
+            ofAddListener(patternRuntime_->triggerEvent, this, &TrackerSequencer::onPatternRuntimeTrigger);
+            
+            // Sync chain index with new pattern
+            PatternChain* chain = getCurrentChain();
+            if (chain && chain->isEnabled()) {
+                const auto& chainPatterns = chain->getChain();
+                for (size_t i = 0; i < chainPatterns.size(); ++i) {
+                    if (chainPatterns[i] == boundPatternName_) {
+                        chain->setCurrentIndex((int)i);
+                        break;
+                    }
+                }
+            }
+            
+            ofLogVerbose("TrackerSequencer") << "Synced pattern binding from PatternRuntime: '" 
+                                            << oldPattern << "' -> '" << boundPatternName_ << "'";
+        }
+        
+        // CRITICAL: Sync boundChainName_ from PatternRuntime (for GUI display)
+        // Note: This is a fallback sync - primary sync happens via onSequencerBindingChanged event
+        if (binding.chainName != boundChainName_) {
+            std::string oldChain = boundChainName_;
+            boundChainName_ = binding.chainName;
+            if (!boundChainName_.empty()) {
+                ofLogVerbose("TrackerSequencer") << "Synced chain binding from PatternRuntime: '" 
+                                                << oldChain << "' -> '" << boundChainName_ << "'";
+            } else if (!oldChain.empty()) {
+                ofLogVerbose("TrackerSequencer") << "Synced chain unbinding from PatternRuntime: '" 
+                                                << oldChain << "' -> [unbound]";
+            }
+        }
+        
+        // Sync playback state for GUI display
+        if (!boundPatternName_.empty()) {
+            PatternPlaybackState* state = patternRuntime_->getPlaybackState(boundPatternName_);
+            if (state) {
+                playbackState.isPlaying = state->isPlaying;
+                playbackState.playbackStep = state->playbackStep;
+                playbackState.currentPlayingStep = state->currentPlayingStep;
+            }
+        }
+    }
+    return;  // Skip evaluation - PatternRuntime handles it in Engine::audioOut()
     
     // Calculate samples per step from our own stepsPerBeat
     float bpm = clock->getBPM();
@@ -754,6 +972,16 @@ ofJson TrackerSequencer::toJson(class ModuleRegistry* registry) const {
     // Save enabled state
     json["enabled"] = isEnabled();
     
+    // Phase 3: Runtime-only architecture - save binding info only
+    if (!boundPatternName_.empty()) {
+        json["boundPatternName"] = boundPatternName_;
+    }
+    
+    // Save chain binding for GUI restoration
+    if (!boundChainName_.empty()) {
+        json["boundChainName"] = boundChainName_;
+    }
+    
     // Note: stepsPerBeat is now saved per-pattern (in Pattern::toJson)
     // Keep sequencer-level stepsPerBeat for backward compatibility only (legacy files)
     json["stepsPerBeat"] = stepsPerBeat;  // Legacy: keep for backward compatibility
@@ -761,21 +989,10 @@ ofJson TrackerSequencer::toJson(class ModuleRegistry* registry) const {
     // Column configuration is now saved per-pattern (in Pattern::toJson)
     // No need to save it here - each pattern saves its own columnConfig
     
-    // Save multi-pattern support
-    json["currentPatternIndex"] = currentPatternIndex;
-    patternChain.toJson(json);
-    
-    // Save all patterns
-    ofJson patternsArray = ofJson::array();
-    for (const auto& p : patterns) {
-        patternsArray.push_back(p.toJson());
-    }
-    json["patterns"] = patternsArray;
-    
-    // Pattern chain serialization is handled by PatternChain::toJson()
-    
-    // Legacy: Save single pattern for backward compatibility
-    json["pattern"] = getCurrentPattern().toJson();
+    // Phase 2: Patterns are saved in PatternRuntime (not here)
+    // Phase 2: Chains are saved in PatternRuntime (not here)
+    // Only save binding info - chains are saved separately in PatternRuntime
+    // Note: Internal patternChain is kept for backward compatibility during migration
     
     return json;
 }
@@ -803,14 +1020,25 @@ void TrackerSequencer::fromJson(const ofJson& json) {
         setEnabled(json["enabled"].get<bool>());
     }
     
+    // Phase 3: Runtime-only architecture - load binding info
+    if (json.contains("boundPatternName")) {
+        boundPatternName_ = json["boundPatternName"].get<std::string>();
+        // Note: Actual binding happens after PatternRuntime is loaded by SessionManager
+    }
+    
+    // Load chain binding for GUI restoration
+    if (json.contains("boundChainName")) {
+        boundChainName_ = json["boundChainName"].get<std::string>();
+        // Note: Actual binding happens after PatternRuntime is loaded by SessionManager
+    }
+    
     // Load basic properties
     if (json.contains("currentStep")) {
         playbackState.playbackStep = json["currentStep"];
     }
     // Note: GUI state (editStep, etc.) no longer loaded here - managed by TrackerSequencerGUI
     
-    // Load stepsPerBeat (backward compatibility: if sequencer-level exists, apply to all patterns)
-    // New format: each pattern saves its own stepsPerBeat in Pattern::toJson/fromJson
+    // Load stepsPerBeat (backward compatibility - kept for legacy files)
     if (json.contains("stepsPerBeat")) {
         // Support both int (legacy) and float (new) formats
         if (json["stepsPerBeat"].is_number_float()) {
@@ -825,77 +1053,94 @@ void TrackerSequencer::fromJson(const ofJson& json) {
             stepsPerBeat = 4.0f;
         }
         stepsPerBeat = std::max(-96.0f, std::min(96.0f, stepsPerBeat));
-        
-        // Backward compatibility: apply sequencer-level value to all patterns that don't have their own
-        for (auto& pattern : patterns) {
-            // Only set if pattern doesn't already have a value (from Pattern::fromJson)
-            // Patterns loaded from JSON will have their own stepsPerBeat, so this only affects new patterns
-            if (pattern.getStepsPerBeat() == 4.0f && patterns.size() > 0 && &pattern != &patterns[0]) {
-                // This is a newly created pattern (not loaded from JSON), apply legacy value
-                pattern.setStepsPerBeat(stepsPerBeat);
-            }
-        }
-        // Also apply to first pattern if it was created before loading (backward compatibility)
-        if (!patterns.empty() && patterns[0].getStepsPerBeat() == 4.0f) {
-            patterns[0].setStepsPerBeat(stepsPerBeat);
-        }
     } else {
-        stepsPerBeat = 4.0f;  // Default fallback (kept for backward compatibility)
+        stepsPerBeat = 4.0f;  // Default fallback
     }
     
     // Column configuration is now per-pattern (loaded in Pattern::fromJson)
     
-    // Load multi-pattern support (new format)
-    if (json.contains("patterns") && json["patterns"].is_array()) {
-        patterns.clear();
-        auto patternsArray = json["patterns"];
-        for (const auto& patternJson : patternsArray) {
-            // Create pattern with default step count - fromJson will set correct count from JSON
-            Pattern p(16);  // Default step count - actual count comes from JSON stepCount field or array size
-            p.fromJson(patternJson);
-            // Pattern size is now per-pattern, preserved from JSON stepCount field
-            patterns.push_back(p);
+    // Phase 2: Patterns are loaded from PatternRuntime by SessionManager
+    // Phase 2: Chains are loaded from PatternRuntime by SessionManager
+    // Legacy pattern chain in JSON will be migrated to PatternRuntime
+    // Load pattern chain info (uses pattern names) and migrate to PatternRuntime
+    if (json.contains("patternChain")) {
+        // Load pattern chain with available pattern names (may be empty if patterns not migrated yet)
+        if (patternRuntime_) {
+            auto patternNames = patternRuntime_->getPatternNames();
+            patternChain.fromJson(json, patternNames);
+            
+            // Phase 2: Migrate chain to PatternRuntime if it has entries
+            if (patternChain.getSize() > 0) {
+                // Create a chain in PatternRuntime for this sequencer
+                std::string chainName = getName() + "_chain";  // Use sequencer name + "_chain"
+                if (!patternRuntime_->chainExists(chainName)) {
+                    patternRuntime_->addChain(chainName);
+                }
+                
+                // Copy chain entries to PatternRuntime
+                const auto& chain = patternChain.getChain();
+                for (size_t i = 0; i < chain.size(); i++) {
+                    patternRuntime_->chainAddPattern(chainName, chain[i]);
+                    int repeatCount = patternChain.getRepeatCount((int)i);
+                    if (repeatCount > 1) {
+                        patternRuntime_->chainSetRepeat(chainName, (int)i, repeatCount);
+                    }
+                    if (patternChain.isEntryDisabled((int)i)) {
+                        patternRuntime_->chainSetEntryDisabled(chainName, (int)i, true);
+                    }
+                }
+                
+                // Set chain enabled state
+                patternRuntime_->chainSetEnabled(chainName, patternChain.isEnabled());
+                
+                // Bind sequencer to the chain
+                bindToChain(chainName);
+                
+                ofLogNotice("TrackerSequencer") << "Migrated chain to PatternRuntime: " << chainName;
+            }
+        } else {
+            // PatternRuntime not available yet - load to internal chain for later migration
+            patternChain.fromJson(json, std::vector<std::string>());
+        }
+    }
+}
+
+void TrackerSequencer::reloadPatternChain(const ofJson& json, const std::vector<std::string>& availablePatternNames) {
+    // Phase 2: Reload pattern chain and migrate to PatternRuntime
+    // This is called by SessionManager after migration when all patterns are available
+    patternChain.fromJson(json, availablePatternNames);
+    
+    // Migrate to PatternRuntime if not already bound
+    if (patternRuntime_ && boundChainName_.empty() && patternChain.getSize() > 0) {
+        // Create a chain in PatternRuntime for this sequencer
+        std::string chainName = getName() + "_chain";
+        if (!patternRuntime_->chainExists(chainName)) {
+            patternRuntime_->addChain(chainName);
         }
         
-        // Load current pattern index
-        if (json.contains("currentPatternIndex")) {
-            int loadedIndex = json["currentPatternIndex"];
-            if (loadedIndex >= 0 && loadedIndex < (int)patterns.size()) {
-                currentPatternIndex = loadedIndex;
-            } else {
-                currentPatternIndex = 0;
+        // Copy chain entries to PatternRuntime
+        const auto& chain = patternChain.getChain();
+        for (size_t i = 0; i < chain.size(); i++) {
+            patternRuntime_->chainAddPattern(chainName, chain[i]);
+            int repeatCount = patternChain.getRepeatCount((int)i);
+            if (repeatCount > 1) {
+                patternRuntime_->chainSetRepeat(chainName, (int)i, repeatCount);
+            }
+            if (patternChain.isEntryDisabled((int)i)) {
+                patternRuntime_->chainSetEntryDisabled(chainName, (int)i, true);
             }
         }
         
-        // Load pattern chain (handles both new and legacy formats)
-        patternChain.fromJson(json, (int)patterns.size());
+        // Set chain enabled state
+        patternRuntime_->chainSetEnabled(chainName, patternChain.isEnabled());
         
-        ofLogNotice("TrackerSequencer") << "Loaded " << patterns.size() << " patterns, current pattern: " << currentPatternIndex;
-    } else if (json.contains("pattern") && json["pattern"].is_array()) {
-        // Legacy: Load single pattern (backward compatibility)
-        patterns.clear();
-        Pattern p(16);  // Default step count - actual count comes from JSON stepCount field or array size
-        p.fromJson(json["pattern"]);
-        // Pattern size is now per-pattern, preserved from JSON stepCount field
-        patterns.push_back(p);
-        currentPatternIndex = 0;
-        patternChain.clear();
-        // Initialize pattern chain with the single pattern for legacy files
-        patternChain.addEntry(0);
-        patternChain.setEnabled(true);
-        ofLogNotice("TrackerSequencer") << "Loaded legacy single pattern format";
-    } else {
-        // No pattern data - ensure we have at least one empty pattern
-        if (patterns.empty()) {
-            patterns.push_back(Pattern(16));  // Default step count
-            currentPatternIndex = 0;
-        }
-        // Initialize pattern chain with the first pattern
-        if (patternChain.getSize() == 0 && !patterns.empty()) {
-            patternChain.addEntry(0);
-            patternChain.setEnabled(true);
-        }
+        // Bind sequencer to the chain
+        bindToChain(chainName);
+        
+        ofLogNotice("TrackerSequencer") << "Migrated chain to PatternRuntime: " << chainName;
     }
+    
+    ofLogNotice("TrackerSequencer") << "Reloaded pattern chain with " << availablePatternNames.size() << " available patterns";
 }
 
 bool TrackerSequencer::loadState(const std::string& filename) {
@@ -963,11 +1208,32 @@ void TrackerSequencer::advanceStep() {
         playbackState.patternCycleCount++;
     }
     
-    // If pattern finished and using pattern chain, handle repeat counts
+    // Phase 2: Pattern chain handling (uses PatternRuntime chains)
+    // Check both chain enabled state AND sequencer binding chainEnabled flag
+    PatternChain* chain = getCurrentChain();
+    bool sequencerChainEnabled = false;
+    if (patternRuntime_ && !getName().empty()) {
+        PatternRuntime::SequencerBinding binding = patternRuntime_->getSequencerBinding(getName());
+        sequencerChainEnabled = binding.chainEnabled && !binding.chainName.empty();
+    }
+    // #region agent log
     if (patternFinished) {
-        int nextPatternIdx = patternChain.advanceOnPatternFinish((int)patterns.size());
-        if (nextPatternIdx >= 0) {
-            currentPatternIndex = nextPatternIdx;
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"E\",\"location\":\"TrackerSequencer.cpp:1150\",\"message\":\"Pattern finished, checking chain\",\"data\":{\"sequencerName\":\"" << getName() << "\",\"boundChainName\":\"" << boundChainName_ << "\",\"chainFound\":" << (chain ? "true" : "false") << ",\"chainEnabled\":" << (chain ? (chain->isEnabled() ? "true" : "false") : "false") << ",\"sequencerChainEnabled\":" << (sequencerChainEnabled ? "true" : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+        logFile.close();
+    }
+    // #endregion
+    // Chain progression requires: chain exists, chain is enabled, AND sequencer binding chainEnabled is true
+    if (patternFinished && chain && chain->isEnabled() && sequencerChainEnabled) {
+        std::string nextPatternName = chain->getNextPattern();
+        // #region agent log
+        {
+            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"E\",\"location\":\"TrackerSequencer.cpp:1162\",\"message\":\"Chain progression\",\"data\":{\"sequencerName\":\"" << getName() << "\",\"nextPatternName\":\"" << nextPatternName << "\"},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+        }
+        // #endregion
+        if (!nextPatternName.empty()) {
+            bindToPattern(nextPatternName);
         }
     }
     
@@ -983,7 +1249,6 @@ void TrackerSequencer::advanceStep() {
 }
 
 void TrackerSequencer::triggerStep(int step) {
-    // step is now 0-based internally
     if (!isValidStep(step)) return;
     if (!clock) return;
     
@@ -1016,7 +1281,6 @@ void TrackerSequencer::triggerStep(int step) {
         
         if (cycleInLoop != ratioA) {
             // Ratio condition failed - don't trigger this step
-            // Clear playing state since step didn't trigger
             playbackState.clearPlayingStep();
             return;
         }
@@ -1033,7 +1297,6 @@ void TrackerSequencer::triggerStep(int step) {
         int roll = (int)(ofRandom(0.0f, 100.0f));
         if (roll >= chance) {
             // Chance failed - don't trigger this step
-            // Clear playing state since step didn't trigger
             playbackState.clearPlayingStep();
             return;
         }
@@ -1065,7 +1328,7 @@ void TrackerSequencer::triggerStep(int step) {
     triggerEvt.step = step;  // Include step number for position memory modes
     
     // Map Step parameters to TrackerSequencer parameters
-    // "note" is the sequencer's parameter name (maps to stepData.index for MediaPool)
+    // "note" is the sequencer's parameter name (maps to stepData.index for MultiSampler)
     if (stepData.index >= 0) {
         triggerEvt.parameters["note"] = (float)stepData.index;
     } else {
@@ -1105,14 +1368,14 @@ void TrackerSequencer::triggerStep(int step) {
         if (columnParamNames.find(paramName) != columnParamNames.end()) {
             // Add parameter to trigger event
             // Note: We don't validate ranges here because we don't have access to parameter descriptors
-            // MediaPool will validate ranges when it receives the parameter
+            // MultiSampler will validate ranges when it receives the parameter
             triggerEvt.parameters[paramName] = paramValue;
         }
     }
     
     // Broadcast trigger event to all subscribers (modular!)
     // NOTE: ofNotifyEvent is called from audio thread - this is acceptable for event dispatch
-    // The actual handlers (MediaPool::onTrigger) now use lock-free queue
+    // The actual handlers (MultiSampler::onTrigger) now use lock-free queue
     ofNotifyEvent(triggerEvent, triggerEvt);
     
     // Legacy: Also notify old event system for backward compatibility
@@ -1247,6 +1510,40 @@ float TrackerSequencer::getParameter(const std::string& paramName) const {
     }
     // For other parameters that might be added in the future
     return Module::getParameter(paramName); // Default
+}
+
+//--------------------------------------------------------------
+// Indexed parameter support (for ParameterRouter step[4].position access)
+//--------------------------------------------------------------
+float TrackerSequencer::getIndexedParameter(const std::string& paramName, int index) const {
+    // Validate step index
+    if (!isValidStep(index)) {
+        ofLogWarning("TrackerSequencer") << "Invalid step index " << index << " for getIndexedParameter";
+        return 0.0f;
+    }
+    
+    // Get step and return parameter value
+    Step step = getStep(index);
+    return step.getParameterValue(paramName, 0.0f);
+}
+
+void TrackerSequencer::setIndexedParameter(const std::string& paramName, int index, float value, bool notify) {
+    // Validate step index
+    if (!isValidStep(index)) {
+        ofLogWarning("TrackerSequencer") << "Invalid step index " << index << " for setIndexedParameter";
+        return;
+    }
+    
+    // Get step, update parameter, and save back
+    // This triggers proper notifications and pattern updates via setStep()
+    Step step = getStep(index);
+    step.setParameterValue(paramName, value);
+    setStep(index, step);  // This triggers notifications and pattern updates
+    
+    // Notify parameter change callback if requested
+    if (notify && parameterChangeCallback) {
+        parameterChangeCallback(paramName, value);
+    }
 }
 
 // Keyboard input handling has been moved to TrackerSequencerGUI::handleKeyPress()
@@ -1515,133 +1812,689 @@ void TrackerSequencer::updateStepActiveState() {
 
 // Multi-pattern support implementation
 //--------------------------------------------------------------
-void TrackerSequencer::setCurrentPatternIndex(int index) {
-    if (index >= 0 && index < (int)patterns.size()) {
-        currentPatternIndex = index;
-        ofLogNotice("TrackerSequencer") << "Switched to pattern " << index;
+// Phase 3: Pattern management methods updated for Runtime-only architecture
+void TrackerSequencer::setCurrentPatternName(const std::string& patternName) {
+    if (patternRuntime_ && patternRuntime_->patternExists(patternName)) {
+        bindToPattern(patternName);
+        ofLogNotice("TrackerSequencer") << "Switched to pattern: " << patternName;
+    } else {
+        ofLogWarning("TrackerSequencer") << "Invalid pattern name: " << patternName;
+    }
+}
+
+int TrackerSequencer::getNumPatterns() const {
+    if (patternRuntime_) {
+        return (int)patternRuntime_->getPatternNames().size();
+    }
+    return 0;
+}
+
+std::vector<std::string> TrackerSequencer::getAllPatternNames() const {
+    if (patternRuntime_) {
+        return patternRuntime_->getPatternNames();
+    }
+    return std::vector<std::string>();
+}
+
+// Index-based methods (for GUI compatibility)
+int TrackerSequencer::addPattern() {
+    std::string patternName = addPatternByName();  // Call name-based helper
+    if (patternName.empty()) {
+        return -1;
+    }
+    // Return index of newly added pattern
+    auto patternNames = patternRuntime_->getPatternNames();
+    for (size_t i = 0; i < patternNames.size(); ++i) {
+        if (patternNames[i] == patternName) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+void TrackerSequencer::removePattern(int index) {
+    if (!patternRuntime_) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available";
+        return;
+    }
+    auto patternNames = patternRuntime_->getPatternNames();
+    if (index >= 0 && index < (int)patternNames.size()) {
+        removePatternByName(patternNames[index]);  // Call name-based helper
     } else {
         ofLogWarning("TrackerSequencer") << "Invalid pattern index: " << index;
     }
 }
 
-int TrackerSequencer::addPattern() {
+void TrackerSequencer::copyPattern(int sourceIndex, int destIndex) {
+    if (!patternRuntime_) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available";
+        return;
+    }
+    auto patternNames = patternRuntime_->getPatternNames();
+    if (sourceIndex >= 0 && sourceIndex < (int)patternNames.size() &&
+        destIndex >= 0 && destIndex < (int)patternNames.size()) {
+        copyPatternByName(patternNames[sourceIndex], patternNames[destIndex]);  // Call name-based helper
+    } else {
+        ofLogWarning("TrackerSequencer") << "Invalid pattern indices: " << sourceIndex << ", " << destIndex;
+    }
+}
+
+void TrackerSequencer::duplicatePattern(int index) {
+    if (!patternRuntime_) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available";
+        return;
+    }
+    auto patternNames = patternRuntime_->getPatternNames();
+    if (index >= 0 && index < (int)patternNames.size()) {
+        duplicatePatternByName(patternNames[index]);  // Call name-based helper
+    } else {
+        ofLogWarning("TrackerSequencer") << "Invalid pattern index: " << index;
+    }
+}
+
+// Name-based methods (internal implementation)
+std::string TrackerSequencer::addPatternByName() {
+    if (!patternRuntime_) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available";
+        return "";
+    }
+    
     // New pattern uses same step count and stepsPerBeat as current pattern
     int stepCount = getCurrentPattern().getStepCount();
     float currentSPB = getCurrentPattern().getStepsPerBeat();
     Pattern newPattern(stepCount);
-    newPattern.setStepsPerBeat(currentSPB);  // Copy stepsPerBeat from current pattern
-    patterns.push_back(newPattern);
-    int newIndex = (int)patterns.size() - 1;
-    ofLogNotice("TrackerSequencer") << "Added new pattern at index " << newIndex << " with " << stepCount << " steps, SPB=" << currentSPB;
-    return newIndex;
+    newPattern.setStepsPerBeat(currentSPB);
+    
+    // Use simple pattern naming (P0, P1, P2, etc.) - let PatternRuntime generate the name
+    std::string patternName = patternRuntime_->addPattern(newPattern, "");
+    ofLogNotice("TrackerSequencer") << "Added new pattern '" << patternName << "' with " << stepCount << " steps, SPB=" << currentSPB;
+    return patternName;
 }
 
-void TrackerSequencer::removePattern(int index) {
-    if (patterns.size() <= 1) {
+void TrackerSequencer::removePatternByName(const std::string& patternName) {
+    if (!patternRuntime_) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available";
+        return;
+    }
+    
+    if (!patternRuntime_->patternExists(patternName)) {
+        ofLogWarning("TrackerSequencer") << "Pattern not found: " << patternName;
+        return;
+    }
+    
+    // Don't remove if it's the only pattern
+    if (getNumPatterns() <= 1) {
         ofLogWarning("TrackerSequencer") << "Cannot remove pattern: must have at least one pattern";
         return;
     }
     
-    if (index < 0 || index >= (int)patterns.size()) {
-        ofLogWarning("TrackerSequencer") << "Invalid pattern index for removal: " << index;
-        return;
-    }
-    
-    patterns.erase(patterns.begin() + index);
-    
-    // Adjust current pattern index if necessary
-    if (currentPatternIndex >= (int)patterns.size()) {
-        currentPatternIndex = (int)patterns.size() - 1;
-    }
-    
-    // Adjust pattern chain indices
-    const auto& chain = patternChain.getChain();
-    for (int i = (int)chain.size() - 1; i >= 0; i--) {
-        if (chain[i] == index) {
-            // Remove entry from pattern chain
-            patternChain.removeEntry(i);
-        } else if (chain[i] > index) {
-            // Decrement indices greater than removed index
-            patternChain.setEntry(i, chain[i] - 1);
+    // If removing bound pattern, bind to another pattern first
+    if (boundPatternName_ == patternName) {
+        auto patternNames = patternRuntime_->getPatternNames();
+        for (const auto& name : patternNames) {
+            if (name != patternName) {
+                bindToPattern(name);
+                break;
+            }
         }
     }
     
-    // Adjust current chain index if necessary
-    if (patternChain.getCurrentIndex() >= patternChain.getSize()) {
-        patternChain.setCurrentIndex(std::max(0, patternChain.getSize() - 1));
-    }
-    
-    ofLogNotice("TrackerSequencer") << "Removed pattern at index " << index;
+    patternRuntime_->removePattern(patternName);
+    ofLogNotice("TrackerSequencer") << "Removed pattern: " << patternName;
 }
 
-void TrackerSequencer::copyPattern(int sourceIndex, int destIndex) {
-    if (sourceIndex < 0 || sourceIndex >= (int)patterns.size()) {
-        ofLogWarning("TrackerSequencer") << "Invalid source pattern index: " << sourceIndex;
+void TrackerSequencer::copyPatternByName(const std::string& sourceName, const std::string& destName) {
+    if (!patternRuntime_) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available";
         return;
     }
     
-    if (destIndex < 0 || destIndex >= (int)patterns.size()) {
-        ofLogWarning("TrackerSequencer") << "Invalid destination pattern index: " << destIndex;
+    const Pattern* sourcePattern = patternRuntime_->getPattern(sourceName);
+    if (!sourcePattern) {
+        ofLogWarning("TrackerSequencer") << "Source pattern not found: " << sourceName;
         return;
     }
     
-    // Copy pattern data
-    patterns[destIndex] = patterns[sourceIndex];
-    ofLogNotice("TrackerSequencer") << "Copied pattern " << sourceIndex << " to pattern " << destIndex;
+    if (!patternRuntime_->patternExists(destName)) {
+        ofLogWarning("TrackerSequencer") << "Destination pattern not found: " << destName;
+        return;
+    }
+    
+    patternRuntime_->updatePattern(destName, *sourcePattern);
+    ofLogNotice("TrackerSequencer") << "Copied pattern '" << sourceName << "' to '" << destName << "'";
 }
 
-void TrackerSequencer::duplicatePattern(int index) {
-    if (index < 0 || index >= (int)patterns.size()) {
-        ofLogWarning("TrackerSequencer") << "Invalid pattern index for duplication: " << index;
-        return;
+std::string TrackerSequencer::duplicatePatternByName(const std::string& patternName) {
+    if (!patternRuntime_) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available";
+        return "";
     }
     
-    Pattern newPattern = patterns[index];
-    patterns.push_back(newPattern);
-    int newIndex = (int)patterns.size() - 1;
-    ofLogNotice("TrackerSequencer") << "Duplicated pattern " << index << " to new pattern " << newIndex;
+    const Pattern* sourcePattern = patternRuntime_->getPattern(patternName);
+    if (!sourcePattern) {
+        ofLogWarning("TrackerSequencer") << "Pattern not found: " << patternName;
+        return "";
+    }
+    
+    // Use simple pattern naming for duplicates (P0, P1, P2, etc.) - let PatternRuntime generate the name
+    std::string newName = patternRuntime_->addPattern(*sourcePattern, "");
+    ofLogNotice("TrackerSequencer") << "Duplicated pattern '" << patternName << "' to '" << newName << "'";
+    return newName;
+}
+
+// Helper: Get pattern name by index (for PatternChain compatibility)
+std::string TrackerSequencer::getPatternNameByIndex(int index) const {
+    if (!patternRuntime_) {
+        return "";
+    }
+    auto patternNames = patternRuntime_->getPatternNames();
+    if (index >= 0 && index < (int)patternNames.size()) {
+        return patternNames[index];
+    }
+    return "";
+}
+
+// DEPRECATED: Index-based compatibility methods (kept for backward compatibility, use name-based methods instead)
+int TrackerSequencer::getCurrentPatternIndex() const {
+    if (!patternRuntime_ || boundPatternName_.empty()) {
+        return 0;
+    }
+    auto patternNames = patternRuntime_->getPatternNames();
+    for (size_t i = 0; i < patternNames.size(); ++i) {
+        if (patternNames[i] == boundPatternName_) {
+            return (int)i;
+        }
+    }
+    return 0;
+}
+
+void TrackerSequencer::setCurrentPatternIndex(int index) {
+    if (!patternRuntime_) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available";
+        return;
+    }
+    auto patternNames = patternRuntime_->getPatternNames();
+    if (index >= 0 && index < (int)patternNames.size()) {
+        bindToPattern(patternNames[index]);
+        ofLogNotice("TrackerSequencer") << "Switched to pattern index " << index << " (" << patternNames[index] << ")";
+    } else {
+        ofLogWarning("TrackerSequencer") << "Invalid pattern index: " << index;
+    }
 }
 
 // Pattern chain (pattern chaining) implementation
+// Phase 2: Chains are now in PatternRuntime, accessed via sequencer bindings
 //--------------------------------------------------------------
+
+// Helper to get current chain (from PatternRuntime or fallback to internal)
+PatternChain* TrackerSequencer::getCurrentChain() {
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"E\",\"location\":\"TrackerSequencer.cpp:1961\",\"message\":\"getCurrentChain (non-const)\",\"data\":{\"sequencerName\":\"" << getName() << "\",\"boundChainName\":\"" << boundChainName_ << "\",\"hasRuntime\":" << (patternRuntime_ ? "true" : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+    }
+    // #endregion
+    if (patternRuntime_ && !boundChainName_.empty()) {
+        PatternChain* chain = patternRuntime_->getChain(boundChainName_);
+        // #region agent log
+        {
+            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"E\",\"location\":\"TrackerSequencer.cpp:1963\",\"message\":\"getCurrentChain returning PatternRuntime chain\",\"data\":{\"sequencerName\":\"" << getName() << "\",\"chainName\":\"" << boundChainName_ << "\",\"chainFound\":" << (chain ? "true" : "false") << ",\"chainSize\":" << (chain ? chain->getChain().size() : 0) << ",\"chainEnabled\":" << (chain ? (chain->isEnabled() ? "true" : "false") : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+        }
+        // #endregion
+        return chain;
+    }
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"E\",\"location\":\"TrackerSequencer.cpp:1969\",\"message\":\"getCurrentChain returning internal chain\",\"data\":{\"sequencerName\":\"" << getName() << "\",\"internalChainSize\":" << patternChain.getSize() << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+    }
+    // #endregion
+    // Fallback to internal chain for backward compatibility
+    return &patternChain;
+}
+
+const PatternChain* TrackerSequencer::getCurrentChain() const {
+    if (patternRuntime_ && !boundChainName_.empty()) {
+        return patternRuntime_->getChain(boundChainName_);
+    }
+    // Fallback to internal chain for backward compatibility
+    return &patternChain;
+}
+
+void TrackerSequencer::bindToChain(const std::string& chainName) {
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"TrackerSequencer.cpp:1964\",\"message\":\"bindToChain called\",\"data\":{\"sequencerName\":\"" << getName() << "\",\"chainName\":\"" << chainName << "\"},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+    }
+    // #endregion
+    if (!patternRuntime_) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available for chain binding";
+        return;
+    }
+    
+    if (!patternRuntime_->chainExists(chainName)) {
+        ofLogError("TrackerSequencer") << "Chain not found in Runtime: " << chainName;
+        return;
+    }
+    
+    boundChainName_ = chainName;
+    
+    // Update PatternRuntime sequencer binding
+    patternRuntime_->bindSequencerChain(getName(), chainName);
+    
+    // Sync chain enabled state
+    PatternChain* chain = patternRuntime_->getChain(chainName);
+    if (chain) {
+        patternRuntime_->setSequencerChainEnabled(getName(), chain->isEnabled());
+        
+        // CRITICAL: Sync chain's current index with bound pattern
+        // This ensures chain progression starts from the correct position
+        if (!boundPatternName_.empty()) {
+            const auto& chainPatterns = chain->getChain();
+            for (size_t i = 0; i < chainPatterns.size(); ++i) {
+                if (chainPatterns[i] == boundPatternName_) {
+                    chain->setCurrentIndex((int)i);
+                    ofLogVerbose("TrackerSequencer") << "Synced chain index to " << i << " for pattern '" << boundPatternName_ << "'";
+                    break;
+                }
+            }
+        }
+    }
+    
+    ofLogNotice("TrackerSequencer") << "Bound to chain: " << chainName;
+}
+
+void TrackerSequencer::unbindChain() {
+    if (!boundChainName_.empty()) {
+        if (patternRuntime_) {
+            patternRuntime_->unbindSequencerChain(getName());
+        }
+        boundChainName_.clear();
+        ofLogNotice("TrackerSequencer") << "Unbound from chain";
+    }
+}
+
+int TrackerSequencer::getPatternChainSize() const {
+    const PatternChain* chain = getCurrentChain();
+    return chain ? chain->getSize() : 0;
+}
+
+int TrackerSequencer::getCurrentChainIndex() const {
+    const PatternChain* chain = getCurrentChain();
+    return chain ? chain->getCurrentIndex() : 0;
+}
+
 void TrackerSequencer::setCurrentChainIndex(int index) {
-    patternChain.setCurrentIndex(index);
-    // Update current pattern index based on pattern chain
-    if (patternChain.isEnabled()) {
-        int patternIdx = patternChain.getEntry(index);
-        if (patternIdx >= 0 && patternIdx < (int)patterns.size()) {
-            currentPatternIndex = patternIdx;
+    PatternChain* chain = getCurrentChain();
+    if (!chain) return;
+    
+    chain->setCurrentIndex(index);
+    
+    // Update bound pattern based on pattern chain
+    if (chain->isEnabled()) {
+        std::string patternName = chain->getEntry(index);
+        if (!patternName.empty()) {
+            bindToPattern(patternName);
         }
     }
 }
 
-void TrackerSequencer::addToPatternChain(int patternIndex) {
-    if (patternIndex < 0 || patternIndex >= (int)patterns.size()) {
-        ofLogWarning("TrackerSequencer") << "Invalid pattern index for chain: " << patternIndex;
+void TrackerSequencer::addToPatternChain(const std::string& patternName) {
+    if (!patternRuntime_) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available";
         return;
     }
-    patternChain.addEntry(patternIndex);
+    if (!patternRuntime_->patternExists(patternName)) {
+        ofLogWarning("TrackerSequencer") << "Invalid pattern name for chain: '" << patternName << "'";
+        return;
+    }
+    
+    // Phase 2: Auto-migrate to PatternRuntime if not already bound
+    // This ensures chains created/modified via GUI are immediately stored in PatternRuntime
+    // Only migrate if we have existing chain entries OR this is the first pattern being added
+    if (boundChainName_.empty()) {
+        // Create a chain in PatternRuntime for this sequencer
+        std::string chainName = getName() + "_chain";
+        if (!patternRuntime_->chainExists(chainName)) {
+            patternRuntime_->addChain(chainName);
+        }
+        
+        // Migrate existing internal chain entries if any
+        if (patternChain.getSize() > 0) {
+            const auto& chain = patternChain.getChain();
+            for (size_t i = 0; i < chain.size(); i++) {
+                patternRuntime_->chainAddPattern(chainName, chain[i]);
+                int repeatCount = patternChain.getRepeatCount((int)i);
+                if (repeatCount > 1) {
+                    patternRuntime_->chainSetRepeat(chainName, (int)i, repeatCount);
+                }
+                if (patternChain.isEntryDisabled((int)i)) {
+                    patternRuntime_->chainSetEntryDisabled(chainName, (int)i, true);
+                }
+            }
+            // Set chain enabled state (always enable by default)
+            patternRuntime_->chainSetEnabled(chainName, true);
+            // Sync current index
+            PatternChain* runtimeChain = patternRuntime_->getChain(chainName);
+            if (runtimeChain) {
+                runtimeChain->setCurrentIndex(patternChain.getCurrentIndex());
+            }
+        } else {
+            // No existing chain entries - just ensure chain is enabled (will be populated by this add call)
+            patternRuntime_->chainSetEnabled(chainName, true);
+        }
+        
+        // Bind sequencer to the chain
+        bindToChain(chainName);
+        patternRuntime_->setSequencerChainEnabled(getName(), true);
+        ofLogVerbose("TrackerSequencer") << "Auto-migrated chain to PatternRuntime: " << chainName;
+    }
+    
+    // Now add the new pattern (chain is guaranteed to be bound at this point)
+    patternRuntime_->chainAddPattern(boundChainName_, patternName);
+    
+    // Ensure chain is enabled after adding pattern (chains are enabled by default)
+    PatternChain* chain = patternRuntime_->getChain(boundChainName_);
+    if (chain && !chain->isEnabled()) {
+        patternRuntime_->chainSetEnabled(boundChainName_, true);
+        patternRuntime_->setSequencerChainEnabled(getName(), true);
+    }
 }
 
 void TrackerSequencer::removeFromPatternChain(int chainIndex) {
-    patternChain.removeEntry(chainIndex);
+    PatternChain* chain = getCurrentChain();
+    if (!chain) return;
+    
+    // If using PatternRuntime chain, use PatternRuntime API
+    if (patternRuntime_ && !boundChainName_.empty()) {
+        patternRuntime_->chainRemovePattern(boundChainName_, chainIndex);
+    } else {
+        // Fallback to internal chain
+        chain->removeEntry(chainIndex);
+    }
     
     // Switch to the pattern at the new current chain index
-    int newCurrentIndex = patternChain.getCurrentIndex();
-    if (newCurrentIndex >= 0 && newCurrentIndex < patternChain.getSize()) {
-        int newPatternIndex = patternChain.getEntry(newCurrentIndex);
-        if (newPatternIndex >= 0 && newPatternIndex < (int)patterns.size()) {
-            setCurrentPatternIndex(newPatternIndex);
+    int newCurrentIndex = chain->getCurrentIndex();
+    if (newCurrentIndex >= 0 && newCurrentIndex < chain->getSize()) {
+        std::string newPatternName = chain->getEntry(newCurrentIndex);
+        if (!newPatternName.empty()) {
+            bindToPattern(newPatternName);
         }
     }
 }
 
-void TrackerSequencer::setPatternChainEntry(int chainIndex, int patternIndex) {
-    if (patternIndex < 0 || patternIndex >= (int)patterns.size()) {
-        ofLogWarning("TrackerSequencer") << "Invalid pattern index: " << patternIndex;
+void TrackerSequencer::clearPatternChain() {
+    PatternChain* chain = getCurrentChain();
+    if (!chain) return;
+    
+    // If using PatternRuntime chain, use PatternRuntime API
+    if (patternRuntime_ && !boundChainName_.empty()) {
+        patternRuntime_->chainClear(boundChainName_);
+    } else {
+        // Fallback to internal chain
+        chain->clear();
+    }
+}
+
+std::string TrackerSequencer::getPatternChainEntry(int chainIndex) const {
+    const PatternChain* chain = getCurrentChain();
+    return chain ? chain->getEntry(chainIndex) : "";
+}
+
+void TrackerSequencer::setPatternChainEntry(int chainIndex, const std::string& patternName) {
+    if (!patternRuntime_) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available";
         return;
     }
-    patternChain.setEntry(chainIndex, patternIndex);
+    if (!patternRuntime_->patternExists(patternName)) {
+        ofLogWarning("TrackerSequencer") << "Invalid pattern name: '" << patternName << "'";
+        return;
+    }
+    
+    // Phase 2: Auto-migrate to PatternRuntime if not already bound
+    if (boundChainName_.empty() && patternChain.getSize() > 0) {
+        // Create a chain in PatternRuntime for this sequencer
+        std::string chainName = getName() + "_chain";
+        if (!patternRuntime_->chainExists(chainName)) {
+            patternRuntime_->addChain(chainName);
+        }
+        
+        // Migrate existing internal chain entries
+        const auto& chain = patternChain.getChain();
+        for (size_t i = 0; i < chain.size(); i++) {
+            patternRuntime_->chainAddPattern(chainName, chain[i]);
+            int repeatCount = patternChain.getRepeatCount((int)i);
+            if (repeatCount > 1) {
+                patternRuntime_->chainSetRepeat(chainName, (int)i, repeatCount);
+            }
+            if (patternChain.isEntryDisabled((int)i)) {
+                patternRuntime_->chainSetEntryDisabled(chainName, (int)i, true);
+            }
+        }
+        // Set chain enabled state
+        patternRuntime_->chainSetEnabled(chainName, patternChain.isEnabled());
+        // Sync current index
+        PatternChain* runtimeChain = patternRuntime_->getChain(chainName);
+        if (runtimeChain) {
+            runtimeChain->setCurrentIndex(patternChain.getCurrentIndex());
+        }
+        
+        // Bind sequencer to the chain
+        bindToChain(chainName);
+        ofLogVerbose("TrackerSequencer") << "Auto-migrated chain to PatternRuntime: " << chainName;
+    }
+    
+    PatternChain* chain = getCurrentChain();
+    if (!chain) return;
+    
+    // If using PatternRuntime chain, we need to update it
+    // Since PatternRuntime doesn't have a direct setEntry, we'll rebuild the chain
+    if (patternRuntime_ && !boundChainName_.empty()) {
+        // Get current chain patterns
+        auto patterns = patternRuntime_->chainGetPatterns(boundChainName_);
+        if (chainIndex >= 0 && chainIndex < (int)patterns.size()) {
+            // Rebuild chain: replace pattern at chainIndex
+            patternRuntime_->chainClear(boundChainName_);
+            for (int i = 0; i < (int)patterns.size(); i++) {
+                if (i == chainIndex) {
+                    patternRuntime_->chainAddPattern(boundChainName_, patternName);
+                } else {
+                    patternRuntime_->chainAddPattern(boundChainName_, patterns[i]);
+                }
+            }
+        } else {
+            // Index out of bounds - just add to end
+            patternRuntime_->chainAddPattern(boundChainName_, patternName);
+        }
+    } else {
+        // Fallback to internal chain
+        chain->setEntry(chainIndex, patternName);
+    }
+}
+
+const std::vector<std::string>& TrackerSequencer::getPatternChain() const {
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"E\",\"location\":\"TrackerSequencer.cpp:2203\",\"message\":\"getPatternChain called\",\"data\":{\"sequencerName\":\"" << getName() << "\",\"boundChainName\":\"" << boundChainName_ << "\",\"hasRuntime\":" << (patternRuntime_ ? "true" : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+    }
+    // #endregion
+    const PatternChain* chain = getCurrentChain();
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"E\",\"location\":\"TrackerSequencer.cpp:2206\",\"message\":\"getPatternChain result\",\"data\":{\"sequencerName\":\"" << getName() << "\",\"chainFound\":" << (chain ? "true" : "false") << ",\"chainSize\":" << (chain ? chain->getChain().size() : 0) << ",\"chainEnabled\":" << (chain ? (chain->isEnabled() ? "true" : "false") : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+    }
+    // #endregion
+    if (chain) {
+        return chain->getChain();
+    }
+    // Fallback: return empty vector
+    static const std::vector<std::string> empty;
+    return empty;
+}
+
+int TrackerSequencer::getPatternChainRepeatCount(int chainIndex) const {
+    const PatternChain* chain = getCurrentChain();
+    return chain ? chain->getRepeatCount(chainIndex) : 1;
+}
+
+void TrackerSequencer::setPatternChainRepeatCount(int chainIndex, int repeatCount) {
+    // Phase 2: Auto-migrate to PatternRuntime if not already bound and chain has entries
+    if (patternRuntime_ && boundChainName_.empty() && patternChain.getSize() > 0) {
+        // Create a chain in PatternRuntime for this sequencer
+        std::string chainName = getName() + "_chain";
+        if (!patternRuntime_->chainExists(chainName)) {
+            patternRuntime_->addChain(chainName);
+        }
+        
+        // Migrate existing internal chain entries
+        const auto& chain = patternChain.getChain();
+        for (size_t i = 0; i < chain.size(); i++) {
+            patternRuntime_->chainAddPattern(chainName, chain[i]);
+            int oldRepeatCount = patternChain.getRepeatCount((int)i);
+            if (oldRepeatCount > 1) {
+                patternRuntime_->chainSetRepeat(chainName, (int)i, oldRepeatCount);
+            }
+            if (patternChain.isEntryDisabled((int)i)) {
+                patternRuntime_->chainSetEntryDisabled(chainName, (int)i, true);
+            }
+        }
+        // Set chain enabled state
+        patternRuntime_->chainSetEnabled(chainName, patternChain.isEnabled());
+        // Sync current index
+        PatternChain* runtimeChain = patternRuntime_->getChain(chainName);
+        if (runtimeChain) {
+            runtimeChain->setCurrentIndex(patternChain.getCurrentIndex());
+        }
+        
+        // Bind sequencer to the chain
+        bindToChain(chainName);
+        ofLogVerbose("TrackerSequencer") << "Auto-migrated chain to PatternRuntime: " << chainName;
+    }
+    
+    PatternChain* chain = getCurrentChain();
+    if (!chain) return;
+    
+    // If using PatternRuntime chain, use PatternRuntime API
+    if (patternRuntime_ && !boundChainName_.empty()) {
+        patternRuntime_->chainSetRepeat(boundChainName_, chainIndex, repeatCount);
+    } else {
+        // Fallback to internal chain
+        chain->setRepeatCount(chainIndex, repeatCount);
+    }
+}
+
+bool TrackerSequencer::getUsePatternChain() const {
+    const PatternChain* chain = getCurrentChain();
+    bool result = chain ? chain->isEnabled() : false;
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"E\",\"location\":\"TrackerSequencer.cpp:2264\",\"message\":\"getUsePatternChain\",\"data\":{\"sequencerName\":\"" << getName() << "\",\"boundChainName\":\"" << boundChainName_ << "\",\"chainFound\":" << (chain ? "true" : "false") << ",\"chainEnabled\":" << (chain ? (chain->isEnabled() ? "true" : "false") : "false") << ",\"result\":" << (result ? "true" : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+    }
+    // #endregion
+    return result;
+}
+
+void TrackerSequencer::setUsePatternChain(bool use) {
+    // Phase 2: Auto-migrate to PatternRuntime if not already bound and chain has entries
+    if (patternRuntime_ && boundChainName_.empty() && patternChain.getSize() > 0) {
+        // Create a chain in PatternRuntime for this sequencer
+        std::string chainName = getName() + "_chain";
+        if (!patternRuntime_->chainExists(chainName)) {
+            patternRuntime_->addChain(chainName);
+        }
+        
+        // Migrate existing internal chain entries
+        const auto& chain = patternChain.getChain();
+        for (size_t i = 0; i < chain.size(); i++) {
+            patternRuntime_->chainAddPattern(chainName, chain[i]);
+            int repeatCount = patternChain.getRepeatCount((int)i);
+            if (repeatCount > 1) {
+                patternRuntime_->chainSetRepeat(chainName, (int)i, repeatCount);
+            }
+            if (patternChain.isEntryDisabled((int)i)) {
+                patternRuntime_->chainSetEntryDisabled(chainName, (int)i, true);
+            }
+        }
+        // Set chain enabled state
+        patternRuntime_->chainSetEnabled(chainName, patternChain.isEnabled());
+        // Sync current index
+        PatternChain* runtimeChain = patternRuntime_->getChain(chainName);
+        if (runtimeChain) {
+            runtimeChain->setCurrentIndex(patternChain.getCurrentIndex());
+        }
+        
+        // Bind sequencer to the chain
+        bindToChain(chainName);
+        ofLogVerbose("TrackerSequencer") << "Auto-migrated chain to PatternRuntime: " << chainName;
+    }
+    
+    PatternChain* chain = getCurrentChain();
+    if (!chain) return;
+    
+    // If using PatternRuntime chain, use PatternRuntime API
+    if (patternRuntime_ && !boundChainName_.empty()) {
+        patternRuntime_->chainSetEnabled(boundChainName_, use);
+        patternRuntime_->setSequencerChainEnabled(getName(), use);
+    } else {
+        // Fallback to internal chain
+        chain->setEnabled(use);
+    }
+}
+
+bool TrackerSequencer::isPatternChainEntryDisabled(int chainIndex) const {
+    const PatternChain* chain = getCurrentChain();
+    return chain ? chain->isEntryDisabled(chainIndex) : false;
+}
+
+void TrackerSequencer::setPatternChainEntryDisabled(int chainIndex, bool disabled) {
+    // Phase 2: Auto-migrate to PatternRuntime if not already bound and chain has entries
+    if (patternRuntime_ && boundChainName_.empty() && patternChain.getSize() > 0) {
+        // Create a chain in PatternRuntime for this sequencer
+        std::string chainName = getName() + "_chain";
+        if (!patternRuntime_->chainExists(chainName)) {
+            patternRuntime_->addChain(chainName);
+        }
+        
+        // Migrate existing internal chain entries
+        const auto& chain = patternChain.getChain();
+        for (size_t i = 0; i < chain.size(); i++) {
+            patternRuntime_->chainAddPattern(chainName, chain[i]);
+            int repeatCount = patternChain.getRepeatCount((int)i);
+            if (repeatCount > 1) {
+                patternRuntime_->chainSetRepeat(chainName, (int)i, repeatCount);
+            }
+            if (patternChain.isEntryDisabled((int)i)) {
+                patternRuntime_->chainSetEntryDisabled(chainName, (int)i, true);
+            }
+        }
+        // Set chain enabled state
+        patternRuntime_->chainSetEnabled(chainName, patternChain.isEnabled());
+        // Sync current index
+        PatternChain* runtimeChain = patternRuntime_->getChain(chainName);
+        if (runtimeChain) {
+            runtimeChain->setCurrentIndex(patternChain.getCurrentIndex());
+        }
+        
+        // Bind sequencer to the chain
+        bindToChain(chainName);
+        ofLogVerbose("TrackerSequencer") << "Auto-migrated chain to PatternRuntime: " << chainName;
+    }
+    
+    PatternChain* chain = getCurrentChain();
+    if (!chain) return;
+    
+    // If using PatternRuntime chain, use PatternRuntime API
+    if (patternRuntime_ && !boundChainName_.empty()) {
+        patternRuntime_->chainSetEntryDisabled(boundChainName_, chainIndex, disabled);
+    } else {
+        // Fallback to internal chain
+        chain->setEntryDisabled(chainIndex, disabled);
+    }
 }
 
 // CellWidget adapter methods removed - moved to TrackerSequencerGUI
@@ -1678,3 +2531,174 @@ namespace {
     };
     static TrackerSequencerRegistrar g_trackerSequencerRegistrar;
 }
+
+// ═══════════════════════════════════════════════════════════
+// PATTERN RUNTIME INTEGRATION (Phase 3: Runtime-Only Architecture)
+// ═══════════════════════════════════════════════════════════
+
+bool TrackerSequencer::bindToPattern(const std::string& patternName) {
+    if (!patternRuntime_) {
+        ofLogError("TrackerSequencer") << "PatternRuntime not available for binding";
+        return false;
+    }
+    
+    if (!patternRuntime_->patternExists(patternName)) {
+        ofLogError("TrackerSequencer") << "Pattern not found in Runtime: " << patternName;
+        return false;
+    }
+    
+    // Unsubscribe from previous pattern events
+    if (!boundPatternName_.empty()) {
+        ofRemoveListener(patternRuntime_->triggerEvent, this, &TrackerSequencer::onPatternRuntimeTrigger);
+    }
+    
+    boundPatternName_ = patternName;
+    
+    // CRITICAL: Update PatternRuntime sequencer binding so it's persisted
+    // This ensures the binding is saved/restored correctly
+    patternRuntime_->bindSequencerPattern(getName(), patternName);
+    
+    // Subscribe to PatternRuntime events for forwarding
+    ofAddListener(patternRuntime_->triggerEvent, this, &TrackerSequencer::onPatternRuntimeTrigger);
+    
+    // CRITICAL: Sync pattern chain current index with bound pattern
+    // If pattern chain is enabled and contains this pattern, update current index
+    PatternChain* chain = getCurrentChain();
+    if (chain && chain->isEnabled()) {
+        const auto& chainPatterns = chain->getChain();
+        for (size_t i = 0; i < chainPatterns.size(); ++i) {
+            if (chainPatterns[i] == patternName) {
+                chain->setCurrentIndex((int)i);
+                ofLogVerbose("TrackerSequencer") << "Synced chain index to " << i << " for pattern '" << patternName << "'";
+                break;
+            }
+        }
+    }
+    
+    ofLogNotice("TrackerSequencer") << "Bound to pattern: " << patternName;
+    return true;
+}
+
+void TrackerSequencer::onPatternRuntimeTrigger(TriggerEvent& evt) {
+    // Forward PatternRuntime events to TrackerSequencer's triggerEvent
+    // This preserves module-based routing (TrackerSequencer → MultiSampler)
+    // Only forward events for the bound pattern
+    // Phase 3: Forward events from bound pattern only
+    if (!boundPatternName_.empty() && evt.patternName == boundPatternName_) {
+        // Forward the event (preserves all metadata including patternName)
+        ofNotifyEvent(triggerEvent, evt);
+    }
+}
+
+void TrackerSequencer::onSequencerBindingChanged(std::string& sequencerName) {
+    // Only sync if this event is for this sequencer
+    if (sequencerName != getName() || !patternRuntime_) {
+        return;
+    }
+    
+    // Immediately sync bindings from PatternRuntime
+    PatternRuntime::SequencerBinding binding = patternRuntime_->getSequencerBinding(getName());
+    
+    // Sync pattern binding
+    if (!binding.patternName.empty() && binding.patternName != boundPatternName_) {
+        std::string oldPattern = boundPatternName_;
+        boundPatternName_ = binding.patternName;
+        
+        // Unsubscribe from old pattern events
+        if (!oldPattern.empty()) {
+            ofRemoveListener(patternRuntime_->triggerEvent, this, &TrackerSequencer::onPatternRuntimeTrigger);
+        }
+        
+        // Subscribe to new pattern events
+        ofAddListener(patternRuntime_->triggerEvent, this, &TrackerSequencer::onPatternRuntimeTrigger);
+        
+        ofLogVerbose("TrackerSequencer") << "Synced pattern binding from PatternRuntime: '" 
+                                        << oldPattern << "' -> '" << boundPatternName_ << "'";
+    } else if (binding.patternName.empty() && !boundPatternName_.empty()) {
+        // Pattern was unbound
+        std::string oldPattern = boundPatternName_;
+        boundPatternName_.clear();
+        
+        // Unsubscribe from pattern events
+        ofRemoveListener(patternRuntime_->triggerEvent, this, &TrackerSequencer::onPatternRuntimeTrigger);
+        
+        ofLogVerbose("TrackerSequencer") << "Synced pattern unbinding from PatternRuntime: '" 
+                                        << oldPattern << "' -> [unbound]";
+    }
+    
+    // Sync chain binding
+    if (binding.chainName != boundChainName_) {
+        std::string oldChain = boundChainName_;
+        boundChainName_ = binding.chainName;
+        
+        if (!boundChainName_.empty()) {
+            ofLogVerbose("TrackerSequencer") << "Synced chain binding from PatternRuntime: '" 
+                                            << oldChain << "' -> '" << boundChainName_ << "'";
+        } else {
+            ofLogVerbose("TrackerSequencer") << "Synced chain unbinding from PatternRuntime: '" 
+                                            << oldChain << "' -> [unbound]";
+        }
+    }
+}
+
+void TrackerSequencer::onPatternDeleted(std::string& deletedPatternName) {
+    // Handle pattern deletion: rebind if needed and clean up pattern chain
+    if (!patternRuntime_) {
+        return;
+    }
+    
+    // If bound to deleted pattern, rebind to another pattern
+    if (boundPatternName_ == deletedPatternName) {
+        auto patternNames = patternRuntime_->getPatternNames();
+        if (!patternNames.empty()) {
+            // Bind to first available pattern
+            bindToPattern(patternNames[0]);
+            ofLogNotice("TrackerSequencer") << "Rebound to pattern '" << patternNames[0] 
+                                            << "' after deletion of bound pattern '" << deletedPatternName << "'";
+        } else {
+            // No patterns left - create a default one
+            Pattern defaultPattern(16);
+            std::string newName = patternRuntime_->addPattern(defaultPattern, "");
+            if (!newName.empty()) {
+                bindToPattern(newName);
+                ofLogNotice("TrackerSequencer") << "Created and bound to default pattern '" << newName 
+                                                << "' after deletion of bound pattern '" << deletedPatternName << "'";
+            } else {
+                boundPatternName_.clear();
+                ofLogWarning("TrackerSequencer") << "Failed to create default pattern after deletion";
+            }
+        }
+    }
+    
+    // Remove deleted pattern from pattern chain
+    PatternChain* chain = getCurrentChain();
+    if (chain) {
+        const auto& chainPatterns = chain->getChain();
+        bool chainModified = false;
+        for (int i = (int)chainPatterns.size() - 1; i >= 0; --i) {
+            if (chainPatterns[i] == deletedPatternName) {
+                // If using PatternRuntime chain, use PatternRuntime API
+                if (patternRuntime_ && !boundChainName_.empty()) {
+                    patternRuntime_->chainRemovePattern(boundChainName_, i);
+                } else {
+                    // Fallback to internal chain
+                    chain->removeEntry(i);
+                }
+                chainModified = true;
+                ofLogVerbose("TrackerSequencer") << "Removed deleted pattern '" << deletedPatternName 
+                                                 << "' from pattern chain at index " << i;
+            }
+        }
+        
+        // Update current chain index if needed
+        if (chainModified) {
+            int currentIndex = chain->getCurrentIndex();
+            if (currentIndex >= chain->getSize()) {
+                chain->setCurrentIndex(std::max(0, chain->getSize() - 1));
+            }
+        }
+    }
+}
+
+// Phase 3: migrateToPatternRuntime() removed - patterns are always in Runtime
+

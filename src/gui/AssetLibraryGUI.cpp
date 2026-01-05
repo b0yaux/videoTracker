@@ -689,12 +689,12 @@ void AssetLibraryGUI::drawAssetTooltip(const std::string& assetId, const AssetIn
                 cacheIt->second.lastUsed = std::chrono::steady_clock::now();
             }
             
-            // If player is cached, use it immediately (smooth like MediaPool)
+            // If player is cached, use it immediately (smooth like MultiSampler)
             if (cachedPlayer && cachedPlayer->isVideoLoaded()) {
-                // Update video frame for animation (like MediaPool)
+                // Update video frame for animation (like MultiSampler)
                 updateCachedPlayerFrame(cachedPlayer);
                 
-                // Show live video frame (like MediaPool)
+                // Show live video frame (like MultiSampler)
                 float thumbnailHeight = MediaPreview::drawVideoThumbnail(cachedPlayer, 160.0f);
                 if (thumbnailHeight > 0.0f && hasCachedWaveform) {
                     ImGui::Spacing();
@@ -711,10 +711,10 @@ void AssetLibraryGUI::drawAssetTooltip(const std::string& assetId, const AssetIn
                 if (hoverDuration > 20 && hoveredAssetId_ == assetId) {
                     MediaPlayer* player = getOrLoadPlayer(assetId, asset);
                     if (player && player->isVideoLoaded()) {
-                        // Update video frame for animation (like MediaPool)
+                        // Update video frame for animation (like MultiSampler)
                         updateCachedPlayerFrame(player);
                         
-                        // Show live video frame (like MediaPool)
+                        // Show live video frame (like MultiSampler)
                         float thumbnailHeight = MediaPreview::drawVideoThumbnail(player, 160.0f);
                         if (thumbnailHeight > 0.0f && hasCachedWaveform) {
                             ImGui::Spacing();
@@ -1165,11 +1165,11 @@ void AssetLibraryGUI::setupDragDropSource(const std::string& assetId, const Asse
         std::vector<std::string> filePaths;
         
         if (asset.conversionStatus == ConversionStatus::COMPLETE) {
-            // For AV files: send audio first, then video, so MediaPool can pair them correctly
+            // For AV files: send audio first, then video, so MultiSampler can pair them correctly
             // Audio-only files: just send audio
             // Video-only files: just send video
             if (asset.isAudio && asset.isVideo) {
-                // AV file: send audio first, then video (MediaPool pairs by base name)
+                // AV file: send audio first, then video (MultiSampler pairs by base name)
                 if (!asset.convertedAudioPath.empty() && 
                     ofFile::doesFileExist(asset.convertedAudioPath) &&
                     asset.convertedAudioPath != asset.convertedVideoPath) {
@@ -1235,7 +1235,7 @@ void AssetLibraryGUI::setupFolderDragDropSource(const std::string& folderName, c
             // Resolve asset to file paths (prefer converted, fallback to original)
             // Same logic as setupDragDropSource for individual assets
             if (asset->conversionStatus == ConversionStatus::COMPLETE) {
-                // For AV files: send audio first, then video, so MediaPool can pair them correctly
+                // For AV files: send audio first, then video, so MultiSampler can pair them correctly
                 if (asset->isAudio && asset->isVideo) {
                     // AV file: send audio first, then video
                     if (!asset->convertedAudioPath.empty() && 
@@ -1439,7 +1439,7 @@ void AssetLibraryGUI::updateCachedPlayerFrame(MediaPlayer* player) {
     if (!player || !player->isVideoLoaded()) return;
     
     try {
-        // Update video frame for animation (like MediaPool does)
+            // Update video frame for animation (like MultiSampler does)
         auto& videoFile = player->getVideoPlayer().getVideoFile();
         if (videoFile.isLoaded()) {
             // Keep position at 10% for preview (or cycle through for animation)
@@ -1558,7 +1558,7 @@ void AssetLibraryGUI::playAssetPreview(const std::string& assetId, const AssetIn
 void AssetLibraryGUI::stopAssetPreview() {
     if (previewPlayer_) {
         try {
-            // CRITICAL: Disconnect audio before stopping (like MediaPool does)
+            // CRITICAL: Disconnect audio before stopping (like MultiSampler does)
             // This removes the preview player from the mixer's connection list
             if (previewPlayer_->isAudioLoaded()) {
                 previewPlayer_->getAudioPlayer().disconnect();

@@ -300,42 +300,28 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
 
     // Priority 1: Window Navigation - Ctrl+Arrow Keys or Cmd+Arrow Keys (spatial navigation)
     // Support both Ctrl (cross-platform) and Cmd (macOS) modifiers
-    // Note: We use ImGui's AddKeyEvent with false to prevent ImGui from processing the same
-    // arrow keys for its internal navigation, avoiding conflicts between window navigation
-    // and ImGui's keyboard navigation within windows
-    if ((ctrlPressed || cmdPressed) && viewManager) {
+    // CRITICAL: Only handle if ImGui is NOT capturing keyboard input (to avoid breaking ImGui navigation)
+    // When ImGui wants keyboard input, let it handle arrow keys for its own navigation
+    ImGuiIO& io = ImGui::GetIO();
+    bool imGuiWantsKeyboard = io.WantCaptureKeyboard;
+    
+    if ((ctrlPressed || cmdPressed) && viewManager && !imGuiWantsKeyboard) {
         if (key == OF_KEY_LEFT) {
-            // Prevent ImGui from processing this arrow key
-            ImGuiIO& io = ImGui::GetIO();
-            io.AddKeyEvent(ImGuiKey_LeftArrow, false);
-
             viewManager->previousWindow();
             logKeyPress(key, "Navigation: Ctrl/Cmd+Left Arrow - Previous Window");
             return true;
         }
         if (key == OF_KEY_RIGHT) {
-            // Prevent ImGui from processing this arrow key
-            ImGuiIO& io = ImGui::GetIO();
-            io.AddKeyEvent(ImGuiKey_RightArrow, false);
-
             viewManager->nextWindow();
             logKeyPress(key, "Navigation: Ctrl/Cmd+Right Arrow - Next Window");
             return true;
         }
         if (key == OF_KEY_UP) {
-            // Prevent ImGui from processing this arrow key
-            ImGuiIO& io = ImGui::GetIO();
-            io.AddKeyEvent(ImGuiKey_UpArrow, false);
-
             viewManager->upWindow();
             logKeyPress(key, "Navigation: Ctrl/Cmd+Up Arrow - Up Window");
             return true;
         }
         if (key == OF_KEY_DOWN) {
-            // Prevent ImGui from processing this arrow key
-            ImGuiIO& io = ImGui::GetIO();
-            io.AddKeyEvent(ImGuiKey_DownArrow, false);
-
             viewManager->downWindow();
             logKeyPress(key, "Navigation: Ctrl/Cmd+Down Arrow - Down Window");
             return true;

@@ -3,7 +3,7 @@
 #include "MediaConverter.h"
 #include "core/ModuleRegistry.h"
 #include "modules/Module.h"
-#include "modules/MediaPool.h"
+#include "modules/MultiSampler.h"
 #include "modules/MediaPlayer.h"
 #include "ofxFFmpeg.h"
 #include "ofLog.h"
@@ -398,8 +398,8 @@ bool AssetLibrary::sendToModule(const std::string& assetId, const std::string& m
         return false;
     }
     
-    auto mediaPool = std::dynamic_pointer_cast<MediaPool>(module);
-    if (!mediaPool) {
+    auto multiSampler = std::dynamic_pointer_cast<MultiSampler>(module);
+    if (!multiSampler) {
         return false;
     }
     
@@ -411,29 +411,29 @@ bool AssetLibrary::sendToModule(const std::string& assetId, const std::string& m
     
     bool success = false;
     
-    // For [AV] assets, add audio first, then video - MediaPool will pair them into one player
+    // For [AV] assets, add audio first, then video - MultiSampler will pair them into one player
     if (asset->conversionStatus == ConversionStatus::COMPLETE) {
         bool hasVideo = !asset->convertedVideoPath.empty() && ofFile(asset->convertedVideoPath).exists();
         bool hasAudio = !asset->convertedAudioPath.empty() && ofFile(asset->convertedAudioPath).exists();
         
         if (hasVideo && hasAudio) {
             // For [AV] assets: use addMediaFiles with both paths (audio first, then video)
-            // MediaPool will pair them automatically into one [AV] player
+            // MultiSampler will pair them automatically into one [AV] player
             std::vector<std::string> paths = {asset->convertedAudioPath, asset->convertedVideoPath};
-            mediaPool->addMediaFiles(paths);
+            multiSampler->addMediaFiles(paths);
             success = true;  // addMediaFiles doesn't return a value, assume success if we got here
             if (success) {
-                ofLogNotice("AssetLibrary") << "Sent [AV] asset " << assetId << " to MediaPool: " << moduleInstanceName;
+                ofLogNotice("AssetLibrary") << "Sent [AV] asset " << assetId << " to MultiSampler: " << moduleInstanceName;
             }
         } else if (hasVideo) {
-            success = mediaPool->addMediaFile(asset->convertedVideoPath);
+            success = multiSampler->addMediaFile(asset->convertedVideoPath);
             if (success) {
-                ofLogNotice("AssetLibrary") << "Sent [V] asset " << assetId << " to MediaPool: " << moduleInstanceName;
+                ofLogNotice("AssetLibrary") << "Sent [V] asset " << assetId << " to MultiSampler: " << moduleInstanceName;
             }
         } else if (hasAudio) {
-            success = mediaPool->addMediaFile(asset->convertedAudioPath);
+            success = multiSampler->addMediaFile(asset->convertedAudioPath);
             if (success) {
-                ofLogNotice("AssetLibrary") << "Sent [A] asset " << assetId << " to MediaPool: " << moduleInstanceName;
+                ofLogNotice("AssetLibrary") << "Sent [A] asset " << assetId << " to MultiSampler: " << moduleInstanceName;
             }
         }
     }
@@ -442,9 +442,9 @@ bool AssetLibrary::sendToModule(const std::string& assetId, const std::string& m
     if (!success) {
         std::string assetPath = getAssetPath(assetId);
         if (!assetPath.empty()) {
-            success = mediaPool->addMediaFile(assetPath);
+            success = multiSampler->addMediaFile(assetPath);
             if (success) {
-                ofLogNotice("AssetLibrary") << "Sent asset " << assetId << " to MediaPool: " << moduleInstanceName;
+                ofLogNotice("AssetLibrary") << "Sent asset " << assetId << " to MultiSampler: " << moduleInstanceName;
             }
         }
     }
@@ -459,8 +459,8 @@ std::vector<std::string> AssetLibrary::getModuleTargets() const {
     
     // Use forEachModule to iterate through all modules
     moduleRegistry_->forEachModule([&targets](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
-        auto mediaPool = std::dynamic_pointer_cast<MediaPool>(module);
-        if (mediaPool) {
+        auto multiSampler = std::dynamic_pointer_cast<MultiSampler>(module);
+        if (multiSampler) {
             targets.push_back(name);
         }
     });

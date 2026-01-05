@@ -34,7 +34,7 @@ class Clock;
  * Usage:
  * ```cpp
  * auto oscilloscope = std::make_shared<Oscilloscope>();
- * auto audioSource = std::make_shared<MediaPool>();
+ * auto audioSource = std::make_shared<MultiSampler>();
  * 
  * // Connect audio source to oscilloscope
  * oscilloscope->connectAudioSource(audioSource->getAudioOutput());

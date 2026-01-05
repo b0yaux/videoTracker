@@ -4,6 +4,9 @@
 #include "gui/GUIManager.h"
 #include "Module.h"
 #include "AssetLibrary.h"
+#include "Clock.h"
+#include "PatternRuntime.h"
+#include "data/Pattern.h"
 #include "ofLog.h"
 #include "ofFileUtils.h"
 #include "ofSystemUtils.h"
@@ -44,12 +47,16 @@ void CommandExecutor::setup(
     ModuleRegistry* registry_,
     GUIManager* guiManager_,
     ConnectionManager* connectionManager_,
-    AssetLibrary* assetLibrary_
+    AssetLibrary* assetLibrary_,
+    Clock* clock_,
+    PatternRuntime* patternRuntime_
 ) {
     registry = registry_;
     guiManager = guiManager_;
     this->connectionManager_ = connectionManager_;
     this->assetLibrary = assetLibrary_;
+    clock = clock_;
+    patternRuntime = patternRuntime_;
 }
 
 void CommandExecutor::executeCommand(const std::string& command) {
@@ -62,7 +69,194 @@ void CommandExecutor::executeCommand(const std::string& command) {
     std::string cmdLower = cmd;
     std::transform(cmdLower.begin(), cmdLower.end(), cmdLower.begin(), ::tolower);
     
-    // Execute
+    // Check for object-oriented commands (pattern, chain, sequencer, module, session)
+    if (cmdLower == "pattern") {
+        // Parse pattern command: pattern <action> [args...]
+        // Handle case where args might be empty or just whitespace
+        if (args.empty() || trim(args).empty()) {
+            output("Usage: pattern [create|delete|play|stop|reset|pause|ls|info]");
+            output("Example: pattern ls");
+            return;
+        }
+        
+        auto [action, actionArgs] = parseCommand(args);
+        std::string actionLower = action;
+        std::transform(actionLower.begin(), actionLower.end(), actionLower.begin(), ::tolower);
+        
+        if (actionLower == "ls" || actionLower == "list") {
+            cmdPatternList();
+        } else if (actionLower == "create") {
+            cmdPatternCreate(actionArgs);
+        } else if (actionLower == "delete" || actionLower == "del" || actionLower == "remove" || actionLower == "rm") {
+            cmdPatternDelete(actionArgs);
+        } else if (actionLower == "play") {
+            cmdPatternPlay(actionArgs);
+        } else if (actionLower == "stop") {
+            cmdPatternStop(actionArgs);
+        } else if (actionLower == "reset") {
+            cmdPatternReset(actionArgs);
+        } else if (actionLower == "pause") {
+            cmdPatternPause(actionArgs);
+        } else if (actionLower == "info") {
+            cmdPatternInfo(actionArgs);
+        } else {
+            output("Error: Unknown pattern command '%s'. Use: pattern [create|delete|play|stop|reset|pause|ls|info]", action.c_str());
+        }
+        return;
+    }
+    
+    // Check for chain commands
+    if (cmdLower == "chain") {
+        // Parse chain command: chain <action> [args...]
+        if (args.empty() || trim(args).empty()) {
+            output("Usage: chain [create|delete|ls|info|add|remove|repeat|enable|disable|clear|reset]");
+            output("Example: chain ls");
+            return;
+        }
+        
+        auto [action, actionArgs] = parseCommand(args);
+        std::string actionLower = action;
+        std::transform(actionLower.begin(), actionLower.end(), actionLower.begin(), ::tolower);
+        
+        if (actionLower == "ls" || actionLower == "list") {
+            cmdChainList();
+        } else if (actionLower == "create") {
+            cmdChainCreate(actionArgs);
+        } else if (actionLower == "delete" || actionLower == "del" || actionLower == "remove" || actionLower == "rm") {
+            cmdChainDelete(actionArgs);
+        } else if (actionLower == "info") {
+            cmdChainInfo(actionArgs);
+        } else if (actionLower == "add") {
+            cmdChainAdd(actionArgs);
+        } else if (actionLower == "remove" || actionLower == "rm") {
+            cmdChainRemove(actionArgs);
+        } else if (actionLower == "repeat") {
+            cmdChainRepeat(actionArgs);
+        } else if (actionLower == "enable" || actionLower == "on") {
+            cmdChainEnable(actionArgs);
+        } else if (actionLower == "disable" || actionLower == "off") {
+            cmdChainDisable(actionArgs);
+        } else if (actionLower == "clear") {
+            cmdChainClear(actionArgs);
+        } else if (actionLower == "reset") {
+            cmdChainReset(actionArgs);
+        } else {
+            output("Error: Unknown chain command '%s'. Use: chain [create|delete|ls|info|add|remove|repeat|enable|disable|clear|reset]", action.c_str());
+        }
+        return;
+    }
+    
+    // Check for sequencer commands
+    if (cmdLower == "sequencer" || cmdLower == "seq") {
+        // Parse sequencer command: sequencer [<sequencerName>] <action> [args...]
+        // or: sequencer <action> [args...] (for ls, info without name)
+        if (args.empty() || trim(args).empty()) {
+            output("Usage: sequencer [ls|info] or sequencer <name> [bind|unbind|enable|disable|info]");
+            output("Example: sequencer ls");
+            output("Example: sequencer trackerSequencer1 bind pattern P1");
+            return;
+        }
+        
+        // Try to parse as: sequencer <name> <action> [args...]
+        // or: sequencer <action> [args...]
+        auto [firstArg, restArgs] = parseCommand(args);
+        std::string firstArgLower = firstArg;
+        std::transform(firstArgLower.begin(), firstArgLower.end(), firstArgLower.begin(), ::tolower);
+        
+        // Check if first arg is an action (ls, info) or a sequencer name
+        if (firstArgLower == "ls" || firstArgLower == "list") {
+            cmdSequencerList();
+        } else if (firstArgLower == "info") {
+            cmdSequencerInfo(restArgs);
+        } else {
+            // First arg is likely a sequencer name, parse action
+            if (restArgs.empty() || trim(restArgs).empty()) {
+                output("Usage: sequencer <name> [bind|unbind|enable|disable|info]");
+                output("Example: sequencer trackerSequencer1 bind pattern P1");
+                return;
+            }
+            
+            auto [action, actionArgs] = parseCommand(restArgs);
+            std::string actionLower = action;
+            std::transform(actionLower.begin(), actionLower.end(), actionLower.begin(), ::tolower);
+            
+            // Build full args with sequencer name: "<name> <actionArgs>"
+            std::string fullArgs = firstArg + " " + actionArgs;
+            
+            if (actionLower == "info") {
+                cmdSequencerInfo(firstArg);  // Just pass sequencer name
+            } else if (actionLower == "bind") {
+                // Parse: bind pattern <patternName> or bind chain <chainName>
+                if (actionArgs.empty() || trim(actionArgs).empty()) {
+                    output("Usage: sequencer <name> bind [pattern|chain] <name>");
+                    return;
+                }
+                auto [bindType, bindTarget] = parseCommand(actionArgs);
+                std::string bindTypeLower = bindType;
+                std::transform(bindTypeLower.begin(), bindTypeLower.end(), bindTypeLower.begin(), ::tolower);
+                
+                if (bindTypeLower == "pattern") {
+                    cmdSequencerBindPattern(firstArg + " " + bindTarget);
+                } else if (bindTypeLower == "chain") {
+                    cmdSequencerBindChain(firstArg + " " + bindTarget);
+                } else {
+                    output("Error: Unknown bind type '%s'. Use: bind [pattern|chain] <name>", bindType.c_str());
+                }
+            } else if (actionLower == "unbind") {
+                // Parse: unbind pattern or unbind chain
+                if (actionArgs.empty() || trim(actionArgs).empty()) {
+                    output("Usage: sequencer <name> unbind [pattern|chain]");
+                    return;
+                }
+                auto [unbindType, _] = parseCommand(actionArgs);
+                std::string unbindTypeLower = unbindType;
+                std::transform(unbindTypeLower.begin(), unbindTypeLower.end(), unbindTypeLower.begin(), ::tolower);
+                
+                if (unbindTypeLower == "pattern") {
+                    cmdSequencerUnbindPattern(firstArg);
+                } else if (unbindTypeLower == "chain") {
+                    cmdSequencerUnbindChain(firstArg);
+                } else {
+                    output("Error: Unknown unbind type '%s'. Use: unbind [pattern|chain]", unbindType.c_str());
+                }
+            } else if (actionLower == "enable" || actionLower == "on") {
+                // Parse: enable chain
+                if (actionArgs.empty() || trim(actionArgs).empty()) {
+                    output("Usage: sequencer <name> enable chain");
+                    return;
+                }
+                auto [enableType, _] = parseCommand(actionArgs);
+                std::string enableTypeLower = enableType;
+                std::transform(enableTypeLower.begin(), enableTypeLower.end(), enableTypeLower.begin(), ::tolower);
+                
+                if (enableTypeLower == "chain") {
+                    cmdSequencerEnableChain(firstArg);
+                } else {
+                    output("Error: Unknown enable type '%s'. Use: enable chain", enableType.c_str());
+                }
+            } else if (actionLower == "disable" || actionLower == "off") {
+                // Parse: disable chain
+                if (actionArgs.empty() || trim(actionArgs).empty()) {
+                    output("Usage: sequencer <name> disable chain");
+                    return;
+                }
+                auto [disableType, _] = parseCommand(actionArgs);
+                std::string disableTypeLower = disableType;
+                std::transform(disableTypeLower.begin(), disableTypeLower.end(), disableTypeLower.begin(), ::tolower);
+                
+                if (disableTypeLower == "chain") {
+                    cmdSequencerDisableChain(firstArg);
+                } else {
+                    output("Error: Unknown disable type '%s'. Use: disable chain", disableType.c_str());
+                }
+            } else {
+                output("Error: Unknown sequencer command '%s'. Use: sequencer <name> [bind|unbind|enable|disable|info]", action.c_str());
+            }
+        }
+        return;
+    }
+    
+    // Legacy commands (for backward compatibility)
     if (cmdLower == "list" || cmdLower == "ls") {
         cmdList();
     } else if (cmdLower == "remove" || cmdLower == "rm" || cmdLower == "delete" || cmdLower == "del") {
@@ -77,6 +271,18 @@ void CommandExecutor::executeCommand(const std::string& command) {
         cmdConnections(args);
     } else if (cmdLower == "import") {
         cmdImport(args);
+    } else if (cmdLower == "play" || cmdLower == "start") {
+        cmdPlay();
+    } else if (cmdLower == "stop") {
+        cmdStop();
+    } else if (cmdLower == "bpm") {
+        cmdBPM(args);
+    } else if (cmdLower == "get" || cmdLower == "param") {
+        cmdGetParam(args);
+    } else if (cmdLower == "set") {
+        cmdSetParam(args);
+    } else if (cmdLower == "info") {
+        cmdInfo(args);
     } else if (cmdLower == "help" || cmdLower == "?") {
         cmdHelp();
     } else if (cmdLower == "clear" || cmdLower == "cls") {
@@ -194,7 +400,7 @@ void CommandExecutor::cmdRemove(const std::string& args) {
 void CommandExecutor::cmdAdd(const std::string& args) {
     if (args.empty()) {
         output("Usage: add <module_type>");
-        output("Types: pool, tracker, MediaPool, TrackerSequencer");
+        output("Types: pool, tracker, MultiSampler, TrackerSequencer");
         return;
     }
     
@@ -208,13 +414,13 @@ void CommandExecutor::cmdAdd(const std::string& args) {
     std::transform(typeLower.begin(), typeLower.end(), typeLower.begin(), ::tolower);
     
     std::string moduleType;
-    if (typeLower == "pool" || typeLower == "mediapool") {
-        moduleType = "MediaPool";
+    if (typeLower == "pool" || typeLower == "multisampler") {
+        moduleType = "MultiSampler";
     } else if (typeLower == "tracker" || typeLower == "trackersequencer") {
         moduleType = "TrackerSequencer";
     } else {
         output("Error: Unknown module type '%s'", args.c_str());
-        output("Valid types: pool, tracker, MediaPool, TrackerSequencer");
+        output("Valid types: pool, tracker, MultiSampler, TrackerSequencer");
         return;
     }
     
@@ -636,8 +842,47 @@ void CommandExecutor::cmdHelp() {
     output("  unroute <mod> [from <target>] - Disconnect module from target");
     output("  connections, conn     - List all connections");
     output("  import <url_or_path>  - Import media from URL, file path, or folder");
+    output("  play, start           - Start transport");
+    output("  stop                  - Stop transport");
+    output("  bpm [value]           - Get or set BPM");
+    output("  get <mod> <param>     - Get module parameter value");
+    output("  set <mod> <param> <value> - Set module parameter value");
+    output("  info <mod>            - Show module information");
     output("  clear, cls            - Clear console");
     output("  help, ?               - Show this help");
+    output("");
+    output("=== Pattern Commands ===");
+    output("  pattern ls            - List all patterns");
+    output("  pattern create <name> [steps] - Create pattern (default: 16 steps)");
+    output("  pattern delete <name> - Delete pattern");
+    output("  pattern play <name>   - Start pattern playback");
+    output("  pattern stop <name>   - Stop pattern playback");
+    output("  pattern reset <name> - Reset pattern to step 0");
+    output("  pattern pause <name>  - Pause pattern");
+    output("  pattern info <name>  - Show pattern details");
+    output("");
+    output("=== Chain Commands ===");
+    output("  chain ls              - List all chains");
+    output("  chain create [name]   - Create chain (auto-name if omitted)");
+    output("  chain delete <name>   - Delete chain");
+    output("  chain info <name>     - Show chain details");
+    output("  chain add <chain> <pattern> [index] - Add pattern to chain");
+    output("  chain remove <chain> <index> - Remove pattern from chain");
+    output("  chain repeat <chain> <index> <count> - Set repeat count");
+    output("  chain enable <name>   - Enable chain");
+    output("  chain disable <name>  - Disable chain");
+    output("  chain clear <name>    - Clear all entries from chain");
+    output("  chain reset <name>    - Reset chain state");
+    output("");
+    output("=== Sequencer Commands ===");
+    output("  sequencer ls          - List all sequencers");
+    output("  sequencer info [<name>] - Show sequencer binding info (all if no name)");
+    output("  sequencer <name> bind pattern <patternName> - Bind sequencer to pattern");
+    output("  sequencer <name> bind chain <chainName> - Bind sequencer to chain");
+    output("  sequencer <name> unbind pattern - Unbind pattern from sequencer");
+    output("  sequencer <name> unbind chain - Unbind chain from sequencer");
+    output("  sequencer <name> enable chain - Enable chain for sequencer");
+    output("  sequencer <name> disable chain - Disable chain for sequencer");
     output("");
     output("=== Examples ===");
     output("  list");
@@ -653,16 +898,194 @@ void CommandExecutor::cmdHelp() {
     output("  connections");
     output("  remove pool2");
     output("");
-    output("=== Shortcuts ===");
-    output("  :                    - Toggle console");
-    output("  Cmd+'='              - Toggle command bar");
-    output("  Up/Down arrows       - Navigate command history");
-    output("  Ctrl+C / Cmd+C       - Copy selected text");
+
 }
 
 void CommandExecutor::cmdClear() {
     // Clear is handled by the UI (Console), but we provide the command for consistency
     output("Console cleared.");
+}
+
+void CommandExecutor::cmdPlay() {
+    if (!clock) {
+        output("Error: Clock not available");
+        return;
+    }
+    clock->start();
+    output("Transport started");
+}
+
+void CommandExecutor::cmdStop() {
+    if (!clock) {
+        output("Error: Clock not available");
+        return;
+    }
+    clock->stop();
+    output("Transport stopped");
+}
+
+void CommandExecutor::cmdBPM(const std::string& args) {
+    if (!clock) {
+        output("Error: Clock not available");
+        return;
+    }
+    
+    if (args.empty()) {
+        // Get current BPM
+        float bpm = clock->getBPM();
+        output("Current BPM: %.2f", bpm);
+    } else {
+        // Set BPM
+        try {
+            float bpm = std::stof(args);
+            clock->setBPM(bpm);
+            output("BPM set to: %.2f", bpm);
+        } catch (const std::exception& e) {
+            output("Error: Invalid BPM value '%s'", args.c_str());
+            output("Usage: bpm <value>");
+            output("Example: bpm 140");
+        }
+    }
+}
+
+void CommandExecutor::cmdGetParam(const std::string& args) {
+    if (args.empty()) {
+        output("Usage: get <module> <parameter>");
+        output("Example: get pool1 volume");
+        return;
+    }
+    
+    if (!registry) {
+        output("Error: Registry not set");
+        return;
+    }
+    
+    std::istringstream iss(args);
+    std::string moduleName, paramName;
+    iss >> moduleName;
+    iss >> paramName;
+    
+    if (moduleName.empty() || paramName.empty()) {
+        output("Error: Module and parameter names required");
+        output("Usage: get <module> <parameter>");
+        return;
+    }
+    
+    auto module = registry->getModule(moduleName);
+    if (!module) {
+        output("Error: Module '%s' not found", moduleName.c_str());
+        return;
+    }
+    
+    try {
+        float value = module->getParameter(paramName);
+        output("%s.%s = %.4f", moduleName.c_str(), paramName.c_str(), value);
+    } catch (const std::exception& e) {
+        output("Error: %s", e.what());
+    }
+}
+
+void CommandExecutor::cmdSetParam(const std::string& args) {
+    if (args.empty()) {
+        output("Usage: set <module> <parameter> <value>");
+        output("Example: set pool1 volume 0.8");
+        return;
+    }
+    
+    if (!registry) {
+        output("Error: Registry not set");
+        return;
+    }
+    
+    std::istringstream iss(args);
+    std::string moduleName, paramName, valueStr;
+    iss >> moduleName;
+    iss >> paramName;
+    iss >> valueStr;
+    
+    if (moduleName.empty() || paramName.empty() || valueStr.empty()) {
+        output("Error: Module, parameter, and value required");
+        output("Usage: set <module> <parameter> <value>");
+        return;
+    }
+    
+    auto module = registry->getModule(moduleName);
+    if (!module) {
+        output("Error: Module '%s' not found", moduleName.c_str());
+        return;
+    }
+    
+    try {
+        float value = std::stof(valueStr);
+        module->setParameter(paramName, value);
+        output("%s.%s = %.4f", moduleName.c_str(), paramName.c_str(), value);
+    } catch (const std::exception& e) {
+        output("Error: %s", e.what());
+    }
+}
+
+void CommandExecutor::cmdInfo(const std::string& args) {
+    if (args.empty()) {
+        output("Usage: info <module>");
+        output("Example: info pool1");
+        return;
+    }
+    
+    if (!registry) {
+        output("Error: Registry not set");
+        return;
+    }
+    
+    auto module = registry->getModule(args);
+    if (!module) {
+        output("Error: Module '%s' not found", args.c_str());
+        return;
+    }
+    
+    auto metadata = module->getMetadata();
+    output("=== Module: %s ===", args.c_str());
+    output("Type: %s", metadata.typeName.c_str());
+    output("Enabled: %s", module->isEnabled() ? "yes" : "no");
+    
+    // List parameters
+    if (!metadata.parameterNames.empty()) {
+        output("Parameters:");
+        for (const auto& paramName : metadata.parameterNames) {
+            try {
+                float value = module->getParameter(paramName);
+                output("  %s = %.4f", paramName.c_str(), value);
+            } catch (...) {
+                output("  %s = (error reading)", paramName.c_str());
+            }
+        }
+    }
+    
+    // List events
+    if (!metadata.eventNames.empty()) {
+        output("Events:");
+        for (const auto& eventName : metadata.eventNames) {
+            output("  %s", eventName.c_str());
+        }
+    }
+    
+    // Ports
+    auto inputPorts = module->getInputPorts();
+    auto outputPorts = module->getOutputPorts();
+    if (!inputPorts.empty() || !outputPorts.empty()) {
+        output("Ports:");
+        if (!inputPorts.empty()) {
+            output("  Inputs:");
+            for (const auto& port : inputPorts) {
+                output("    %s", port.name.c_str());
+            }
+        }
+        if (!outputPorts.empty()) {
+            output("  Outputs:");
+            for (const auto& port : outputPorts) {
+                output("    %s", port.name.c_str());
+            }
+        }
+    }
 }
 
 void CommandExecutor::output(const std::string& text) {
@@ -1159,5 +1582,875 @@ void CommandExecutor::processDownload(const DownloadJob& job) {
         std::lock_guard<std::mutex> lock(importMutex_);
         importQueue_.push(importJob);
     }
+}
+
+// ═══════════════════════════════════════════════════════════
+// PATTERN MANAGEMENT COMMANDS
+// ═══════════════════════════════════════════════════════════
+
+void CommandExecutor::cmdPatternList() {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    auto patternNames = patternRuntime->getPatternNames();
+    
+    if (patternNames.empty()) {
+        output("No patterns found");
+        return;
+    }
+    
+    output("=== Patterns ===");
+    for (const auto& name : patternNames) {
+        const Pattern* pattern = patternRuntime->getPattern(name);
+        const PatternPlaybackState* state = patternRuntime->getPlaybackState(name);
+        
+        if (pattern && state) {
+            std::string status = state->isPlaying ? "[PLAYING]" : "[STOPPED]";
+            output("  %s %s (%d steps)", name.c_str(), status.c_str(), pattern->getStepCount());
+        } else {
+            output("  %s [ERROR]", name.c_str());
+        }
+    }
+    output("Total: %zu patterns", patternNames.size());
+}
+
+void CommandExecutor::cmdPatternCreate(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: pattern create <name> [steps=16]");
+        output("Example: pattern create beat1 16");
+        return;
+    }
+    
+    // Parse name and optional steps
+    std::istringstream iss(args);
+    std::string name;
+    int steps = 16;  // Default
+    
+    iss >> name;
+    if (iss >> steps) {
+        // Steps provided
+    }
+    
+    if (name.empty()) {
+        output("Error: Pattern name required");
+        return;
+    }
+    
+    // Check if pattern already exists
+    if (patternRuntime->patternExists(name)) {
+        output("Error: Pattern '%s' already exists", name.c_str());
+        return;
+    }
+    
+    // Create pattern
+    Pattern pattern(steps);
+    std::string createdName = patternRuntime->addPattern(pattern, name);
+    
+    output("Created pattern '%s' with %d steps", createdName.c_str(), steps);
+}
+
+void CommandExecutor::cmdPatternDelete(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: pattern delete <name>");
+        output("Example: pattern delete beat1");
+        return;
+    }
+    
+    std::string name = trim(args);
+    
+    if (!patternRuntime->patternExists(name)) {
+        output("Error: Pattern '%s' not found", name.c_str());
+        return;
+    }
+    
+    patternRuntime->removePattern(name);
+    output("Deleted pattern '%s'", name.c_str());
+}
+
+void CommandExecutor::cmdPatternPlay(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: pattern play <name>");
+        output("Example: pattern play beat1");
+        return;
+    }
+    
+    std::string name = trim(args);
+    
+    if (!patternRuntime->patternExists(name)) {
+        output("Error: Pattern '%s' not found", name.c_str());
+        return;
+    }
+    
+    patternRuntime->playPattern(name);
+    output("Playing pattern '%s'", name.c_str());
+}
+
+void CommandExecutor::cmdPatternStop(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: pattern stop <name>");
+        output("Example: pattern stop beat1");
+        return;
+    }
+    
+    std::string name = trim(args);
+    
+    if (!patternRuntime->patternExists(name)) {
+        output("Error: Pattern '%s' not found", name.c_str());
+        return;
+    }
+    
+    patternRuntime->stopPattern(name);
+    output("Stopped pattern '%s'", name.c_str());
+}
+
+void CommandExecutor::cmdPatternReset(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: pattern reset <name>");
+        output("Example: pattern reset beat1");
+        return;
+    }
+    
+    std::string name = trim(args);
+    
+    if (!patternRuntime->patternExists(name)) {
+        output("Error: Pattern '%s' not found", name.c_str());
+        return;
+    }
+    
+    patternRuntime->resetPattern(name);
+    output("Reset pattern '%s'", name.c_str());
+}
+
+void CommandExecutor::cmdPatternPause(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: pattern pause <name>");
+        output("Example: pattern pause beat1");
+        return;
+    }
+    
+    std::string name = trim(args);
+    
+    if (!patternRuntime->patternExists(name)) {
+        output("Error: Pattern '%s' not found", name.c_str());
+        return;
+    }
+    
+    patternRuntime->pausePattern(name);
+    output("Paused pattern '%s'", name.c_str());
+}
+
+void CommandExecutor::cmdPatternInfo(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: pattern info <name>");
+        output("Example: pattern info beat1");
+        return;
+    }
+    
+    std::string name = trim(args);
+    
+    if (!patternRuntime->patternExists(name)) {
+        output("Error: Pattern '%s' not found", name.c_str());
+        return;
+    }
+    
+    const Pattern* pattern = patternRuntime->getPattern(name);
+    const PatternPlaybackState* state = patternRuntime->getPlaybackState(name);
+    
+    if (!pattern || !state) {
+        output("Error: Could not get pattern or state for '%s'", name.c_str());
+        return;
+    }
+    
+    output("=== Pattern: %s ===", name.c_str());
+    output("Steps: %d", pattern->getStepCount());
+    output("Steps per beat: %.1f", pattern->getStepsPerBeat());
+    output("Status: %s", state->isPlaying ? "PLAYING" : "STOPPED");
+    output("Playback step: %d", state->playbackStep);
+    output("Current playing step: %d", state->currentPlayingStep);
+    output("Pattern cycle count: %d", state->patternCycleCount);
+}
+
+// ═══════════════════════════════════════════════════════════
+// CHAIN MANAGEMENT COMMANDS
+// ═══════════════════════════════════════════════════════════
+
+void CommandExecutor::cmdChainList() {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    auto chainNames = patternRuntime->getChainNames();
+    
+    if (chainNames.empty()) {
+        output("No chains found");
+        return;
+    }
+    
+    output("=== Chains ===");
+    for (const auto& name : chainNames) {
+        const PatternChain* chain = patternRuntime->getChain(name);
+        if (chain) {
+            std::string status = chain->isEnabled() ? "[ENABLED]" : "[DISABLED]";
+            int size = chain->getSize();
+            output("  %s %s (%d entries)", name.c_str(), status.c_str(), size);
+        } else {
+            output("  %s [ERROR]", name.c_str());
+        }
+    }
+    output("Total: %zu chains", chainNames.size());
+}
+
+void CommandExecutor::cmdChainCreate(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    std::string name = trim(args);
+    
+    if (name.empty()) {
+        // Auto-generate name
+        std::string createdName = patternRuntime->addChain();
+        output("Created chain '%s'", createdName.c_str());
+    } else {
+        if (patternRuntime->chainExists(name)) {
+            output("Error: Chain '%s' already exists", name.c_str());
+            return;
+        }
+        std::string createdName = patternRuntime->addChain(name);
+        output("Created chain '%s'", createdName.c_str());
+    }
+}
+
+void CommandExecutor::cmdChainDelete(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: chain delete <name>");
+        output("Example: chain delete chain1");
+        return;
+    }
+    
+    std::string name = trim(args);
+    
+    if (!patternRuntime->chainExists(name)) {
+        output("Error: Chain '%s' not found", name.c_str());
+        return;
+    }
+    
+    patternRuntime->removeChain(name);
+    output("Deleted chain '%s'", name.c_str());
+}
+
+void CommandExecutor::cmdChainInfo(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: chain info <name>");
+        output("Example: chain info chain1");
+        return;
+    }
+    
+    std::string name = trim(args);
+    const PatternChain* chain = patternRuntime->getChain(name);
+    
+    if (!chain) {
+        output("Error: Chain '%s' not found", name.c_str());
+        return;
+    }
+    
+    output("=== Chain: %s ===", name.c_str());
+    output("Enabled: %s", chain->isEnabled() ? "yes" : "no");
+    output("Size: %d entries", chain->getSize());
+    output("Current index: %d", chain->getCurrentIndex());
+    
+    auto patterns = patternRuntime->chainGetPatterns(name);
+    if (patterns.empty()) {
+        output("Patterns: (empty)");
+    } else {
+        output("Patterns:");
+        for (size_t i = 0; i < patterns.size(); i++) {
+            int repeatCount = chain->getRepeatCount((int)i);
+            bool disabled = chain->isEntryDisabled((int)i);
+            std::string disabledStr = disabled ? " [DISABLED]" : "";
+            output("  [%zu] %s (repeat: %d)%s", i, patterns[i].c_str(), repeatCount, disabledStr.c_str());
+        }
+    }
+}
+
+void CommandExecutor::cmdChainAdd(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: chain add <chainName> <patternName> [index]");
+        output("Example: chain add chain1 beat1");
+        output("Example: chain add chain1 beat1 0  (insert at index 0)");
+        return;
+    }
+    
+    std::istringstream iss(args);
+    std::string chainName, patternName;
+    int index = -1;
+    
+    iss >> chainName >> patternName;
+    if (iss >> index) { /* index parsed */ }
+    
+    if (chainName.empty() || patternName.empty()) {
+        output("Error: Both chain name and pattern name are required");
+        return;
+    }
+    
+    if (!patternRuntime->chainExists(chainName)) {
+        output("Error: Chain '%s' not found", chainName.c_str());
+        return;
+    }
+    
+    if (!patternRuntime->patternExists(patternName)) {
+        output("Error: Pattern '%s' not found", patternName.c_str());
+        return;
+    }
+    
+    patternRuntime->chainAddPattern(chainName, patternName, index);
+    output("Added pattern '%s' to chain '%s'", patternName.c_str(), chainName.c_str());
+}
+
+void CommandExecutor::cmdChainRemove(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: chain remove <chainName> <index>");
+        output("Example: chain remove chain1 0");
+        return;
+    }
+    
+    std::istringstream iss(args);
+    std::string chainName;
+    int index = -1;
+    
+    iss >> chainName >> index;
+    
+    if (chainName.empty() || index < 0) {
+        output("Error: Chain name and valid index are required");
+        return;
+    }
+    
+    if (!patternRuntime->chainExists(chainName)) {
+        output("Error: Chain '%s' not found", chainName.c_str());
+        return;
+    }
+    
+    patternRuntime->chainRemovePattern(chainName, index);
+    output("Removed entry at index %d from chain '%s'", index, chainName.c_str());
+}
+
+void CommandExecutor::cmdChainRepeat(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: chain repeat <chainName> <index> <repeatCount>");
+        output("Example: chain repeat chain1 0 4");
+        return;
+    }
+    
+    std::istringstream iss(args);
+    std::string chainName;
+    int index = -1;
+    int repeatCount = 1;
+    
+    iss >> chainName >> index >> repeatCount;
+    
+    if (chainName.empty() || index < 0 || repeatCount < 1) {
+        output("Error: Chain name, valid index, and repeat count (>=1) are required");
+        return;
+    }
+    
+    if (!patternRuntime->chainExists(chainName)) {
+        output("Error: Chain '%s' not found", chainName.c_str());
+        return;
+    }
+    
+    patternRuntime->chainSetRepeat(chainName, index, repeatCount);
+    output("Set repeat count to %d for entry %d in chain '%s'", repeatCount, index, chainName.c_str());
+}
+
+void CommandExecutor::cmdChainEnable(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: chain enable <name>");
+        output("Example: chain enable chain1");
+        return;
+    }
+    
+    std::string name = trim(args);
+    
+    if (!patternRuntime->chainExists(name)) {
+        output("Error: Chain '%s' not found", name.c_str());
+        return;
+    }
+    
+    patternRuntime->chainSetEnabled(name, true);
+    output("Enabled chain '%s'", name.c_str());
+}
+
+void CommandExecutor::cmdChainDisable(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: chain disable <name>");
+        output("Example: chain disable chain1");
+        return;
+    }
+    
+    std::string name = trim(args);
+    
+    if (!patternRuntime->chainExists(name)) {
+        output("Error: Chain '%s' not found", name.c_str());
+        return;
+    }
+    
+    patternRuntime->chainSetEnabled(name, false);
+    output("Disabled chain '%s'", name.c_str());
+}
+
+void CommandExecutor::cmdChainClear(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: chain clear <name>");
+        output("Example: chain clear chain1");
+        return;
+    }
+    
+    std::string name = trim(args);
+    
+    if (!patternRuntime->chainExists(name)) {
+        output("Error: Chain '%s' not found", name.c_str());
+        return;
+    }
+    
+    patternRuntime->chainClear(name);
+    output("Cleared chain '%s'", name.c_str());
+}
+
+void CommandExecutor::cmdChainReset(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (args.empty()) {
+        output("Usage: chain reset <name>");
+        output("Example: chain reset chain1");
+        return;
+    }
+    
+    std::string name = trim(args);
+    
+    if (!patternRuntime->chainExists(name)) {
+        output("Error: Chain '%s' not found", name.c_str());
+        return;
+    }
+    
+    patternRuntime->chainReset(name);
+    output("Reset chain '%s'", name.c_str());
+}
+
+// ═══════════════════════════════════════════════════════════
+// SEQUENCER BINDING COMMANDS
+// ═══════════════════════════════════════════════════════════
+
+void CommandExecutor::cmdSequencerList() {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    auto sequencerNames = patternRuntime->getSequencerNames();
+    
+    if (sequencerNames.empty()) {
+        output("No sequencers found");
+        return;
+    }
+    
+    output("=== Sequencers ===");
+    for (const auto& name : sequencerNames) {
+        auto binding = patternRuntime->getSequencerBinding(name);
+        std::string status = "";
+        if (!binding.patternName.empty()) {
+            status += "pattern:" + binding.patternName;
+        }
+        if (!binding.chainName.empty()) {
+            if (!status.empty()) status += ", ";
+            status += "chain:" + binding.chainName;
+            if (binding.chainEnabled) {
+                status += " [ENABLED]";
+            } else {
+                status += " [DISABLED]";
+            }
+        }
+        if (status.empty()) {
+            status = "[no bindings]";
+        }
+        output("  %s - %s", name.c_str(), status.c_str());
+    }
+    output("Total: %zu sequencer(s)", sequencerNames.size());
+}
+
+void CommandExecutor::cmdSequencerInfo(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    std::string sequencerName = trim(args);
+    
+    if (sequencerName.empty()) {
+        // Show info for all sequencers
+        auto sequencerNames = patternRuntime->getSequencerNames();
+        if (sequencerNames.empty()) {
+            output("No sequencers found");
+            return;
+        }
+        
+        for (const auto& name : sequencerNames) {
+            auto binding = patternRuntime->getSequencerBinding(name);
+            output("");
+            output("=== Sequencer: %s ===", name.c_str());
+            if (!binding.patternName.empty()) {
+                output("Pattern: %s", binding.patternName.c_str());
+            } else {
+                output("Pattern: [not bound]");
+            }
+            if (!binding.chainName.empty()) {
+                output("Chain: %s", binding.chainName.c_str());
+                output("Chain enabled: %s", binding.chainEnabled ? "yes" : "no");
+            } else {
+                output("Chain: [not bound]");
+            }
+        }
+    } else {
+        // Show info for specific sequencer
+        auto binding = patternRuntime->getSequencerBinding(sequencerName);
+        
+        // Check if sequencer exists (has any binding)
+        auto sequencerNames = patternRuntime->getSequencerNames();
+        bool exists = std::find(sequencerNames.begin(), sequencerNames.end(), sequencerName) != sequencerNames.end();
+        
+        if (!exists) {
+            output("Error: Sequencer '%s' not found", sequencerName.c_str());
+            output("Available sequencers:");
+            for (const auto& name : sequencerNames) {
+                output("  %s", name.c_str());
+            }
+            return;
+        }
+        
+        output("=== Sequencer: %s ===", sequencerName.c_str());
+        if (!binding.patternName.empty()) {
+            output("Pattern: %s", binding.patternName.c_str());
+            
+            // Show pattern details
+            Pattern* pattern = patternRuntime->getPattern(binding.patternName);
+            if (pattern) {
+                PatternPlaybackState* state = patternRuntime->getPlaybackState(binding.patternName);
+                output("  Steps: %d", pattern->getStepCount());
+                output("  Steps per beat: %.1f", pattern->getStepsPerBeat());
+                if (state) {
+                    output("  Playing: %s", state->isPlaying ? "yes" : "no");
+                    output("  Current step: %d", state->playbackStep);
+                    output("  Cycle count: %d", state->patternCycleCount);
+                }
+            }
+        } else {
+            output("Pattern: [not bound]");
+        }
+        
+        if (!binding.chainName.empty()) {
+            output("Chain: %s", binding.chainName.c_str());
+            output("Chain enabled: %s", binding.chainEnabled ? "yes" : "no");
+            
+            // Show chain details
+            PatternChain* chain = patternRuntime->getChain(binding.chainName);
+            if (chain) {
+                auto chainPatterns = patternRuntime->chainGetPatterns(binding.chainName);
+                output("  Chain size: %zu entries", chainPatterns.size());
+                output("  Current index: %d", chain->getCurrentIndex());
+                output("  Chain patterns:");
+                for (size_t i = 0; i < chainPatterns.size(); ++i) {
+                    int repeatCount = chain->getRepeatCount((int)i);
+                    bool disabled = chain->isEntryDisabled((int)i);
+                    std::string status = "";
+                    if (i == (size_t)chain->getCurrentIndex()) {
+                        status = " [CURRENT]";
+                    }
+                    if (disabled) {
+                        status += " [DISABLED]";
+                    }
+                    output("    [%zu] %s (repeat: %d)%s", i, chainPatterns[i].c_str(), repeatCount, status.c_str());
+                }
+            }
+        } else {
+            output("Chain: [not bound]");
+        }
+    }
+}
+
+void CommandExecutor::cmdSequencerBindPattern(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (!registry) {
+        output("Error: ModuleRegistry not set");
+        return;
+    }
+    
+    std::istringstream iss(args);
+    std::string sequencerName, patternName;
+    iss >> sequencerName >> patternName;
+    
+    if (sequencerName.empty() || patternName.empty()) {
+        output("Usage: sequencer <sequencerName> bind pattern <patternName>");
+        output("Example: sequencer trackerSequencer1 bind pattern P1");
+        return;
+    }
+    
+    // Verify sequencer module exists (sequencer-agnostic check)
+    auto module = registry->getModule(sequencerName);
+    if (!module) {
+        output("Error: Sequencer '%s' not found", sequencerName.c_str());
+        return;
+    }
+    
+    if (!patternRuntime->patternExists(patternName)) {
+        output("Error: Pattern '%s' not found", patternName.c_str());
+        return;
+    }
+    
+    // Bind sequencer to pattern via PatternRuntime
+    // The sequencer module will sync immediately via sequencerBindingChangedEvent
+    patternRuntime->bindSequencerPattern(sequencerName, patternName);
+    
+    output("Bound sequencer '%s' to pattern '%s'", sequencerName.c_str(), patternName.c_str());
+}
+
+void CommandExecutor::cmdSequencerBindChain(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (!registry) {
+        output("Error: ModuleRegistry not set");
+        return;
+    }
+    
+    std::istringstream iss(args);
+    std::string sequencerName, chainName;
+    iss >> sequencerName >> chainName;
+    
+    if (sequencerName.empty() || chainName.empty()) {
+        output("Usage: sequencer <sequencerName> bind chain <chainName>");
+        output("Example: sequencer trackerSequencer1 bind chain chain1");
+        return;
+    }
+    
+    // Verify sequencer module exists (sequencer-agnostic check)
+    auto module = registry->getModule(sequencerName);
+    if (!module) {
+        output("Error: Sequencer '%s' not found", sequencerName.c_str());
+        return;
+    }
+    
+    if (!patternRuntime->chainExists(chainName)) {
+        output("Error: Chain '%s' not found", chainName.c_str());
+        return;
+    }
+    
+    // Bind sequencer to chain via PatternRuntime
+    // The sequencer module will sync immediately via sequencerBindingChangedEvent
+    patternRuntime->bindSequencerChain(sequencerName, chainName);
+    
+    // Enable chain by default if chain is enabled
+    PatternChain* chain = patternRuntime->getChain(chainName);
+    if (chain && chain->isEnabled()) {
+        patternRuntime->setSequencerChainEnabled(sequencerName, true);
+    }
+    
+    output("Bound sequencer '%s' to chain '%s'", sequencerName.c_str(), chainName.c_str());
+}
+
+void CommandExecutor::cmdSequencerUnbindPattern(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (!registry) {
+        output("Error: ModuleRegistry not set");
+        return;
+    }
+    
+    std::string sequencerName = trim(args);
+    
+    if (sequencerName.empty()) {
+        output("Usage: sequencer <sequencerName> unbind pattern");
+        return;
+    }
+    
+    // Verify sequencer module exists (sequencer-agnostic check)
+    auto module = registry->getModule(sequencerName);
+    if (!module) {
+        output("Error: Sequencer '%s' not found", sequencerName.c_str());
+        return;
+    }
+    
+    // Unbind pattern via PatternRuntime
+    // The sequencer module will sync immediately via sequencerBindingChangedEvent
+    patternRuntime->unbindSequencerPattern(sequencerName);
+    
+    output("Unbound pattern from sequencer '%s'", sequencerName.c_str());
+}
+
+void CommandExecutor::cmdSequencerUnbindChain(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    if (!registry) {
+        output("Error: ModuleRegistry not set");
+        return;
+    }
+    
+    std::string sequencerName = trim(args);
+    
+    if (sequencerName.empty()) {
+        output("Usage: sequencer <sequencerName> unbind chain");
+        return;
+    }
+    
+    // Verify sequencer module exists (sequencer-agnostic check)
+    auto module = registry->getModule(sequencerName);
+    if (!module) {
+        output("Error: Sequencer '%s' not found", sequencerName.c_str());
+        return;
+    }
+    
+    // Unbind chain via PatternRuntime
+    // The sequencer module will sync immediately via sequencerBindingChangedEvent
+    patternRuntime->unbindSequencerChain(sequencerName);
+    
+    output("Unbound chain from sequencer '%s'", sequencerName.c_str());
+}
+
+void CommandExecutor::cmdSequencerEnableChain(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    std::string sequencerName = trim(args);
+    
+    if (sequencerName.empty()) {
+        output("Usage: sequencer <sequencerName> enable chain");
+        return;
+    }
+    
+    auto binding = patternRuntime->getSequencerBinding(sequencerName);
+    if (binding.chainName.empty()) {
+        output("Error: Sequencer '%s' is not bound to a chain", sequencerName.c_str());
+        return;
+    }
+    
+    patternRuntime->setSequencerChainEnabled(sequencerName, true);
+    output("Enabled chain for sequencer '%s'", sequencerName.c_str());
+}
+
+void CommandExecutor::cmdSequencerDisableChain(const std::string& args) {
+    if (!patternRuntime) {
+        output("Error: PatternRuntime not set");
+        return;
+    }
+    
+    std::string sequencerName = trim(args);
+    
+    if (sequencerName.empty()) {
+        output("Usage: sequencer <sequencerName> disable chain");
+        return;
+    }
+    
+    auto binding = patternRuntime->getSequencerBinding(sequencerName);
+    if (binding.chainName.empty()) {
+        output("Error: Sequencer '%s' is not bound to a chain", sequencerName.c_str());
+        return;
+    }
+    
+    patternRuntime->setSequencerChainEnabled(sequencerName, false);
+    output("Disabled chain for sequencer '%s'", sequencerName.c_str());
 }
 

@@ -740,7 +740,7 @@ std::shared_ptr<Module> ModuleGUI::getModule() const {
     return registry->getModule(instanceName);
 }
 
-CellWidget ModuleGUI::createCellWidget(
+std::unique_ptr<BaseCell> ModuleGUI::createCellWidget(
     const ParameterDescriptor& paramDesc,
     std::function<float()> customGetter,
     std::function<void(float)> customSetter,
@@ -750,8 +750,8 @@ CellWidget ModuleGUI::createCellWidget(
 ) const {
     auto module = getModule();
     if (!module) {
-        // Return empty CellWidget if module not found
-        return CellWidget();
+        // Return nullptr if module not found
+        return nullptr;
     }
     
     // Use ParameterCell internally as implementation detail
@@ -774,8 +774,8 @@ CellWidget ModuleGUI::createCellWidget(
         cell.setCustomParser(customParser);
     }
     
-    // Return configured CellWidget
-    return cell.createCellWidget();
+    // Return configured BaseCell
+    return cell.createCell();
 }
 
 // ============================================================================
