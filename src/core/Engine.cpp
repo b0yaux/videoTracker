@@ -854,25 +854,11 @@ void Engine::notifyStateChange() {
     }
     // #endregion
     
-    // CRITICAL FIX: Only defer if commands are actively processing
-    // Commands are processed atomically, so state is stable after commands are done
-    // Script execution just queues commands, doesn't modify state directly
-    // So it's safe to notify when commands are done, even if script is executing
-    if (commandsBeingProcessed_.load()) {
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SIMPLIFIED\",\"hypothesisId\":\"SIMPLIFIED\",\"location\":\"Engine.cpp:notifyStateChange\",\"message\":\"notifyStateChange - skipping (commands processing)\",\"data\":{},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
-        ofLogVerbose("Engine") << "notifyStateChange() skipped - commands processing";
-        return;
-    }
+    // CRITICAL FIX: Don't skip notifications during command processing
+    // getState() now handles unsafe periods by returning cached state
+    // This ensures observers always receive state updates, even during command processing
+    // Observers will see the last known good state, which is acceptable
+    // The stateNeedsNotification_ flag ensures notifications happen after commands complete
     
     // CRITICAL FIX: Throttle expensive state snapshot building
     // Prevents main thread blocking from excessive snapshot generation
