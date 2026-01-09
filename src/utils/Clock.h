@@ -35,7 +35,8 @@ public:
     // Setup and configuration
     void setup();
     void setBPM(float bpm);
-    float getBPM() const;
+    float getBPM() const;  // Returns smoothed currentBpm (for audio/display)
+    float getTargetBPM() const;  // Returns targetBpm (for state snapshots/script generation)
     
     // Transport control
     // NOTE: Clock is the SINGLE SOURCE OF TRUTH for global transport state.
@@ -59,6 +60,9 @@ public:
     
     // Time event system for sample-accurate beat timing
     ofEvent<TimeEvent> timeEvent;  // Fires BEAT events only (step timing is handled by TrackerSequencer instances)
+    
+    // BPM change event - fires when BPM is changed (for state sync)
+    ofEvent<float> bpmChangedEvent;  // Fires with new BPM value when setBPM() is called
     
     // Configuration
     void setConfig(const ClockConfig& cfg);

@@ -6,6 +6,7 @@
 #include <map>
 #include <vector>
 #include <functional>
+#include <shared_mutex>
 #include "ofJson.h"
 
 // Forward declarations
@@ -139,6 +140,12 @@ public:
     void clear();
     
     /**
+     * Set callback for parameter change notifications (for script sync)
+     * @param callback Function to call when parameters change (can be nullptr)
+     */
+    void setParameterChangeNotificationCallback(std::function<void()> callback);
+    
+    /**
      * Initialize all registered modules
      * This should be called after modules are registered to ensure proper initialization
      * @param clock Pointer to Clock instance (can be nullptr)
@@ -184,7 +191,7 @@ public:
         class ConnectionManager* connectionManager,
         class ParameterRouter* parameterRouter,
         class PatternRuntime* patternRuntime = nullptr,  // PatternRuntime for modules that need pattern access
-        class GUIManager* guiManager = nullptr,
+        std::function<void(const std::string&)> onAdded = nullptr,  // Callback when module is added (for UI sync)
         const std::string& masterAudioOutName = "masterAudioOut",
         const std::string& masterVideoOutName = "masterVideoOut"
     );
@@ -202,7 +209,7 @@ public:
     bool removeModule(
         const std::string& identifier,
         class ConnectionManager* connectionManager,
-        class GUIManager* guiManager = nullptr,
+        std::function<void(const std::string&)> onRemoved = nullptr,  // Callback when module is removed (for UI cleanup)
         const std::string& masterAudioOutName = "masterAudioOut",
         const std::string& masterVideoOutName = "masterVideoOut"
     );
@@ -216,5 +223,14 @@ private:
     
     // Human name -> UUID mapping (for reverse lookup)
     std::map<std::string, std::string> nameToUUID;
+    
+    // Callback for parameter change notifications (for script sync)
+    std::function<void()> parameterChangeNotificationCallback_;
+    
+    // Thread-safe registry access mutex (read-write lock)
+    // Protects module storage and iteration from concurrent access
+    // Read operations (getModule, forEachModule) use shared_lock
+    // Write operations (registerModule, removeModule) use unique_lock
+    mutable std::shared_mutex registryMutex_;
 };
 

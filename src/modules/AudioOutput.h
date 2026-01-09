@@ -52,11 +52,17 @@ public:
     // Module interface implementation
     std::string getName() const override;
     ModuleType getType() const override;
-    std::vector<ParameterDescriptor> getParameters() const override;
+    std::vector<ParameterDescriptor> getParametersImpl() const override;
     void onTrigger(TriggerEvent& event) override; // Outputs don't receive triggers
-    void setParameter(const std::string& paramName, float value, bool notify = true) override;
-    float getParameter(const std::string& paramName) const override;
+    void setParameterImpl(const std::string& paramName, float value, bool notify = true) override;
+    float getParameterImpl(const std::string& paramName) const override;
     ModuleMetadata getMetadata() const override;
+    
+    // Indexed parameter support for connection-based parameters
+    bool supportsIndexedParameters() const override { return true; }
+    std::vector<std::pair<std::string, int>> getIndexedParameterRanges() const override;
+    float getIndexedParameter(const std::string& baseName, int index) const override;
+    void setIndexedParameter(const std::string& baseName, int index, float value, bool notify = true) override;
     
     // Routing interface - AudioOutput accepts audio input (it's a sink, not a source)
     // But internally it uses a mixer, so sources connect to the mixer

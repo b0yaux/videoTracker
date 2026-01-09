@@ -99,14 +99,49 @@ void MultiSamplerGUI::drawContent() {
     }
     
     // Get current MultiSampler instance (handles null case)
-    MultiSampler* pool = getMultiSampler();
-    if (!pool) {
+    MultiSampler* sampler = getMultiSampler();
+    if (!sampler) {
         std::string instanceName = ModuleGUI::getInstanceName();
         ImGui::Text("Instance '%s' not found", instanceName.empty() ? "unknown" : instanceName.c_str());
-        // Still set up drag drop target even if pool is null
+        // Still set up drag drop target even if sampler is null
         setupDragDropTarget();
         return;
     }
+    
+    // Sync selectedSampleIndex_ to currently playing sample and sync GUI state from voice
+    // This ensures the GUI shows the waveform and parameters for the last played sample
+    // GUI layer owns this sync logic (separation of concerns - backend doesn't know about GUI)
+    // 
+    // NOTE: Direct state reads (isPlaying, getSampleCount, isSamplePlaying) are used here for display logic.
+    // These could be replaced with EngineState snapshots in the future, but would require parsing
+    // JSON from typeSpecificData. Parameter reads already use commands (correct), so these direct
+    // reads are acceptable for now as they're module-specific display state, not parameter state.
+    if (sampler->isPlaying()) {
+        size_t sampleCount = sampler->getSampleCount();
+        // Find the first playing sample (in monophonic mode, there's only one)
+        // In polyphonic mode, show the first one found (could be enhanced to show most recent)
+        for (size_t i = 0; i < sampleCount; ++i) {
+            if (sampler->isSamplePlaying(static_cast<int>(i))) {
+                selectedSampleIndex_ = i;
+                
+                // Sync GUI state from voice (GUI's responsibility, not backend's)
+                Voice* voice = sampler->getVoiceForSample(static_cast<int>(i));
+                if (voice && (voice->state == Voice::PLAYING || voice->state == Voice::RELEASING)) {
+                    SampleRef& sample = sampler->getSampleMutable(i);
+                    // Sync GUI state from MediaPlayer (single source of truth for position)
+                    sample.currentPlayheadPosition = voice->player.playheadPosition.get();
+                    sample.currentSpeed = voice->player.speed.get();
+                    sample.currentVolume = voice->player.volume.get();
+                    sample.currentStartPosition = voice->player.startPosition.get();
+                    sample.currentRegionStart = voice->player.regionStart.get();
+                    sample.currentRegionEnd = voice->player.regionEnd.get();
+                    sample.currentGrainSize = voice->player.loopSize.get();
+                }
+                break;  // In monophonic mode, there's only one playing sample
+            }
+        }
+    }
+    // If not playing, keep the current selectedSampleIndex_ (user's manual selection)
     
     // Global Controls (Simple Button Bar - NOT in child window)
     drawGlobalControls();
@@ -173,8 +208,8 @@ void MultiSamplerGUI::drawContent() {
 /// MARK: - GLOBAL CONTROLS
 /// @brief Draw simple button bar for global controls (PLAY, PLAY STYLE, POLYPHONY)
 void MultiSamplerGUI::drawGlobalControls() {
-    MultiSampler* pool = getMultiSampler();
-    if (!pool) return;
+    MultiSampler* sampler = getMultiSampler();
+    if (!sampler) return;
     
     // Simple horizontal button layout - divide available width equally
     // We have 4 buttons: PLAY, PLAY STYLE, POLYPHONY, and Waveform Overlay Mode
@@ -182,9 +217,9 @@ void MultiSamplerGUI::drawGlobalControls() {
     float buttonWidth = (availableWidth - 3 * ImGui::GetStyle().ItemSpacing.x) / 4.0f;
     
     // 1. PLAY Button (mediaIndex)
-    size_t currentIndex = pool->getCurrentIndex();
-    size_t numPlayers = pool->getNumPlayers();
-    bool isActive = pool->isSamplePlaying(static_cast<int>(currentIndex));
+    size_t currentIndex = selectedSampleIndex_;
+    size_t numPlayers = sampler->getSampleCount();
+    bool isActive = sampler->isSamplePlaying(static_cast<int>(currentIndex));
     
     char indexBuf[8];
     if (numPlayers > 0) {
@@ -204,18 +239,18 @@ void MultiSamplerGUI::drawGlobalControls() {
         if (numPlayers == 0) return;
         if (isActive) {
             // Stop all voices playing this sample
-            auto voices = pool->getVoicesForSample(static_cast<int>(currentIndex));
+            auto voices = sampler->getVoicesForSample(static_cast<int>(currentIndex));
             for (auto* voice : voices) {
                 voice->release();
                 voice->state = Voice::RELEASING;
             }
             // If no other samples are playing, transition to IDLE
-            if (!pool->isPlaying()) {
-                pool->setModeIdle();
+            if (!sampler->isPlaying()) {
+                sampler->setModeIdle();
             }
         } else {
             // Start manual playback - plays normally (no gate duration)
-            pool->playMediaManual(currentIndex);
+            sampler->playMediaManual(currentIndex);
         }
     }
     ImGui::PopItemFlag();
@@ -227,7 +262,7 @@ void MultiSamplerGUI::drawGlobalControls() {
     ImGui::SameLine();
     
     // 2. PLAY STYLE Button (enum - cycles ONCE/LOOP/GRAIN/NEXT)
-    PlayStyle currentStyle = pool->getPlayStyle();
+    PlayStyle currentStyle = sampler->getPlayStyle();
     const char* styleLabel;
     switch (currentStyle) {
         case PlayStyle::ONCE: styleLabel = "ONCE"; break;
@@ -247,7 +282,7 @@ void MultiSamplerGUI::drawGlobalControls() {
             case PlayStyle::GRAIN: nextStyle = PlayStyle::NEXT; break;
             case PlayStyle::NEXT: nextStyle = PlayStyle::ONCE; break;
         }
-        pool->setPlayStyle(nextStyle);
+        sampler->setPlayStyle(nextStyle);
     }
     ImGui::PopItemFlag();
     
@@ -276,7 +311,7 @@ void MultiSamplerGUI::drawGlobalControls() {
     ImGui::SameLine();
     
     // 3. POLYPHONY Button (enum - toggles MONO/POLY)
-    PolyphonyMode currentMode = pool->getPolyphonyMode();
+    PolyphonyMode currentMode = sampler->getPolyphonyMode();
     const char* modeLabel = (currentMode == PolyphonyMode::POLYPHONIC) ? "POLY" : "MONO";
     const char* tooltipText = (currentMode == PolyphonyMode::POLYPHONIC) 
         ? "POLYPHONIC\nClick to switch to MONOPHONIC"
@@ -286,7 +321,7 @@ void MultiSamplerGUI::drawGlobalControls() {
     if (ImGui::Button(modeLabel, ImVec2(buttonWidth, 0))) {
         // Toggle polyphony mode
         float newValue = (currentMode == PolyphonyMode::MONOPHONIC) ? 1.0f : 0.0f;
-        pool->setParameter("polyphonyMode", newValue, true);
+        setParameterViaCommand("polyphonyMode", newValue);
     }
     ImGui::PopItemFlag();
     
@@ -344,9 +379,9 @@ void MultiSamplerGUI::drawGlobalControls() {
 /// @param paramDesc 
 /// @return std::unique_ptr<BaseCell>
 std::unique_ptr<BaseCell> MultiSamplerGUI::createCellWidgetForParameter(const ParameterDescriptor& paramDesc) {
-    MultiSampler* pool = getMultiSampler();
-    if (!pool) {
-        return nullptr;  // Return nullptr if no pool
+    MultiSampler* sampler = getMultiSampler();
+    if (!sampler) {
+        return nullptr;  // Return nullptr if no sampler
     }
     
     // Use ModuleGUI helper to create BaseCell with routing awareness
@@ -354,29 +389,30 @@ std::unique_ptr<BaseCell> MultiSamplerGUI::createCellWidgetForParameter(const Pa
     // Set up custom getter - capture mediaPool to get active player dynamically
     // This ensures we always get the current active player, not a stale reference
     auto customGetter = [this, paramDesc]() -> float {
-        MultiSampler* pool = getMultiSampler();
-        if (!pool) {
+        MultiSampler* sampler = getMultiSampler();
+        if (!sampler) {
             return std::numeric_limits<float>::quiet_NaN();
         }
         
-        const SampleRef* displaySample = pool->getDisplaySample();
+        const SampleRef* displaySample = (sampler && selectedSampleIndex_ < sampler->getSampleCount()) 
+            ? &sampler->getSample(selectedSampleIndex_) : nullptr;
         if (!displaySample) {
             return std::numeric_limits<float>::quiet_NaN();
         }
         
-        // Read from GUI state (synced from voice during playback, editable when idle)
+        // Read from parameter state cache (synced from voice during playback, editable when idle)
         if (paramDesc.name == "position") {
-            return displaySample->guiStartPosition;
+            return displaySample->currentStartPosition;
         } else if (paramDesc.name == "speed") {
-            return displaySample->guiSpeed;
+            return displaySample->currentSpeed;
         } else if (paramDesc.name == "volume") {
-            return displaySample->guiVolume;
+            return displaySample->currentVolume;
         } else if (paramDesc.name == "regionStart") {
-            return displaySample->guiRegionStart;
+            return displaySample->currentRegionStart;
         } else if (paramDesc.name == "regionEnd") {
-            return displaySample->guiRegionEnd;
+            return displaySample->currentRegionEnd;
         } else if (paramDesc.name == "grainSize" || paramDesc.name == "loopSize") {
-            return displaySample->guiGrainSize;
+            return displaySample->currentGrainSize;
         }
         
         return std::numeric_limits<float>::quiet_NaN();
@@ -384,20 +420,12 @@ std::unique_ptr<BaseCell> MultiSamplerGUI::createCellWidgetForParameter(const Pa
     
     // Set up custom setter
     auto customSetter = [this, paramDesc](float value) {
-        MultiSampler* pool = getMultiSampler();
-        if (pool) {
-            // setParameter updates GUI state (works even without active player)
-            pool->setParameter(paramDesc.name, value, true);
-        }
+        setParameterViaCommand(paramDesc.name, value);
     };
     
     // Set up custom remover: reset to default value (double-click to reset)
     auto customRemover = [this, paramDesc]() {
-        MultiSampler* pool = getMultiSampler();
-        if (pool) {
-            // setParameter updates GUI state (works even without active player)
-            pool->setParameter(paramDesc.name, paramDesc.defaultValue, true);
-        }
+        setParameterViaCommand(paramDesc.name, paramDesc.defaultValue);
     };
     
     // Special handling for grainSize: logarithmic mapping for better precision at low values (1-100ms granular range)
@@ -409,12 +437,13 @@ std::unique_ptr<BaseCell> MultiSamplerGUI::createCellWidgetForParameter(const Pa
         
         // Calculate default slider value from actual grainSize value (not hardcoded 1.0s)
         // This ensures the slider shows the correct value even when grainSize is 0
-        MultiSampler* pool = getMultiSampler();
+        MultiSampler* sampler = getMultiSampler();
         float defaultSeconds = 0.0f;
-        if (pool) {
-            const SampleRef* displaySample = pool->getDisplaySample();
+        if (sampler) {
+            const SampleRef* displaySample = (sampler && selectedSampleIndex_ < sampler->getSampleCount()) 
+            ? &sampler->getSample(selectedSampleIndex_) : nullptr;
             if (displaySample) {
-                defaultSeconds = displaySample->guiGrainSize;
+                defaultSeconds = displaySample->currentGrainSize;
             }
         }
         // If still 0, use a reasonable default (0.1s = 100ms) for initial display
@@ -438,14 +467,15 @@ std::unique_ptr<BaseCell> MultiSamplerGUI::createCellWidgetForParameter(const Pa
         
         // Override getter: Map from actual seconds to logarithmic slider value (0.0-1.0)
         auto loopSizeGetter = [this, MIN_LOOP_SIZE, MAX_LOOP_SIZE]() -> float {
-            MultiSampler* pool = getMultiSampler();
-            if (!pool) return 0.0f;
+            MultiSampler* sampler = getMultiSampler();
+            if (!sampler) return 0.0f;
             
-            const SampleRef* displaySample = pool->getDisplaySample();
+            const SampleRef* displaySample = (sampler && selectedSampleIndex_ < sampler->getSampleCount()) 
+            ? &sampler->getSample(selectedSampleIndex_) : nullptr;
             if (!displaySample) return 0.0f;
             
             // Get actual grainSize value in seconds from GUI state
-            float actualValue = displaySample->guiGrainSize;
+            float actualValue = displaySample->currentGrainSize;
             
             // Map from linear seconds to logarithmic slider value (0.0-1.0)
             // Inverse of: value = MIN * pow(MAX/MIN, sliderValue)
@@ -473,8 +503,8 @@ std::unique_ptr<BaseCell> MultiSamplerGUI::createCellWidgetForParameter(const Pa
         
         // Override setter: Map from slider value to actual seconds
         auto loopSizeSetter = [this, paramDesc, MIN_LOOP_SIZE, MAX_LOOP_SIZE](float sliderValue) {
-            MultiSampler* pool = getMultiSampler();
-            if (!pool) {
+            MultiSampler* sampler = getMultiSampler();
+            if (!sampler) {
                 ofLogWarning("MultiSamplerGUI") << "[CRASH PREVENTION] MultiSampler is null in setValue callback for parameter: " << paramDesc.name;
                 return;
             }
@@ -498,15 +528,14 @@ std::unique_ptr<BaseCell> MultiSamplerGUI::createCellWidgetForParameter(const Pa
             }
             
             // Clamp to actual duration if available
-            auto activePlayer = pool->getActivePlayer();
-            if (activePlayer) {
-                float duration = activePlayer->getDuration();
-                if (duration > 0.001f) {
-                    actualValue = std::min(actualValue, duration);
+            if (selectedSampleIndex_ < sampler->getSampleCount()) {
+                const SampleRef& sample = sampler->getSample(selectedSampleIndex_);
+                if (sample.duration > 0.001f) {
+                    actualValue = std::min(actualValue, sample.duration);
                 }
             }
             
-            pool->setParameter(paramDesc.name, actualValue, true);
+            setParameterViaCommand(paramDesc.name, actualValue);
         };
         
         // Override formatter: Show actual seconds with appropriate precision
@@ -549,13 +578,10 @@ std::unique_ptr<BaseCell> MultiSamplerGUI::createCellWidgetForParameter(const Pa
                                      paramDesc.displayName);
         
         // Override setter to allow values beyond REASONABLE_MAX_MS (for direct input)
-        auto adsrSetter = [this, paramDesc, REASONABLE_MAX_MS](float value) {
-            MultiSampler* pool = getMultiSampler();
-            if (pool) {
-                // Allow values beyond REASONABLE_MAX_MS (no clamping in setter)
-                // The parameter descriptor's maxValue is only used for drag sensitivity
-                pool->setParameter(paramDesc.name, value, true);
-            }
+        auto adsrSetter = [this, paramDesc](float value) {
+            // Allow values beyond REASONABLE_MAX_MS (no clamping in setter)
+            // The parameter descriptor's maxValue is only used for drag sensitivity
+            setParameterViaCommand(paramDesc.name, value);
         };
         
         // Use standard getter (no special mapping needed)
@@ -572,13 +598,12 @@ std::unique_ptr<BaseCell> MultiSamplerGUI::createCellWidgetForParameter(const Pa
 // ParameterDescriptor : Returns a vector of ParameterDescriptor objects representing editable parameters.
 // Parameters named "note" are excluded from the returned vector.
 std::vector<ParameterDescriptor> MultiSamplerGUI::getEditableParameters() const {
-    MultiSampler* pool = getMultiSampler();
-    if (!pool) {
+    MultiSampler* sampler = getMultiSampler();
+    if (!sampler) {
         ofLogWarning("MultiSamplerGUI") << "[CRASH PREVENTION] MultiSampler is null in getEditableParameters()";
         return std::vector<ParameterDescriptor>(); // Return empty vector
     }
-    
-    auto params = pool->getParameters();
+    auto params = sampler->getParameters();
     std::vector<ParameterDescriptor> editableParams;
     for (const auto& param : params) {
         if (param.name != "note") {
@@ -590,8 +615,8 @@ std::vector<ParameterDescriptor> MultiSamplerGUI::getEditableParameters() const 
 
 
 void MultiSamplerGUI::drawParameters() {
-    MultiSampler* pool = getMultiSampler();
-    if (!pool) return;
+    MultiSampler* sampler = getMultiSampler();
+    if (!sampler) return;
     
     // Start at the very top of the child window (no padding)
     ImGui::SetCursorPosY(0);
@@ -722,7 +747,8 @@ void MultiSamplerGUI::drawParameters() {
         }
         isParentWidgetFocused = false;
     };
-    callbacks.createCell = [this, pool](int row, int col, const CellGridColumnConfig& colConfig) -> std::unique_ptr<BaseCell> {
+    
+    callbacks.createCell = [this, sampler](int row, int col, const CellGridColumnConfig& colConfig) -> std::unique_ptr<BaseCell> {
         // Use parameter name directly from colConfig - no need to search through all parameters
         const std::string& paramName = colConfig.parameterName;
         
@@ -742,11 +768,12 @@ void MultiSamplerGUI::drawParameters() {
         return nullptr; // Return nullptr if not found
     };
     callbacks.drawSpecialColumn = nullptr; // Will be set after all other callbacks are defined
-    callbacks.getCellValue = [this, pool](int row, int col, const CellGridColumnConfig& colConfig) -> float {
+    callbacks.getCellValue = [this, sampler](int row, int col, const CellGridColumnConfig& colConfig) -> float {
         // Use parameter name directly from colConfig - no index conversion needed
         const std::string& paramName = colConfig.parameterName;
         
-        const SampleRef* displaySample = pool->getDisplaySample();
+        const SampleRef* displaySample = (sampler && selectedSampleIndex_ < sampler->getSampleCount()) 
+            ? &sampler->getSample(selectedSampleIndex_) : nullptr;
         if (!displaySample) {
             // Fallback: look up default value from available parameters
             auto editableParams = getEditableParameters();
@@ -758,19 +785,19 @@ void MultiSamplerGUI::drawParameters() {
             return 0.0f;
         }
         
-        // Read from GUI state (synced from voice during playback, editable when idle)
+        // Read from parameter state cache (synced from voice during playback, editable when idle)
         if (paramName == "position") {
-            return displaySample->guiStartPosition;
+            return displaySample->currentStartPosition;
         } else if (paramName == "speed") {
-            return displaySample->guiSpeed;
+            return displaySample->currentSpeed;
         } else if (paramName == "volume") {
-            return displaySample->guiVolume;
+            return displaySample->currentVolume;
         } else if (paramName == "regionStart") {
-            return displaySample->guiRegionStart;
+            return displaySample->currentRegionStart;
         } else if (paramName == "regionEnd") {
-            return displaySample->guiRegionEnd;
+            return displaySample->currentRegionEnd;
         } else if (paramName == "grainSize" || paramName == "loopSize") {
-            return displaySample->guiGrainSize;
+            return displaySample->currentGrainSize;
         }
         
         // Fallback: look up default value from available parameters
@@ -782,14 +809,12 @@ void MultiSamplerGUI::drawParameters() {
         }
         return 0.0f;
     };
-    callbacks.setCellValue = [pool](int row, int col, float value, const CellGridColumnConfig& colConfig) {
+    callbacks.setCellValue = [this](int row, int col, float value, const CellGridColumnConfig& colConfig) {
         // Use parameter name directly from colConfig - no index conversion needed
         const std::string& paramName = colConfig.parameterName;
         
-        // CRITICAL FIX: Don't require activePlayer - parameters can be edited even when no player is active
-        // The setParameter method works on SampleRef defaults, not just active players
-        // Use MultiSampler's unified parameter setting API
-        pool->setParameter(paramName, value, true);
+        // Route through command queue for thread-safe parameter changes
+        setParameterViaCommand(paramName, value);
     };
     callbacks.onRowStart = [](int row, bool isPlaybackRow, bool isEditRow) {
         // Set row background color
@@ -832,7 +857,7 @@ void MultiSamplerGUI::drawParameters() {
     auto onCellFocusChangedCallback = callbacks.onCellFocusChanged;
     auto onCellClickedCallback = callbacks.onCellClicked;
     
-    callbacks.drawSpecialColumn = [this, pool, getCellValueCallback, setCellValueCallback, 
+    callbacks.drawSpecialColumn = [this, sampler, getCellValueCallback, setCellValueCallback, 
                                     createCellCallback, isCellFocusedCallback,
                                     onCellFocusChangedCallback, onCellClickedCallback]
                                     (int row, int col, const CellGridColumnConfig& colConfig) {
@@ -980,18 +1005,18 @@ void MultiSamplerGUI::drawParameters() {
 }
 
 void MultiSamplerGUI::drawADSRParameters() {
-    MultiSampler* pool = getMultiSampler();
-    if (!pool) return;
+    MultiSampler* sampler = getMultiSampler();
+    if (!sampler) return;
     
     // Only show ADSR in ONCE and LOOP modes
-    PlayStyle currentStyle = pool->getPlayStyle();
+    PlayStyle currentStyle = sampler->getPlayStyle();
     if (currentStyle != PlayStyle::ONCE && currentStyle != PlayStyle::LOOP) {
         return;
     }
     
     // Get ADSR parameters
     std::vector<ParameterDescriptor> adsrParams;
-    auto allParams = pool->getParameters();
+    auto allParams = sampler->getParameters();
     for (const auto& param : allParams) {
         if (param.name == "attackMs" || param.name == "decayMs" || 
             param.name == "sustain" || param.name == "releaseMs") {
@@ -1039,9 +1064,9 @@ void MultiSamplerGUI::drawADSRParameters() {
     
     setupStandardCellGridCallbacks(callbacks, adsrFocusState, adsrCallbacksState, adsrCellGrid, true);
     
-    callbacks.createCell = [this, pool](int row, int col, const CellGridColumnConfig& colConfig) -> std::unique_ptr<BaseCell> {
+    callbacks.createCell = [this, sampler](int row, int col, const CellGridColumnConfig& colConfig) -> std::unique_ptr<BaseCell> {
         const std::string& paramName = colConfig.parameterName;
-        auto allParams = pool->getParameters();
+        auto allParams = sampler->getParameters();
         for (const auto& paramDesc : allParams) {
             if (paramDesc.name == paramName) {
                 return createCellWidgetForParameter(paramDesc);
@@ -1050,14 +1075,14 @@ void MultiSamplerGUI::drawADSRParameters() {
         return nullptr;
     };
     
-    callbacks.getCellValue = [this, pool](int row, int col, const CellGridColumnConfig& colConfig) -> float {
+    callbacks.getCellValue = [this, sampler](int row, int col, const CellGridColumnConfig& colConfig) -> float {
         const std::string& paramName = colConfig.parameterName;
-        return pool->getParameter(paramName);
+        return sampler->getParameter(paramName);
     };
     
-    callbacks.setCellValue = [pool](int row, int col, float value, const CellGridColumnConfig& colConfig) {
+    callbacks.setCellValue = [this](int row, int col, float value, const CellGridColumnConfig& colConfig) {
         const std::string& paramName = colConfig.parameterName;
-        pool->setParameter(paramName, value, true);
+        setParameterViaCommand(paramName, value);
     };
     
     callbacks.onRowStart = [](int row, bool isPlaybackRow, bool isEditRow) {
@@ -1077,18 +1102,18 @@ void MultiSamplerGUI::drawADSRParameters() {
 }
 
 void MultiSamplerGUI::drawGranularControls() {
-    MultiSampler* pool = getMultiSampler();
-    if (!pool) return;
+    MultiSampler* sampler = getMultiSampler();
+    if (!sampler) return;
     
     // Only show granular controls in GRAIN mode
-    PlayStyle currentStyle = pool->getPlayStyle();
+    PlayStyle currentStyle = sampler->getPlayStyle();
     if (currentStyle != PlayStyle::GRAIN) {
         return;
     }
     
     // Get granular parameters
     std::vector<ParameterDescriptor> granularParams;
-    auto allParams = pool->getParameters();
+    auto allParams = sampler->getParameters();
     for (const auto& param : allParams) {
         if (param.name == "grainSize" || param.name == "grainEnvelope") {
             granularParams.push_back(param);
@@ -1135,9 +1160,9 @@ void MultiSamplerGUI::drawGranularControls() {
     
     setupStandardCellGridCallbacks(callbacks, granularFocusState, granularCallbacksState, granularCellGrid, true);
     
-    callbacks.createCell = [this, pool](int row, int col, const CellGridColumnConfig& colConfig) -> std::unique_ptr<BaseCell> {
+    callbacks.createCell = [this, sampler](int row, int col, const CellGridColumnConfig& colConfig) -> std::unique_ptr<BaseCell> {
         const std::string& paramName = colConfig.parameterName;
-        auto allParams = pool->getParameters();
+        auto allParams = sampler->getParameters();
         for (const auto& paramDesc : allParams) {
             if (paramDesc.name == paramName) {
                 return createCellWidgetForParameter(paramDesc);
@@ -1146,27 +1171,28 @@ void MultiSamplerGUI::drawGranularControls() {
         return nullptr;
     };
     
-    callbacks.getCellValue = [this, pool](int row, int col, const CellGridColumnConfig& colConfig) -> float {
+    callbacks.getCellValue = [this, sampler](int row, int col, const CellGridColumnConfig& colConfig) -> float {
         const std::string& paramName = colConfig.parameterName;
-        const SampleRef* displaySample = pool->getDisplaySample();
+        const SampleRef* displaySample = (sampler && selectedSampleIndex_ < sampler->getSampleCount()) 
+            ? &sampler->getSample(selectedSampleIndex_) : nullptr;
         if (!displaySample) {
-            return pool->getParameter(paramName);
+            return sampler->getParameter(paramName);
         }
         
-        // Read from GUI state (synced from voice during playback, editable when idle)
+        // Read from parameter state cache (synced from voice during playback, editable when idle)
         if (paramName == "grainSize" || paramName == "loopSize") {
-            return displaySample->guiGrainSize;
+            return displaySample->currentGrainSize;
         } else if (paramName == "grainEnvelope") {
             // For now, return parameter value (grainEnvelope not yet stored in SampleRef)
-            return pool->getParameter(paramName);
+            return sampler->getParameter(paramName);
         }
         
-        return pool->getParameter(paramName);
+        return sampler->getParameter(paramName);
     };
     
-    callbacks.setCellValue = [pool](int row, int col, float value, const CellGridColumnConfig& colConfig) {
+    callbacks.setCellValue = [this](int row, int col, float value, const CellGridColumnConfig& colConfig) {
         const std::string& paramName = colConfig.parameterName;
-        pool->setParameter(paramName, value, true);
+        setParameterViaCommand(paramName, value);
     };
     
     callbacks.onRowStart = [](int row, bool isPlaybackRow, bool isEditRow) {
@@ -1254,39 +1280,39 @@ void MultiSamplerGUI::drawMediaList() {
     // Track if any list item is focused (to update parent widget focus state)
     bool anyListItemFocused = false;
     
-    MultiSampler* pool = getMultiSampler();
-    if (!pool) return;
+    MultiSampler* sampler = getMultiSampler();
+    if (!sampler) return;
     
     // Get current index for auto-scrolling
-    size_t currentIndex = pool->getCurrentIndex();
+    size_t currentIndex = selectedSampleIndex_;
     
     // Track if index changed to determine if we should sync scroll
     bool shouldSyncScroll = (currentIndex != previousMediaIndex);
     
     // Get polyphony mode for display logic
-    PolyphonyMode polyMode = pool->getPolyphonyMode();
+    PolyphonyMode polyMode = sampler->getPolyphonyMode();
     bool isPolyMode = (polyMode == PolyphonyMode::POLYPHONIC);
     
     // SAMPLER-INSPIRED: Show indexed sample list from sample bank
-    size_t numSamples = pool->getSampleCount();
+    size_t numSamples = sampler->getSampleCount();
     if (numSamples > 0) {
         // Log list iteration for troubleshooting
         ofLogVerbose("MediaPoolGUI") << "[drawMediaList] Iterating " << numSamples << " samples";
         
         for (size_t i = 0; i < numSamples; i++) {
-            const SampleRef& sample = pool->getSample(i);
+            const SampleRef& sample = sampler->getSample(i);
             
             // PROFESSIONAL VOICE STATE TRACKING
             // Check if this sample is the currently displayed one (for waveform sync)
             bool isDisplayed = (i == currentIndex);
             
             // Check if sample is actively playing (any voice)
-            bool isPlaying = pool->isSamplePlaying(static_cast<int>(i));
+            bool isPlaying = sampler->isSamplePlaying(static_cast<int>(i));
             
             // Get voice count for polyphonic mode display
             int voiceCount = 0;
             if (isPolyMode) {
-                voiceCount = pool->getVoiceCountForSample(static_cast<int>(i));
+                voiceCount = sampler->getVoiceCountForSample(static_cast<int>(i));
             }
             
             // Create clean display format: [01] [AV] Title
@@ -1353,7 +1379,7 @@ void MultiSamplerGUI::drawMediaList() {
                     ofLogError("MultiSamplerGUI") << "[CRASH PREVENTION] Index " << i << " out of bounds when clicking sample";
                 } else {
                     // Set as displayed sample (for waveform sync)
-                    clickedPool->setDisplayIndex(i);
+                    selectedSampleIndex_ = i;  // GUI manages selection
                     
                     // Play sample normally (no gate duration - plays until stopped)
                     // In MONO mode: stops previous sample automatically
@@ -1419,7 +1445,7 @@ void MultiSamplerGUI::drawMediaList() {
                 if (isPolyMode && voiceCount > 0) {
                     if (ImGui::MenuItem("Stop All Voices")) {
                         // Release all voices playing this sample
-                        auto voices = pool->getVoicesForSample(static_cast<int>(i));
+                        auto voices = sampler->getVoicesForSample(static_cast<int>(i));
                         for (auto* voice : voices) {
                             voice->release();
                             voice->state = Voice::RELEASING;
@@ -1433,11 +1459,11 @@ void MultiSamplerGUI::drawMediaList() {
                 
                 if (ImGui::MenuItem("Unload from Memory", nullptr, false, isLoaded)) {
                     // Unload the sample's shared audio and display player
-                    SampleRef& mutableSample = pool->getSampleMutable(i);
+                    SampleRef& mutableSample = sampler->getSampleMutable(i);
                     mutableSample.unloadSharedAudio();
                     
                     // Release all voices playing this sample
-                    auto voices = pool->getVoicesForSample(static_cast<int>(i));
+                    auto voices = sampler->getVoicesForSample(static_cast<int>(i));
                     for (auto* voice : voices) {
                         voice->stop();
                         voice->state = Voice::FREE;
@@ -1447,7 +1473,7 @@ void MultiSamplerGUI::drawMediaList() {
                 ImGui::Separator();
                 
                 if (ImGui::MenuItem("Remove from List")) {
-                    pool->removeSample(i);
+                    sampler->removeSample(i);
                 }
                 
                 ImGui::EndPopup();
@@ -1494,8 +1520,9 @@ void MultiSamplerGUI::drawWaveform() {
     if (!sampler) return;
     
     // Get current media index for per-index zoom state
-    size_t currentIndex = sampler->getCurrentIndex();
-    const SampleRef* displaySample = sampler->getDisplaySample();
+    size_t currentIndex = selectedSampleIndex_;
+        const SampleRef* displaySample = (sampler && selectedSampleIndex_ < sampler->getSampleCount()) 
+            ? &sampler->getSample(selectedSampleIndex_) : nullptr;
     
     auto zoomState = getWaveformZoomState(currentIndex);
     float waveformZoom = zoomState.first;
@@ -1769,7 +1796,7 @@ void MultiSamplerGUI::drawWaveform() {
     // Draw waveform using industry-standard min/max vertical lines
     if (hasAudioData) {
         float amplitudeScale = canvasHeight * WAVEFORM_AMPLITUDE_SCALE;
-        float volume = displaySample->guiVolume;
+        float volume = displaySample->currentVolume;
         ImU32 lineColor = GUIConstants::toU32(GUIConstants::Waveform::Line);
         
         // Draw each channel as vertical lines from min to max
@@ -1797,10 +1824,11 @@ void MultiSamplerGUI::drawWaveform() {
 /// @param canvasHeight 
 /// @return void
 void MultiSamplerGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2& canvasMax, float canvasWidth, float canvasHeight) {
-    MultiSampler* pool = getMultiSampler();
-    if (!pool) return;
+    MultiSampler* sampler = getMultiSampler();
+    if (!sampler) return;
     
-    const SampleRef* displaySample = pool->getDisplaySample();
+    const SampleRef* displaySample = (sampler && selectedSampleIndex_ < sampler->getSampleCount()) 
+        ? &sampler->getSample(selectedSampleIndex_) : nullptr;
     if (!displaySample || !displaySample->isReadyForPlayback()) return;
     
     // CRITICAL: Check if dragging a BaseCell (NumCell) - prevents interference with waveform interactions
@@ -1816,16 +1844,16 @@ void MultiSamplerGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     
     // Get current media index for per-index zoom state
-    size_t currentIndex = getMultiSampler()->getCurrentIndex();
+    size_t currentIndex = selectedSampleIndex_;
     auto zoomState = getWaveformZoomState(currentIndex);
     float waveformZoom = zoomState.first;
     float waveformOffset = zoomState.second;
     
     // Get current parameter values from GUI state
-    float playheadPos = displaySample->guiPlayheadPosition; // Absolute position
-    float startPosRelative = displaySample->guiStartPosition; // Relative position (0.0-1.0 within region)
-    float regionStart = displaySample->guiRegionStart;
-    float regionEnd = displaySample->guiRegionEnd;
+    float playheadPos = displaySample->currentPlayheadPosition; // Absolute position
+    float startPosRelative = displaySample->currentStartPosition; // Relative position (0.0-1.0 within region)
+    float regionStart = displaySample->currentRegionStart;
+    float regionEnd = displaySample->currentRegionEnd;
     
     // Ensure region bounds are valid (start <= end)
     if (regionStart > regionEnd) {
@@ -1931,14 +1959,15 @@ void MultiSamplerGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2
                 waveformDragStartX = mouseX;
             } else {
                 // Click on empty area: update GUI state
-                MultiSampler* pool = getMultiSampler();
-                SampleRef* displaySample = pool ? pool->getDisplaySample() : nullptr;
-                if (displaySample && pool) {
-                    if (pool->isPlaying()) {
+                MultiSampler* sampler = getMultiSampler();
+                SampleRef* displaySample = (sampler && selectedSampleIndex_ < sampler->getSampleCount()) 
+                    ? &sampler->getSampleMutable(selectedSampleIndex_) : nullptr;
+                if (displaySample && sampler) {
+                    if (sampler->isPlaying()) {
                         // PLAYING mode (sequencer active): Update startPosition for next trigger
                         // Do NOT seek playhead - playback controls the playhead (synced from voice)
-                        float regionStartVal = displaySample->guiRegionStart;
-                        float regionEndVal = displaySample->guiRegionEnd;
+                        float regionStartVal = displaySample->currentRegionStart;
+                        float regionEndVal = displaySample->currentRegionEnd;
                         float regionSize = regionEndVal - regionStartVal;
                         
                         float relativePos = 0.0f;
@@ -1950,11 +1979,11 @@ void MultiSamplerGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2
                             relativePos = std::max(0.0f, std::min(1.0f, relativeX));
                         }
                         
-                        displaySample->guiStartPosition = relativePos;
-                        pool->setParameter("position", relativePos, true);
+                        displaySample->currentStartPosition = relativePos;
+                        setParameterViaCommand("position", relativePos);
                     } else {
                         // IDLE mode: Set playhead position for visual feedback only
-                        displaySample->guiPlayheadPosition = relativeX;
+                        displaySample->currentPlayheadPosition = relativeX;
                     }
                 }
             }
@@ -1962,30 +1991,31 @@ void MultiSamplerGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2
         
         // Continue dragging
         if (draggingMarker != WaveformMarker::NONE && ImGui::IsMouseDragging(0)) {
-            MultiSampler* pool = getMultiSampler();
-            SampleRef* displaySample = pool ? pool->getDisplaySample() : nullptr;
-            if (displaySample && pool) {
+            MultiSampler* sampler = getMultiSampler();
+            SampleRef* displaySample = (sampler && selectedSampleIndex_ < sampler->getSampleCount()) 
+                ? &sampler->getSampleMutable(selectedSampleIndex_) : nullptr;
+            if (displaySample && sampler) {
                 switch (draggingMarker) {
                     case WaveformMarker::REGION_START: {
                         float newStart = relativeX;
                         // Clamp to [0, regionEnd]
                         newStart = std::max(0.0f, std::min(regionEnd, newStart));
-                        displaySample->guiRegionStart = newStart;
-                        pool->setParameter("regionStart", newStart, true);
+                        displaySample->currentRegionStart = newStart;
+                        setParameterViaCommand("regionStart", newStart);
                         break;
                     }
                     case WaveformMarker::REGION_END: {
                         float newEnd = relativeX;
                         // Clamp to [regionStart, 1]
                         newEnd = std::max(regionStart, std::min(1.0f, newEnd));
-                        displaySample->guiRegionEnd = newEnd;
-                        pool->setParameter("regionEnd", newEnd, true);
+                        displaySample->currentRegionEnd = newEnd;
+                        setParameterViaCommand("regionEnd", newEnd);
                         break;
                     }
                     case WaveformMarker::POSITION: {
                         // Update startPosition (position marker) - map absolute to relative within region
-                        float regionStartVal = displaySample->guiRegionStart;
-                        float regionEndVal = displaySample->guiRegionEnd;
+                        float regionStartVal = displaySample->currentRegionStart;
+                        float regionEndVal = displaySample->currentRegionEnd;
                         float regionSize = regionEndVal - regionStartVal;
                         
                         float relativePos = 0.0f;
@@ -1998,14 +2028,14 @@ void MultiSamplerGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2
                             relativePos = std::max(0.0f, std::min(1.0f, relativeX));
                         }
                         
-                        displaySample->guiStartPosition = relativePos;
-                        if (!pool->isPlaying()) {
+                        displaySample->currentStartPosition = relativePos;
+                        if (!sampler->isPlaying()) {
                             // Update playheadPosition to show absolute position
                             float absolutePos = (regionSize > 0.001f) ? 
                                 (regionStartVal + relativePos * regionSize) : relativePos;
-                            displaySample->guiPlayheadPosition = absolutePos;
+                            displaySample->currentPlayheadPosition = absolutePos;
                         }
-                        pool->setParameter("position", relativePos, true);
+                        setParameterViaCommand("position", relativePos);
                         break;
                     }
                     default:
@@ -2025,19 +2055,20 @@ void MultiSamplerGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2
     // Only allow scrubbing if not dragging automation curves or region markers
     bool isDraggingAutomation = false; // Will be set by automation editor if active
     if (draggingMarker == WaveformMarker::NONE && ImGui::IsMouseDragging(0) && !isDraggingParameter && !isDraggingAutomation && (isCanvasHovered || isCanvasActive)) {
-        MultiSampler* pool = getMultiSampler();
-        SampleRef* displaySample = pool ? pool->getDisplaySample() : nullptr;
-        if (!displaySample || !pool) return;
+        MultiSampler* sampler = getMultiSampler();
+        SampleRef* displaySample = (sampler && selectedSampleIndex_ < sampler->getSampleCount()) 
+            ? &sampler->getSampleMutable(selectedSampleIndex_) : nullptr;
+        if (!displaySample || !sampler) return;
         
         // Use existing relativeX (already calculated above with zoom/pan)
         
-        if (pool->isPlaying()) {
+        if (sampler->isPlaying()) {
             // Only set scrubbing flag when actually scrubbing (while playing)
             isScrubbing = true;
             // PLAYING mode: Update position continuously during drag
             // Map absolute position to relative position within region
-            float regionStartVal = displaySample->guiRegionStart;
-            float regionEndVal = displaySample->guiRegionEnd;
+            float regionStartVal = displaySample->currentRegionStart;
+            float regionEndVal = displaySample->currentRegionEnd;
             float regionSize = regionEndVal - regionStartVal;
             
             float relativePos = 0.0f;
@@ -2050,14 +2081,14 @@ void MultiSamplerGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2
             }
             
             // Update GUI state immediately for smooth visual feedback
-            displaySample->guiStartPosition = relativePos;
-            // Note: guiPlayheadPosition shows current playback (synced from voice), not scrubbed position
+            displaySample->currentStartPosition = relativePos;
+            // Note: currentPlayheadPosition shows current playback (synced from voice), not scrubbed position
             
             // CRITICAL: Scrubbing while playing only updates startPosition (for next trigger)
             // It does NOT affect playheadPosition (current playback position)
             // Directly update ALL active voices for this sample for continuous updates
-            size_t currentIndex = pool->getCurrentIndex();
-            auto activeVoices = pool->getVoicesForSample(static_cast<int>(currentIndex));
+            size_t currentIndex = selectedSampleIndex_;
+            auto activeVoices = sampler->getVoicesForSample(static_cast<int>(currentIndex));
             
             // Update startPosition on all active voices (affects next trigger, not current playback)
             for (auto* voice : activeVoices) {
@@ -2067,8 +2098,8 @@ void MultiSamplerGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2
                 }
             }
             
-            // Also update via setParameter for GUI state consistency
-            pool->setParameter("position", relativePos, true);
+            // Also update via command queue for GUI state consistency
+            setParameterViaCommand("position", relativePos);
         }
         // IDLE mode scrubbing removed - no audio feedback when paused
     }
@@ -2186,12 +2217,12 @@ void MultiSamplerGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2
     // Draw loop range visualization (when in LOOP play style with loopSize > 0)
     PlayStyle currentPlayStyle = getMultiSampler()->getPlayStyle();
     if (currentPlayStyle == PlayStyle::GRAIN) {
-        float grainSizeSeconds = displaySample->guiGrainSize;
+        float grainSizeSeconds = displaySample->currentGrainSize;
         if (grainSizeSeconds > 0.001f) {
             float duration = displaySample->duration;
             if (duration > 0.001f) {
                 // Calculate loop start position (absolute) - same logic as in MultiSampler::update()
-                float relativeStartPos = displaySample->guiStartPosition;
+                float relativeStartPos = displaySample->currentStartPosition;
                 float regionSize = regionEnd - regionStart;
                 float loopStartAbsolute = 0.0f;
                 
@@ -2819,13 +2850,13 @@ bool MultiSamplerGUI::handleKeyPress(int key, bool ctrlPressed, bool shiftPresse
 }
 
 bool MultiSamplerGUI::handleFileDrop(const std::vector<std::string>& filePaths) {
-    MultiSampler* pool = getMultiSampler();
-    if (!pool || filePaths.empty()) {
+    MultiSampler* sampler = getMultiSampler();
+    if (!sampler || filePaths.empty()) {
         return false;
     }
     
     // Add files to MultiSampler
-    pool->addMediaFiles(filePaths);
+    sampler->addMediaFiles(filePaths);
     return true;
 }
 

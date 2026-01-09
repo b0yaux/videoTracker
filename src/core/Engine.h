@@ -12,14 +12,23 @@
 #include "MediaConverter.h"
 #include "AssetLibrary.h"
 #include "PatternRuntime.h"
+#include "ScriptManager.h"
+#include "Command.h"
 #include "modules/AudioOutput.h"
 #include "modules/VideoOutput.h"
 #include "ofxSoundObjects.h"
+#include "ofxLua.h"
+#include "readerwriterqueue.h"
+#include "../../libs/concurrentqueue/blockingconcurrentqueue.h"  // From moodycamel (Phase 7.3)
 #include <memory>
 #include <shared_mutex>
+#include <mutex>
 #include <atomic>
 #include <vector>
 #include <functional>
+#include <cstdint>
+#include <thread>
+#include <chrono>
 
 // Forward declarations
 class GUIManager;
@@ -78,9 +87,70 @@ public:
     // Execute any command - returns result with success/error
     Result executeCommand(const std::string& command);
     
-    // Script execution (for future Lua integration)
+    /**
+     * Execute Lua script synchronously (blocks until completion).
+     * 
+     * Use this for:
+     * - Internal engine operations that need immediate results
+     * - Scripts that must complete before continuing
+     * - Fallback when async execution unavailable
+     * 
+     * For UI-triggered script execution, use evalAsync() instead (non-blocking).
+     */
     Result eval(const std::string& script);
     Result evalFile(const std::string& path);
+    
+    /**
+     * Execute Lua script asynchronously (non-blocking, returns immediately).
+     * 
+     * Use this for:
+     * - User-triggered script execution (CMD+R, auto-evaluation)
+     * - Long-running scripts that shouldn't block UI
+     * - Scripts that can complete in background
+     * 
+     * Result delivered via callback on main thread.
+     * 
+     * @param script Script to execute
+     * @param callback Callback function (executed on main thread)
+     * @param timeoutMs Timeout in milliseconds (0 = no timeout)
+     * @return Execution ID (0 if queue failed, use for cancellation)
+     */
+    uint64_t evalAsync(const std::string& script, std::function<void(Result)> callback, int timeoutMs = 0);
+    
+    /**
+     * Execute script with sync contract (Script → Engine synchronization).
+     * 
+     * This method executes script and waits for state to be updated before calling callback.
+     * Guarantees script changes are reflected in engine state before callback fires.
+     * 
+     * Uses:
+     * - Command queue synchronization (waits for commands to be processed)
+     * - State versioning (waits for state version to be updated)
+     * 
+     * @param script Script to execute
+     * @param callback Callback function (executed when sync is complete)
+     *                  Receives success/failure status
+     */
+    void syncScriptToEngine(const std::string& script, std::function<void(bool success)> callback);
+    
+    // ═══════════════════════════════════════════════════════════
+    // SHELL-SAFE API (Shells should ONLY use these methods)
+    // ═══════════════════════════════════════════════════════════
+    // 
+    // Shells (CodeShell, EditorShell, CommandShell, CLIShell) should
+    // ONLY use the methods in this section. All other methods are for
+    // internal use, Lua bindings, or GUI components.
+    // 
+    // Shell-Safe Methods:
+    // - getState() - Read state via immutable snapshots
+    // - executeCommand() - Change state via commands
+    // - enqueueCommand() - Queue commands for audio thread
+    // - subscribe() / unsubscribe() - Subscribe to state changes
+    // - setScriptUpdateCallback() - Register script update callback
+    // - setScriptAutoUpdate() - Control script auto-update
+    // - isScriptAutoUpdateEnabled() - Check auto-update status
+    // 
+    // See docs/SHELL_ABSTRACTION.md for complete pattern documentation.
     
     // ═══════════════════════════════════════════════════════════
     // STATE OBSERVATION (Read-Only Snapshots)
@@ -92,7 +162,117 @@ public:
     // Get specific module state
     EngineState::ModuleState getModuleState(const std::string& name) const;
     
+    // ═══════════════════════════════════════════════════════════
+    // STATE SNAPSHOT (Lock-Free Serialization)
+    // ═══════════════════════════════════════════════════════════
+    
+    /**
+     * Get current engine state snapshot (lock-free read).
+     * Returns immutable JSON snapshot that can be serialized without locks.
+     * 
+     * THREAD-SAFE: Lock-free read (atomic pointer load).
+     * Can be called from any thread without locks.
+     * 
+     * @return Shared pointer to immutable JSON snapshot, or nullptr if snapshot not yet created
+     */
+    std::shared_ptr<const ofJson> getStateSnapshot() const {
+        std::lock_guard<std::mutex> lock(snapshotJsonMutex_);
+        return snapshotJson_;  // Fast read with mutex (C++17 compatible)
+    }
+    
+    /**
+     * Get current state version number.
+     * Used for snapshot staleness detection.
+     * 
+     * THREAD-SAFE: Atomic read.
+     * 
+     * @return Current state version number
+     */
+    uint64_t getStateVersion() const {
+        return stateVersion_.load();
+    }
+    
+    /**
+     * Wait for state to reach target version (optional, for future sync contracts).
+     * This method waits for state to reach target version (for future bidirectional sync contracts).
+     * Uses std::this_thread::yield() in wait loop (non-blocking).
+     * Returns when stateVersion_ >= targetVersion or timeout occurs.
+     * 
+     * @param targetVersion Target version number to wait for
+     * @param timeoutMs Timeout in milliseconds (default 1000ms)
+     */
+    void waitForStateVersion(uint64_t targetVersion, uint64_t timeoutMs = 1000);
+    
+    /**
+     * Sync engine state to editor shells with completion guarantee (Engine → Editor Shell synchronization).
+     * 
+     * This method ensures editor shells receive state updates with completion guarantee.
+     * Uses event-driven notification queue for proper ordering.
+     * 
+     * @param callback Callback function (executed when sync is complete)
+     *                  Receives state snapshot when sync is complete
+     */
+    void syncEngineToEditor(std::function<void(const EngineState&)> callback);
+    
+    // ═══════════════════════════════════════════════════════════
+    // SHELL-SAFE API (for ScriptManager operations)
+    // ═══════════════════════════════════════════════════════════
+    
+    /**
+     * Set script update callback (Shell-safe API)
+     * Wraps ScriptManager::setScriptUpdateCallback()
+     * @param callback Function called when script updates
+     */
+    void setScriptUpdateCallback(std::function<void(const std::string&)> callback);
+    
+    /**
+     * Set script auto-update enabled/disabled (Shell-safe API)
+     * Wraps ScriptManager::setAutoUpdate()
+     * @param enabled Whether to enable auto-updates
+     */
+    void setScriptAutoUpdate(bool enabled);
+    
+    /**
+     * Check if script auto-update is enabled (Shell-safe API)
+     * Wraps ScriptManager::isAutoUpdateEnabled()
+     * @return true if auto-update is enabled
+     */
+    bool isScriptAutoUpdateEnabled() const;
+    
+    // ═══════════════════════════════════════════════════════════
+    // COMMAND QUEUE (Unified command processing)
+    // ═══════════════════════════════════════════════════════════
+    
+    /**
+     * Enqueue a command for processing in the audio thread
+     * @param cmd Command to enqueue (takes ownership)
+     * @return true if enqueued successfully, false if queue is full
+     */
+    bool enqueueCommand(std::unique_ptr<Command> cmd);
+    
+    /**
+     * Process all queued commands (called from audio thread)
+     * @return Number of commands processed
+     */
+    int processCommands();
+    
+    /**
+     * Execute a command immediately (synchronous, for non-audio operations)
+     * @param cmd Command to execute (takes ownership)
+     */
+    void executeCommandImmediate(std::unique_ptr<Command> cmd);
+    
     // Subscribe to state changes
+    // 
+    // Observer Safety Requirements:
+    // - Observers MUST be read-only: only read state, never modify it
+    // - Observers MUST NOT call enqueueCommand() or executeCommand() during notification
+    // - Observers MUST NOT call notifyStateChange() (would cause recursive notifications)
+    // - Observers MUST handle exceptions internally (exceptions are caught and logged, observer removed)
+    // - Observers receive state via getState() which handles unsafe periods by returning cached state
+    // - Observers may be called during command processing or script execution (state is cached)
+    // 
+    // Violations will cause the observer to be removed automatically.
     using StateObserver = std::function<void(const EngineState&)>;
     size_t subscribe(StateObserver callback);
     void unsubscribe(size_t id);
@@ -114,8 +294,19 @@ public:
     bool deserializeState(const std::string& data);
     
     // ═══════════════════════════════════════════════════════════
-    // DIRECT ACCESS (for performance-critical operations)
+    // DIRECT ACCESS (NOT for Shells - Internal/Lua/GUI use only)
     // ═══════════════════════════════════════════════════════════
+    // 
+    // WARNING: Shells should NOT use these methods!
+    // These are for:
+    // - Lua bindings (SWIG code generation)
+    // - GUI components (GUIManager, ModuleGUI, etc.)
+    // - Engine internal code
+    // 
+    // Shells should use Shell-safe API methods instead (see above).
+    // 
+    // If you're implementing a Shell and need access to these, you're
+    // doing something wrong. Use getState() and executeCommand() instead.
     
     Clock& getClock() { return clock_; }
     ModuleRegistry& getModuleRegistry() { return moduleRegistry_; }
@@ -128,6 +319,7 @@ public:
     CommandExecutor& getCommandExecutor() { return commandExecutor_; }
     PatternRuntime& getPatternRuntime() { return patternRuntime_; }
     const PatternRuntime& getPatternRuntime() const { return patternRuntime_; }
+    ScriptManager& getScriptManager() { return scriptManager_; }
     
     // Get master outputs
     std::shared_ptr<AudioOutput> getMasterAudioOut() const { return masterAudioOut_; }
@@ -142,11 +334,47 @@ public:
     void setOnProjectClosed(std::function<void()> callback) { onProjectClosed_ = callback; }
     void setOnUpdateWindowTitle(std::function<void()> callback) { onUpdateWindowTitle_ = callback; }
     
-    // Setup GUI managers (called from ofApp)
-    void setupGUIManagers(GUIManager* guiManager, ViewManager* viewManager);
+    // UI operation callbacks (optional, registered by Shells)
+    void setOnModuleAdded(std::function<void(const std::string&)> callback) { onModuleAdded_ = callback; }
+    void setOnModuleRemoved(std::function<void(const std::string&)> callback) { onModuleRemoved_ = callback; }
     
-    // Get GUIManager pointer (for components that need it)
-    GUIManager* getGUIManager() const { return guiManager_; }
+    
+    // Unsafe state detection (consolidated from multiple flags)
+    // Purpose: Single source of truth for unsafe state detection
+    // Uses bitmask to track multiple unsafe conditions simultaneously
+    // Bit 0: Script executing
+    // Bit 1: Commands being processed
+    // Bit 2+: Reserved for future use
+    enum class UnsafeState : uint8_t {
+        NONE = 0,
+        SCRIPT_EXECUTING = 1 << 0,
+        COMMANDS_PROCESSING = 1 << 1
+    };
+    
+    // Check if script is currently executing (for components that need to defer operations)
+    bool isExecutingScript() const { return hasUnsafeState(UnsafeState::SCRIPT_EXECUTING); }
+    
+    /**
+     * Check if we're currently building a state snapshot (thread-local check)
+     * Used to prevent recursive calls during snapshot building
+     * @return true if buildStateSnapshot() is currently executing on this thread
+     */
+    static bool isBuildingSnapshot() { return isBuildingSnapshot_; }
+    bool commandsBeingProcessed() const { return hasUnsafeState(UnsafeState::COMMANDS_PROCESSING); }
+    bool hasPendingCommands() const { return commandQueue_.size_approx() > 0; }
+    bool isInUnsafeState() const { 
+        return unsafeStateFlags_.load() != 0 || parametersBeingModified_.load() > 0; 
+    }
+    
+    // Render guard (prevents state updates during rendering)
+    bool isRendering() const { return isRendering_.load(); }
+    void setRendering(bool rendering) { isRendering_.store(rendering); }
+    
+    // Public method for ParameterRouter to notify state changes
+    void notifyParameterChanged();  // Debounced parameter change notification for script sync
+    
+    // Event handlers
+    void onBPMChanged(float& newBpm);  // Called when Clock BPM changes
     
 private:
     // Core components (already exist, just moved from ofApp)
@@ -168,37 +396,238 @@ private:
     // Command execution
     CommandExecutor commandExecutor_;
     
+    // Script management (generates Lua from state)
+    ScriptManager scriptManager_;
+    
+    // Lua scripting
+    std::unique_ptr<ofxLua> lua_;
+    
+    // Background thread Lua state (for async execution)
+    std::unique_ptr<ofxLua> asyncLua_;
+    
     // Configuration
     EngineConfig config_;
     bool isSetup_ = false;
     
+    // Frame counter for deferring notification processing during startup
+    // Skip notification processing for first few frames to allow window to appear
+    mutable std::atomic<size_t> updateFrameCount_{0};
+    
     // State observation
+    // Purpose: Protects observers_ vector during registration/unregistration
+    // When used: subscribe() and unsubscribe() methods (called by Shells)
+    // Still needed: Yes - Shells register/unregister observers dynamically
+    // Can be simplified: No - shared_mutex allows concurrent reads, exclusive writes
     mutable std::shared_mutex stateMutex_;
     std::vector<std::pair<size_t, StateObserver>> observers_;
+    // Purpose: Thread-safe observer ID generation
+    // When used: subscribe() method to assign unique IDs
+    // Still needed: Yes - Multiple threads may subscribe concurrently
+    // Can be simplified: No - Atomic counter is optimal
     std::atomic<size_t> nextObserverId_{0};
+    
+    // Unsafe state flags (implementation detail - enum is public for inline method access)
+    std::atomic<uint8_t> unsafeStateFlags_{0};
+    
+    // Helper methods for unsafe state management
+    void setUnsafeState(UnsafeState state, bool active);
+    bool hasUnsafeState(UnsafeState state) const;
+    
+    // Render guard (prevents state updates during rendering)
+    // Purpose: Flag indicating rendering is in progress (ImGui draw() method)
+    // When used: notifyStateChange() checks this to defer notifications during rendering
+    // Still needed: Yes - Prevents crashes from state updates during ImGui rendering
+    // Can be simplified: No - Critical for preventing crashes during rendering
+    std::atomic<bool> isRendering_{false};
+    
+    // CRITICAL: Mutex to completely block state snapshot building during script execution
+    // Purpose: Prevents buildStateSnapshot() from running during script execution
+    // When used: buildStateSnapshot() tries to acquire this (non-blocking) before building
+    // Still needed: Yes - buildStateSnapshot() is still used by getState() for state observation
+    // Can be simplified: Potentially - If Shells migrate to snapshots, buildStateSnapshot() may become unused
+    // Note: Serialization no longer uses this (uses getStateSnapshot() instead - lock-free)
+    // TODO: Remove after consolidating with unsafeStateFlags_ (Task 2)
+    mutable std::mutex scriptExecutionMutex_;
+    
+    // Background thread for async script execution
+    std::thread scriptExecutionThread_;
+    std::atomic<bool> scriptExecutionThreadRunning_{false};
+    std::atomic<uint64_t> nextScriptExecutionId_{1};
+    
+    // Script execution request for async execution
+    struct ScriptExecutionRequest {
+        std::string script;
+        std::function<void(Result)> callback;
+        uint64_t id;
+        std::chrono::steady_clock::time_point timestamp;
+        int timeoutMs = 0;  // 0 = no timeout
+        
+        ScriptExecutionRequest() : id(0), timeoutMs(0) {}
+    };
+    moodycamel::BlockingConcurrentQueue<ScriptExecutionRequest> scriptExecutionQueue_;
+    
+    // Pending callbacks to execute on main thread
+    struct PendingCallback {
+        uint64_t id;
+        Result result;
+        std::function<void(Result)> callback;
+    };
+    moodycamel::BlockingConcurrentQueue<PendingCallback> pendingScriptCallbacks_;
+    
+    // Background thread function for script execution
+    void scriptExecutionThreadFunction();
+    
+    // Execute script in background Lua state
+    Result executeScriptInBackground(const std::string& script, int timeoutMs = 0);
+    
+    // Post script execution result to main thread
+    void postScriptResultToMainThread(uint64_t id, Result result, std::function<void(Result)> callback);
+    
+    // CRITICAL: Cooldown period after command processing to prevent crashes
+    // Purpose: Prevents video drawing immediately after commands complete
+    // When used: Video rendering checks this before accessing module state
+    
+    // Parameter modification guard (prevents state snapshots during parameter modification)
+    // Purpose: Counter for nested parameter modifications (allows nested calls)
+    // When used: buildStateSnapshot() checks this to return cached state during parameter changes
+    // Still needed: Yes - getState() uses this to detect unsafe periods
+    // Can be simplified: No - Counter pattern needed for nested modifications
+    std::atomic<int> parametersBeingModified_{0};  // Counter for nested parameter modifications
+    
+    // Unified command queue (lock-free, processed in audio thread)
+    // Producer: GUI thread (enqueueCommand)
+    // Consumer: Audio thread (processCommands)
+    // Capacity: 1024 commands (should be more than enough)
+    moodycamel::ReaderWriterQueue<std::unique_ptr<Command>> commandQueue_{1024};
+    
+    // Event-driven notification queue (unified notification mechanism)
+    // Purpose: Queue stores all state notification callbacks that are processed in update()
+    // When used: All state changes enqueue notifications here, update() processes queue on main thread
+    // Simplification: Removed stateNeedsNotification_ flag - queue is single source of truth
+    // Still needed: Yes - Ensures notifications happen on main thread event loop, not during rendering or from audio thread
+    moodycamel::BlockingConcurrentQueue<std::function<void()>> notificationQueue_;
+    
+    // Recursive notification guard (prevents observers from triggering recursive notifications)
+    // Purpose: Prevents infinite recursion if observer calls notifyStateChange()
+    // When used: notifyStateChange() checks this before notifying, sets during notification
+    // Still needed: Yes - Prevents recursive notification crashes
+    // Can be simplified: No - Guard pattern is necessary
+    std::atomic<bool> notifyingObservers_{false};
+    
+    // Command statistics (for debugging)
+    struct CommandStats {
+        uint64_t commandsProcessed = 0;
+        uint64_t commandsDropped = 0;
+        uint64_t queueOverflows = 0;
+    };
+    CommandStats commandStats_;
+    
+    // State snapshot throttling (prevents excessive expensive snapshot building)
+    // Purpose: Limits buildStateSnapshot() frequency to prevent performance issues
+    // When used: buildStateSnapshot() checks this before building (throttles to 100ms)
+    // Still needed: Yes - Prevents excessive snapshot building (expensive operation)
+    // Can be simplified: No - Throttling is necessary for performance
+    std::atomic<uint64_t> lastStateSnapshotTime_{0};
+    static constexpr uint64_t STATE_SNAPSHOT_THROTTLE_MS = 100;  // Max once per 100ms
+    
+    // Cached state snapshot (for use during script execution)
+    // Purpose: Stores last valid state snapshot for use during unsafe periods
+    // When used: getState() returns cachedState_ when buildStateSnapshot() can't run
+    // Still needed: Yes - getState() needs fallback during unsafe periods
+    // Can be simplified: Potentially - If Shells migrate to snapshots, getState() may become unused
+    // Note: Serialization no longer uses this (uses getStateSnapshot() instead - lock-free)
+    mutable std::unique_ptr<EngineState> cachedState_;
+    // Purpose: Protects cachedState_ access during updates
+    // When used: buildStateSnapshot() updates cachedState_ with exclusive lock
+    // Still needed: Yes - Protects cachedState_ updates
+    // Can be simplified: Potentially - If cachedState_ becomes unused, this can be removed
+    mutable std::shared_mutex cachedStateMutex_;
+    
+    // Guard to prevent concurrent snapshot building
+    // Purpose: Prevents multiple threads from building snapshots simultaneously
+    // When used: buildStateSnapshot() acquires snapshotMutex_ for exclusive access
+    // Still needed: Yes - buildStateSnapshot() is still used by getState() for state observation
+    // Can be simplified: Potentially - If Shells migrate to snapshots, buildStateSnapshot() may become unused
+    // Note: Serialization no longer uses this (uses getStateSnapshot() instead - lock-free)
+    mutable std::mutex snapshotMutex_;
+    
+    // Thread-local flag to detect recursive snapshot building
+    // Purpose: Prevents getCurrentScript() from calling getState() during buildStateSnapshot()
+    // When used: buildStateSnapshot() sets this flag, getCurrentScript() checks it
+    // Still needed: Yes - Prevents deadlock when buildStateSnapshot() calls getCurrentScript()
+    static thread_local bool isBuildingSnapshot_;
+    
+    // Immutable JSON snapshot for lock-free serialization
+    // Purpose: Lock-free JSON snapshot for serialization (from Phase 7.2)
+    // When used: getStateSnapshot() reads this, updateStateSnapshot() updates this
+    // Still needed: Yes - Core of lock-free serialization system
+    // Can be simplified: No - This is the new lock-free pattern
+    // Note: Stored as mutex-protected shared_ptr (C++17 compatible - std::atomic<shared_ptr> requires C++20)
+    //       Mutex is only used for pointer updates, reads are fast (single mutex lock)
+    //       Consistent with Phase 7.1's Module snapshot pattern
+    mutable std::mutex snapshotJsonMutex_;
+    mutable std::shared_ptr<const ofJson> snapshotJson_;
+    
+    // State version number (incremented on each snapshot update)
+    // Purpose: Version tracking for snapshot staleness detection (from Phase 7.2)
+    // When used: SessionManager checks version before serializing to detect stale snapshots
+    // Still needed: Yes - Critical for async serialization staleness detection
+    // Can be simplified: No - Version tracking is necessary
+    std::atomic<uint64_t> stateVersion_{0};
+    
+    // Helper to get current timestamp
+    uint64_t getCurrentTimestamp() const;
     
     // Callbacks
     std::function<void()> onProjectOpened_;
     std::function<void()> onProjectClosed_;
     std::function<void()> onUpdateWindowTitle_;
     
-    // GUI manager reference (set during setupGUIManagers)
-    GUIManager* guiManager_ = nullptr;
+    // UI operation callbacks (optional, registered by Shells)
+    std::function<void(const std::string&)> onModuleAdded_;
+    std::function<void(const std::string&)> onModuleRemoved_;
     
     // Internal methods
     void notifyStateChange();
+    void processNotificationQueue();  // Process queued notifications from main thread event loop
+    void notifyObserversWithState();  // Helper to actually call observers with current state
+    
+    // Simplified notification: enqueue notification to be processed on main thread
+    // Replaces stateNeedsNotification_ flag pattern - queue is single source of truth
+    void enqueueStateNotification();
     EngineState buildStateSnapshot() const;
     
     // Setup helpers
     void setupCoreSystems();
     void setupMasterOutputs();
     void setupCommandExecutor();
+    void setupLua();
     void initializeProjectAndSession();
     
     // State building helpers
-    void buildModuleStates(EngineState& state) const;
+    // Returns true if completed successfully, false if aborted due to unsafe period
+    bool buildModuleStates(EngineState& state) const;
     void buildConnectionStates(EngineState& state) const;
     void buildTransportState(EngineState& state) const;
+    
+    /**
+     * Update engine state snapshot (called during safe periods).
+     * Aggregates module snapshots (from Phase 7.1) and creates new immutable JSON snapshot.
+     * 
+     * THREAD-SAFE: Must be called during safe periods (after commands/scripts complete).
+     * Called from main thread (update()) or audio thread (processCommands()).
+     * 
+     * Implementation:
+     * 1. Get module snapshots (from Module::getSnapshot() - lock-free)
+     * 2. Get transport state (with lock)
+     * 3. Get connections (with lock)
+     * 4. Get script state (from ScriptManager)
+     * 5. Aggregate into JSON (similar to buildStateSnapshot() but uses module snapshots)
+     * 6. Include version number in JSON
+     * 7. Atomically update snapshotJson_ pointer
+     * 8. Increment state version
+     */
+    void updateStateSnapshot();
 };
 
 } // namespace vt

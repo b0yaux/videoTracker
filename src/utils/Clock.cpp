@@ -7,6 +7,8 @@
 #include "Clock.h"
 #include <imgui.h>
 #include "ofJson.h"
+#include <fstream>
+#include <chrono>
 
 //--------------------------------------------------------------
 Clock::Clock() 
@@ -35,10 +37,34 @@ void Clock::setup() {
 
 //--------------------------------------------------------------
 void Clock::setBPM(float bpm) {
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            float oldTarget = targetBpm.load();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\",\"location\":\"Clock.cpp:37\",\"message\":\"setBPM called\",\"data\":{\"requestedBpm\":" << bpm << ",\"oldTargetBpm\":" << oldTarget << "},\"timestamp\":" << now << "}\n";
+            logFile.close();
+        }
+    }
+    // #endregion
+    
     // Silent clamping using config
     float clampedBpm = ofClamp(bpm, config.minBPM, config.maxBPM);
     if (clampedBpm > 0 && clampedBpm != targetBpm.load()) {
         targetBpm.store(clampedBpm);
+        
+        // #region agent log
+        {
+            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (logFile.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\",\"location\":\"Clock.cpp:42\",\"message\":\"BPM updated, calling onBPMChanged\",\"data\":{\"newTargetBpm\":" << clampedBpm << "},\"timestamp\":" << now << "}\n";
+                logFile.close();
+            }
+        }
+        // #endregion
+        
         onBPMChanged();
     }
 }
@@ -46,6 +72,11 @@ void Clock::setBPM(float bpm) {
 //--------------------------------------------------------------
 float Clock::getBPM() const {
     return currentBpm.load();
+}
+
+//--------------------------------------------------------------
+float Clock::getTargetBPM() const {
+    return targetBpm.load();
 }
 
 //--------------------------------------------------------------
@@ -59,10 +90,45 @@ void Clock::start() {
         // This ensures sample-accurate timing from the start
         ofLogNotice("Clock") << "Audio-rate clock started at BPM: " << currentBpm.load() << " (will detect SR from first buffer)";
         
+        // #region agent log
+        {
+            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (logFile.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,C\",\"location\":\"Clock.cpp:start\",\"message\":\"Clock::start() - before transport listeners\",\"data\":{\"listenerCount\":" << transportListeners.size() << "},\"timestamp\":" << now << "}\n";
+                logFile.flush();
+                logFile.close();
+            }
+        }
+        // #endregion
+        
         // Notify transport listeners
         for (auto& listener : transportListeners) {
+            // #region agent log
+            {
+                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                if (logFile.is_open()) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,C\",\"location\":\"Clock.cpp:start\",\"message\":\"Clock::start() - calling transport listener\",\"data\":{},\"timestamp\":" << now << "}\n";
+                    logFile.flush();
+                    logFile.close();
+                }
+            }
+            // #endregion
             listener(true);
         }
+        
+        // #region agent log
+        {
+            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (logFile.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,C\",\"location\":\"Clock.cpp:start\",\"message\":\"Clock::start() - after transport listeners\",\"data\":{},\"timestamp\":" << now << "}\n";
+                logFile.flush();
+                logFile.close();
+            }
+        }
+        // #endregion
     }
 }
 
@@ -244,8 +310,21 @@ float Clock::getSampleRate() const {
 
 //--------------------------------------------------------------
 void Clock::onBPMChanged() {
-    // This method can be extended to notify other components
-    // about BPM changes if needed in the future
+    float newBpm = targetBpm.load();
+    
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\",\"location\":\"Clock.cpp:246\",\"message\":\"onBPMChanged - firing event\",\"data\":{\"newBpm\":" << newBpm << "},\"timestamp\":" << now << "}\n";
+            logFile.close();
+        }
+    }
+    // #endregion
+    
+    // Fire BPM change event (proper decoupled architecture)
+    ofNotifyEvent(bpmChangedEvent, newBpm);
 }
 
 //--------------------------------------------------------------

@@ -15,6 +15,7 @@ class BaseCell;  // Forward declaration
 class CellGrid;  // Forward declaration
 struct CellGridColumnConfig;  // Forward declaration
 struct CellGridCallbacks;  // Forward declaration
+namespace vt { class Engine; }  // Forward declaration
 #include <functional>  // For std::function
 
 /**
@@ -64,6 +65,9 @@ public:
     // GUIManager connection (for rename operations)
     void setGUIManager(class GUIManager* manager) { this->guiManager = manager; }
     class GUIManager* getGUIManager() const { return guiManager; }
+    
+    // Set Engine reference (for command queue routing)
+    void setEngine(vt::Engine* engine) { engine_ = engine; }
     
     // Get module type name (e.g., "TrackerSequencer", "MultiSampler")
     // Returns empty string if module not found in registry
@@ -155,6 +159,15 @@ public:
 protected:
     // Subclasses implement this to draw panel-specific content
     virtual void drawContent() = 0;
+    
+    /**
+     * Set parameter via command queue (thread-safe)
+     * All GUI parameter changes should use this method instead of direct module->setParameter()
+     * @param paramName Parameter name
+     * @param value New parameter value
+     * @return true if command was enqueued successfully
+     */
+    bool setParameterViaCommand(const std::string& paramName, float value);
     
     // Drag & drop support: override to handle file drops
     // Returns true if files were accepted, false otherwise
@@ -364,7 +377,7 @@ protected:
         std::function<void()> customRemover = nullptr,
         std::function<std::string(float)> customFormatter = nullptr,
         std::function<float(const std::string&)> customParser = nullptr
-    ) const;
+    );
     
     // State
     std::string instanceName;
@@ -374,6 +387,7 @@ protected:
     ParameterRouter* parameterRouter = nullptr;
     class ConnectionManager* connectionManager = nullptr;
     class GUIManager* guiManager = nullptr;
+    vt::Engine* engine_ = nullptr;  // For command queue routing
     
     // Module popup menu state
     char renameBuffer_[256] = {0};  // Buffer for rename input field

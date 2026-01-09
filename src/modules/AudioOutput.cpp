@@ -65,7 +65,7 @@ ModuleType AudioOutput::getType() const {
     return ModuleType::UTILITY;
 }
 
-std::vector<ParameterDescriptor> AudioOutput::getParameters() const {
+std::vector<ParameterDescriptor> AudioOutput::getParametersImpl() const {
     std::vector<ParameterDescriptor> params;
     
     // Master volume parameter
@@ -111,7 +111,7 @@ void AudioOutput::onTrigger(TriggerEvent& event) {
     // Outputs don't receive triggers
 }
 
-void AudioOutput::setParameter(const std::string& paramName, float value, bool notify) {
+void AudioOutput::setParameterImpl(const std::string& paramName, float value, bool notify) {
     if (paramName == "masterVolume") {
         setMasterVolume(value);
         if (notify && parameterChangeCallback) {
@@ -148,7 +148,7 @@ void AudioOutput::setParameter(const std::string& paramName, float value, bool n
     }
 }
 
-float AudioOutput::getParameter(const std::string& paramName) const {
+float AudioOutput::getParameterImpl(const std::string& paramName) const {
     if (paramName == "masterVolume") {
         return getMasterVolume();
     } else if (paramName == "audioDevice") {
@@ -174,8 +174,53 @@ float AudioOutput::getParameter(const std::string& paramName) const {
             return 0.0f;
         }
     }
-    // Unknown parameter - return default
-    return Module::getParameter(paramName);
+    // Unknown parameter - return default (base class default is 0.0f)
+    // NOTE: Cannot call Module::getParameter() here as it would deadlock (lock already held)
+    return 0.0f;
+}
+
+// Indexed parameter support for connection-based parameters
+std::vector<std::pair<std::string, int>> AudioOutput::getIndexedParameterRanges() const {
+    std::vector<std::pair<std::string, int>> ranges;
+    
+    std::lock_guard<std::mutex> lock(connectionMutex_);
+    size_t numConnections = connectedModules_.size();
+    
+    // Count valid (non-expired) connections
+    size_t validConnections = 0;
+    for (size_t i = 0; i < numConnections; i++) {
+        if (!connectedModules_[i].expired()) {
+            validConnections = i + 1; // Update max index
+        }
+    }
+    
+    if (validConnections > 0) {
+        // Return max index (validConnections - 1) since indices are 0-based
+        ranges.push_back({"connectionVolume", static_cast<int>(validConnections - 1)});
+    }
+    
+    return ranges;
+}
+
+float AudioOutput::getIndexedParameter(const std::string& baseName, int index) const {
+    if (baseName == "connectionVolume") {
+        if (index < 0) {
+            return 0.0f;
+        }
+        return getConnectionVolume(static_cast<size_t>(index));
+    }
+    return 0.0f;
+}
+
+void AudioOutput::setIndexedParameter(const std::string& baseName, int index, float value, bool notify) {
+    if (baseName == "connectionVolume") {
+        if (index < 0) {
+            return;
+        }
+        setConnectionVolume(static_cast<size_t>(index), value);
+        // Note: setConnectionVolume() should trigger parameterChangeCallback if needed
+        // Check if it does, otherwise we need to add it
+    }
 }
 
 Module::ModuleMetadata AudioOutput::getMetadata() const {

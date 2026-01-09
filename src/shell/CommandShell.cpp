@@ -32,6 +32,13 @@ CommandShell::~CommandShell() {
 }
 
 void CommandShell::setup() {
+    // Call parent setup() first to subscribe to state changes
+    Shell::setup();
+    
+    if (observerId_ > 0) {
+        ofLogNotice("CommandShell") << "Subscribed to state changes (ID: " << observerId_ << ")";
+    }
+    
     // Initialize output with welcome message
     outputLines_.clear();
     outputLines_.push_back("VideoTracker - Command Shell");
@@ -80,7 +87,22 @@ void CommandShell::draw() {
 }
 
 void CommandShell::exit() {
-    // Cleanup if needed
+    if (observerId_ > 0) {
+        ofLogNotice("CommandShell") << "Unsubscribing from state changes (ID: " << observerId_ << ")";
+    }
+    // Call parent exit() last to unsubscribe from state changes
+    Shell::exit();
+}
+
+void CommandShell::onStateChanged(const EngineState& state) {
+    // Cache state snapshot for thread-safe access in draw() method
+    cachedState_ = state;
+    
+    // Log state changes for debugging
+    ofLogNotice("CommandShell") << "State changed";
+    
+    // Note: UI updates should be deferred to draw() method
+    // This callback just caches the state snapshot
 }
 
 bool CommandShell::handleKeyPress(int key) {
@@ -257,6 +279,14 @@ void CommandShell::appendOutput(const std::string& text) {
 
 void CommandShell::appendError(const std::string& text) {
     appendOutput(text);
+}
+
+void CommandShell::setEmbeddedBounds(float x, float y, float w, float h) {
+    embeddedX_ = x;
+    embeddedY_ = y;
+    embeddedW_ = w;
+    embeddedH_ = h;
+    updateTerminalSize();
 }
 
 void CommandShell::resetInput() {
@@ -450,16 +480,24 @@ void CommandShell::updateTerminalSize() {
     float screenWidth = ofGetWidth();
     float screenHeight = ofGetHeight();
     
-    // Safety check: ensure we have valid screen dimensions
-    if (screenWidth <= 0 || screenHeight <= 0) {
-        ofLogWarning("CommandShell") << "Invalid screen dimensions, skipping size update";
-        return;
+    // Use embedded bounds if in embedded mode
+    if (embeddedMode_ && embeddedW_ > 0 && embeddedH_ > 0) {
+        terminalX_ = embeddedX_;
+        terminalY_ = embeddedY_;
+        terminalWidth_ = embeddedW_;
+        terminalHeight_ = embeddedH_;
+    } else {
+        // Safety check: ensure we have valid screen dimensions
+        if (screenWidth <= 0 || screenHeight <= 0) {
+            ofLogWarning("CommandShell") << "Invalid screen dimensions, skipping size update";
+            return;
+        }
+        
+        terminalX_ = padding_;
+        terminalY_ = padding_;
+        terminalWidth_ = screenWidth - (padding_ * 2.0f);
+        terminalHeight_ = screenHeight - (padding_ * 2.0f);
     }
-    
-    terminalX_ = padding_;
-    terminalY_ = padding_;
-    terminalWidth_ = screenWidth - (padding_ * 2.0f);
-    terminalHeight_ = screenHeight - (padding_ * 2.0f);
     
     // Ensure minimum sizes
     if (terminalWidth_ < 100.0f) terminalWidth_ = 100.0f;

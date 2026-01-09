@@ -13,6 +13,7 @@ struct ImVec2;  // Forward declaration for ImGui types
 
 // Forward declarations
 class ParameterRouter;
+namespace vt { class Engine; }
 
 /**
  * GUIManager - Manages GUI object lifecycle, one per module instance
@@ -183,10 +184,17 @@ public:
      */
     bool renameInstance(const std::string& oldName, const std::string& newName);
 
+    /**
+     * Set Engine reference (for command queue routing in ModuleGUI)
+     * @param engine Engine instance
+     */
+    void setEngine(vt::Engine* engine);
+    
 private:
     ModuleRegistry* registry = nullptr;
     ParameterRouter* parameterRouter = nullptr;
     class ConnectionManager* connectionManager = nullptr;
+    vt::Engine* engine_ = nullptr;  // For command queue routing in ModuleGUI
     
     // Static registration map: typeName -> GUI creator function
     // Note: Implementation uses function-local static for initialization order safety

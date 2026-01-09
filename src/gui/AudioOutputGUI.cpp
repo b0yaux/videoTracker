@@ -98,7 +98,7 @@ void AudioOutputGUI::drawDeviceSelection() {
                             // Set parameter directly on module
                             AudioOutput* audioOutput = getAudioOutput();
                             if (audioOutput) {
-                                audioOutput->setParameter("audioDevice", static_cast<float>(i), true);
+                                setParameterViaCommand("audioDevice", static_cast<float>(i));
                             }
                         }
                         if (isSelected) {

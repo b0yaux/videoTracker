@@ -1,6 +1,8 @@
 #include "ModuleGUI.h"
 #include "core/ModuleRegistry.h"
 #include "core/ConnectionManager.h"
+#include "core/Engine.h"
+#include "core/Command.h"
 #include "gui/GUIManager.h"
 #include "ParameterCell.h"
 #include "modules/Module.h"
@@ -747,7 +749,7 @@ std::unique_ptr<BaseCell> ModuleGUI::createCellWidget(
     std::function<void()> customRemover,
     std::function<std::string(float)> customFormatter,
     std::function<float(const std::string&)> customParser
-) const {
+) {
     auto module = getModule();
     if (!module) {
         // Return nullptr if module not found
@@ -756,6 +758,20 @@ std::unique_ptr<BaseCell> ModuleGUI::createCellWidget(
     
     // Use ParameterCell internally as implementation detail
     ParameterCell cell(module.get(), paramDesc, parameterRouter);
+    
+    // Create default setter that routes through command queue
+    if (!customSetter) {
+        customSetter = [this, paramDesc](float value) {
+            setParameterViaCommand(paramDesc.name, value);
+        };
+    }
+    
+    // Create default remover that routes through command queue
+    if (!customRemover) {
+        customRemover = [this, paramDesc]() {
+            setParameterViaCommand(paramDesc.name, paramDesc.defaultValue);
+        };
+    }
     
     // Apply custom callbacks if provided
     if (customGetter) {
@@ -865,41 +881,102 @@ void ModuleGUI::setupStandardCellGridCallbacks(CellGridCallbacks& callbacks,
     
     // Standard edit mode changed callback
     callbacks.onEditModeChanged = [&cellFocusState](int row, int col, bool editing) {
+        // #region agent log
+        {
+            std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (log.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"C,D\",\"location\":\"ModuleGUI.cpp:867\",\"message\":\"onEditModeChanged callback called\",\"data\":{\"row\":" << row << ",\"col\":" << col << ",\"editing\":" << (editing ? "true" : "false") << ",\"focusedRow\":" << cellFocusState.row << ",\"focusedCol\":" << cellFocusState.column << "},\"timestamp\":" << now << "}\n";
+            }
+        }
+        // #endregion
         // Track editing state for UI coordination (CellWidget manages editing state internally)
         ImGuiIO& io = ImGui::GetIO();
         bool navWasEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
         
+        // CRITICAL FIX: If cellFocusState is stale (no cell focused) but we're being called for edit mode,
+        // it means the cell IS focused but cellFocusState wasn't updated (e.g., when Enter is pressed
+        // on an already-focused cell). Update cellFocusState to match the actual focused cell.
+        // This fixes the issue where Enter disables navigation but cellFocusState shows no cell is focused.
+        if (!cellFocusState.hasFocus() && row >= 0 && col >= 0) {
+            // #region agent log
+            {
+                std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                if (log.is_open()) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"F\",\"location\":\"ModuleGUI.cpp:877\",\"message\":\"Fixing stale cellFocusState\",\"data\":{\"oldRow\":" << cellFocusState.row << ",\"oldCol\":" << cellFocusState.column << ",\"newRow\":" << row << ",\"newCol\":" << col << "},\"timestamp\":" << now << "}\n";
+                }
+            }
+            // #endregion
+            cellFocusState.row = row;
+            cellFocusState.column = col;
+        }
+        
         // Update focus state if this is the focused cell
-        if (cellFocusState.row == row && cellFocusState.column == col) {
+        bool isFocusedCell = (cellFocusState.row == row && cellFocusState.column == col);
+        if (isFocusedCell) {
             bool wasEditing = cellFocusState.isEditing;
             cellFocusState.isEditing = editing;
         }
         
-        // CRITICAL: Always manage navigation based on edit mode, regardless of focus state
-        // This ensures navigation is restored even if focus was lost during edit mode
-        if (editing) {
-            // Disable ImGui keyboard navigation when entering edit mode
-            // Arrow keys should only adjust values, not navigate
-            io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-            ofLogNotice("ModuleGUI") << "[EDIT_MODE] Entering edit mode (row=" << row << ", col=" << col 
-                                     << ") - Navigation " << (navWasEnabled ? "was ENABLED, disabled" : "already disabled");
+        // CRITICAL: Only manage navigation for the focused cell to prevent navigation from being disabled
+        // when Enter is pressed on a non-focused cell or when callback is triggered incorrectly
+        // This fixes the issue where Enter disables navigation without actually entering edit mode
+        if (isFocusedCell) {
+            if (editing) {
+                // Disable ImGui keyboard navigation when entering edit mode
+                // Arrow keys should only adjust values, not navigate
+                io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+                bool navNowEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+                // #region agent log
+                {
+                    std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                    if (log.is_open()) {
+                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"ModuleGUI.cpp:897\",\"message\":\"ModuleGUI disabling navigation\",\"data\":{\"navWasEnabled\":" << (navWasEnabled ? "true" : "false") << ",\"navNowEnabled\":" << (navNowEnabled ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+                    }
+                }
+                // #endregion
+                ofLogNotice("ModuleGUI") << "[EDIT_MODE] Entering edit mode (row=" << row << ", col=" << col 
+                                         << ") - Navigation " << (navWasEnabled ? "was ENABLED, disabled" : "already disabled");
+            } else {
+                // Restore ImGui keyboard navigation when exiting edit mode
+                io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+                bool navNowEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+                // #region agent log
+                {
+                    std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                    if (log.is_open()) {
+                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"ModuleGUI.cpp:906\",\"message\":\"ModuleGUI re-enabling navigation\",\"data\":{\"navWasEnabled\":" << (navWasEnabled ? "true" : "false") << ",\"navNowEnabled\":" << (navNowEnabled ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+                    }
+                }
+                // #endregion
+                ofLogNotice("ModuleGUI") << "[EDIT_MODE] Exiting edit mode (row=" << row << ", col=" << col 
+                                         << ") - Navigation " << (navWasEnabled ? "was already enabled" : "restored")
+                                         << ", now " << (navNowEnabled ? "ENABLED" : "DISABLED");
+            }
         } else {
-            // Restore ImGui keyboard navigation when exiting edit mode
-            // CRITICAL: Always restore navigation when exiting edit mode, even if cell doesn't match focus state
-            // This handles cases where focus was lost but edit mode is still active
-            io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-            bool navNowEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
-            bool isFocusedCell = (cellFocusState.row == row && cellFocusState.column == col);
-            ofLogNotice("ModuleGUI") << "[EDIT_MODE] Exiting edit mode (row=" << row << ", col=" << col 
-                                     << ", isFocused=" << isFocusedCell
-                                     << ") - Navigation " << (navWasEnabled ? "was already enabled" : "restored")
-                                     << ", now " << (navNowEnabled ? "ENABLED" : "DISABLED");
+            // Not the focused cell - log but don't change navigation state
+            // This prevents navigation from being disabled when callback is triggered for wrong cell
+            ofLogVerbose("ModuleGUI") << "[EDIT_MODE] Edit mode changed for non-focused cell (row=" << row 
+                                      << ", col=" << col << ", editing=" << editing 
+                                      << ") - Navigation state unchanged";
         }
         // Note: Refocus is now handled automatically by CellWidget when exiting edit mode
     };
     
     // Standard cell focus changed callback
     callbacks.onCellFocusChanged = [this, &cellFocusState, &callbacksState, &cellGrid, isSingleRow](int row, int col) {
+        // #region agent log
+        {
+            std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (log.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"F\",\"location\":\"ModuleGUI.cpp:936\",\"message\":\"onCellFocusChanged called\",\"data\":{\"row\":" << row << ",\"col\":" << col << ",\"currentFocusRow\":" << cellFocusState.row << ",\"currentFocusCol\":" << cellFocusState.column << "},\"timestamp\":" << now << "}\n";
+            }
+        }
+        // #endregion
         // CRITICAL: Ignore focus callbacks if focus was cleared in the same frame
         // This prevents infinite loops where clearing focus triggers a callback that restores focus
         // Frame-based guard works regardless of execution order (drawRow vs handleFocusClearing)
@@ -925,6 +1002,15 @@ void ModuleGUI::setupStandardCellGridCallbacks(CellGridCallbacks& callbacks,
         }
         callbacksState.anyCellFocusedThisFrame = true;
         
+        // #region agent log
+        {
+            std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (log.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"F\",\"location\":\"ModuleGUI.cpp:960\",\"message\":\"cellFocusState updated\",\"data\":{\"oldRow\":" << oldRow << ",\"oldCol\":" << oldCol << ",\"newRow\":" << cellFocusState.row << ",\"newCol\":" << cellFocusState.column << "},\"timestamp\":" << now << "}\n";
+            }
+        }
+        // #endregion
         ofLogNotice("ModuleGUI") << "[FOCUS_CHANGED] Cell focus changed from (" << oldRow << "," << oldCol 
                                  << ") to (" << actualRow << "," << col 
                                  << "), anyCellFocusedThisFrame=" << callbacksState.anyCellFocusedThisFrame
@@ -1075,5 +1161,21 @@ bool ModuleGUI::handleFocusClearing(CellFocusState& cellFocusState,
         return true;
     }
     return false;
+}
+
+bool ModuleGUI::setParameterViaCommand(const std::string& paramName, float value) {
+    if (!engine_ || instanceName.empty()) {
+        ofLogWarning("ModuleGUI") << "Cannot set parameter: engine or instanceName not set";
+        return false;
+    }
+    
+    auto cmd = std::make_unique<vt::SetParameterCommand>(instanceName, paramName, value);
+    if (engine_->enqueueCommand(std::move(cmd))) {
+        return true;
+    } else {
+        ofLogWarning("ModuleGUI") << "Failed to enqueue SetParameterCommand for " 
+                                  << instanceName << "." << paramName;
+        return false;
+    }
 }
 

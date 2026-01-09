@@ -1,7 +1,6 @@
 #include "ModuleRegistry.h"
 #include "ModuleFactory.h"
 #include "ConnectionManager.h"
-#include "GUIManager.h"
 #include "ofLog.h"
 #include "ofJson.h"
 #include <set>
@@ -30,6 +29,9 @@ bool ModuleRegistry::registerModule(const std::string& uuid, std::shared_ptr<Mod
         return false;
     }
     
+    // THREAD-SAFE: Exclusive lock for write operation
+    std::unique_lock<std::shared_mutex> lock(registryMutex_);
+    
     // Check if UUID already exists
     if (modules.find(uuid) != modules.end()) {
         ofLogError("ModuleRegistry") << "UUID already registered: " << uuid;
@@ -47,6 +49,11 @@ bool ModuleRegistry::registerModule(const std::string& uuid, std::shared_ptr<Mod
     uuidToName[uuid] = humanName;
     nameToUUID[humanName] = uuid;
     
+    // CRITICAL: Set instance name on module immediately during registration
+    // This ensures getInstanceName() returns the correct instance name, not the type name
+    // This is especially important during session restoration
+    module->setInstanceName(humanName);
+    
     ofLogNotice("ModuleRegistry") << "Registered module: UUID=" << uuid << ", name=" << humanName 
                                    << ", type=" << static_cast<int>(module->getType());
     
@@ -54,6 +61,9 @@ bool ModuleRegistry::registerModule(const std::string& uuid, std::shared_ptr<Mod
 }
 
 std::shared_ptr<Module> ModuleRegistry::getModule(const std::string& identifier) const {
+    // THREAD-SAFE: Shared lock for read operation
+    std::shared_lock<std::shared_mutex> lock(registryMutex_);
+    
     // Try as UUID first
     auto it = modules.find(identifier);
     if (it != modules.end()) {
@@ -122,6 +132,9 @@ bool ModuleRegistry::removeModule(const std::string& identifier) {
 
 //--------------------------------------------------------------
 bool ModuleRegistry::renameModule(const std::string& oldName, const std::string& newName) {
+    // THREAD-SAFE: Exclusive lock for write operation
+    std::unique_lock<std::shared_mutex> lock(registryMutex_);
+    
     // Validate old name exists
     auto oldNameIt = nameToUUID.find(oldName);
     if (oldNameIt == nameToUUID.end()) {
@@ -176,6 +189,9 @@ bool ModuleRegistry::renameModule(const std::string& oldName, const std::string&
 }
 
 std::string ModuleRegistry::getUUID(const std::string& humanName) const {
+    // THREAD-SAFE: Shared lock for read operation
+    std::shared_lock<std::shared_mutex> lock(registryMutex_);
+    
     auto it = nameToUUID.find(humanName);
     if (it != nameToUUID.end()) {
         return it->second;
@@ -184,6 +200,9 @@ std::string ModuleRegistry::getUUID(const std::string& humanName) const {
 }
 
 std::string ModuleRegistry::getName(const std::string& uuid) const {
+    // THREAD-SAFE: Shared lock for read operation
+    std::shared_lock<std::shared_mutex> lock(registryMutex_);
+    
     auto it = uuidToName.find(uuid);
     if (it != uuidToName.end()) {
         return it->second;
@@ -195,6 +214,9 @@ std::string ModuleRegistry::getName(std::shared_ptr<Module> module) const {
     if (!module) {
         return "";
     }
+    
+    // THREAD-SAFE: Shared lock for read operation
+    std::shared_lock<std::shared_mutex> lock(registryMutex_);
     
     // Find the module in our map by comparing pointers
     for (const auto& pair : modules) {
@@ -209,6 +231,9 @@ std::string ModuleRegistry::getName(std::shared_ptr<Module> module) const {
 }
 
 std::vector<std::string> ModuleRegistry::getAllUUIDs() const {
+    // THREAD-SAFE: Shared lock for read operation
+    std::shared_lock<std::shared_mutex> lock(registryMutex_);
+    
     std::vector<std::string> uuids;
     uuids.reserve(modules.size());
     for (const auto& pair : modules) {
@@ -218,6 +243,9 @@ std::vector<std::string> ModuleRegistry::getAllUUIDs() const {
 }
 
 std::vector<std::string> ModuleRegistry::getAllHumanNames() const {
+    // THREAD-SAFE: Shared lock for read operation
+    std::shared_lock<std::shared_mutex> lock(registryMutex_);
+    
     std::vector<std::string> names;
     names.reserve(nameToUUID.size());
     for (const auto& pair : nameToUUID) {
@@ -227,6 +255,9 @@ std::vector<std::string> ModuleRegistry::getAllHumanNames() const {
 }
 
 std::vector<std::shared_ptr<Module>> ModuleRegistry::getModulesByType(ModuleType type) const {
+    // THREAD-SAFE: Shared lock for read operation
+    std::shared_lock<std::shared_mutex> lock(registryMutex_);
+    
     std::vector<std::shared_ptr<Module>> result;
     for (const auto& pair : modules) {
         if (pair.second && pair.second->getType() == type) {
@@ -237,6 +268,10 @@ std::vector<std::shared_ptr<Module>> ModuleRegistry::getModulesByType(ModuleType
 }
 
 void ModuleRegistry::forEachModule(std::function<void(const std::string& uuid, const std::string& humanName, std::shared_ptr<Module>)> callback) const {
+    // THREAD-SAFE: Shared lock for read operation (iteration)
+    // This prevents modules from being deleted during iteration
+    std::shared_lock<std::shared_mutex> lock(registryMutex_);
+    
     for (const auto& pair : modules) {
         const std::string& uuid = pair.first;
         auto nameIt = uuidToName.find(uuid);
@@ -247,6 +282,9 @@ void ModuleRegistry::forEachModule(std::function<void(const std::string& uuid, c
 }
 
 void ModuleRegistry::clear() {
+    // THREAD-SAFE: Exclusive lock for write operation
+    std::unique_lock<std::shared_mutex> lock(registryMutex_);
+    
     size_t count = modules.size();
     modules.clear();
     uuidToName.clear();
@@ -258,14 +296,27 @@ void ModuleRegistry::clear() {
 ofJson ModuleRegistry::toJson() const {
     ofJson json = ofJson::array();
     
-    forEachModule([&json, this](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
+    // Use forEachModule for iteration safety (minimal lock time)
+    // But use Module::getSnapshot() instead of module->toJson() (lock-free read)
+    forEachModule([&json](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
         if (module) {
+            // Get module snapshot (lock-free read - no moduleMutex_ needed)
+            auto moduleSnapshot = module->getSnapshot();
+            if (!moduleSnapshot) {
+                ofLogWarning("ModuleRegistry") << "Module " << name << " has no snapshot, skipping";
+                return;  // Skip modules without snapshots
+            }
+            
+            // Build module JSON from snapshot
             ofJson moduleJson;
             moduleJson["uuid"] = uuid;
             moduleJson["name"] = name;
-            moduleJson["type"] = module->getTypeName();
-            // Pass registry context so modules can look up UUIDs/names for connected modules
-            moduleJson["data"] = module->toJson(const_cast<ModuleRegistry*>(this));
+            moduleJson["type"] = module->getTypeName();  // Still need type name (const method, safe)
+            
+            // Module snapshot is already JSON (from Phase 7.1)
+            // Use snapshot directly as "data" field
+            moduleJson["data"] = *moduleSnapshot;
+            
             json.push_back(moduleJson);
         }
     });
@@ -324,6 +375,8 @@ bool ModuleRegistry::fromJson(const ofJson& json, ModuleFactory& factory) {
         if (module && moduleJson.contains("data")) {
             try {
                 module->fromJson(moduleJson["data"]);
+                // Initialize rendering snapshot after module restoration
+                module->updateRenderingSnapshot();
             } catch (const std::exception& e) {
                 ofLogError("ModuleRegistry") << "Failed to deserialize module " << uuid << ": " << e.what();
                 return false;
@@ -334,13 +387,67 @@ bool ModuleRegistry::fromJson(const ofJson& json, ModuleFactory& factory) {
     return true;
 }
 
+void ModuleRegistry::setParameterChangeNotificationCallback(std::function<void()> callback) {
+    parameterChangeNotificationCallback_ = callback;
+    
+    // CRITICAL: Update all existing modules' callbacks when this is set
+    // This ensures master outputs and other early-initialized modules get callbacks
+    for (const auto& [uuid, module] : modules) {
+        if (module && parameterChangeNotificationCallback_) {
+            auto existingCallback = module->getParameterChangeCallback();
+            module->setParameterChangeCallback([existingCallback, this](const std::string& paramName, float value) {
+                // Call existing callback (ParameterRouter notification)
+                if (existingCallback) {
+                    existingCallback(paramName, value);
+                }
+                // Also notify Engine for script sync
+                if (parameterChangeNotificationCallback_) {
+                    parameterChangeNotificationCallback_();
+                }
+            });
+        }
+    }
+}
+
 void ModuleRegistry::setupAllModules(class Clock* clock, class ModuleRegistry* registry, class ConnectionManager* connectionManager, class ParameterRouter* parameterRouter, class PatternRuntime* patternRuntime, bool isRestored) {
     // Use this registry if none provided
     ModuleRegistry* reg = registry ? registry : this;
     
     for (const auto& [uuid, module] : modules) {
         if (module) {
+            // CRITICAL FIX: Ensure instance name is set correctly
+            // Check if instance name equals type name (means it wasn't set properly)
+            // This handles cases where modules were registered before instance names were set
+            auto nameIt = uuidToName.find(uuid);
+            if (nameIt != uuidToName.end()) {
+                std::string expectedName = nameIt->second;
+                std::string currentInstanceName = module->getInstanceName();
+                
+                // If instance name equals type name, it means instanceName_ wasn't set
+                // Set it to the expected name from the registry
+                if (currentInstanceName == module->getName() || currentInstanceName != expectedName) {
+                    module->setInstanceName(expectedName);
+                    ofLogVerbose("ModuleRegistry") << "Set instance name for module " << uuid 
+                                                    << ": '" << currentInstanceName << "' -> '" << expectedName << "'";
+                }
+            }
             module->initialize(clock, reg, connectionManager, parameterRouter, patternRuntime, isRestored);
+            
+            // Set up parameter change notification callback chain
+            // This ensures script sync when GUI changes parameters
+            if (parameterChangeNotificationCallback_) {
+                auto existingCallback = module->getParameterChangeCallback();
+                module->setParameterChangeCallback([existingCallback, this](const std::string& paramName, float value) {
+                    // Call existing callback (ParameterRouter notification)
+                    if (existingCallback) {
+                        existingCallback(paramName, value);
+                    }
+                    // Also notify Engine for script sync
+                    if (parameterChangeNotificationCallback_) {
+                        parameterChangeNotificationCallback_();
+                    }
+                });
+            }
         }
     }
 }
@@ -353,7 +460,7 @@ std::string ModuleRegistry::addModule(
     class ConnectionManager* connectionManager,
     class ParameterRouter* parameterRouter,
     class PatternRuntime* patternRuntime,
-    class GUIManager* guiManager,
+    std::function<void(const std::string&)> onAdded,
     const std::string& masterAudioOutName,
     const std::string& masterVideoOutName
 ) {
@@ -388,17 +495,43 @@ std::string ModuleRegistry::addModule(
         return "";
     }
     
+    // CRITICAL: Set instance name in module before initialization
+    // This allows modules to use getInstanceName() during initialization
+    module->setInstanceName(instanceName);
+    
     // Initialize module
     module->initialize(clock, this, connectionManager, parameterRouter, patternRuntime, false);
+    
+    // Initialize module snapshot (for lock-free serialization)
+    module->updateSnapshot();
+    
+    // Initialize rendering snapshot (for lock-free rendering)
+    module->updateRenderingSnapshot();
+    
+    // Set up parameter change notification callback chain
+    // This ensures script sync when GUI changes parameters
+    if (parameterChangeNotificationCallback_) {
+        auto existingCallback = module->getParameterChangeCallback();
+        module->setParameterChangeCallback([existingCallback, this](const std::string& paramName, float value) {
+            // Call existing callback (ParameterRouter notification)
+            if (existingCallback) {
+                existingCallback(paramName, value);
+            }
+            // Also notify Engine for script sync
+            if (parameterChangeNotificationCallback_) {
+                parameterChangeNotificationCallback_();
+            }
+        });
+    }
     
     // Auto-connect to master outputs
     if (connectionManager) {
         connectionManager->autoRouteToMasters(masterAudioOutName, masterVideoOutName);
     }
     
-    // Sync GUI
-    if (guiManager) {
-        guiManager->syncWithRegistry();
+    // Notify callback if registered (for UI sync)
+    if (onAdded) {
+        onAdded(instanceName);
     }
     
     ofLogNotice("ModuleRegistry") << "Added module: " << instanceName << " (type: " << moduleType << ")";
@@ -410,7 +543,7 @@ std::string ModuleRegistry::addModule(
 bool ModuleRegistry::removeModule(
     const std::string& identifier,
     class ConnectionManager* connectionManager,
-    class GUIManager* guiManager,
+    std::function<void(const std::string&)> onRemoved,
     const std::string& masterAudioOutName,
     const std::string& masterVideoOutName
 ) {
@@ -472,22 +605,21 @@ bool ModuleRegistry::removeModule(
         }
     }
     
-    // Remove GUI BEFORE removing from registry to prevent race conditions
-    // This ensures GUI cleanup happens while module still exists
-    // Use direct removal method to avoid iterating through all modules
-    if (guiManager) {
+    // Notify callback BEFORE removing from registry to prevent race conditions
+    // This ensures UI cleanup happens while module still exists
+    if (onRemoved) {
         try {
-            guiManager->removeGUI(moduleName);
-            ofLogNotice("ModuleRegistry") << "✓ Removed GUI for module: " << moduleName;
+            onRemoved(moduleName);
+            ofLogNotice("ModuleRegistry") << "✓ Notified UI callback for module removal: " << moduleName;
         } catch (const std::exception& e) {
-            ofLogError("ModuleRegistry") << "Exception in removeGUI(): " << e.what();
+            ofLogError("ModuleRegistry") << "Exception in onRemoved callback: " << e.what();
         } catch (...) {
-            ofLogError("ModuleRegistry") << "Unknown exception in removeGUI()";
+            ofLogError("ModuleRegistry") << "Unknown exception in onRemoved callback";
         }
     }
     
-    // Remove from all maps AFTER GUI cleanup
-    // This ensures syncWithRegistry() won't try to access a deleted module
+    // Remove from all maps AFTER callback notification
+    // This ensures any UI operations can still access the module if needed
     modules.erase(uuid);
     uuidToName.erase(uuid);
     nameToUUID.erase(moduleName);

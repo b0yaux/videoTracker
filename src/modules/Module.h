@@ -5,6 +5,8 @@
 #include <map>
 #include <functional>
 #include <memory>
+#include <atomic>
+#include <shared_mutex>
 #include "ofJson.h"
 #include "core/ParameterDescriptor.h"  // For ParameterDescriptor and ParameterType
 
@@ -105,10 +107,42 @@ struct Port {
 // This allows for future BespokeSynth-style evolution where TrackerSequencer becomes a Module too
 class Module {
 public:
+    // Rendering snapshot for lock-free rendering paths
+    // Similar to JSON snapshot pattern (Phase 7), but for rendering parameters
+    struct RenderingSnapshot {
+        const bool enabled;
+        const float scale;  // Common parameter (modules can extend)
+        const float pointSize;  // Common parameter (modules can extend)
+        // Modules can extend this struct for module-specific parameters
+        
+        RenderingSnapshot(bool e, float s = 0.5f, float ps = 1.0f)
+            : enabled(e), scale(s), pointSize(ps) {}
+        
+        // Virtual destructor to make struct polymorphic (required for dynamic_pointer_cast)
+        virtual ~RenderingSnapshot() = default;
+    };
+    
     virtual ~Module() = default;
     
     // Identity
-    virtual std::string getName() const = 0;
+    virtual std::string getName() const = 0;  // Returns type name (e.g., "TrackerSequencer")
+    
+    /**
+     * Get instance name (e.g., "trackerSequencer1")
+     * Returns the instance name set by ModuleRegistry during initialization.
+     * Falls back to getName() if instance name not set.
+     */
+    std::string getInstanceName() const {
+        return instanceName_.empty() ? getName() : instanceName_;
+    }
+    
+    /**
+     * Set instance name (called by ModuleRegistry during initialization)
+     * @param name Instance name (e.g., "trackerSequencer1")
+     */
+    void setInstanceName(const std::string& name) {
+        instanceName_ = name;
+    }
     
     // GUI-only: Module type for UI organization (not used for backend logic)
     // Backend should use capabilities, producesAudio(), producesVideo() instead
@@ -117,7 +151,18 @@ public:
     
     // Get all available parameters that this module can accept
     // TrackerSequencer will query this to discover what parameters can be mapped to columns
-    virtual std::vector<ParameterDescriptor> getParameters() const = 0;
+    // 
+    // THREAD-SAFE: Uses shared lock for concurrent reads from multiple threads.
+    std::vector<ParameterDescriptor> getParameters() const {
+        std::shared_lock<std::shared_mutex> lock(moduleMutex_);
+        return getParametersImpl();
+    }
+    
+    /**
+     * Internal implementation of getParameters (called with lock held)
+     * Modules override this instead of getParameters() for thread-safe access.
+     */
+    virtual std::vector<ParameterDescriptor> getParametersImpl() const = 0;
     
     // Discrete trigger event (called when a step triggers)
     // This is separate from continuous parameter modulation
@@ -130,7 +175,20 @@ public:
     // paramName: The parameter name (e.g., "position", "speed", "volume")
     // value: The value to set (interpreted based on parameter type)
     // notify: If true, notify parameter change callback (default: true)
-    virtual void setParameter(const std::string& paramName, float value, bool notify = true) = 0;
+    // 
+    // THREAD-SAFE: Uses exclusive lock for safe writes from audio thread.
+    void setParameter(const std::string& paramName, float value, bool notify = true) {
+        std::unique_lock<std::shared_mutex> lock(moduleMutex_);
+        setParameterImpl(paramName, value, notify);
+        // Update rendering snapshot after parameter change
+        updateRenderingSnapshot();
+    }
+    
+    /**
+     * Internal implementation of setParameter (called with lock held)
+     * Modules override this instead of setParameter() for thread-safe access.
+     */
+    virtual void setParameterImpl(const std::string& paramName, float value, bool notify = true) = 0;
     
     /**
      * Get a parameter value by name
@@ -140,8 +198,19 @@ public:
      * This complements setParameter() to provide full parameter access.
      * Modules must implement this for all parameters listed in metadata.parameterNames.
      * This enables generic parameter routing without module-specific knowledge.
+     * 
+     * THREAD-SAFE: Uses shared lock for concurrent reads from multiple threads.
      */
-    virtual float getParameter(const std::string& paramName) const {
+    float getParameter(const std::string& paramName) const {
+        std::shared_lock<std::shared_mutex> lock(moduleMutex_);
+        return getParameterImpl(paramName);
+    }
+    
+    /**
+     * Internal implementation of getParameter (called with lock held)
+     * Modules override this instead of getParameter() for thread-safe access.
+     */
+    virtual float getParameterImpl(const std::string& paramName) const {
         // Default implementation: return 0.0f
         // Modules override to return actual parameter values
         return 0.0f;
@@ -151,41 +220,60 @@ public:
      * Optional: Check if this module supports indexed parameters
      * @return True if module supports indexed parameter access (e.g., step[4].position)
      * 
-     * Modules that support indexed parameters (like TrackerSequencer with step indices)
-     * should override this to return true and implement getIndexedParameter/setIndexedParameter.
+     * Modules that support indexed parameters (like TrackerSequencer with step indices,
+     * or VideoOutput/AudioOutput with connection-based parameters) should override this
+     * to return true and implement getIndexedParameter/setIndexedParameter.
      */
     virtual bool supportsIndexedParameters() const { return false; }
     
     /**
+     * Optional: Get list of indexed parameter base names and their valid index ranges
+     * @return Vector of pairs: (baseName, maxIndex). For example:
+     *   - TrackerSequencer: [("step", 15)] for 16 steps (0-15)
+     *   - VideoOutput: [("connectionOpacity", 5)] for 6 connections (0-5)
+     * 
+     * This allows Engine to discover which indexed parameters exist without
+     * needing to parse string names. Returns empty vector if not supported.
+     */
+    virtual std::vector<std::pair<std::string, int>> getIndexedParameterRanges() const {
+        return {};
+    }
+    
+    /**
      * Optional: Get an indexed parameter value
-     * @param paramName Parameter name (e.g., "position", "speed", "volume")
-     * @param index Index for the parameter (e.g., step index for TrackerSequencer)
+     * @param baseName Base parameter name (e.g., "connectionOpacity", "step")
+     * @param index Index for the parameter (e.g., connection index, step index)
      * @return Parameter value, or 0.0f if not supported or invalid index
      * 
      * Modules that support indexed parameters should override this.
      * Default implementation returns 0.0f (not supported).
      */
-    virtual float getIndexedParameter(const std::string& paramName, int index) const {
+    virtual float getIndexedParameter(const std::string& baseName, int index) const {
         return 0.0f;
     }
     
     /**
      * Optional: Set an indexed parameter value
-     * @param paramName Parameter name (e.g., "position", "speed", "volume")
-     * @param index Index for the parameter (e.g., step index for TrackerSequencer)
+     * @param baseName Base parameter name (e.g., "connectionOpacity", "step")
+     * @param index Index for the parameter (e.g., connection index, step index)
      * @param value Value to set
      * @param notify If true, notify parameter change callback (default: true)
      * 
      * Modules that support indexed parameters should override this.
      * Default implementation does nothing (not supported).
      */
-    virtual void setIndexedParameter(const std::string& paramName, int index, float value, bool notify = true) {
+    virtual void setIndexedParameter(const std::string& baseName, int index, float value, bool notify = true) {
         // Default: no-op - modules that support indexing override this
     }
     
     // Parameter change callback (modules can notify external systems like ParameterRouter)
     void setParameterChangeCallback(std::function<void(const std::string&, float)> callback) {
         parameterChangeCallback = callback;
+    }
+    
+    // Get current parameter change callback (for chaining)
+    std::function<void(const std::string&, float)> getParameterChangeCallback() const {
+        return parameterChangeCallback;
     }
     
     // Optional: update loop (for modules that need continuous updates)
@@ -337,7 +425,108 @@ public:
     // State snapshot for Engine (returns JSON to avoid Engine knowing about specific module types)
     // Default implementation uses toJson() - modules only override if they need to extract
     // specific runtime state (like current playback position, active voices, etc.)
-    virtual ofJson getStateSnapshot() const { return toJson(); }
+    // 
+    // THREAD-SAFE: Uses shared lock for concurrent reads from main thread.
+    ofJson getStateSnapshot() const {
+        std::shared_lock<std::shared_mutex> lock(moduleMutex_);
+        return getStateSnapshotImpl();
+    }
+    
+    /**
+     * Internal implementation of getStateSnapshot (called with lock held)
+     * Modules override this instead of getStateSnapshot() for thread-safe access.
+     */
+    virtual ofJson getStateSnapshotImpl() const { return toJson(); }
+    
+    // Immutable snapshot system for lock-free serialization
+    // Snapshots are created during safe periods and can be read without locks
+    
+    /**
+     * RENDERING SNAPSHOT SYSTEM (Phase 7.6)
+     * 
+     * Modules maintain immutable rendering snapshots for lock-free rendering paths.
+     * Similar to JSON snapshots (Phase 7.1), but for rendering-specific parameters.
+     * 
+     * Usage:
+     * - Rendering paths call getRenderingSnapshot() (lock-free read)
+     * - Use snapshot values instead of isEnabled()/getParameter() (no locks needed)
+     * - Snapshots updated after parameter changes (during safe periods)
+     * 
+     * This eliminates deadlocks between rendering (main thread) and parameter updates (audio thread).
+     */
+    
+    /**
+     * Update module snapshot (called during safe periods with lock held).
+     * Creates new immutable JSON snapshot from current module state.
+     * 
+     * THREAD-SAFE: Must be called with moduleMutex_ lock held (shared or exclusive).
+     * Called during safe periods (after commands/scripts complete).
+     * 
+     * Reuses existing getStateSnapshotImpl() logic to generate JSON snapshot.
+     */
+    void updateSnapshot() {
+        std::shared_lock<std::shared_mutex> lock(moduleMutex_);
+        ofJson json = getStateSnapshotImpl();  // Reuse existing snapshot logic
+        {
+            std::lock_guard<std::mutex> snapshotLock(snapshotMutex_);
+            snapshotJson_ = std::make_shared<const ofJson>(std::move(json));  // Update with mutex (C++17 compatible)
+        }
+        // Also update rendering snapshot
+        updateRenderingSnapshot();
+    }
+    
+    /**
+     * Get current module snapshot (fast read with mutex).
+     * Returns immutable JSON snapshot that can be serialized without locks.
+     * 
+     * THREAD-SAFE: Fast read with mutex (C++17 compatible - std::atomic<shared_ptr> requires C++20).
+     * Can be called from any thread.
+     * 
+     * @return Shared pointer to immutable JSON snapshot, or nullptr if snapshot not yet created
+     */
+    std::shared_ptr<const ofJson> getSnapshot() const {
+        std::lock_guard<std::mutex> lock(snapshotMutex_);
+        return snapshotJson_;  // Fast read with mutex (C++17 compatible)
+    }
+    
+    /**
+     * Update rendering snapshot (called during safe periods with lock held).
+     * Creates new immutable rendering snapshot from current module parameters.
+     * 
+     * THREAD-SAFE: Must be called with moduleMutex_ lock held (shared or exclusive).
+     * Called during safe periods (after commands/scripts complete).
+     * 
+     * Default implementation captures enabled_ and common parameters.
+     * Modules can override to include module-specific parameters.
+     */
+    virtual void updateRenderingSnapshot() {
+        // NOTE: Must be called with moduleMutex_ lock already held (shared or exclusive)
+        // Default: only enabled_ (now atomic, but snapshot for consistency)
+        // Modules override to include their parameters
+        auto snapshot = std::make_shared<const RenderingSnapshot>(
+            enabled_.load(),  // Atomic read (safe even with lock held)
+            0.5f,  // Default scale (modules override)
+            1.0f   // Default pointSize (modules override)
+        );
+        {
+            std::lock_guard<std::mutex> snapshotLock(renderingSnapshotMutex_);
+            renderingSnapshot_ = snapshot;
+        }
+    }
+    
+    /**
+     * Get current rendering snapshot (fast read with mutex).
+     * Returns immutable rendering snapshot for lock-free rendering.
+     * 
+     * THREAD-SAFE: Fast read with mutex (C++17 compatible).
+     * Can be called from any thread (especially rendering paths).
+     * 
+     * @return Shared pointer to immutable rendering snapshot, or nullptr if snapshot not yet created
+     */
+    std::shared_ptr<const RenderingSnapshot> getRenderingSnapshot() const {
+        std::lock_guard<std::mutex> lock(renderingSnapshotMutex_);
+        return renderingSnapshot_;  // Fast read with mutex (C++17 compatible)
+    }
     
     /**
      * Unified initialization method - replaces postCreateSetup, configureSelf, and completeRestore
@@ -418,7 +607,18 @@ public:
     
     // Get module type name for serialization (e.g., "TrackerSequencer", "MultiSampler")
     // Default implementation returns getName() - override only if different
-    virtual std::string getTypeName() const {
+    // 
+    // THREAD-SAFE: Uses shared lock for concurrent reads from multiple threads.
+    std::string getTypeName() const {
+        std::shared_lock<std::shared_mutex> lock(moduleMutex_);
+        return getTypeNameImpl();
+    }
+    
+    /**
+     * Internal implementation of getTypeName (called with lock held)
+     * Modules override this instead of getTypeName() for thread-safe access.
+     */
+    virtual std::string getTypeNameImpl() const {
         return getName();
     }
     
@@ -455,8 +655,23 @@ public:
     virtual ofEvent<TriggerEvent>* getEvent(const std::string& eventName) { return nullptr; }
     
     // Enable/disable state
-    virtual void setEnabled(bool enabled) { enabled_ = enabled; }
-    bool isEnabled() const { return enabled_; }
+    // THREAD-SAFE: Uses atomic operations (lock-free reads/writes).
+    void setEnabled(bool enabled) {
+        enabled_.store(enabled, std::memory_order_release);  // Lock-free atomic write
+        setEnabledImpl(enabled);  // Call implementation (for modules that override)
+    }
+    bool isEnabled() const {
+        return enabled_.load(std::memory_order_acquire);  // Lock-free atomic read
+    }
+    
+    /**
+     * Internal implementation of setEnabled (called with lock held)
+     * Modules can override this to add custom behavior (e.g., stop playback)
+     */
+    virtual void setEnabledImpl(bool enabled) {
+        // enabled_ is now set by setEnabled() via atomic store
+        // Modules can override this for custom behavior (e.g., stop playback)
+    }
     
     // Capability query interface - modules declare what they can do
     // Used instead of type-specific checks (dynamic_pointer_cast)
@@ -683,5 +898,26 @@ public:
 protected:
     // Parameter change callback for synchronization systems
     std::function<void(const std::string&, float)> parameterChangeCallback;
-    bool enabled_ = true;  // Module enabled state (default: enabled)
+    std::atomic<bool> enabled_{true};  // Module enabled state (atomic, lock-free)
+    
+    // Instance name (set by ModuleRegistry during initialization)
+    // e.g., "trackerSequencer1", "multiSampler2", etc.
+    std::string instanceName_;
+    
+    // Thread-safe access mutex (read-write lock for concurrent reads, exclusive writes)
+    // Protects all module state access (parameters, state snapshots, enabled state)
+    // Read operations (getParameter, getStateSnapshot, isEnabled) use shared_lock
+    // Write operations (setParameter, setEnabled) use unique_lock
+    mutable std::shared_mutex moduleMutex_;
+    
+    // Immutable JSON snapshot for lock-free serialization
+    // Stored as mutex-protected shared_ptr (C++17 compatible - std::atomic<shared_ptr> requires C++20)
+    // Mutex is only used for pointer updates, reads are fast (single mutex lock)
+    mutable std::mutex snapshotMutex_;
+    mutable std::shared_ptr<const ofJson> snapshotJson_;
+    
+    // Rendering snapshot (immutable, lock-free access)
+    // Stored as mutex-protected shared_ptr (C++17 compatible)
+    mutable std::mutex renderingSnapshotMutex_;
+    mutable std::shared_ptr<const RenderingSnapshot> renderingSnapshot_;
 };

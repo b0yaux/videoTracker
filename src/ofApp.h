@@ -41,6 +41,7 @@
 #include "shell/EditorShell.h"
 #include "shell/CLIShell.h"
 #include "shell/CommandShell.h"
+#include "shell/CodeShell.h"
 #include <memory>
 #include <vector>
 
@@ -78,6 +79,7 @@ private:
     vt::shell::Shell* activeShell_ = nullptr;
     vt::shell::EditorShell* editorShell_ = nullptr;  // Pointer to EditorShell in shells_ vector
     vt::shell::CommandShell* commandShell_ = nullptr;      // Pointer to CommandShell in shells_ vector
+    vt::shell::CodeShell* codeShell_ = nullptr;            // Pointer to CodeShell in shells_ vector
     
     // Time objects (for GUI)
     ClockGUI clockGUI;
@@ -164,6 +166,7 @@ private:
     void switchShell(vt::shell::Shell* shell);
     void switchToEditor();
     void switchToCommand();
+    void switchToCodeShell();
     bool handleShellKeyPress(int key);
     vt::shell::Shell* findShellByName(const std::string& name);
 };

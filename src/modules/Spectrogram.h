@@ -53,10 +53,10 @@ public:
     // Module interface implementation
     std::string getName() const override;
     ModuleType getType() const override;
-    std::vector<ParameterDescriptor> getParameters() const override;
+    std::vector<ParameterDescriptor> getParametersImpl() const override;
     void onTrigger(TriggerEvent& event) override;
-    void setParameter(const std::string& paramName, float value, bool notify = true) override;
-    float getParameter(const std::string& paramName) const override;
+    void setParameterImpl(const std::string& paramName, float value, bool notify = true) override;
+    float getParameterImpl(const std::string& paramName) const override;
     ModuleMetadata getMetadata() const override;
     
     // Routing interface - Spectrogram produces video output
@@ -186,6 +186,9 @@ private:
     void renderSpectrogram();
     void loadShaders();
     void updateTexture();
+    
+    // Override to initialize rendering snapshot
+    void updateRenderingSnapshot() override;
     
     // FFT scale conversion helpers
     float frequencyToPosition(float freq, float minFreq, float maxFreq) const;

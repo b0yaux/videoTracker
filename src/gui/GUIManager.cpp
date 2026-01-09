@@ -2,6 +2,7 @@
 #include "core/ModuleRegistry.h"
 #include "core/ParameterRouter.h"
 #include "core/ConnectionManager.h"
+#include "core/Engine.h"
 #include "ofLog.h"
 #include <imgui.h>
 #include <algorithm>
@@ -77,6 +78,25 @@ void GUIManager::setConnectionManager(ConnectionManager* manager) {
     }
 }
 
+void GUIManager::setEngine(vt::Engine* engine) {
+    engine_ = engine;
+    
+    // Update all existing GUIs with the Engine reference
+    int updatedCount = 0;
+    for (auto& pair : allGUIs) {
+        if (pair.second) {
+            pair.second->setEngine(engine_);
+            updatedCount++;
+        }
+    }
+    
+    if (updatedCount > 0) {
+        ofLogNotice("GUIManager") << "Updated " << updatedCount << " existing GUIs with Engine reference";
+    } else {
+        ofLogNotice("GUIManager") << "setEngine: No existing GUIs to update (will be set on new GUIs)";
+    }
+}
+
 /**
  * Sync GUI objects with registry (create/destroy as needed)
  * 
@@ -116,6 +136,7 @@ void GUIManager::syncWithRegistry() {
                     gui->setParameterRouter(parameterRouter);
                     gui->setConnectionManager(connectionManager);
                     gui->setGUIManager(this);  // Set GUIManager reference for rename operations
+                    gui->setEngine(engine_);  // Set Engine reference for command queue routing
                     if (!connectionManager) {
                         ofLogWarning("GUIManager") << "WARNING: Creating GUI for " << name << " but ConnectionManager is null!";
                     }

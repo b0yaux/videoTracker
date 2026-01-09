@@ -461,17 +461,7 @@ void ViewManager::drawModulePanels() {
         windowClass.DockingAlwaysTabBar = true;
         ImGui::SetNextWindowClass(&windowClass);
         
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::system_clock::now();
-                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-                logFile << "{\"id\":\"log_" << ms << "_module_class\",\"timestamp\":" << ms << ",\"location\":\"ViewManager.cpp:368\",\"message\":\"Module window SetNextWindowClass\",\"data\":{\"instanceName\":\"" << instanceName << "\",\"hasWindowClass\":true},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H1\"}\n";
-                logFile.close();
-            }
-        }
-        // #endregion
+        
 
         // ImGui::Begin() returns false when window is collapsed
         // windowID uses "DisplayName###UUID" format so UUID is used for window ID (position storage)

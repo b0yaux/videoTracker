@@ -7,17 +7,13 @@
 #include "ModuleFactory.h"
 #include "ParameterRouter.h"
 #include "ConnectionManager.h"
-#include "gui/ViewManager.h"
-#include "gui/GUIManager.h"
-#include "gui/ModuleGUI.h"
 #include "modules/Module.h"
 #include "modules/TrackerSequencer.h"
 #include "core/PatternRuntime.h"
+#include "core/Engine.h"  // For Engine::getStateSnapshot() and getStateVersion()
 #include "ofMain.h"  // For ofGetElapsedTimef()
 #include "ofLog.h"
 #include "ofJson.h"
-#include <imgui.h>
-#include <imgui_internal.h>
 #include <fstream>
 #include <chrono>
 #include "ofFileUtils.h"
@@ -36,20 +32,93 @@ SessionManager::SessionManager(
     ModuleRegistry* registry,
     ModuleFactory* factory,
     ParameterRouter* router,
-    ConnectionManager* connectionManager,
-    ViewManager* viewManager
-) : projectManager_(projectManager), clock(clock), registry(registry), factory(factory), router(router), connectionManager_(connectionManager), viewManager_(viewManager), guiManager_(nullptr), currentSessionName_(""), postLoadCallback_(nullptr), projectOpenedCallback_(nullptr), pendingImGuiState_(""), pendingVisibilityState_(ofJson::object()) {
+    ConnectionManager* connectionManager
+) : projectManager_(projectManager), clock(clock), registry(registry), factory(factory), router(router), connectionManager_(connectionManager), patternRuntime_(nullptr), currentSessionName_(""), postLoadCallback_(nullptr), projectOpenedCallback_(nullptr), pendingImGuiState_(""), originalImGuiState_(""), pendingVisibilityState_(ofJson::object()), engine_(nullptr) {
     if (!clock || !registry || !factory || !router) {
         ofLogError("SessionManager") << "SessionManager initialized with null pointers";
+    }
+    
+    // Start serialization thread
+    serializationThread_ = std::thread(&SessionManager::serializationThreadFunction, this);
+}
+
+//--------------------------------------------------------------
+SessionManager::~SessionManager() {
+    // Signal serialization thread to stop
+    shouldStopSerializationThread_.store(true);
+    
+    // CRITICAL: Notify queue to wake waiting thread (BlockingConcurrentQueue handles this internally)
+    // The wait_dequeue_timed will wake up when shouldStopSerializationThread_ is checked
+    
+    // Wait for thread to finish (only if thread was started)
+    if (serializationThread_.joinable()) {
+        serializationQueue_.enqueue(SerializationRequest{});  // Wake up thread with empty request
+        serializationThread_.join();
     }
 }
 
 //--------------------------------------------------------------
-    // Default constructor implementation (already defined inline in header)
-    // Note: viewManager_ is nullptr in default constructor
+SessionManager& SessionManager::operator=(SessionManager&& other) noexcept {
+    if (this != &other) {
+        // Stop current thread if running (default-constructed SessionManager won't have a running thread)
+        if (serializationThread_.joinable()) {
+            shouldStopSerializationThread_.store(true);
+            serializationQueue_.enqueue(SerializationRequest{});  // Wake up thread
+            serializationThread_.join();
+        }
+        
+        // Use default move assignment for all members (std::thread is moveable)
+        // This will move the thread from other to this
+        projectManager_ = other.projectManager_;
+        clock = other.clock;
+        registry = other.registry;
+        factory = other.factory;
+        router = other.router;
+        connectionManager_ = other.connectionManager_;
+        patternRuntime_ = other.patternRuntime_;
+        currentSessionName_ = std::move(other.currentSessionName_);
+        postLoadCallback_ = std::move(other.postLoadCallback_);
+        projectOpenedCallback_ = std::move(other.projectOpenedCallback_);
+        pendingImGuiState_ = std::move(other.pendingImGuiState_);
+        originalImGuiState_ = std::move(other.originalImGuiState_);
+        pendingVisibilityState_ = std::move(other.pendingVisibilityState_);
+        engine_ = other.engine_;
+        autoSaveEnabled_ = other.autoSaveEnabled_;
+        autoSaveInterval_ = other.autoSaveInterval_;
+        lastAutoSave_ = other.lastAutoSave_;
+        saveInProgress_ = other.saveInProgress_;
+        onUpdateWindowTitle_ = std::move(other.onUpdateWindowTitle_);
+        shouldStopSerializationThread_ = other.shouldStopSerializationThread_.load();
+        serializationQueue_ = std::move(other.serializationQueue_);
+        serializationThread_ = std::move(other.serializationThread_);  // Move thread (or default-constructed if other was default-constructed)
+    }
+    return *this;
+}
 
 //--------------------------------------------------------------
 ofJson SessionManager::serializeAll() const {
+    // Get core state (no UI dependencies)
+    ofJson json = serializeCore();
+    
+    // Add empty GUI state object (for backward compatibility)
+    // Note: This method is kept for backward compatibility but will be deprecated
+    // GUI state serialization is now handled by Shells (EditorShell)
+    json["gui"] = ofJson::object();
+    
+    // Preserve existing GUI state from pendingImGuiState_ if available (for backward compatibility)
+    // This allows old code that calls serializeAll() to still get some GUI state
+    if (!pendingImGuiState_.empty()) {
+        json["gui"]["imguiState"] = pendingImGuiState_;
+    }
+    
+    // Note: All other GUI state (viewState, visibleInstances, moduleLayouts) is now handled by Shells
+    // This method is deprecated - use serializeCore() for core state and Shells for UI state
+    
+    return json;
+}
+
+//--------------------------------------------------------------
+ofJson SessionManager::serializeCore() const {
     ofJson json;
     
     // Version and metadata
@@ -62,31 +131,61 @@ ofJson SessionManager::serializeAll() const {
     json["metadata"] = ofJson::object();
     json["metadata"]["modified"] = ss.str();
     
-    // Clock state
-    if (clock) {
-        json["clock"] = clock->toJson();
-        ofLogNotice("SessionManager") << "Saving Clock BPM: " << clock->getBPM();
+    // Get engine snapshot (lock-free read - no registryMutex_ or moduleMutex_ needed)
+    if (engine_) {
+        auto engineSnapshot = engine_->getStateSnapshot();
+        if (engineSnapshot) {
+            // Extract core state from engine snapshot (already JSON)
+            // Engine snapshot includes: transport, modules, connections, script
+            if (engineSnapshot->contains("transport")) {
+                json["clock"] = (*engineSnapshot)["transport"];  // Use transport as clock state
+            }
+            
+            // Modules: Use registry->toJson() which is now lock-free (after Task 1)
+            // Engine snapshot has modules as object, but session format needs array
+            // registry->toJson() uses Module::getSnapshot() (lock-free) and returns correct format
+            if (registry) {
+                json["modules"] = ofJson::object();
+                json["modules"]["instances"] = registry->toJson();  // Lock-free (uses snapshots)
+            }
+            
+            // Connections: Extract from engine snapshot (already array format)
+            if (engineSnapshot->contains("connections")) {
+                json["modules"]["connections"] = (*engineSnapshot)["connections"];
+            }
+            
+            if (engineSnapshot->contains("script")) {
+                // Script state is in engine snapshot, but we may not need it in session
+                // (Script state is runtime, not session state)
+            }
+        } else {
+            ofLogWarning("SessionManager") << "No engine snapshot available, falling back to legacy serialization";
+            // Fallback to legacy serialization if snapshot not available
+            if (clock) {
+                json["clock"] = clock->toJson();
+            }
+            if (registry) {
+                json["modules"] = ofJson::object();
+                json["modules"]["instances"] = registry->toJson();  // Lock-free (uses snapshots)
+            }
+        }
     } else {
-        ofLogWarning("SessionManager") << "Clock is null, cannot save BPM to session";
+        // No engine reference - use legacy serialization
+        if (clock) {
+            json["clock"] = clock->toJson();
+        }
+        if (registry) {
+            json["modules"] = ofJson::object();
+            json["modules"]["instances"] = registry->toJson();  // Lock-free (uses snapshots)
+        }
     }
     
-    // Modules
-    if (registry) {
-        json["modules"] = ofJson::object();
-        json["modules"]["instances"] = registry->toJson();
-    }
-    
-    // Parameter routing
+    // Parameter routing (still needs router->toJson() - minimal lock time, separate system)
     if (router) {
         json["modules"]["routing"] = router->toJson();
     }
     
-    // Unified connections (audio, video, parameter, event)
-    if (connectionManager_) {
-        json["modules"]["connections"] = connectionManager_->toJson();
-    }
-    
-    // PatternRuntime state (Phase 2: Save patterns from Runtime, not TrackerSequencer)
+    // PatternRuntime state (still needs patternRuntime_->toJson() - minimal lock time, separate system)
     if (patternRuntime_) {
         json["patternRuntime"] = patternRuntime_->toJson();
         ofLogNotice("SessionManager") << "Saving PatternRuntime patterns";
@@ -94,152 +193,712 @@ ofJson SessionManager::serializeAll() const {
         ofLogWarning("SessionManager") << "PatternRuntime is null, cannot save patterns to session";
     }
     
-    // GUI state
-    json["gui"] = ofJson::object();
-    
-    // Module layouts (from ModuleGUI)
-    json["gui"]["moduleLayouts"] = ofJson::object();
-    std::map<std::string, ImVec2> layouts = ModuleGUI::getAllDefaultLayouts();
-    for (const auto& [typeName, size] : layouts) {
-        json["gui"]["moduleLayouts"][typeName] = ofJson::object();
-        json["gui"]["moduleLayouts"][typeName]["width"] = size.x;
-        json["gui"]["moduleLayouts"][typeName]["height"] = size.y;
-    }
-    
-    // View state (panel visibility, current panel, etc.)
-    if (viewManager_) {
-        json["gui"]["viewState"] = ofJson::object();
-        json["gui"]["viewState"]["fileBrowserVisible"] = viewManager_->isFileBrowserVisible();
-        json["gui"]["viewState"]["consoleVisible"] = viewManager_->isConsoleVisible();
-        json["gui"]["viewState"]["assetLibraryVisible"] = viewManager_->isAssetLibraryVisible();
-        json["gui"]["viewState"]["currentFocusedWindow"] = viewManager_->getCurrentFocusedWindow();
-        json["gui"]["viewState"]["masterModulesVisible"] = viewManager_->isMasterModulesVisible();
-    }
-    
-    // Module instance visibility state
-    if (guiManager_) {
-        json["gui"]["visibleInstances"] = ofJson::object();
-        json["gui"]["visibleInstances"]["mediaPool"] = ofJson::array();
-        json["gui"]["visibleInstances"]["tracker"] = ofJson::array();
-        json["gui"]["visibleInstances"]["audioOutput"] = ofJson::array();
-        json["gui"]["visibleInstances"]["videoOutput"] = ofJson::array();
-        json["gui"]["visibleInstances"]["audioMixer"] = ofJson::array();
-        json["gui"]["visibleInstances"]["videoMixer"] = ofJson::array();
-        
-        auto visibleInstruments = guiManager_->getVisibleInstances(ModuleType::INSTRUMENT);
-        for (const auto& name : visibleInstruments) {
-            json["gui"]["visibleInstances"]["mediaPool"].push_back(name);
-        }
-        
-        auto visibleTracker = guiManager_->getVisibleInstances(ModuleType::SEQUENCER);
-        for (const auto& name : visibleTracker) {
-            json["gui"]["visibleInstances"]["tracker"].push_back(name);
-        }
-        
-        auto visibleUtility = guiManager_->getVisibleInstances(ModuleType::UTILITY);
-        // Separate utility types by checking module metadata (generic approach)
-        for (const auto& name : visibleUtility) {
-            auto module = registry->getModule(name);
-            if (module) {
-                auto metadata = module->getMetadata();
-                std::string typeName = metadata.typeName;
-                if (typeName == "AudioOutput") {
-                    json["gui"]["visibleInstances"]["audioOutput"].push_back(name);
-                } else if (typeName == "VideoOutput") {
-                    json["gui"]["visibleInstances"]["videoOutput"].push_back(name);
-                } else if (typeName == "AudioMixer") {
-                    json["gui"]["visibleInstances"]["audioMixer"].push_back(name);
-                } else if (typeName == "VideoMixer") {
-                    json["gui"]["visibleInstances"]["videoMixer"].push_back(name);
-                }
-            }
-        }
-    }
-    
-    // ImGui window state (docking, positions, sizes)
-    // Only save if layout was actually loaded from session, or preserve existing session layout
-    if (!sessionLayoutWasLoaded_) {
-        // Layout was never loaded - check if we should preserve existing session layout
-        // Use originalImGuiState_ which contains the original layout from session JSON
-        // Check if it's meaningful before preserving it
-        bool shouldPreserve = false;
-        std::string layoutToPreserve;
-        
-        if (!originalImGuiState_.empty()) {
-            // Check if original layout is meaningful (not empty)
-            bool originalIsMeaningful = originalImGuiState_.size() > 50 || 
-                                       originalImGuiState_.find("[Window") != std::string::npos;
-            if (originalIsMeaningful) {
-                shouldPreserve = true;
-                layoutToPreserve = originalImGuiState_;
-                ofLogNotice("SessionManager") << "Preserving original meaningful session layout (was never loaded): " 
-                                             << layoutToPreserve.size() << " bytes";
-            } else {
-                ofLogNotice("SessionManager") << "Original session layout is empty (" << originalImGuiState_.size() 
-                                             << " bytes), not preserving";
-            }
-        } else if (!pendingImGuiState_.empty()) {
-            // Fallback to pendingImGuiState_ if originalImGuiState_ is not available
-            // But still check if it's meaningful
-            bool pendingIsMeaningful = pendingImGuiState_.size() > 50 || 
-                                      pendingImGuiState_.find("[Window") != std::string::npos;
-            if (pendingIsMeaningful) {
-                shouldPreserve = true;
-                layoutToPreserve = pendingImGuiState_;
-                ofLogNotice("SessionManager") << "Preserving pending meaningful session layout (was never loaded): " 
-                                             << layoutToPreserve.size() << " bytes";
-            } else {
-                ofLogNotice("SessionManager") << "Pending session layout is empty (" << pendingImGuiState_.size() 
-                                             << " bytes), not preserving";
-            }
-        }
-        
-        if (shouldPreserve) {
-            json["gui"]["imguiState"] = layoutToPreserve;
-        } else {
-            // Don't add imguiState to JSON - this preserves whatever was in the session file before
-            // (i.e., if there was a good layout, it stays; if it was empty, it stays empty)
-            ofLogNotice("SessionManager") << "Skipping ImGui state save: Layout was never loaded from session (Command Shell only)";
-        }
-        return json;
-    }
-    
-    // Layout was loaded - proceed with normal save
-    // Check if ImGui is initialized
-    ImGuiContext* ctx = ImGui::GetCurrentContext();
-    if (!ctx) {
-        ofLogError("SessionManager") << "Cannot save ImGui state: ImGui context is null";
-        return json;
-    }
-    
-    size_t iniSize = 0;
-    const char* iniData = ImGui::SaveIniSettingsToMemory(&iniSize);
-    
-    if (iniData && iniSize > 0) {
-        // Check if current state is meaningful (contains window configurations, not just empty docking data)
-        std::string currentState(iniData, iniSize);
-        bool currentStateIsMeaningful = iniSize > 50 || currentState.find("[Window") != std::string::npos;
-        
-        if (!currentStateIsMeaningful) {
-            // Current state is empty - don't save it, preserve existing layout instead
-            ofLogNotice("SessionManager") << "Current ImGui state is empty (" << iniSize 
-                                         << " bytes), preserving existing session layout instead of saving empty state";
-            if (!pendingImGuiState_.empty()) {
-                // Preserve existing layout if we have one
-                json["gui"]["imguiState"] = pendingImGuiState_;
-                ofLogNotice("SessionManager") << "Preserved existing session layout (" << pendingImGuiState_.size() << " bytes)";
-            }
-            // If no existing layout, don't add imguiState to JSON (preserves whatever was there before)
-            return json;
-        }
-        
-        json["gui"]["imguiState"] = std::string(iniData, iniSize);
-        ofLogNotice("SessionManager") << "✓ Saved ImGui window state (" << iniSize << " bytes) to session";
-    } else {
-        ofLogWarning("SessionManager") << "ImGui state is empty, cannot save to session";
-    }
+    // Note: GUI state (viewState, visibleInstances, imguiState, moduleLayouts) is NOT included
+    // UI state serialization is handled by Shells (EditorShell)
     
     return json;
+}
+
+//--------------------------------------------------------------
+bool SessionManager::loadCore(const ofJson& json) {
+    if (!json.is_object()) {
+        ofLogError("SessionManager") << "Invalid session format: expected object";
+        return false;
+    }
+    
+    // Check version
+    std::string version = json.value("version", "");
+    if (version.empty()) {
+        // Legacy format - try migration
+        ofLogNotice("SessionManager") << "Legacy format detected, attempting migration";
+        return migrateLegacyFormat(json);
+    }
+    
+    if (version != SESSION_VERSION) {
+        ofLogWarning("SessionManager") << "Session version mismatch: " << version 
+                                       << " (expected " << SESSION_VERSION << ")";
+        // Continue anyway - might still work
+    }
+    
+    // Load clock
+    if (clock && json.contains("clock")) {
+        try {
+            float bpmBefore = clock->getBPM();
+            ofLogNotice("SessionManager") << "Loading Clock BPM from session (current: " << bpmBefore << ")";
+            clock->fromJson(json["clock"]);
+            float bpmAfter = clock->getBPM();
+            ofLogNotice("SessionManager") << "Clock BPM loaded: " << bpmAfter << " (was: " << bpmBefore << ")";
+        } catch (const std::exception& e) {
+            ofLogError("SessionManager") << "Failed to load clock: " << e.what();
+            return false;
+        }
+    } else {
+        if (!clock) {
+            ofLogWarning("SessionManager") << "Clock is null, cannot load BPM from session";
+        } else if (!json.contains("clock")) {
+            ofLogWarning("SessionManager") << "Session JSON does not contain 'clock' key, using default BPM";
+        }
+    }
+    
+    // Load modules
+    if (registry && factory && json.contains("modules") && json["modules"].is_object()) {
+        auto modulesJson = json["modules"];
+        if (modulesJson.contains("instances")) {
+            try {
+                // Clear existing modules and factory state before loading
+                // This prevents UUID conflicts when loading a session
+                registry->clear();
+                factory->clear();
+                
+                if (!registry->fromJson(modulesJson["instances"], *factory)) {
+                    ofLogError("SessionManager") << "Failed to load modules";
+                    return false;
+                }
+            } catch (const std::exception& e) {
+                ofLogError("SessionManager") << "Failed to load modules: " << e.what();
+                return false;
+            }
+        }
+        
+        // Load parameter routing (after modules are loaded)
+        if (router && modulesJson.contains("routing")) {
+            try {
+                if (!router->fromJson(modulesJson["routing"])) {
+                    ofLogError("SessionManager") << "Failed to load parameter routing";
+                    return false;
+                }
+            } catch (const std::exception& e) {
+                ofLogError("SessionManager") << "Failed to load parameter routing: " << e.what();
+                return false;
+            }
+        }
+        
+        // Load unified connections (after modules are loaded)
+        if (connectionManager_ && modulesJson.contains("connections")) {
+            try {
+                // ConnectionManager::fromJson() will restore connections immediately
+                // This establishes the physical connections but sets default volumes/opacities
+                if (!connectionManager_->fromJson(modulesJson["connections"])) {
+                    ofLogError("SessionManager") << "Failed to load module connections";
+                    return false;
+                }
+            } catch (const std::exception& e) {
+                ofLogError("SessionManager") << "Failed to load module connections: " << e.what();
+                return false;
+            }
+            
+            // CRITICAL: After ConnectionManager restores connections, restore connection-specific
+            // parameters (volumes, opacities, blend modes) from module JSON data
+            // ConnectionManager only establishes the connections, but doesn't restore the parameters
+            if (modulesJson.contains("instances")) {
+                ofLogNotice("SessionManager") << "Restoring connection parameters (volumes, opacities, blend modes)...";
+                restoreMixerConnections(modulesJson["instances"]);
+            }
+        } else {
+            // Fallback: Restore mixer connections from module data (backward compatibility)
+            restoreMixerConnections(modulesJson["instances"]);
+        }
+        
+        // Load PatternRuntime (Phase 2: Load patterns from Runtime, migrate TrackerSequencer patterns)
+        if (patternRuntime_ && json.contains("patternRuntime") && json["patternRuntime"].is_object()) {
+            try {
+                ofLogNotice("SessionManager") << "Loading PatternRuntime patterns from session...";
+                patternRuntime_->fromJson(json["patternRuntime"]);
+                ofLogNotice("SessionManager") << "PatternRuntime patterns loaded";
+            } catch (const std::exception& e) {
+                ofLogError("SessionManager") << "Failed to load PatternRuntime: " << e.what();
+                // Non-fatal, continue (patterns may be in TrackerSequencer for migration)
+            }
+        }
+        
+        // Complete module restoration (for deferred operations like media loading)
+        // This is called after all modules are loaded and connections are restored
+        // but before GUI state is restored, so modules can prepare their state
+        if (registry) {
+            ofLogNotice("SessionManager") << "Completing module restoration...";
+            if (!patternRuntime_) {
+                ofLogError("SessionManager") << "CRITICAL: PatternRuntime is null during module restoration! "
+                                              << "Modules will not have access to patterns.";
+            }
+            size_t restoredCount = 0;
+            registry->forEachModule([&](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
+                if (module) {
+                    try {
+                        // Initialize module with PatternRuntime and isRestored=true to trigger restoration logic
+                        if (!patternRuntime_) {
+                            ofLogWarning("SessionManager") << "Initializing module '" << name 
+                                                            << "' without PatternRuntime (PatternRuntime is null)";
+                        }
+                        module->initialize(clock, registry, connectionManager_, router, patternRuntime_, true);
+                        restoredCount++;
+                    } catch (const std::exception& e) {
+                        ofLogError("SessionManager") << "Failed to initialize restored module " 
+                                                     << name << " (" << uuid << "): " << e.what();
+                    }
+                }
+            });
+            ofLogNotice("SessionManager") << "Module restoration complete: " << restoredCount << " module(s) restored";
+            
+            // CRITICAL: Migrate old "TrackerSequencer_chain" to instance-specific chains BEFORE restoring bindings
+            // This ensures bindings are restored with the correct instance-specific chain names
+            if (patternRuntime_ && registry) {
+                bool hasOldChain = patternRuntime_->chainExists("TrackerSequencer_chain");
+                PatternChain* oldChain = hasOldChain ? patternRuntime_->getChain("TrackerSequencer_chain") : nullptr;
+                
+                // Check if any sequencer has boundChainName_ set to old chain (from fromJson())
+                auto sequencerModules = registry->getModulesByType(ModuleType::SEQUENCER);
+                bool needsMigration = false;
+                for (const auto& module : sequencerModules) {
+                    if (!module) continue;
+                    auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(module);
+                    if (!tracker) continue;
+                    if (tracker->getBoundChainName() == "TrackerSequencer_chain") {
+                        needsMigration = true;
+                        break;
+                    }
+                }
+                
+                // Also check PatternRuntime bindings for old chain
+                // Note: getSequencerNames() only returns sequencers with existing bindings,
+                // so we also need to check all sequencers from ModuleRegistry
+                auto sequencerNames = patternRuntime_->getSequencerNames();
+                for (const auto& seqName : sequencerNames) {
+                    auto binding = patternRuntime_->getSequencerBinding(seqName);
+                    if (binding.chainName == "TrackerSequencer_chain") {
+                        needsMigration = true;
+                        break;
+                    }
+                }
+                
+                // CRITICAL: Also check ALL sequencers from ModuleRegistry (not just those with bindings)
+                // This catches sequencers that have boundChainName_ set but no PatternRuntime binding yet
+                // OR sequencers that are using the old chain via getCurrentChain() even if boundChainName_ is empty
+                for (const auto& module : sequencerModules) {
+                    if (!module) continue;
+                    auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(module);
+                    if (!tracker) continue;
+                    std::string boundChain = tracker->getBoundChainName();
+                    if (boundChain == "TrackerSequencer_chain") {
+                        needsMigration = true;
+                        break;
+                    }
+                    // Also check if getCurrentChain() returns the old chain
+                    PatternChain* currentChain = tracker->getCurrentChain();
+                    if (currentChain && oldChain && currentChain == oldChain) {
+                        needsMigration = true;
+                        break;
+                    }
+                }
+                
+                if (hasOldChain || needsMigration) {
+                    ofLogNotice("SessionManager") << "Found old 'TrackerSequencer_chain' references, migrating to instance-specific chains...";
+                    int migratedCount = 0;
+                    
+                    for (const auto& module : sequencerModules) {
+                        if (!module) continue;
+                        
+                        std::string instanceName = registry->getName(module);
+                        if (instanceName.empty()) continue;
+                        
+                        auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(module);
+                        if (!tracker) continue;
+                        
+                        // Check if this sequencer is bound to the old chain
+                        // Check both PatternRuntime binding AND tracker's boundChainName_
+                        auto binding = patternRuntime_->getSequencerBinding(instanceName);
+                        std::string trackerBoundChain = tracker->getBoundChainName();
+                        
+                        // Also check if getCurrentChain() returns the old chain (even if boundChainName_ isn't set)
+                        // This handles cases where the sequencer is using the old chain but boundChainName_ is empty
+                        PatternChain* currentChain = tracker->getCurrentChain();
+                        bool usingOldChain = false;
+                        if (currentChain && oldChain && currentChain == oldChain) {
+                            usingOldChain = true;
+                        }
+                        
+                        // Migrate if:
+                        // 1. PatternRuntime binding points to old chain, OR
+                        // 2. tracker's boundChainName_ points to old chain, OR
+                        // 3. sequencer is currently using the old chain (via getCurrentChain())
+                        if (binding.chainName == "TrackerSequencer_chain" || 
+                            trackerBoundChain == "TrackerSequencer_chain" || 
+                            usingOldChain) {
+                            // Create instance-specific chain
+                            std::string newChainName = instanceName + "_chain";
+                            
+                            if (!patternRuntime_->chainExists(newChainName)) {
+                                patternRuntime_->addChain(newChainName);
+                                
+                                // Copy chain entries from old chain if it exists
+                                if (oldChain) {
+                                    const auto& chainPatterns = oldChain->getChain();
+                                    for (size_t i = 0; i < chainPatterns.size(); i++) {
+                                        patternRuntime_->chainAddPattern(newChainName, chainPatterns[i]);
+                                        int repeatCount = oldChain->getRepeatCount((int)i);
+                                        if (repeatCount > 1) {
+                                            patternRuntime_->chainSetRepeat(newChainName, (int)i, repeatCount);
+                                        }
+                                        if (oldChain->isEntryDisabled((int)i)) {
+                                            patternRuntime_->chainSetEntryDisabled(newChainName, (int)i, true);
+                                        }
+                                    }
+                                    
+                                    // Copy chain state
+                                    patternRuntime_->chainSetEnabled(newChainName, oldChain->isEnabled());
+                                    PatternChain* newChain = patternRuntime_->getChain(newChainName);
+                                    if (newChain) {
+                                        newChain->setCurrentIndex(oldChain->getCurrentIndex());
+                                    }
+                                } else {
+                                    // Old chain doesn't exist - create empty chain with default state
+                                    patternRuntime_->chainSetEnabled(newChainName, binding.chainEnabled);
+                                    ofLogNotice("SessionManager") << "Created new empty chain '" << newChainName 
+                                                                  << "' for sequencer '" << instanceName 
+                                                                  << "' (old chain 'TrackerSequencer_chain' not found)";
+                                }
+                                
+                                // Update binding to new chain in PatternRuntime
+                                patternRuntime_->bindSequencerChain(instanceName, newChainName);
+                                if (binding.chainEnabled) {
+                                    patternRuntime_->setSequencerChainEnabled(instanceName, true);
+                                }
+                                
+                                // Update tracker's boundChainName_
+                                tracker->bindToChain(newChainName);
+                                
+                                migratedCount++;
+                                ofLogNotice("SessionManager") << "Migrated chain for sequencer '" << instanceName 
+                                                              << "' from 'TrackerSequencer_chain' to '" << newChainName << "'";
+                            }
+                        }
+                    }
+                    
+                    if (migratedCount > 0) {
+                        ofLogNotice("SessionManager") << "Migrated " << migratedCount << " sequencer(s) from old chain name";
+                    }
+                }
+            }
+            
+            // Phase 2: Restore sequencer bindings from PatternRuntime AFTER modules are initialized and migration is complete
+            if (patternRuntime_) {
+                auto sequencerNames = patternRuntime_->getSequencerNames();
+                
+                for (const auto& seqName : sequencerNames) {
+                    auto binding = patternRuntime_->getSequencerBinding(seqName);
+                    
+                    
+                    // CRITICAL: Only restore bindings for sequencers that match the sequencer name
+                    // This prevents applying bindings from one sequencer to another
+                    auto module = registry->getModule(seqName);
+                    auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(module);
+                    if (tracker) {
+                        // CRITICAL: Verify sequencer instance name matches (prevent cross-binding)
+                        // Use getInstanceName() not getName() - getName() returns type name "TrackerSequencer"
+                        if (tracker->getInstanceName() != seqName) {
+                            ofLogWarning("SessionManager") << "Sequencer name mismatch: binding for '" << seqName 
+                                                           << "' but tracker instance name is '" << tracker->getInstanceName() << "', skipping";
+                            continue;
+                        }
+                        
+                        
+                        // Restore pattern binding
+                        if (!binding.patternName.empty() && patternRuntime_->patternExists(binding.patternName)) {
+                            tracker->bindToPattern(binding.patternName);
+                        }
+                        
+                        // CRITICAL: Only restore chain binding if this sequencer actually has one
+                        // This prevents applying a chain from one sequencer to all sequencers
+                        if (!binding.chainName.empty() && patternRuntime_->chainExists(binding.chainName)) {
+                            
+                            
+                            // CRITICAL: Set chain enabled state BEFORE binding to ensure it's correct
+                            // This must happen before bindToChain() so the binding is set up correctly
+                            PatternChain* chain = patternRuntime_->getChain(binding.chainName);
+                            if (chain) {
+                                // Restore chain enabled state from binding (or use chain's current state)
+                                if (binding.chainEnabled) {
+                                    patternRuntime_->setSequencerChainEnabled(seqName, true);
+                                } else if (chain->isEnabled()) {
+                                    // Chain is enabled but binding says disabled - honor chain state
+                                    patternRuntime_->setSequencerChainEnabled(seqName, true);
+                                }
+                            }
+                            
+                            // Now bind to chain (this will sync chain index with bound pattern)
+                            // Note: bindToChain() sets boundChainName_ internally
+                            tracker->bindToChain(binding.chainName);
+                            
+                            // CRITICAL: Verify boundChainName_ was set correctly
+                            // If fromJson() loaded boundChainName_, it should match
+                            // If not, bindToChain() should have set it
+                            if (tracker->getBoundChainName() != binding.chainName) {
+                                ofLogWarning("SessionManager") << "Chain binding mismatch for sequencer '" << seqName 
+                                                              << "': expected '" << binding.chainName 
+                                                              << "', got '" << tracker->getBoundChainName() << "'";
+                            }
+                            
+                            
+                        }
+                        
+                        ofLogVerbose("SessionManager") << "Restored bindings for sequencer '" << seqName 
+                                                       << "': pattern='" << binding.patternName 
+                                                       << "', chain='" << binding.chainName << "'";
+                    } else {
+                        
+                        ofLogWarning("SessionManager") << "Sequencer binding found for '" << seqName 
+                                                       << "' but module not found in registry";
+                    }
+                }
+                
+                // CRITICAL: Ensure ALL sequencer modules have bindings, even if they weren't in saved bindings
+                // This fixes the issue where only some sequencers appear in the list
+                if (registry && patternRuntime_) {
+                    // Get old chain reference for late migration (if it exists)
+                    bool hasOldChainForLateMigration = patternRuntime_->chainExists("TrackerSequencer_chain");
+                    PatternChain* oldChainForLateMigration = hasOldChainForLateMigration ? patternRuntime_->getChain("TrackerSequencer_chain") : nullptr;
+                    
+                    auto sequencerModules = registry->getModulesByType(ModuleType::SEQUENCER);
+                    for (const auto& module : sequencerModules) {
+                        if (!module) continue;
+                        
+                        std::string name = registry->getName(module);
+                        if (name.empty()) continue;
+                        
+                        auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(module);
+                        if (!tracker) continue;
+                        
+                        // Check if this sequencer already has a binding
+                        auto binding = patternRuntime_->getSequencerBinding(name);
+                        
+                        // CRITICAL: If sequencer has no chain binding but is using "TrackerSequencer_chain",
+                        // migrate it now (this handles sequencers that were missed in the earlier migration)
+                        std::string trackerBoundChain = tracker->getBoundChainName();
+                        if (binding.chainName.empty() && trackerBoundChain == "TrackerSequencer_chain" && hasOldChainForLateMigration) {
+                            std::string newChainName = name + "_chain";
+                            if (!patternRuntime_->chainExists(newChainName)) {
+                                patternRuntime_->addChain(newChainName);
+                                
+                                // Copy chain entries from old chain
+                                if (oldChainForLateMigration) {
+                                    const auto& chainPatterns = oldChainForLateMigration->getChain();
+                                    for (size_t i = 0; i < chainPatterns.size(); i++) {
+                                        patternRuntime_->chainAddPattern(newChainName, chainPatterns[i]);
+                                        int repeatCount = oldChainForLateMigration->getRepeatCount((int)i);
+                                        if (repeatCount > 1) {
+                                            patternRuntime_->chainSetRepeat(newChainName, (int)i, repeatCount);
+                                        }
+                                        if (oldChainForLateMigration->isEntryDisabled((int)i)) {
+                                            patternRuntime_->chainSetEntryDisabled(newChainName, (int)i, true);
+                                        }
+                                    }
+                                    
+                                    // Copy chain state
+                                    patternRuntime_->chainSetEnabled(newChainName, oldChainForLateMigration->isEnabled());
+                                    PatternChain* newChain = patternRuntime_->getChain(newChainName);
+                                    if (newChain) {
+                                        newChain->setCurrentIndex(oldChainForLateMigration->getCurrentIndex());
+                                    }
+                                }
+                                
+                                // Update binding to new chain in PatternRuntime
+                                patternRuntime_->bindSequencerChain(name, newChainName);
+                                patternRuntime_->setSequencerChainEnabled(name, oldChainForLateMigration ? oldChainForLateMigration->isEnabled() : true);
+                                
+                                // Update tracker's boundChainName_
+                                tracker->bindToChain(newChainName);
+                                
+                                ofLogNotice("SessionManager") << "Late migration: Migrated chain for sequencer '" << name 
+                                                              << "' from 'TrackerSequencer_chain' to '" << newChainName << "'";
+                            }
+                        }
+                        
+                        // CRITICAL: If sequencer has no chain binding, create instance-specific chain
+                        // This ensures all sequencers have their own chains, even if they weren't in saved bindings
+                        if (binding.chainName.empty()) {
+                            std::string newChainName = name + "_chain";
+                            if (!patternRuntime_->chainExists(newChainName)) {
+                                patternRuntime_->addChain(newChainName);
+                                ofLogNotice("SessionManager") << "Created instance-specific chain '" << newChainName 
+                                                              << "' for sequencer '" << name << "' (no binding found)";
+                            }
+                            // Bind sequencer to the new chain
+                            patternRuntime_->bindSequencerChain(name, newChainName);
+                            patternRuntime_->setSequencerChainEnabled(name, true);
+                            tracker->bindToChain(newChainName);
+                            ofLogNotice("SessionManager") << "Bound sequencer '" << name << "' to chain '" << newChainName << "'";
+                        }
+                        
+                        // If no pattern binding, ensure sequencer gets one
+                        if (binding.patternName.empty()) {
+                            // Get available patterns
+                            auto patternNames = patternRuntime_->getPatternNames();
+                            
+                            if (!patternNames.empty()) {
+                                // Bind to first available pattern
+                                ofLogNotice("SessionManager") << "Auto-binding sequencer '" << name 
+                                                              << "' to pattern '" << patternNames[0] << "'";
+                                tracker->bindToPattern(patternNames[0]);
+                            } else {
+                                // No patterns exist - create default pattern
+                                Pattern defaultPattern(16);
+                                std::string patternName = patternRuntime_->addPattern(defaultPattern, "");
+                                if (!patternName.empty()) {
+                                    ofLogNotice("SessionManager") << "Created default pattern '" << patternName 
+                                                                  << "' for sequencer '" << name << "'";
+                                    tracker->bindToPattern(patternName);
+                                }
+                            }
+                        } else {
+                            // Pattern binding exists - verify it's still valid
+                            if (!patternRuntime_->patternExists(binding.patternName)) {
+                                // Pattern doesn't exist - bind to first available or create default
+                                auto patternNames = patternRuntime_->getPatternNames();
+                                if (!patternNames.empty()) {
+                                    ofLogWarning("SessionManager") << "Pattern '" << binding.patternName 
+                                                                   << "' not found for sequencer '" << name 
+                                                                   << "', binding to '" << patternNames[0] << "'";
+                                    tracker->bindToPattern(patternNames[0]);
+                                } else {
+                                    Pattern defaultPattern(16);
+                                    std::string patternName = patternRuntime_->addPattern(defaultPattern, "");
+                                    if (!patternName.empty()) {
+                                        tracker->bindToPattern(patternName);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Phase 3: Migrate TrackerSequencer patterns to PatternRuntime (for legacy sessions)
+            // Only migrate if PatternRuntime is empty (new format sessions already have patterns in Runtime)
+            if (patternRuntime_ && modulesJson.contains("instances")) {
+                // Check if PatternRuntime already has patterns (new format session)
+                bool runtimeHasPatterns = !patternRuntime_->getPatternNames().empty();
+                
+                if (!runtimeHasPatterns) {
+                    ofLogNotice("SessionManager") << "PatternRuntime is empty, checking for legacy patterns to migrate...";
+                    size_t migratedCount = 0;
+                    
+                    // Check each module's JSON for patterns
+                    // Note: Module JSON structure is: {"uuid": "...", "name": "...", "type": "...", "data": {...}}
+                    // Patterns are stored in moduleJson["data"]["patterns"] for legacy sessions
+                    for (auto& [uuid, moduleJson] : modulesJson["instances"].items()) {
+                        if (moduleJson.contains("type") && moduleJson["type"].get<std::string>() == "TrackerSequencer") {
+                            // Check if this TrackerSequencer has patterns in its data JSON (legacy format)
+                            // FIX: Patterns are in moduleJson["data"]["patterns"], not moduleJson["patterns"]
+                            if (moduleJson.contains("data") && 
+                                moduleJson["data"].is_object() &&
+                                moduleJson["data"].contains("patterns") && 
+                                moduleJson["data"]["patterns"].is_array()) {
+                                
+                                auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(registry->getModule(uuid));
+                                if (tracker) {
+                                    std::string trackerName = tracker->getName();
+                                    auto patternsArray = moduleJson["data"]["patterns"];  // FIX: Access from "data" object
+                                    
+                                    if (patternsArray.empty()) {
+                                        ofLogVerbose("SessionManager") << "TrackerSequencer '" << trackerName 
+                                                                       << "' has empty patterns array, skipping";
+                                        continue;
+                                    }
+                                    
+                                    ofLogNotice("SessionManager") << "Found " << patternsArray.size() 
+                                                                  << " legacy patterns in TrackerSequencer '" << trackerName << "'";
+                                    
+                                    // Migrate each pattern to PatternRuntime
+                                    std::vector<std::string> migratedNames;
+                                    for (size_t i = 0; i < patternsArray.size(); ++i) {
+                                        try {
+                                            Pattern p(16);  // Default step count, will be updated from JSON
+                                            p.fromJson(patternsArray[i]);
+                                            // Use simple pattern naming (P0, P1, P2, etc.) - let PatternRuntime generate the name
+                                            std::string actualName = patternRuntime_->addPattern(p, "");
+                                            
+                                            // PatternRuntime will generate a unique name
+                                            if (!actualName.empty()) {
+                                                migratedNames.push_back(actualName);
+                                                ofLogVerbose("SessionManager") << "Migrated pattern '" << actualName 
+                                                                               << "' from TrackerSequencer '" << trackerName << "'";
+                                            } else {
+                                                ofLogWarning("SessionManager") << "Failed to add pattern to PatternRuntime during migration";
+                                            }
+                                        } catch (const std::exception& e) {
+                                            ofLogError("SessionManager") << "Failed to migrate pattern " << i 
+                                                                          << " from TrackerSequencer '" << trackerName << "': " << e.what();
+                                        }
+                                    }
+                                    
+                                    // Bind to first migrated pattern (or existing pattern if migration skipped)
+                                    if (!migratedNames.empty()) {
+                                        tracker->bindToPattern(migratedNames[0]);
+                                        migratedCount++;
+                                        ofLogNotice("SessionManager") << "Migrated " << patternsArray.size() 
+                                                                      << " patterns from TrackerSequencer '" << trackerName 
+                                                                      << "' to PatternRuntime, bound to '" << migratedNames[0] << "'";
+                                    } else {
+                                        ofLogWarning("SessionManager") << "No patterns migrated from TrackerSequencer '" 
+                                                                      << trackerName << "' (all patterns failed to migrate)";
+                                    }
+                                } else {
+                                    ofLogWarning("SessionManager") << "TrackerSequencer module not found for UUID: " << uuid;
+                                }
+                            } else {
+                                // No patterns found in this TrackerSequencer (might be new format or empty)
+                                ofLogVerbose("SessionManager") << "TrackerSequencer module has no legacy patterns to migrate";
+                            }
+                        }
+                    }
+                    
+                    if (migratedCount > 0) {
+                        ofLogNotice("SessionManager") << "Migration complete: " << migratedCount << " TrackerSequencer(s) migrated to PatternRuntime";
+                    } else {
+                        ofLogNotice("SessionManager") << "No legacy patterns found to migrate (session may already be in new format)";
+                    }
+                } else {
+                    ofLogNotice("SessionManager") << "PatternRuntime already has patterns (new format session), skipping migration";
+                }
+                
+                // CRITICAL: Reload pattern chains for all TrackerSequencers after migration/load
+                // Pattern chains were loaded in fromJson() before patterns existed in PatternRuntime,
+                // so we need to reload them now that patterns are available
+                if (patternRuntime_) {
+                    auto patternNames = patternRuntime_->getPatternNames();
+                    if (!patternNames.empty()) {
+                        ofLogNotice("SessionManager") << "Reloading pattern chains with " << patternNames.size() << " available patterns...";
+                        size_t reloadedCount = 0;
+                        
+                        for (auto& [uuid, moduleJson] : modulesJson["instances"].items()) {
+                            if (moduleJson.contains("type") && moduleJson["type"].get<std::string>() == "TrackerSequencer") {
+                                auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(registry->getModule(uuid));
+                                if (tracker && moduleJson.contains("data") && moduleJson["data"].is_object()) {
+                                    // Reload pattern chain from JSON with now-available pattern names
+                                    if (moduleJson["data"].contains("patternChain")) {
+                                        try {
+                                            // Get the pattern chain JSON from the module data
+                                            auto chainJson = moduleJson["data"]["patternChain"];
+                                            // Reload pattern chain with available pattern names
+                                            tracker->reloadPatternChain(chainJson, patternNames);
+                                            
+                                            // CRITICAL: After reloading pattern chain, sync current chain index with bound pattern
+                                            // This ensures the GUI displays the correct active pattern
+                                            std::string boundName = tracker->getCurrentPatternName();
+                                            if (!boundName.empty() && tracker->getUsePatternChain()) {
+                                                const auto& chain = tracker->getPatternChain();
+                                                for (size_t i = 0; i < chain.size(); ++i) {
+                                                    if (chain[i] == boundName) {
+                                                        tracker->setCurrentChainIndex((int)i);
+                                                        ofLogVerbose("SessionManager") << "Synced chain index to " << i 
+                                                                                       << " for TrackerSequencer '" << tracker->getInstanceName() << "' after chain reload";
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            
+                                            reloadedCount++;
+                                            ofLogVerbose("SessionManager") << "Reloaded pattern chain for TrackerSequencer '" 
+                                                                           << tracker->getInstanceName() << "'";
+                                        } catch (const std::exception& e) {
+                                            ofLogWarning("SessionManager") << "Failed to reload pattern chain for TrackerSequencer '" 
+                                                                           << tracker->getInstanceName() << "': " << e.what();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if (reloadedCount > 0) {
+                            ofLogNotice("SessionManager") << "Reloaded pattern chains for " << reloadedCount << " TrackerSequencer(s)";
+                        }
+                    }
+                }
+            }
+            
+            // CRITICAL: Always validate TrackerSequencer bindings AFTER migration/pattern loading
+            // This ensures all TrackerSequencers have valid pattern bindings regardless of session format
+            // This runs OUTSIDE the migration block so it always executes
+            if (patternRuntime_ && modulesJson.contains("instances")) {
+                ofLogNotice("SessionManager") << "Validating TrackerSequencer pattern bindings...";
+                auto patternNames = patternRuntime_->getPatternNames();
+                
+                for (auto& [uuid, moduleJson] : modulesJson["instances"].items()) {
+                    if (moduleJson.contains("type") && moduleJson["type"].get<std::string>() == "TrackerSequencer") {
+                        auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(registry->getModule(uuid));
+                        if (tracker) {
+                            std::string boundName = tracker->getCurrentPatternName();
+                            
+                            if (boundName.empty()) {
+                                // No pattern bound - bind to first available pattern or create default
+                                if (!patternNames.empty()) {
+                                    ofLogNotice("SessionManager") << "TrackerSequencer '" << tracker->getInstanceName() 
+                                                                    << "' has no bound pattern, binding to first available pattern: " << patternNames[0];
+                                    tracker->bindToPattern(patternNames[0]);
+                                } else {
+                                    // No patterns exist - create default pattern
+                                    Pattern defaultPattern(16);
+                                    // Use simple pattern naming (P0, P1, P2, etc.) - let PatternRuntime generate the name
+                                    std::string actualName = patternRuntime_->addPattern(defaultPattern, "");
+                                    if (!actualName.empty()) {
+                                        tracker->bindToPattern(actualName);
+                                        ofLogNotice("SessionManager") << "Created default pattern '" << actualName 
+                                                                      << "' for TrackerSequencer '" << tracker->getInstanceName() << "'";
+                                    }
+                                }
+                            } else if (!patternRuntime_->patternExists(boundName)) {
+                                // Bound pattern doesn't exist - bind to first available pattern or create default
+                                if (!patternNames.empty()) {
+                                    ofLogWarning("SessionManager") << "TrackerSequencer '" << tracker->getInstanceName() 
+                                                                    << "' bound to non-existent pattern '" << boundName 
+                                                                    << "', binding to first available pattern: " << patternNames[0];
+                                    tracker->bindToPattern(patternNames[0]);
+                                } else {
+                                    // No patterns exist - create default pattern
+                                    Pattern defaultPattern(16);
+                                    // Use simple pattern naming (P0, P1, P2, etc.) - let PatternRuntime generate the name
+                                    std::string actualName = patternRuntime_->addPattern(defaultPattern, "");
+                                    if (!actualName.empty()) {
+                                        tracker->bindToPattern(actualName);
+                                        ofLogNotice("SessionManager") << "Created default pattern '" << actualName 
+                                                                      << "' for TrackerSequencer '" << tracker->getInstanceName() << "'";
+                                    }
+                                }
+                            } else {
+                                // Pattern exists and is valid - verify binding worked
+                                ofLogVerbose("SessionManager") << "TrackerSequencer '" << tracker->getInstanceName() 
+                                                                << "' correctly bound to pattern '" << boundName << "'";
+                                
+                                // CRITICAL: Sync pattern chain current index with bound pattern after restoration
+                                // This ensures the GUI displays the correct active pattern in the chain
+                                const auto& chain = tracker->getPatternChain();
+                                if (tracker->getUsePatternChain() && !chain.empty()) {
+                                    for (size_t i = 0; i < chain.size(); ++i) {
+                                        if (chain[i] == boundName) {
+                                            tracker->setCurrentChainIndex((int)i);
+                                            ofLogVerbose("SessionManager") << "Synced chain index to " << i 
+                                                                           << " for TrackerSequencer '" << tracker->getInstanceName() << "'";
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ofLogNotice("SessionManager") << "Pattern binding validation complete";
+            }
+        }
+    }
+    
+    // Note: GUI state loading (viewState, visibleInstances, imguiState, moduleLayouts) is NOT included
+    // UI state deserialization is handled by Shells (EditorShell)
+    
+    // Call post-load callback if set (for re-initializing audio streams, etc.)
+    if (postLoadCallback_) {
+        postLoadCallback_();
+    }
+    
+    return true;
 }
 
 //--------------------------------------------------------------
@@ -382,42 +1041,168 @@ bool SessionManager::deserializeAll(const ofJson& json) {
             });
             ofLogNotice("SessionManager") << "Module restoration complete: " << restoredCount << " module(s) restored";
             
-            // Phase 2: Restore sequencer bindings from PatternRuntime AFTER modules are initialized
-            if (patternRuntime_) {
-                auto sequencerNames = patternRuntime_->getSequencerNames();
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"SessionManager.cpp:395\",\"message\":\"Restoring sequencer bindings\",\"data\":{\"sequencerCount\":" << sequencerNames.size() << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+            // CRITICAL: Migrate old "TrackerSequencer_chain" to instance-specific chains BEFORE restoring bindings
+            // This ensures bindings are restored with the correct instance-specific chain names
+            if (patternRuntime_ && registry) {
+                bool hasOldChain = patternRuntime_->chainExists("TrackerSequencer_chain");
+                PatternChain* oldChain = hasOldChain ? patternRuntime_->getChain("TrackerSequencer_chain") : nullptr;
+                
+                // Check if any sequencer has boundChainName_ set to old chain (from fromJson())
+                auto sequencerModules = registry->getModulesByType(ModuleType::SEQUENCER);
+                bool needsMigration = false;
+                for (const auto& module : sequencerModules) {
+                    if (!module) continue;
+                    auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(module);
+                    if (!tracker) continue;
+                    if (tracker->getBoundChainName() == "TrackerSequencer_chain") {
+                        needsMigration = true;
+                        break;
+                    }
                 }
-                // #endregion
+                
+                // Also check PatternRuntime bindings for old chain
+                // Note: getSequencerNames() only returns sequencers with existing bindings,
+                // so we also need to check all sequencers from ModuleRegistry
+                auto sequencerNames = patternRuntime_->getSequencerNames();
                 for (const auto& seqName : sequencerNames) {
                     auto binding = patternRuntime_->getSequencerBinding(seqName);
-                    // #region agent log
-                    {
-                        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"SessionManager.cpp:399\",\"message\":\"Processing sequencer binding\",\"data\":{\"sequencerName\":\"" << seqName << "\",\"patternName\":\"" << binding.patternName << "\",\"chainName\":\"" << binding.chainName << "\",\"chainEnabled\":" << (binding.chainEnabled ? "true" : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
+                    if (binding.chainName == "TrackerSequencer_chain") {
+                        needsMigration = true;
+                        break;
                     }
-                    // #endregion
+                }
+                
+                // CRITICAL: Also check ALL sequencers from ModuleRegistry (not just those with bindings)
+                // This catches sequencers that have boundChainName_ set but no PatternRuntime binding yet
+                // OR sequencers that are using the old chain via getCurrentChain() even if boundChainName_ is empty
+                for (const auto& module : sequencerModules) {
+                    if (!module) continue;
+                    auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(module);
+                    if (!tracker) continue;
+                    std::string boundChain = tracker->getBoundChainName();
+                    if (boundChain == "TrackerSequencer_chain") {
+                        needsMigration = true;
+                        break;
+                    }
+                    // Also check if getCurrentChain() returns the old chain
+                    PatternChain* currentChain = tracker->getCurrentChain();
+                    if (currentChain && oldChain && currentChain == oldChain) {
+                        needsMigration = true;
+                        break;
+                    }
+                }
+                
+                if (hasOldChain || needsMigration) {
+                    ofLogNotice("SessionManager") << "Found old 'TrackerSequencer_chain' references, migrating to instance-specific chains...";
+                    int migratedCount = 0;
+                    
+                    for (const auto& module : sequencerModules) {
+                        if (!module) continue;
+                        
+                        std::string instanceName = registry->getName(module);
+                        if (instanceName.empty()) continue;
+                        
+                        auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(module);
+                        if (!tracker) continue;
+                        
+                        // Check if this sequencer is bound to the old chain
+                        // Check both PatternRuntime binding AND tracker's boundChainName_
+                        auto binding = patternRuntime_->getSequencerBinding(instanceName);
+                        std::string trackerBoundChain = tracker->getBoundChainName();
+                        
+                        // Also check if getCurrentChain() returns the old chain (even if boundChainName_ isn't set)
+                        // This handles cases where the sequencer is using the old chain but boundChainName_ is empty
+                        PatternChain* currentChain = tracker->getCurrentChain();
+                        bool usingOldChain = false;
+                        if (currentChain && oldChain && currentChain == oldChain) {
+                            usingOldChain = true;
+                        }
+                        
+                        // Migrate if:
+                        // 1. PatternRuntime binding points to old chain, OR
+                        // 2. tracker's boundChainName_ points to old chain, OR
+                        // 3. sequencer is currently using the old chain (via getCurrentChain())
+                        if (binding.chainName == "TrackerSequencer_chain" || 
+                            trackerBoundChain == "TrackerSequencer_chain" || 
+                            usingOldChain) {
+                            // Create instance-specific chain
+                            std::string newChainName = instanceName + "_chain";
+                            
+                            if (!patternRuntime_->chainExists(newChainName)) {
+                                patternRuntime_->addChain(newChainName);
+                                
+                                // Copy chain entries from old chain if it exists
+                                if (oldChain) {
+                                    const auto& chainPatterns = oldChain->getChain();
+                                    for (size_t i = 0; i < chainPatterns.size(); i++) {
+                                        patternRuntime_->chainAddPattern(newChainName, chainPatterns[i]);
+                                        int repeatCount = oldChain->getRepeatCount((int)i);
+                                        if (repeatCount > 1) {
+                                            patternRuntime_->chainSetRepeat(newChainName, (int)i, repeatCount);
+                                        }
+                                        if (oldChain->isEntryDisabled((int)i)) {
+                                            patternRuntime_->chainSetEntryDisabled(newChainName, (int)i, true);
+                                        }
+                                    }
+                                    
+                                    // Copy chain state
+                                    patternRuntime_->chainSetEnabled(newChainName, oldChain->isEnabled());
+                                    PatternChain* newChain = patternRuntime_->getChain(newChainName);
+                                    if (newChain) {
+                                        newChain->setCurrentIndex(oldChain->getCurrentIndex());
+                                    }
+                                } else {
+                                    // Old chain doesn't exist - create empty chain with default state
+                                    patternRuntime_->chainSetEnabled(newChainName, binding.chainEnabled);
+                                    ofLogNotice("SessionManager") << "Created new empty chain '" << newChainName 
+                                                                  << "' for sequencer '" << instanceName 
+                                                                  << "' (old chain 'TrackerSequencer_chain' not found)";
+                                }
+                                
+                                // Update binding to new chain in PatternRuntime
+                                patternRuntime_->bindSequencerChain(instanceName, newChainName);
+                                if (binding.chainEnabled) {
+                                    patternRuntime_->setSequencerChainEnabled(instanceName, true);
+                                }
+                                
+                                // Update tracker's boundChainName_
+                                tracker->bindToChain(newChainName);
+                                
+                                migratedCount++;
+                                ofLogNotice("SessionManager") << "Migrated chain for sequencer '" << instanceName 
+                                                              << "' from 'TrackerSequencer_chain' to '" << newChainName << "'";
+                            }
+                        }
+                    }
+                    
+                    if (migratedCount > 0) {
+                        ofLogNotice("SessionManager") << "Migrated " << migratedCount << " sequencer(s) from old chain name";
+                    }
+                }
+            }
+            
+            // Phase 2: Restore sequencer bindings from PatternRuntime AFTER modules are initialized and migration is complete
+            if (patternRuntime_) {
+                auto sequencerNames = patternRuntime_->getSequencerNames();
+                
+                for (const auto& seqName : sequencerNames) {
+                    auto binding = patternRuntime_->getSequencerBinding(seqName);
+                    
                     
                     // CRITICAL: Only restore bindings for sequencers that match the sequencer name
                     // This prevents applying bindings from one sequencer to another
                     auto module = registry->getModule(seqName);
                     auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(module);
                     if (tracker) {
-                        // CRITICAL: Verify sequencer name matches (prevent cross-binding)
-                        if (tracker->getName() != seqName) {
+                        // CRITICAL: Verify sequencer instance name matches (prevent cross-binding)
+                        // Use getInstanceName() not getName() - getName() returns type name "TrackerSequencer"
+                        if (tracker->getInstanceName() != seqName) {
                             ofLogWarning("SessionManager") << "Sequencer name mismatch: binding for '" << seqName 
-                                                           << "' but tracker name is '" << tracker->getName() << "', skipping";
+                                                           << "' but tracker instance name is '" << tracker->getInstanceName() << "', skipping";
                             continue;
                         }
                         
-                        // #region agent log
-                        {
-                            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"SessionManager.cpp:404\",\"message\":\"TrackerSequencer found\",\"data\":{\"sequencerName\":\"" << seqName << "\",\"trackerName\":\"" << tracker->getName() << "\"},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                        }
-                        // #endregion
+                        
                         // Restore pattern binding
                         if (!binding.patternName.empty() && patternRuntime_->patternExists(binding.patternName)) {
                             tracker->bindToPattern(binding.patternName);
@@ -426,13 +1211,7 @@ bool SessionManager::deserializeAll(const ofJson& json) {
                         // CRITICAL: Only restore chain binding if this sequencer actually has one
                         // This prevents applying a chain from one sequencer to all sequencers
                         if (!binding.chainName.empty() && patternRuntime_->chainExists(binding.chainName)) {
-                            // #region agent log
-                            {
-                                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"SessionManager.cpp:417\",\"message\":\"Before bindToChain\",\"data\":{\"sequencerName\":\"" << seqName << "\",\"chainName\":\"" << binding.chainName << "\"},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                                logFile.close();
-                            }
-                            // #endregion
+                            
                             
                             // CRITICAL: Set chain enabled state BEFORE binding to ensure it's correct
                             // This must happen before bindToChain() so the binding is set up correctly
@@ -460,27 +1239,136 @@ bool SessionManager::deserializeAll(const ofJson& json) {
                                                               << "', got '" << tracker->getBoundChainName() << "'";
                             }
                             
-                            // #region agent log
-                            {
-                                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"SessionManager.cpp:440\",\"message\":\"After bindToChain\",\"data\":{\"sequencerName\":\"" << seqName << "\",\"chainName\":\"" << binding.chainName << "\",\"boundChainName\":\"" << tracker->getBoundChainName() << "\",\"chainMatches\":" << (tracker->getBoundChainName() == binding.chainName ? "true" : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                                logFile.close();
-                            }
-                            // #endregion
+                            
                         }
                         
                         ofLogVerbose("SessionManager") << "Restored bindings for sequencer '" << seqName 
                                                        << "': pattern='" << binding.patternName 
                                                        << "', chain='" << binding.chainName << "'";
                     } else {
-                        // #region agent log
-                        {
-                            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"SessionManager.cpp:420\",\"message\":\"TrackerSequencer NOT found\",\"data\":{\"sequencerName\":\"" << seqName << "\",\"moduleFound\":" << (module ? "true" : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                        }
-                        // #endregion
+                        
                         ofLogWarning("SessionManager") << "Sequencer binding found for '" << seqName 
                                                        << "' but module not found in registry";
+                    }
+                }
+                
+                // CRITICAL: Ensure ALL sequencer modules have bindings, even if they weren't in saved bindings
+                // This fixes the issue where only some sequencers appear in the list
+                if (registry && patternRuntime_) {
+                    // Get old chain reference for late migration (if it exists)
+                    bool hasOldChainForLateMigration = patternRuntime_->chainExists("TrackerSequencer_chain");
+                    PatternChain* oldChainForLateMigration = hasOldChainForLateMigration ? patternRuntime_->getChain("TrackerSequencer_chain") : nullptr;
+                    
+                    auto sequencerModules = registry->getModulesByType(ModuleType::SEQUENCER);
+                    for (const auto& module : sequencerModules) {
+                        if (!module) continue;
+                        
+                        std::string name = registry->getName(module);
+                        if (name.empty()) continue;
+                        
+                        auto tracker = std::dynamic_pointer_cast<class TrackerSequencer>(module);
+                        if (!tracker) continue;
+                        
+                        // Check if this sequencer already has a binding
+                        auto binding = patternRuntime_->getSequencerBinding(name);
+                        
+                        // CRITICAL: If sequencer has no chain binding but is using "TrackerSequencer_chain",
+                        // migrate it now (this handles sequencers that were missed in the earlier migration)
+                        std::string trackerBoundChain = tracker->getBoundChainName();
+                        if (binding.chainName.empty() && trackerBoundChain == "TrackerSequencer_chain" && hasOldChainForLateMigration) {
+                            std::string newChainName = name + "_chain";
+                            if (!patternRuntime_->chainExists(newChainName)) {
+                                patternRuntime_->addChain(newChainName);
+                                
+                                // Copy chain entries from old chain
+                                if (oldChainForLateMigration) {
+                                    const auto& chainPatterns = oldChainForLateMigration->getChain();
+                                    for (size_t i = 0; i < chainPatterns.size(); i++) {
+                                        patternRuntime_->chainAddPattern(newChainName, chainPatterns[i]);
+                                        int repeatCount = oldChainForLateMigration->getRepeatCount((int)i);
+                                        if (repeatCount > 1) {
+                                            patternRuntime_->chainSetRepeat(newChainName, (int)i, repeatCount);
+                                        }
+                                        if (oldChainForLateMigration->isEntryDisabled((int)i)) {
+                                            patternRuntime_->chainSetEntryDisabled(newChainName, (int)i, true);
+                                        }
+                                    }
+                                    
+                                    // Copy chain state
+                                    patternRuntime_->chainSetEnabled(newChainName, oldChainForLateMigration->isEnabled());
+                                    PatternChain* newChain = patternRuntime_->getChain(newChainName);
+                                    if (newChain) {
+                                        newChain->setCurrentIndex(oldChainForLateMigration->getCurrentIndex());
+                                    }
+                                }
+                                
+                                // Update binding to new chain in PatternRuntime
+                                patternRuntime_->bindSequencerChain(name, newChainName);
+                                patternRuntime_->setSequencerChainEnabled(name, oldChainForLateMigration ? oldChainForLateMigration->isEnabled() : true);
+                                
+                                // Update tracker's boundChainName_
+                                tracker->bindToChain(newChainName);
+                                
+                                ofLogNotice("SessionManager") << "Late migration: Migrated chain for sequencer '" << name 
+                                                              << "' from 'TrackerSequencer_chain' to '" << newChainName << "'";
+                            }
+                        }
+                        
+                        // CRITICAL: If sequencer has no chain binding, create instance-specific chain
+                        // This ensures all sequencers have their own chains, even if they weren't in saved bindings
+                        if (binding.chainName.empty()) {
+                            std::string newChainName = name + "_chain";
+                            if (!patternRuntime_->chainExists(newChainName)) {
+                                patternRuntime_->addChain(newChainName);
+                                ofLogNotice("SessionManager") << "Created instance-specific chain '" << newChainName 
+                                                              << "' for sequencer '" << name << "' (no binding found)";
+                            }
+                            // Bind sequencer to the new chain
+                            patternRuntime_->bindSequencerChain(name, newChainName);
+                            patternRuntime_->setSequencerChainEnabled(name, true);
+                            tracker->bindToChain(newChainName);
+                            ofLogNotice("SessionManager") << "Bound sequencer '" << name << "' to chain '" << newChainName << "'";
+                        }
+                        
+                        // If no pattern binding, ensure sequencer gets one
+                        if (binding.patternName.empty()) {
+                            // Get available patterns
+                            auto patternNames = patternRuntime_->getPatternNames();
+                            
+                            if (!patternNames.empty()) {
+                                // Bind to first available pattern
+                                ofLogNotice("SessionManager") << "Auto-binding sequencer '" << name 
+                                                              << "' to pattern '" << patternNames[0] << "'";
+                                tracker->bindToPattern(patternNames[0]);
+                            } else {
+                                // No patterns exist - create default pattern
+                                Pattern defaultPattern(16);
+                                std::string patternName = patternRuntime_->addPattern(defaultPattern, "");
+                                if (!patternName.empty()) {
+                                    ofLogNotice("SessionManager") << "Created default pattern '" << patternName 
+                                                                  << "' for sequencer '" << name << "'";
+                                    tracker->bindToPattern(patternName);
+                                }
+                            }
+                        } else {
+                            // Pattern binding exists - verify it's still valid
+                            if (!patternRuntime_->patternExists(binding.patternName)) {
+                                // Pattern doesn't exist - bind to first available or create default
+                                auto patternNames = patternRuntime_->getPatternNames();
+                                if (!patternNames.empty()) {
+                                    ofLogWarning("SessionManager") << "Pattern '" << binding.patternName 
+                                                                   << "' not found for sequencer '" << name 
+                                                                   << "', binding to '" << patternNames[0] << "'";
+                                    tracker->bindToPattern(patternNames[0]);
+                                } else {
+                                    Pattern defaultPattern(16);
+                                    std::string patternName = patternRuntime_->addPattern(defaultPattern, "");
+                                    if (!patternName.empty()) {
+                                        tracker->bindToPattern(patternName);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -604,7 +1492,7 @@ bool SessionManager::deserializeAll(const ofJson& json) {
                                                     if (chain[i] == boundName) {
                                                         tracker->setCurrentChainIndex((int)i);
                                                         ofLogVerbose("SessionManager") << "Synced chain index to " << i 
-                                                                                       << " for TrackerSequencer '" << tracker->getName() << "' after chain reload";
+                                                                                       << " for TrackerSequencer '" << tracker->getInstanceName() << "' after chain reload";
                                                         break;
                                                     }
                                                 }
@@ -612,10 +1500,10 @@ bool SessionManager::deserializeAll(const ofJson& json) {
                                             
                                             reloadedCount++;
                                             ofLogVerbose("SessionManager") << "Reloaded pattern chain for TrackerSequencer '" 
-                                                                           << tracker->getName() << "'";
+                                                                           << tracker->getInstanceName() << "'";
                                         } catch (const std::exception& e) {
                                             ofLogWarning("SessionManager") << "Failed to reload pattern chain for TrackerSequencer '" 
-                                                                           << tracker->getName() << "': " << e.what();
+                                                                           << tracker->getInstanceName() << "': " << e.what();
                                         }
                                     }
                                 }
@@ -645,7 +1533,7 @@ bool SessionManager::deserializeAll(const ofJson& json) {
                             if (boundName.empty()) {
                                 // No pattern bound - bind to first available pattern or create default
                                 if (!patternNames.empty()) {
-                                    ofLogNotice("SessionManager") << "TrackerSequencer '" << tracker->getName() 
+                                    ofLogNotice("SessionManager") << "TrackerSequencer '" << tracker->getInstanceName() 
                                                                     << "' has no bound pattern, binding to first available pattern: " << patternNames[0];
                                     tracker->bindToPattern(patternNames[0]);
                                 } else {
@@ -656,13 +1544,13 @@ bool SessionManager::deserializeAll(const ofJson& json) {
                                     if (!actualName.empty()) {
                                         tracker->bindToPattern(actualName);
                                         ofLogNotice("SessionManager") << "Created default pattern '" << actualName 
-                                                                      << "' for TrackerSequencer '" << tracker->getName() << "'";
+                                                                      << "' for TrackerSequencer '" << tracker->getInstanceName() << "'";
                                     }
                                 }
                             } else if (!patternRuntime_->patternExists(boundName)) {
                                 // Bound pattern doesn't exist - bind to first available pattern or create default
                                 if (!patternNames.empty()) {
-                                    ofLogWarning("SessionManager") << "TrackerSequencer '" << tracker->getName() 
+                                    ofLogWarning("SessionManager") << "TrackerSequencer '" << tracker->getInstanceName() 
                                                                     << "' bound to non-existent pattern '" << boundName 
                                                                     << "', binding to first available pattern: " << patternNames[0];
                                     tracker->bindToPattern(patternNames[0]);
@@ -674,12 +1562,12 @@ bool SessionManager::deserializeAll(const ofJson& json) {
                                     if (!actualName.empty()) {
                                         tracker->bindToPattern(actualName);
                                         ofLogNotice("SessionManager") << "Created default pattern '" << actualName 
-                                                                      << "' for TrackerSequencer '" << tracker->getName() << "'";
+                                                                      << "' for TrackerSequencer '" << tracker->getInstanceName() << "'";
                                     }
                                 }
                             } else {
                                 // Pattern exists and is valid - verify binding worked
-                                ofLogVerbose("SessionManager") << "TrackerSequencer '" << tracker->getName() 
+                                ofLogVerbose("SessionManager") << "TrackerSequencer '" << tracker->getInstanceName() 
                                                                 << "' correctly bound to pattern '" << boundName << "'";
                                 
                                 // CRITICAL: Sync pattern chain current index with bound pattern after restoration
@@ -690,7 +1578,7 @@ bool SessionManager::deserializeAll(const ofJson& json) {
                                         if (chain[i] == boundName) {
                                             tracker->setCurrentChainIndex((int)i);
                                             ofLogVerbose("SessionManager") << "Synced chain index to " << i 
-                                                                           << " for TrackerSequencer '" << tracker->getName() << "'";
+                                                                           << " for TrackerSequencer '" << tracker->getInstanceName() << "'";
                                             break;
                                         }
                                     }
@@ -704,77 +1592,14 @@ bool SessionManager::deserializeAll(const ofJson& json) {
         }
     }
     
-    // Load GUI state
+    // Load GUI state (for backward compatibility - UI state should be handled by Shells)
+    // Note: This method is kept for backward compatibility but will be deprecated
+    // GUI state loading is now handled by Shells (EditorShell)
     if (json.contains("gui") && json["gui"].is_object()) {
         auto guiJson = json["gui"];
         
-        // Load module layouts
-        if (guiJson.contains("moduleLayouts") && guiJson["moduleLayouts"].is_object()) {
-            try {
-                std::map<std::string, ImVec2> layouts;
-                for (auto& [key, value] : guiJson["moduleLayouts"].items()) {
-                    if (value.is_object() && value.contains("width") && value.contains("height")) {
-                        float width = value["width"].get<float>();
-                        float height = value["height"].get<float>();
-                        layouts[key] = ImVec2(width, height);
-                    }
-                }
-                ModuleGUI::setAllDefaultLayouts(layouts);
-                ofLogNotice("SessionManager") << "Loaded " << layouts.size() << " module layout(s)";
-            } catch (const std::exception& e) {
-                ofLogError("SessionManager") << "Failed to load module layouts: " << e.what();
-                // Non-fatal, continue
-            }
-        }
-        
-        // Load view state
-        if (viewManager_ && guiJson.contains("viewState") && guiJson["viewState"].is_object()) {
-            try {
-                auto viewState = guiJson["viewState"];
-                if (viewState.contains("fileBrowserVisible")) {
-                    viewManager_->setFileBrowserVisible(viewState["fileBrowserVisible"].get<bool>());
-                }
-                if (viewState.contains("consoleVisible")) {
-                    viewManager_->setConsoleVisible(viewState["consoleVisible"].get<bool>());
-                }
-                if (viewState.contains("assetLibraryVisible")) {
-                    viewManager_->setAssetLibraryVisible(viewState["assetLibraryVisible"].get<bool>());
-                }
-                if (viewState.contains("masterModulesVisible")) {
-                    viewManager_->setMasterModulesVisible(viewState["masterModulesVisible"].get<bool>());
-                }
-                if (viewState.contains("currentPanel")) {
-                    int panelIndex = viewState["currentPanel"].get<int>();
-                    // Legacy panel index - convert to window name (deprecated, will be removed)
-                    std::vector<std::string> legacyPanelNames = {
-                        "Clock ", "Audio Output", "Tracker Sequencer", "Media Pool", 
-                        "File Browser", "Console", "Asset Library"
-                    };
-                    if (panelIndex >= 0 && panelIndex < static_cast<int>(legacyPanelNames.size())) {
-                        viewManager_->navigateToWindow(legacyPanelNames[panelIndex]);
-                    }
-                }
-                
-                // New window name format (preferred)
-                if (viewState.contains("currentFocusedWindow")) {
-                    std::string windowName = viewState["currentFocusedWindow"].get<std::string>();
-                    if (!windowName.empty()) {
-                        viewManager_->navigateToWindow(windowName);
-                    }
-                }
-                
-                ofLogNotice("SessionManager") << "Loaded view state";
-            } catch (const std::exception& e) {
-                ofLogError("SessionManager") << "Failed to load view state: " << e.what();
-                // Non-fatal, continue
-            }
-        }
-        
-        // Store ImGui window state for later loading (after ImGui is initialized)
-        // We can't load it here because ImGui might not be initialized yet
-        // Reset flag - will be set to true when layout is actually loaded
-        sessionLayoutWasLoaded_ = false;
-        
+        // Store ImGui window state for later loading (for backward compatibility)
+        // Note: This is deprecated - UI state should be handled by Shells
         if (guiJson.contains("imguiState") && guiJson["imguiState"].is_string()) {
             pendingImGuiState_ = guiJson["imguiState"].get<std::string>();
             originalImGuiState_ = pendingImGuiState_;  // Preserve original for later reload if needed
@@ -785,54 +1610,26 @@ bool SessionManager::deserializeAll(const ofJson& json) {
             originalImGuiState_.clear();
         }
         
-        // Store visibility state for later restoration (after GUIs are created)
-        // Visibility state will be restored in restoreVisibilityState() after syncWithRegistry()
+        // Store visibility state for later restoration (for backward compatibility)
+        // Note: This is deprecated - UI state should be handled by Shells
         if (guiJson.contains("visibleInstances") && guiJson["visibleInstances"].is_object()) {
             pendingVisibilityState_ = guiJson["visibleInstances"];
             ofLogNotice("SessionManager") << "Stored module instance visibility state for later restoration";
         } else {
             pendingVisibilityState_ = ofJson::object();
         }
+        
+        // Note: Module layouts, view state, and other GUI state are now handled by Shells
     }
     
     ofLogNotice("SessionManager") << "Session loaded successfully";
-    
-    // Sync GUIManager after modules are loaded to ensure GUIs are created
-    // This must happen after modules are loaded but before visibility state is restored
-    if (guiManager_) {
-        // Ensure ConnectionManager is set on GUIManager before syncing
-        // (it should already be set in ofApp::setup(), but this is a safety check)
-        if (connectionManager_) {
-            guiManager_->setConnectionManager(connectionManager_);
-        }
-        guiManager_->syncWithRegistry();
-        ofLogNotice("SessionManager") << "Synced GUIManager after loading session modules";
-        
-        // Make all session-loaded modules visible by default
-        // restoreVisibilityState() will then override with saved visibility if it exists
-        if (registry) {
-            registry->forEachModule([this](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
-                if (module) {
-                    // Skip system modules (they're always visible)
-                    if (name != "masterAudioOut" && name != "masterVideoOut") {
-                        guiManager_->setInstanceVisible(name, true);
-                    }
-                }
-            });
-            ofLogNotice("SessionManager") << "Made all session-loaded modules visible by default";
-        }
-        
-        // Restore visibility state from saved session (will override defaults)
-        restoreVisibilityState();
-    }
     
     // Call post-load callback if set (for re-initializing audio streams, etc.)
     if (postLoadCallback_) {
         postLoadCallback_();
     }
     
-    // Note: ImGui state loading is deferred until after setupGUI() is called
-    // This is handled by calling loadPendingImGuiState() from ofApp::setup()
+    // Note: GUI state restoration (visibility, ImGui layout) is now handled by Shells (EditorShell)
     
     return true;
 }
@@ -878,8 +1675,7 @@ bool SessionManager::saveSession(const std::string& sessionName) {
 bool SessionManager::saveSessionToPath(const std::string& filePath) {
     ofLogNotice("SessionManager") << "DEBUG: saveSessionToPath called with filePath: " << filePath;
     
-    // Update ImGui state in session before serializing
-    updateImGuiStateInSession();
+    // Note: ImGui state update is now handled by Shells (EditorShell)
     
     if (!clock || !registry || !factory || !router) {
         ofLogError("SessionManager") << "Cannot save session: null pointers";
@@ -1264,169 +2060,8 @@ void SessionManager::restoreMixerConnections(const ofJson& modulesJson) {
     // by the output's internal mixer connection.
 }
 
-void SessionManager::restoreVisibilityState() {
-    if (!guiManager_) {
-        ofLogWarning("SessionManager") << "Cannot restore visibility: GUIManager is null";
-        return;
-    }
-    
-    if (pendingVisibilityState_.empty()) {
-        ofLogNotice("SessionManager") << "No saved visibility state to restore - using defaults from syncWithRegistry()";
-        return;
-    }
-    
-    ofLogNotice("SessionManager") << "Restoring visibility state from saved session";
-    
-    try {
-        // Generic restoration: iterate through all saved visibility categories
-        // This handles all module types (mediaPool, tracker, audioOutput, videoOutput, audioMixer, videoMixer, etc.)
-        for (auto& [category, instances] : pendingVisibilityState_.items()) {
-            if (instances.is_array()) {
-                for (const auto& name : instances) {
-                    if (name.is_string()) {
-                        std::string instanceName = name.get<std::string>();
-                        // Verify module exists before making it visible
-                        if (registry && registry->hasModule(instanceName)) {
-                            guiManager_->setInstanceVisible(instanceName, true);
-                            ofLogNotice("SessionManager") << "Restored " << category << " visibility: " << instanceName;
-                        } else {
-                            ofLogWarning("SessionManager") << "Cannot restore visibility for non-existent module: " << instanceName;
-                        }
-                    }
-                }
-            }
-        }
-        
-        ofLogNotice("SessionManager") << "Restored module instance visibility state";
-    } catch (const std::exception& e) {
-        ofLogError("SessionManager") << "Failed to restore visibility state: " << e.what();
-    }
-}
-
-void SessionManager::loadPendingImGuiState() {
-    // Only load if we have pending state and ImGui is initialized
-    if (pendingImGuiState_.empty()) {
-        // No pending state - layout was not loaded from session
-        sessionLayoutWasLoaded_ = false;
-        // No pending state, try to load from imgui.ini as fallback
-        std::string iniPath = ofToDataPath("imgui.ini", true);
-        if (ofFile::doesFileExist(iniPath)) {
-            try {
-                ImGui::LoadIniSettingsFromDisk(iniPath.c_str());
-                ofLogNotice("SessionManager") << "Loaded window layout from imgui.ini (fallback)";
-            } catch (const std::exception& e) {
-                ofLogError("SessionManager") << "Failed to load imgui.ini: " << e.what();
-            }
-        }
-        return;
-    }
-    
-    // CRITICAL FIX: If pendingImGuiState_ is empty/meaningless but originalImGuiState_ is meaningful,
-    // use originalImGuiState_ instead (this handles the case where updateImGuiStateInSession overwrote it)
-    bool pendingIsMeaningful = pendingImGuiState_.size() > 50 || pendingImGuiState_.find("[Window") != std::string::npos;
-    bool originalIsMeaningful = !originalImGuiState_.empty() && (originalImGuiState_.size() > 50 || originalImGuiState_.find("[Window") != std::string::npos);
-    
-    if (!pendingIsMeaningful && originalIsMeaningful) {
-        // pendingImGuiState_ was overwritten with empty state, but we have original meaningful layout
-        pendingImGuiState_ = originalImGuiState_;
-        ofLogNotice("SessionManager") << "Restored pendingImGuiState_ from originalImGuiState_ (" << pendingImGuiState_.size() << " bytes)";
-    }
-    
-    ofLogNotice("SessionManager") << "Loading ImGui state from session (" << pendingImGuiState_.size() << " bytes)";
-    
-    // Check if ImGui is initialized (by checking if context exists)
-    ImGuiContext* ctx = ImGui::GetCurrentContext();
-    if (!ctx) {
-        ofLogWarning("SessionManager") << "ImGui not initialized yet, deferring state load";
-        return;
-    }
-    
-    try {
-        ImGui::LoadIniSettingsFromMemory(pendingImGuiState_.c_str(), pendingImGuiState_.size());
-        ofLogNotice("SessionManager") << "Loaded ImGui window state from session (" 
-                                      << pendingImGuiState_.size() << " bytes)";
-        
-        // CRITICAL: Don't sync here - windows should already exist before layout is loaded
-        // ImGui needs windows to exist when layout is loaded for docking to work properly
-        // syncWithRegistry() should be called BEFORE loadPendingImGuiState(), not after
-        // This ensures windows exist when the layout is applied
-        
-        // Check if layout is meaningful (contains window configurations, not just empty docking data)
-        // Empty layouts are typically < 50 bytes and only contain [Docking][Data] sections
-        bool layoutIsMeaningful = pendingImGuiState_.size() > 50 || 
-                                  pendingImGuiState_.find("[Window") != std::string::npos;
-        
-        if (layoutIsMeaningful) {
-            sessionLayoutWasLoaded_ = true;  // Mark that layout was successfully loaded from session
-            ofLogNotice("SessionManager") << "Layout is meaningful, marking as loaded";
-        } else {
-            sessionLayoutWasLoaded_ = false;  // Empty layout - treat as not loaded
-            ofLogNotice("SessionManager") << "Layout is empty/meaningless (" << pendingImGuiState_.size() 
-                                         << " bytes), treating as not loaded to prevent overwriting";
-        }
-        
-        // Only clear pendingImGuiState_ if layout was successfully loaded
-        // Keep it if layout wasn't loaded (e.g., Command Shell active, Editor windows not drawn)
-        // This allows us to reload it when Editor Shell is activated
-        if (sessionLayoutWasLoaded_) {
-            pendingImGuiState_.clear();  // Clear after successful load
-            originalImGuiState_.clear();  // Also clear original since it's been applied
-        } else {
-            // Keep pendingImGuiState_ for potential reload when Editor Shell activates
-            // Restore from original if we cleared it
-            if (pendingImGuiState_.empty() && !originalImGuiState_.empty()) {
-                pendingImGuiState_ = originalImGuiState_;
-                ofLogNotice("SessionManager") << "Restored pendingImGuiState_ from original for Editor Shell activation";
-            }
-        }
-    } catch (const std::exception& e) {
-        ofLogError("SessionManager") << "Failed to load ImGui state: " << e.what();
-        sessionLayoutWasLoaded_ = false;  // Mark as not loaded on failure
-        // Fall back to imgui.ini if it exists
-        std::string iniPath = ofToDataPath("imgui.ini", true);
-        if (ofFile::doesFileExist(iniPath)) {
-            try {
-                ImGui::LoadIniSettingsFromDisk(iniPath.c_str());
-                ofLogNotice("SessionManager") << "Fell back to imgui.ini for window layout";
-            } catch (const std::exception& e2) {
-                ofLogError("SessionManager") << "Failed to load imgui.ini: " << e2.what();
-            }
-        }
-        // Don't clear on failure - keep for potential reload when Editor Shell activates
-        // pendingImGuiState_ will be preserved for retry
-    }
-}
-
-void SessionManager::updateImGuiStateInSession() {
-    // Check if ImGui is initialized (by checking if context exists)
-    ImGuiContext* ctx = ImGui::GetCurrentContext();
-    if (!ctx) {
-        ofLogWarning("SessionManager") << "ImGui not initialized yet, cannot update state";
-        return;
-    }
-    
-    // Update the pending ImGui state with current state
-    // This will be saved the next time the session is saved
-    size_t iniSize = 0;
-    const char* iniData = ImGui::SaveIniSettingsToMemory(&iniSize);
-    
-    if (iniData && iniSize > 0) {
-        // CRITICAL: Don't overwrite pendingImGuiState_ if layout was never loaded and current state is empty
-        // This preserves the original layout for later use
-        bool currentIsMeaningful = iniSize > 50 || std::string(iniData, std::min<size_t>(100, iniSize)).find("[Window") != std::string::npos;
-        
-        if (!sessionLayoutWasLoaded_ && !currentIsMeaningful) {
-            // Layout was never loaded and current state is empty - preserve original layout
-            ofLogNotice("SessionManager") << "Skipping ImGui state update: Layout was never loaded and current state is empty, preserving original layout";
-            return;
-        }
-        
-        pendingImGuiState_ = std::string(iniData, iniSize);
-        ofLogNotice("SessionManager") << "Updated session ImGui state (" << iniSize << " bytes)";
-    } else {
-        ofLogWarning("SessionManager") << "Failed to save ImGui state to memory";
-    }
-}
+// Note: restoreVisibilityState(), loadPendingImGuiState(), updateImGuiStateInSession(), and setupGUI() 
+// have been removed - UI state management is now handled by Shells (EditorShell)
 
 //--------------------------------------------------------------
 bool SessionManager::initializeProjectAndSession(const std::string& dataPath) {
@@ -1590,45 +2225,7 @@ bool SessionManager::ensureDefaultModules(const std::vector<std::string>& defaul
     return true;
 }
 
-//--------------------------------------------------------------
-bool SessionManager::setupGUI(GUIManager* guiManager) {
-    if (!guiManager) {
-        ofLogError("SessionManager") << "Cannot setup GUI: GUIManager is null";
-        return false;
-    }
-    
-    if (!registry || !router) {
-        ofLogError("SessionManager") << "Cannot setup GUI: Registry or ParameterRouter is null";
-        return false;
-    }
-    
-    // Store reference for later use
-    guiManager_ = guiManager;
-    
-    // Initialize GUIManager with registry and parameter router
-    guiManager->setRegistry(registry);
-    guiManager->setParameterRouter(router);
-    
-    // Sync GUIManager with registry (creates GUI objects for registered modules)
-    guiManager->syncWithRegistry();
-    
-    // Initialize modules after GUI is set up (isRestored=false for new modules)
-    // This replaces all module-specific setup logic in ofApp
-    // CRITICAL: Pass PatternRuntime to all modules (especially TrackerSequencer)
-    if (!patternRuntime_) {
-        ofLogWarning("SessionManager") << "PatternRuntime is null during setupGUI - modules will not have pattern access";
-    }
-    registry->forEachModule([this](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
-        if (module && connectionManager_) {
-            module->initialize(clock, registry, connectionManager_, router, patternRuntime_, false);
-        }
-    });
-    
-    // Note: ImGui layout loading is deferred until first frame after dockspace is created
-    // This is handled in ofApp::drawGUI() to ensure proper timing (dockspace must exist first)
-    
-    return true;
-}
+// Note: setupGUI() has been removed - GUI setup is now handled by Shells (EditorShell)
 
 //--------------------------------------------------------------
 void SessionManager::enableAutoSave(float intervalSeconds, std::function<void()> onUpdateWindowTitle) {
@@ -1678,5 +2275,155 @@ bool SessionManager::autoSaveOnExit() {
     
     ofLogNotice("SessionManager") << "Auto-saving session before exit: " << currentSessionName_;
     return saveSession(currentSessionName_);
+}
+
+//--------------------------------------------------------------
+void SessionManager::serializationThreadFunction() {
+    SerializationRequest request;
+    
+    while (!shouldStopSerializationThread_.load()) {
+        // Blocking wait with timeout (wakes up every 100ms to check shouldStopSerializationThread_)
+        // Lock-free: no mutex needed, BlockingConcurrentQueue handles synchronization internally
+        if (serializationQueue_.wait_dequeue_timed(request, std::chrono::milliseconds(100))) {
+            // Process serialization request
+            processSerializationRequest(request);
+        }
+        // If timeout, loop continues and checks shouldStopSerializationThread_ again
+    }
+}
+
+//--------------------------------------------------------------
+bool SessionManager::processSerializationRequest(const SerializationRequest& request) {
+    if (!engine_) {
+        ofLogError("SessionManager") << "Cannot serialize: Engine not set";
+        return false;
+    }
+    
+    // Check if snapshot is stale (version changed since request was queued)
+    uint64_t currentVersion = engine_->getStateVersion();
+    if (request.snapshotVersion < currentVersion) {
+        ofLogNotice("SessionManager") << "Snapshot is stale (version " << request.snapshotVersion 
+                                      << " < current " << currentVersion 
+                                      << "), getting fresh snapshot";
+        
+        // Get fresh snapshot (lock-free read)
+        auto freshSnapshot = engine_->getStateSnapshot();
+        if (!freshSnapshot) {
+            ofLogError("SessionManager") << "Cannot get fresh snapshot, using stale snapshot";
+            // Continue with stale snapshot (better than failing)
+        } else {
+            // Use fresh snapshot instead
+            SerializationRequest freshRequest = request;
+            freshRequest.snapshot = freshSnapshot;
+            if (freshSnapshot->contains("version")) {
+                freshRequest.snapshotVersion = freshSnapshot->at("version").get<uint64_t>();
+            } else {
+                freshRequest.snapshotVersion = currentVersion;
+            }
+            
+            // Process with fresh snapshot
+            return processSerializationRequestWithSnapshot(freshRequest);
+        }
+    }
+    
+    // Process with original snapshot (not stale or fallback)
+    return processSerializationRequestWithSnapshot(request);
+}
+
+//--------------------------------------------------------------
+bool SessionManager::processSerializationRequestWithSnapshot(const SerializationRequest& request) {
+    // Get snapshot (lock-free read)
+    auto snapshot = request.snapshot;
+    if (!snapshot) {
+        ofLogError("SessionManager") << "Cannot serialize: Snapshot is null";
+        return false;
+    }
+    
+    try {
+        // Serialize snapshot to JSON (snapshot is already JSON, but we may need to merge with UI state)
+        ofJson json = *snapshot;
+        
+        // Add project root to session if ProjectManager is available
+        if (projectManager_ && projectManager_->isProjectOpen()) {
+            json["projectRoot"] = projectManager_->getProjectRoot();
+        }
+        
+        // Create backup of existing session file before overwriting
+        if (ofFile::doesFileExist(request.filePath)) {
+            std::string backupPath = request.filePath + ".backup";
+            if (ofFile::copyFromTo(request.filePath, backupPath, true, true)) {
+                ofLogVerbose("SessionManager") << "Created backup: " << backupPath;
+            } else {
+                ofLogWarning("SessionManager") << "Failed to create backup, continuing with save anyway";
+            }
+        }
+        
+        // Write to file (I/O in background thread)
+        ofFile file(request.filePath, ofFile::WriteOnly);
+        if (!file.is_open()) {
+            ofLogError("SessionManager") << "Failed to open file for writing: " << request.filePath;
+            return false;
+        }
+        
+        file << json.dump(4); // Pretty print with 4 spaces
+        file.close();
+        
+        ofLogNotice("SessionManager") << "Session saved asynchronously to " << request.filePath 
+                                      << " (version " << request.snapshotVersion << ")";
+        return true;
+    } catch (const std::exception& e) {
+        ofLogError("SessionManager") << "Exception while saving session: " << e.what();
+        return false;
+    } catch (...) {
+        ofLogError("SessionManager") << "Unknown exception while saving session";
+        return false;
+    }
+}
+
+//--------------------------------------------------------------
+bool SessionManager::saveSessionAsync(const std::string& filePath) {
+    if (!engine_) {
+        ofLogError("SessionManager") << "Cannot save async: Engine not set";
+        return false;
+    }
+    
+    // Get current snapshot from Engine (lock-free read)
+    auto snapshot = engine_->getStateSnapshot();
+    if (!snapshot) {
+        ofLogWarning("SessionManager") << "No snapshot available, creating one synchronously";
+        // Fallback: use synchronous serialization if snapshot not available
+        return saveSessionToPath(filePath);
+    }
+    
+    // Get snapshot version from Engine (atomic read)
+    uint64_t snapshotVersion = engine_->getStateVersion();
+    
+    // Also check version in JSON snapshot (should match, but use Engine version as source of truth)
+    if (snapshot->contains("version")) {
+        uint64_t jsonVersion = snapshot->at("version").get<uint64_t>();
+        if (jsonVersion != snapshotVersion) {
+            ofLogWarning("SessionManager") << "Snapshot version mismatch: JSON=" << jsonVersion 
+                                            << " Engine=" << snapshotVersion 
+                                            << ", using Engine version";
+        }
+    }
+    
+    // Create serialization request
+    SerializationRequest request;
+    request.filePath = filePath;
+    request.snapshot = snapshot;  // Shared pointer to immutable JSON
+    request.snapshotVersion = snapshotVersion;
+    request.timestamp = std::chrono::steady_clock::now();
+    
+    // Queue request (non-blocking, lock-free)
+    // try_enqueue returns false if queue is full (shouldn't happen in practice)
+    if (!serializationQueue_.try_enqueue(request)) {
+        ofLogError("SessionManager") << "Failed to queue async save request (queue full)";
+        return false;
+    }
+    
+    ofLogVerbose("SessionManager") << "Queued async save request for " << filePath 
+                                    << " (version " << snapshotVersion << ")";
+    return true;
 }
 

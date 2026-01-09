@@ -17,6 +17,7 @@ class AssetLibrary;
 class Clock;
 class PatternRuntime;
 class ofDirectory;
+namespace vt { class Engine; }
 
 /**
  * CommandExecutor - Backend for command execution logic
@@ -40,11 +41,11 @@ public:
     // Setup with dependencies
     void setup(
         ModuleRegistry* registry_,
-        GUIManager* guiManager_,
         ConnectionManager* connectionManager_,
         AssetLibrary* assetLibrary_ = nullptr,
         Clock* clock_ = nullptr,
-        PatternRuntime* patternRuntime_ = nullptr
+        PatternRuntime* patternRuntime_ = nullptr,
+        vt::Engine* engine_ = nullptr
     );
     
     // Set callbacks for module operations
@@ -55,6 +56,9 @@ public:
     void setOutputCallback(std::function<void(const std::string&)> callback) { outputCallback = callback; }
     // Get output callback (for temporary replacement)
     std::function<void(const std::string&)> getOutputCallback() const { return outputCallback; }
+    
+    // Set callback for checking if module has GUI (optional, for UI operations)
+    void setHasGUICallback(std::function<bool(const std::string&)> callback) { hasGUICallback_ = callback; }
     
     // Execute a command string (parses and executes)
     void executeCommand(const std::string& command);
@@ -122,15 +126,16 @@ public:
     
 private:
     ModuleRegistry* registry = nullptr;
-    GUIManager* guiManager = nullptr;
     ConnectionManager* connectionManager_ = nullptr;
     AssetLibrary* assetLibrary = nullptr;
     Clock* clock = nullptr;
     PatternRuntime* patternRuntime = nullptr;
+    vt::Engine* engine_ = nullptr;  // For command queue access
     
     std::function<void(const std::string&)> onAddModule;
     std::function<void(const std::string&)> onRemoveModule;
     std::function<void(const std::string&)> outputCallback;
+    std::function<bool(const std::string&)> hasGUICallback_;  // Optional callback to check if module has GUI
     
     // Internal helper to output messages
     void output(const std::string& text);

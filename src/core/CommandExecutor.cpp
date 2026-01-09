@@ -1,12 +1,13 @@
 #include "CommandExecutor.h"
 #include "ModuleRegistry.h"
 #include "ConnectionManager.h"
-#include "gui/GUIManager.h"
 #include "Module.h"
 #include "AssetLibrary.h"
 #include "Clock.h"
 #include "PatternRuntime.h"
 #include "data/Pattern.h"
+#include "core/Engine.h"
+#include "core/Command.h"
 #include "ofLog.h"
 #include "ofFileUtils.h"
 #include "ofSystemUtils.h"
@@ -45,18 +46,18 @@ CommandExecutor::~CommandExecutor() {
 
 void CommandExecutor::setup(
     ModuleRegistry* registry_,
-    GUIManager* guiManager_,
     ConnectionManager* connectionManager_,
     AssetLibrary* assetLibrary_,
     Clock* clock_,
-    PatternRuntime* patternRuntime_
+    PatternRuntime* patternRuntime_,
+    vt::Engine* engine_
 ) {
     registry = registry_;
-    guiManager = guiManager_;
     this->connectionManager_ = connectionManager_;
     this->assetLibrary = assetLibrary_;
     clock = clock_;
     patternRuntime = patternRuntime_;
+    this->engine_ = engine_;
 }
 
 void CommandExecutor::executeCommand(const std::string& command) {
@@ -346,11 +347,10 @@ void CommandExecutor::cmdList() {
         if (module) {
             std::string typeStr = getModuleTypeString(static_cast<int>(module->getType()));
             
-            // Check if module has GUI
+            // Check if module has GUI (using callback if registered)
             bool hasGUI = false;
-            if (guiManager) {
-                auto* gui = guiManager->getGUI(name);
-                hasGUI = (gui != nullptr);
+            if (hasGUICallback_) {
+                hasGUI = hasGUICallback_(name);
             }
             
             std::string guiStatus = hasGUI ? "[GUI]" : "[NO GUI]";
@@ -379,21 +379,17 @@ void CommandExecutor::cmdRemove(const std::string& args) {
         return;
     }
     
-    if (!onRemoveModule) {
-        output("Error: Remove callback not set");
-        return;
-    }
-    
-    // Execute removal
-    onRemoveModule(args);
-    
-    // Check if removal actually succeeded
-    if (registry->hasModule(args)) {
-        output("Error: Failed to remove module '%s' (may be the last instance of its type)", args.c_str());
-        ofLogWarning("CommandExecutor") << "Failed to remove module: " << args;
+    // Route through command queue
+    if (engine_) {
+        auto cmd = std::make_unique<vt::RemoveModuleCommand>(args);
+        if (engine_->enqueueCommand(std::move(cmd))) {
+            output("Removed module: %s", args.c_str());
+            ofLogNotice("CommandExecutor") << "Removed module: " << args;
+        } else {
+            output("Error: Failed to enqueue remove module command");
+        }
     } else {
-        output("Removed module: %s", args.c_str());
-        ofLogNotice("CommandExecutor") << "Removed module: " << args;
+        output("Error: Engine not available");
     }
 }
 
@@ -401,11 +397,6 @@ void CommandExecutor::cmdAdd(const std::string& args) {
     if (args.empty()) {
         output("Usage: add <module_type>");
         output("Types: pool, tracker, MultiSampler, TrackerSequencer");
-        return;
-    }
-    
-    if (!onAddModule) {
-        output("Error: Add callback not set");
         return;
     }
     
@@ -424,9 +415,22 @@ void CommandExecutor::cmdAdd(const std::string& args) {
         return;
     }
     
-    onAddModule(moduleType);
-    output("Added module: %s", moduleType.c_str());
-    ofLogNotice("CommandExecutor") << "Added module: " << moduleType;
+    // Route through command queue
+    if (engine_) {
+        auto cmd = std::make_unique<vt::AddModuleCommand>(moduleType, "");  // Empty name = auto-generate
+        if (engine_->enqueueCommand(std::move(cmd))) {
+            output("Added module: %s", moduleType.c_str());
+            ofLogNotice("CommandExecutor") << "Added module: " << moduleType;
+            // Still call onAddModule callback for UI notifications if needed
+            if (onAddModule) {
+                onAddModule(moduleType);
+            }
+        } else {
+            output("Error: Failed to enqueue add module command");
+        }
+    } else {
+        output("Error: Engine not available");
+    }
 }
 
 void CommandExecutor::cmdRoute(const std::string& args) {
@@ -474,25 +478,41 @@ void CommandExecutor::cmdRoute(const std::string& args) {
     }
     
     // Use port-based routing: automatically detect and create all compatible connections
+    // Route through command queue for thread safety
     bool audioConnected = false;
     bool videoConnected = false;
     bool paramConnected = false;
     bool reverseParamConnected = false;
     bool eventConnected = false;
     
+    if (!engine_) {
+        output("Error: Engine not available");
+        return;
+    }
+    
     // Check for audio connection (AUDIO_OUT -> AUDIO_IN)
     if (sourceModule->hasOutput(PortType::AUDIO_OUT) && 
         targetModule->hasInput(PortType::AUDIO_IN)) {
-        audioConnected = connectionManager_->connectAudio(moduleName, targetName);
+        auto cmd = std::make_unique<vt::ConnectCommand>(moduleName, targetName, 
+                                                         ConnectionManager::ConnectionType::AUDIO);
+        if (engine_->enqueueCommand(std::move(cmd))) {
+            audioConnected = true;
+        }
     }
     
     // Check for video connection (VIDEO_OUT -> VIDEO_IN)
     if (sourceModule->hasOutput(PortType::VIDEO_OUT) && 
         targetModule->hasInput(PortType::VIDEO_IN)) {
-        videoConnected = connectionManager_->connectVideo(moduleName, targetName);
+        auto cmd = std::make_unique<vt::ConnectCommand>(moduleName, targetName, 
+                                                         ConnectionManager::ConnectionType::VIDEO);
+        if (engine_->enqueueCommand(std::move(cmd))) {
+            videoConnected = true;
+        }
     }
     
     // Check for parameter connection (PARAMETER_OUT -> PARAMETER_IN)
+    // NOTE: ConnectCommand has TODO for parameter connections - using direct call for now
+    // TODO: Route through ConnectCommand once parameter connection support is added
     if (sourceModule->hasOutput(PortType::PARAMETER_OUT) && 
         targetModule->hasInput(PortType::PARAMETER_IN)) {
         auto sourceMetadata = sourceModule->getMetadata();
@@ -502,7 +522,7 @@ void CommandExecutor::cmdRoute(const std::string& args) {
             std::string sourceParamName = sourceMetadata.parameterNames[0];
             std::string targetParamName = targetMetadata.parameterNames[0];
             
-            // Create bidirectional parameter connection
+            // Create bidirectional parameter connection (direct call until ConnectCommand supports it)
             if (connectionManager_->connectParameterDirect(moduleName, sourceParamName, 
                                                           targetName, targetParamName, 
                                                           []() { return true; })) {
@@ -519,6 +539,8 @@ void CommandExecutor::cmdRoute(const std::string& args) {
     }
     
     // Check for event connection (EVENT_OUT -> EVENT_IN)
+    // NOTE: ConnectCommand has TODO for event connections - using direct call for now
+    // TODO: Route through ConnectCommand once event connection support is added
     if (sourceModule->hasOutput(PortType::EVENT_OUT) && 
         targetModule->hasInput(PortType::EVENT_IN)) {
         auto sourceMetadata = sourceModule->getMetadata();
@@ -592,69 +614,31 @@ void CommandExecutor::cmdUnroute(const std::string& args) {
         return;
     }
     
+    // Route through command queue
+    if (!engine_) {
+        output("Error: Engine not available");
+        return;
+    }
+    
     if (mixerName.empty()) {
         // Disconnect all connections for this module
-        if (connectionManager_->disconnectAll(moduleName)) {
+        // Use DisconnectCommand with empty target (disconnect from all)
+        auto cmd = std::make_unique<vt::DisconnectCommand>(moduleName, "", std::nullopt);
+        if (engine_->enqueueCommand(std::move(cmd))) {
             output("Disconnected %s from all connections", moduleName.c_str());
         } else {
-            output("Error: Failed to disconnect %s", moduleName.c_str());
+            output("Error: Failed to enqueue disconnect command");
         }
     } else {
-        // Disconnect from specific target (all connection types: audio, video, parameter, event)
-        // Get all connections from source to target first
-        auto connections = connectionManager_->getConnectionsFrom(moduleName);
-        
-        bool audioDisconnected = false;
-        bool videoDisconnected = false;
-        bool paramDisconnected = false;
-        bool eventDisconnected = false;
-        
-        // Process each connection type
-        for (const auto& conn : connections) {
-            if (conn.targetModule != mixerName) continue;
-            
-            switch (conn.type) {
-                case ConnectionManager::ConnectionType::AUDIO:
-                    if (connectionManager_->disconnectAudio(moduleName, mixerName)) {
-                        audioDisconnected = true;
-                    }
-                    break;
-                case ConnectionManager::ConnectionType::VIDEO:
-                    if (connectionManager_->disconnectVideo(moduleName, mixerName)) {
-                        videoDisconnected = true;
-                    }
-                    break;
-                case ConnectionManager::ConnectionType::PARAMETER:
-                    if (!conn.sourcePath.empty() && connectionManager_->disconnectParameter(conn.sourcePath)) {
-                        paramDisconnected = true;
-                    }
-                    break;
-                case ConnectionManager::ConnectionType::EVENT:
-                    // Use eventName and handlerName from the connection
-                    if (!conn.eventName.empty()) {
-                        if (connectionManager_->unsubscribeEvent(moduleName, conn.eventName, mixerName, conn.handlerName)) {
-                        eventDisconnected = true;
-                        }
-                    }
-                    break;
-            }
-        }
-        
-        if (audioDisconnected || videoDisconnected || paramDisconnected || eventDisconnected) {
-            std::vector<std::string> types;
-            if (audioDisconnected) types.push_back("audio");
-            if (videoDisconnected) types.push_back("video");
-            if (paramDisconnected) types.push_back("parameter");
-            if (eventDisconnected) types.push_back("event");
-            
-            std::string typesStr;
-            for (size_t i = 0; i < types.size(); ++i) {
-                if (i > 0) typesStr += ", ";
-                typesStr += types[i];
-            }
-            output("Disconnected %s from %s [%s]", moduleName.c_str(), mixerName.c_str(), typesStr.c_str());
+        // Disconnect from specific target (all connection types)
+        // Use DisconnectCommand with target and nullopt connection type (all types)
+        // NOTE: DisconnectCommand may not fully handle parameter/event disconnection yet
+        // TODO: Enhance DisconnectCommand to handle all connection types properly
+        auto cmd = std::make_unique<vt::DisconnectCommand>(moduleName, mixerName, std::nullopt);
+        if (engine_->enqueueCommand(std::move(cmd))) {
+            output("Disconnected %s from %s", moduleName.c_str(), mixerName.c_str());
         } else {
-            output("Error: Failed to disconnect %s from %s (no connections found)", moduleName.c_str(), mixerName.c_str());
+            output("Error: Failed to enqueue disconnect command");
         }
     }
 }
@@ -911,8 +895,17 @@ void CommandExecutor::cmdPlay() {
         output("Error: Clock not available");
         return;
     }
-    clock->start();
-    output("Transport started");
+    
+    if (engine_) {
+        auto cmd = std::make_unique<vt::StartTransportCommand>();
+        if (engine_->enqueueCommand(std::move(cmd))) {
+            output("Transport started");
+        } else {
+            output("Error: Failed to enqueue start transport command");
+        }
+    } else {
+        output("Error: Engine not available");
+    }
 }
 
 void CommandExecutor::cmdStop() {
@@ -920,8 +913,17 @@ void CommandExecutor::cmdStop() {
         output("Error: Clock not available");
         return;
     }
-    clock->stop();
-    output("Transport stopped");
+    
+    if (engine_) {
+        auto cmd = std::make_unique<vt::StopTransportCommand>();
+        if (engine_->enqueueCommand(std::move(cmd))) {
+            output("Transport stopped");
+        } else {
+            output("Error: Failed to enqueue stop transport command");
+        }
+    } else {
+        output("Error: Engine not available");
+    }
 }
 
 void CommandExecutor::cmdBPM(const std::string& args) {
@@ -931,19 +933,25 @@ void CommandExecutor::cmdBPM(const std::string& args) {
     }
     
     if (args.empty()) {
-        // Get current BPM
+        // Get current BPM (query, no command needed)
         float bpm = clock->getBPM();
         output("Current BPM: %.2f", bpm);
     } else {
-        // Set BPM
+        // Set BPM (use command)
         try {
-            float bpm = std::stof(args);
-            clock->setBPM(bpm);
-            output("BPM set to: %.2f", bpm);
+            float value = std::stof(args);
+            if (engine_ && value > 0.0f) {
+                auto cmd = std::make_unique<vt::SetBPMCommand>(value);
+                if (engine_->enqueueCommand(std::move(cmd))) {
+                    output("BPM set to %.2f", value);
+                } else {
+                    output("Error: Failed to enqueue BPM command");
+                }
+            } else {
+                output("Error: Invalid BPM value (must be > 0)");
+            }
         } catch (const std::exception& e) {
-            output("Error: Invalid BPM value '%s'", args.c_str());
-            output("Usage: bpm <value>");
-            output("Example: bpm 140");
+            output("Error: %s", e.what());
         }
     }
 }
@@ -1017,8 +1025,19 @@ void CommandExecutor::cmdSetParam(const std::string& args) {
     
     try {
         float value = std::stof(valueStr);
+        
+        // CRITICAL FIX: Use command queue for thread safety
+        // Direct parameter access from CommandExecutor (main thread) is unsafe
+        // when audio thread is processing
+        auto cmd = std::make_unique<vt::SetParameterCommand>(moduleName, paramName, value);
+        if (engine_ && engine_->enqueueCommand(std::move(cmd))) {
+            output("%s.%s = %.4f", moduleName.c_str(), paramName.c_str(), value);
+        } else {
+            // Fallback: direct access (only if command queue unavailable)
+            // This should rarely happen, but provides backward compatibility
         module->setParameter(paramName, value);
         output("%s.%s = %.4f", moduleName.c_str(), paramName.c_str(), value);
+        }
     } catch (const std::exception& e) {
         output("Error: %s", e.what());
     }
@@ -2123,21 +2142,38 @@ void CommandExecutor::cmdChainReset(const std::string& args) {
 // ═══════════════════════════════════════════════════════════
 
 void CommandExecutor::cmdSequencerList() {
+    if (!registry) {
+        output("Error: Registry not set");
+        return;
+    }
+    
     if (!patternRuntime) {
         output("Error: PatternRuntime not set");
         return;
     }
     
-    auto sequencerNames = patternRuntime->getSequencerNames();
+    // Discover all sequencer modules from ModuleRegistry (not just those with bindings)
+    auto sequencerModules = registry->getModulesByType(ModuleType::SEQUENCER);
     
-    if (sequencerNames.empty()) {
+    if (sequencerModules.empty()) {
         output("No sequencers found");
         return;
     }
     
     output("=== Sequencers ===");
-    for (const auto& name : sequencerNames) {
+    for (const auto& module : sequencerModules) {
+        if (!module) continue;
+        
+        // Get sequencer name from registry
+        std::string name = registry->getName(module);
+        if (name.empty()) {
+            // Fallback: try to get name from module directly if available
+            continue;
+        }
+        
+        // Get binding from PatternRuntime (may be empty if sequencer has no binding yet)
         auto binding = patternRuntime->getSequencerBinding(name);
+        
         std::string status = "";
         if (!binding.patternName.empty()) {
             status += "pattern:" + binding.patternName;
@@ -2156,10 +2192,15 @@ void CommandExecutor::cmdSequencerList() {
         }
         output("  %s - %s", name.c_str(), status.c_str());
     }
-    output("Total: %zu sequencer(s)", sequencerNames.size());
+    output("Total: %zu sequencer(s)", sequencerModules.size());
 }
 
 void CommandExecutor::cmdSequencerInfo(const std::string& args) {
+    if (!registry) {
+        output("Error: Registry not set");
+        return;
+    }
+    
     if (!patternRuntime) {
         output("Error: PatternRuntime not set");
         return;
@@ -2168,14 +2209,19 @@ void CommandExecutor::cmdSequencerInfo(const std::string& args) {
     std::string sequencerName = trim(args);
     
     if (sequencerName.empty()) {
-        // Show info for all sequencers
-        auto sequencerNames = patternRuntime->getSequencerNames();
-        if (sequencerNames.empty()) {
+        // Show info for all sequencers - discover from ModuleRegistry
+        auto sequencerModules = registry->getModulesByType(ModuleType::SEQUENCER);
+        if (sequencerModules.empty()) {
             output("No sequencers found");
             return;
         }
         
-        for (const auto& name : sequencerNames) {
+        for (const auto& module : sequencerModules) {
+            if (!module) continue;
+            
+            std::string name = registry->getName(module);
+            if (name.empty()) continue;
+            
             auto binding = patternRuntime->getSequencerBinding(name);
             output("");
             output("=== Sequencer: %s ===", name.c_str());

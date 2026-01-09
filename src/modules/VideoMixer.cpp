@@ -31,7 +31,7 @@ ModuleType VideoMixer::getType() const {
     return ModuleType::UTILITY;
 }
 
-std::vector<ParameterDescriptor> VideoMixer::getParameters() const {
+std::vector<ParameterDescriptor> VideoMixer::getParametersImpl() const {
     std::vector<ParameterDescriptor> params;
     
     // Master opacity parameter
@@ -88,7 +88,7 @@ void VideoMixer::onTrigger(TriggerEvent& event) {
     // This method exists to satisfy Module interface
 }
 
-void VideoMixer::setParameter(const std::string& paramName, float value, bool notify) {
+void VideoMixer::setParameterImpl(const std::string& paramName, float value, bool notify) {
     if (paramName == "masterOpacity") {
         setMasterOpacity(value);
         if (notify && parameterChangeCallback) {
@@ -134,7 +134,7 @@ void VideoMixer::setParameter(const std::string& paramName, float value, bool no
     }
 }
 
-float VideoMixer::getParameter(const std::string& paramName) const {
+float VideoMixer::getParameterImpl(const std::string& paramName) const {
     if (paramName == "masterOpacity") {
         return getMasterOpacity();
     } else if (paramName == "blendMode") {
@@ -166,8 +166,9 @@ float VideoMixer::getParameter(const std::string& paramName) const {
             return 0.0f;
         }
     }
-    // Unknown parameter - return default
-    return Module::getParameter(paramName);
+    // Unknown parameter - return default (base class default is 0.0f)
+    // NOTE: Cannot call Module::getParameter() here as it would deadlock (lock already held)
+    return 0.0f;
 }
 
 Module::ModuleMetadata VideoMixer::getMetadata() const {

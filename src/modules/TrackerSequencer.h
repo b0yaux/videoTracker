@@ -76,10 +76,10 @@ public:
     // Module interface implementation
     std::string getName() const override;
     ModuleType getType() const override;
-    std::vector<ParameterDescriptor> getParameters() const override;
+    std::vector<ParameterDescriptor> getParametersImpl() const override;
     void onTrigger(TriggerEvent& event) override; // Sequencers don't receive triggers, but method exists for interface
-    void setParameter(const std::string& paramName, float value, bool notify = true) override;
-    float getParameter(const std::string& paramName) const override;
+    void setParameterImpl(const std::string& paramName, float value, bool notify = true) override;
+    float getParameterImpl(const std::string& paramName) const override;
     
     // Indexed parameter support (for ParameterRouter step[4].position access)
     bool supportsIndexedParameters() const override { return true; }

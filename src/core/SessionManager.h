@@ -3,7 +3,12 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <memory>
 #include "ofJson.h"
+#include "../../libs/concurrentqueue/blockingconcurrentqueue.h"  // From moodycamel/concurrentqueue (lock-free queue)
 
 // Forward declarations
 class Clock;
@@ -16,6 +21,10 @@ class GUIManager;
 class ProjectManager;
 class ModuleGUI;
 class PatternRuntime;
+
+namespace vt {
+    class Engine;  // Forward declaration for Engine (in vt namespace)
+}
 
 /**
  * SessionManager - Central coordinator for saving/loading complete application sessions
@@ -31,7 +40,7 @@ class SessionManager {
 public:
     // Default constructor (for member initialization)
     // Note: Initialization order must match declaration order
-    SessionManager() : projectManager_(nullptr), clock(nullptr), registry(nullptr), factory(nullptr), router(nullptr), connectionManager_(nullptr), viewManager_(nullptr), guiManager_(nullptr), patternRuntime_(nullptr), postLoadCallback_(nullptr), projectOpenedCallback_(nullptr), pendingImGuiState_(""), originalImGuiState_(""), pendingVisibilityState_(ofJson::object()) {}
+    SessionManager() : projectManager_(nullptr), clock(nullptr), registry(nullptr), factory(nullptr), router(nullptr), connectionManager_(nullptr), patternRuntime_(nullptr), postLoadCallback_(nullptr), projectOpenedCallback_(nullptr), pendingImGuiState_(""), originalImGuiState_(""), pendingVisibilityState_(ofJson::object()), engine_(nullptr) {}
     
     // Constructor with all dependencies (including ProjectManager)
     SessionManager(
@@ -40,9 +49,19 @@ public:
         ModuleRegistry* registry,
         ModuleFactory* factory,
         ParameterRouter* router,
-        ConnectionManager* connectionManager = nullptr,  // Optional: for unified connection management
-        ViewManager* viewManager = nullptr  // Optional: for GUI state
+        ConnectionManager* connectionManager = nullptr  // Optional: for unified connection management
     );
+    
+    // Destructor (must be declared because we have std::thread member)
+    ~SessionManager();
+    
+    // Delete copy constructor and assignment (std::thread is not copyable)
+    SessionManager(const SessionManager&) = delete;
+    SessionManager& operator=(const SessionManager&) = delete;
+    
+    // Move constructor and assignment (needed for move assignment in Engine)
+    SessionManager(SessionManager&&) noexcept = default;
+    SessionManager& operator=(SessionManager&&) noexcept;
     
     /**
      * Set ConnectionManager (can be called after construction)
@@ -88,27 +107,32 @@ public:
     std::string getCurrentSessionName() const { return currentSessionName_; }
     
     /**
-     * Set ViewManager (can be called after construction)
-     */
-    void setViewManager(ViewManager* viewManager) { viewManager_ = viewManager; }
-    
-    /**
-     * Set GUIManager (can be called after construction)
-     */
-    void setGUIManager(GUIManager* guiManager) { guiManager_ = guiManager; }
-    
-    /**
      * Get current session as JSON (for inspection/debugging)
      * @return JSON object representing current session
+     * @deprecated Use serializeCore() for core state and Shells for UI state
      */
     ofJson serializeAll() const;
+    
+    /**
+     * Serialize core state only (no UI dependencies)
+     * @return JSON with modules, connections, clock, patterns, etc. (no GUI state)
+     */
+    ofJson serializeCore() const;
     
     /**
      * Deserialize session from JSON (for testing/custom loading)
      * @param json JSON object representing session
      * @return true if successful, false otherwise
+     * @deprecated Use loadCore() for core state and Shells for UI state
      */
     bool deserializeAll(const ofJson& json);
+    
+    /**
+     * Load core state only (no UI dependencies)
+     * @param json JSON with modules, connections, clock, patterns, etc. (no GUI state)
+     * @return true if successful, false otherwise
+     */
+    bool loadCore(const ofJson& json);
     
     /**
      * Get session version
@@ -126,30 +150,6 @@ public:
      * Useful for notifying FileBrowser and AssetLibrary
      */
     void setProjectOpenedCallback(std::function<void()> callback) { projectOpenedCallback_ = callback; }
-    
-    /**
-     * Load pending ImGui state (call this after ImGui is initialized)
-     * This should be called from the post-load callback or after setupGUI()
-     */
-    void loadPendingImGuiState();
-    
-    /**
-     * Restore module instance visibility state (call this after syncWithRegistry())
-     * This should be called from the post-load callback after GUIs are created
-     */
-    void restoreVisibilityState();
-
-    /**
-     * Update ImGui state in current session (call this after adding new modules)
-     * This ensures newly added module windows are included when session is saved
-     */
-    void updateImGuiStateInSession();
-    
-    /**
-     * Check if session layout was actually loaded into ImGui
-     * @return true if layout was loaded, false otherwise
-     */
-    bool wasSessionLayoutLoaded() const { return sessionLayoutWasLoaded_; }
 
     /**
      * Initialize project and session on application startup
@@ -166,14 +166,6 @@ public:
      * @return true if modules were created or already exist, false on error
      */
     bool ensureDefaultModules(const std::vector<std::string>& defaultModuleTypes = {"TrackerSequencer", "MultiSampler"});
-    
-    /**
-     * Setup GUI coordination
-     * Initializes GUIManager, syncs with registry, configures modules, and loads ImGui state
-     * @param guiManager GUIManager instance to setup
-     * @return true if setup succeeded, false on error
-     */
-    bool setupGUI(class GUIManager* guiManager);
     
     /**
      * Enable auto-save functionality
@@ -198,6 +190,24 @@ public:
      * @return true if save succeeded, false otherwise
      */
     bool autoSaveOnExit();
+    
+    /**
+     * Set Engine reference (required for async serialization).
+     * Must be called before using saveSessionAsync().
+     * @param engine Engine instance for snapshot access
+     */
+    void setEngine(vt::Engine* engine) { engine_ = engine; }
+    
+    /**
+     * Save session asynchronously (non-blocking).
+     * Serialization happens in background thread using engine JSON snapshots.
+     * 
+     * THREAD-SAFE: Non-blocking, lock-free, can be called from any thread.
+     * 
+     * @param filePath Full path to session file
+     * @return true if request queued successfully, false otherwise
+     */
+    bool saveSessionAsync(const std::string& filePath);
 
 private:
     ProjectManager* projectManager_;
@@ -206,8 +216,6 @@ private:
     ModuleFactory* factory;
     ParameterRouter* router;
     ConnectionManager* connectionManager_;  // For unified connection management
-    ViewManager* viewManager_;  // For GUI state
-    GUIManager* guiManager_;  // For visibility state
     PatternRuntime* patternRuntime_;  // For pattern migration and session save/load
     std::string currentSessionName_;
     std::function<void()> postLoadCallback_;  // Called after session load completes
@@ -223,6 +231,37 @@ private:
     float lastAutoSave_ = 0.0f;
     bool saveInProgress_ = false;
     std::function<void()> onUpdateWindowTitle_;  // Callback to update window title after save
+    
+    // ═══════════════════════════════════════════════════════════
+    // ASYNC SERIALIZATION (Background Thread - Lock-Free)
+    // ═══════════════════════════════════════════════════════════
+    
+    // Serialization request structure
+    struct SerializationRequest {
+        std::string filePath;
+        std::shared_ptr<const ofJson> snapshot;  // Immutable JSON snapshot from Engine
+        uint64_t snapshotVersion;  // Version number for staleness detection
+        std::chrono::steady_clock::time_point timestamp;
+    };
+    
+    // Background thread for serialization
+    std::thread serializationThread_;
+    std::atomic<bool> shouldStopSerializationThread_{false};
+    
+    // Lock-free message queue (multi-producer, multi-consumer)
+    moodycamel::BlockingConcurrentQueue<SerializationRequest> serializationQueue_;
+    
+    // Serialization thread function
+    void serializationThreadFunction();
+    
+    // Process a serialization request (called from background thread)
+    bool processSerializationRequest(const SerializationRequest& request);
+    
+    // Helper method to actually serialize (extracted for reuse with fresh snapshots)
+    bool processSerializationRequestWithSnapshot(const SerializationRequest& request);
+    
+    // Reference to Engine for snapshot access (set during setup)
+    vt::Engine* engine_{nullptr};
     
     /**
      * Resolve session path (uses ProjectManager if available, otherwise assumes full path)

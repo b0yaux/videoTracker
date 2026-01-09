@@ -161,6 +161,13 @@ public:
      */
     bool patternExists(const std::string& name) const;
     
+    /**
+     * Get step count for a pattern (thread-safe, returns -1 if pattern doesn't exist)
+     * @param name Pattern name
+     * @return Step count, or -1 if pattern doesn't exist
+     */
+    int getPatternStepCount(const std::string& name) const;
+    
     // ═══════════════════════════════════════════════════════════
     // PLAYBACK STATE MANAGEMENT
     // ═══════════════════════════════════════════════════════════
@@ -255,6 +262,7 @@ public:
     // Chain operations
     void chainAddPattern(const std::string& chainName, const std::string& patternName, int index = -1);
     void chainRemovePattern(const std::string& chainName, int index);
+    void chainSetEntry(const std::string& chainName, int index, const std::string& patternName);  // Direct entry update (preserves chain state)
     void chainSetRepeat(const std::string& chainName, int index, int repeatCount);
     void chainSetEnabled(const std::string& chainName, bool enabled);
     void chainSetEntryDisabled(const std::string& chainName, int index, bool disabled);

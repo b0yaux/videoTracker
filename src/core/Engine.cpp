@@ -1,6 +1,4 @@
 #include "Engine.h"
-#include "gui/GUIManager.h"
-#include "gui/ViewManager.h"
 #include "core/lua/LuaGlobals.h"
 #include "ofLog.h"
 #include "ofFileUtils.h"
@@ -16,16 +14,47 @@
 
 namespace vt {
 
+// Thread-local flag to detect recursive snapshot building
+thread_local bool Engine::isBuildingSnapshot_ = false;
+
+// Helper methods for unsafe state management
+void Engine::setUnsafeState(UnsafeState state, bool active) {
+    uint8_t flag = static_cast<uint8_t>(state);
+    if (active) {
+        unsafeStateFlags_.fetch_or(flag);
+    } else {
+        unsafeStateFlags_.fetch_and(~flag);
+    }
+}
+
+bool Engine::hasUnsafeState(UnsafeState state) const {
+    uint8_t flag = static_cast<uint8_t>(state);
+    return (unsafeStateFlags_.load() & flag) != 0;
+}
+
 Engine::Engine() 
     : assetLibrary_(&projectManager_, &mediaConverter_, &moduleRegistry_)
     , scriptManager_(this) {
+    // Initialize snapshot system
+    snapshotJson_ = nullptr;  // Will be created on first updateStateSnapshot() call
+    stateVersion_ = 0;
 }
 
 Engine::~Engine() {
+    // Stop background script execution thread
+    scriptExecutionThreadRunning_.store(false);
+    if (scriptExecutionThread_.joinable()) {
+        // Wake up thread with empty request to exit wait loop
+        ScriptExecutionRequest emptyReq;
+        scriptExecutionQueue_.enqueue(emptyReq);
+        scriptExecutionThread_.join();
+    }
+    
     // Cleanup handled by member destructors
 }
 
 void Engine::setup(const EngineConfig& config) {
+    
     if (isSetup_) {
         ofLogWarning("Engine") << "Engine already setup, skipping";
         return;
@@ -60,29 +89,55 @@ void Engine::setup(const EngineConfig& config) {
     // Setup Lua scripting
     setupLua();
     
+    // Start background script execution thread (after Lua is initialized)
+    scriptExecutionThreadRunning_.store(true);
+    scriptExecutionThread_ = std::thread(&Engine::scriptExecutionThreadFunction, this);
+    
     // Initialize project and session FIRST (before ScriptManager)
     // This ensures session is loaded before script generation
     initializeProjectAndSession();
     
-    // Setup ScriptManager AFTER session is loaded
-    // This ensures script is generated from loaded session state
-    scriptManager_.setup();
+    // Build initial state snapshot and cache it BEFORE ScriptManager setup
+    // This ensures ScriptManager gets a populated state with modules/connections
+    // CRITICAL: This must happen before scriptManager_.setup() so the script is generated
+    // from the loaded session state, not an empty cached state
+    ofLogNotice("Engine") << "Building initial state snapshot...";
+    size_t registryCountBefore = moduleRegistry_.getModuleCount();
+    ofLogNotice("Engine") << "ModuleRegistry has " << registryCountBefore << " modules registered before snapshot";
     
-    // Build initial state snapshot and cache it
-    // This ensures cached state is always valid, even before first getState() call
     try {
         EngineState initialState = buildStateSnapshot();
         {
             std::unique_lock<std::shared_mutex> cacheLock(cachedStateMutex_);
             *cachedState_ = initialState;
         }
+        ofLogNotice("Engine") << "Initial state snapshot built - modules: " << initialState.modules.size() 
+                             << ", connections: " << initialState.connections.size();
+        // Log module names for debugging
+        if (initialState.modules.empty()) {
+            ofLogError("Engine") << "ERROR: Initial state snapshot has NO modules!";
+            ofLogError("Engine") << "ModuleRegistry has " << registryCountBefore << " modules, but snapshot has 0!";
+            ofLogError("Engine") << "This will cause script generation to fail - modules won't appear in script!";
+            // This is a critical error - the script will be empty
+        } else {
+            ofLogNotice("Engine") << "Modules in snapshot:";
+            for (const auto& [name, moduleState] : initialState.modules) {
+                ofLogNotice("Engine") << "  - " << name << " (" << moduleState.type << ")";
+            }
+        }
     } catch (const std::exception& e) {
-        ofLogWarning("Engine") << "Failed to build initial state snapshot: " << e.what();
-        // Cached state already initialized with empty state, which is acceptable
+        ofLogError("Engine") << "Failed to build initial state snapshot: " << e.what();
+        ofLogError("Engine") << "Cached state will remain empty - script generation will fail!";
+        // Cached state already initialized with empty state, which is NOT acceptable
     }
+    
+    // Setup ScriptManager AFTER session is loaded AND initial snapshot is built
+    // This ensures script is generated from loaded session state with modules/connections
+    scriptManager_.setup();
     
     isSetup_ = true;
     ofLogNotice("Engine") << "Engine setup complete";
+    
 }
 
 void Engine::setupCoreSystems() {
@@ -93,18 +148,20 @@ void Engine::setupCoreSystems() {
     connectionManager_.setParameterRouter(&parameterRouter_);
     connectionManager_.setPatternRuntime(&patternRuntime_);  // Enable PatternRuntime access for module initialization
     
-    // Initialize SessionManager with dependencies
-    sessionManager_ = SessionManager(
+    // Initialize SessionManager with dependencies (use move assignment since std::thread is not copyable)
+    sessionManager_ = std::move(SessionManager(
         &projectManager_,
         &clock_,
         &moduleRegistry_,
         &moduleFactory_,
         &parameterRouter_,
-        &connectionManager_,
-        nullptr  // ViewManager set later via setupGUIManagers
-    );
+        &connectionManager_
+    ));
     sessionManager_.setConnectionManager(&connectionManager_);
     sessionManager_.setPatternRuntime(&patternRuntime_);  // Phase 2: Enable pattern migration
+    
+    // Set Engine reference in SessionManager for async serialization
+    sessionManager_.setEngine(this);
 }
 
 void Engine::setupMasterOutputs() {
@@ -143,36 +200,64 @@ void Engine::setupMasterOutputs() {
 }
 
 void Engine::setupCommandExecutor() {
-    // Setup CommandExecutor with dependencies
-    // GUIManager will be set later via setupGUIManagers
-    commandExecutor_.setup(&moduleRegistry_, nullptr, &connectionManager_, &assetLibrary_, &clock_, &patternRuntime_, this);
+    // Setup CommandExecutor with dependencies (no UI dependencies)
+    commandExecutor_.setup(&moduleRegistry_, &connectionManager_, &assetLibrary_, &clock_, &patternRuntime_, this);
     
     // Set callbacks for module operations
-    // These will be updated when GUIManager is available
     commandExecutor_.setOnAddModule([this](const std::string& moduleType) {
-        moduleRegistry_.addModule(
+        std::string moduleName = moduleRegistry_.addModule(
             moduleFactory_,
             moduleType,
             &clock_,
             &connectionManager_,
             &parameterRouter_,
             &patternRuntime_,
-            nullptr,  // GUIManager set later via setupGUIManagers
+            [this](const std::string& name) {
+                // Notify UI callback if registered
+                if (onModuleAdded_) {
+                    onModuleAdded_(name);
+                }
+            },
             config_.masterAudioOutName,
             config_.masterVideoOutName
         );
-        notifyStateChange();
+        // CRITICAL FIX: Use deferred notification pattern to prevent recursive notifications
+        // These callbacks can be triggered during state notifications (e.g., when scripts add/remove modules)
+        enqueueStateNotification();
     });
     
     commandExecutor_.setOnRemoveModule([this](const std::string& instanceName) {
-        moduleRegistry_.removeModule(
+        bool removed = moduleRegistry_.removeModule(
             instanceName,
             &connectionManager_,
-            nullptr,  // GUIManager set later via setupGUIManagers
+            [this](const std::string& name) {
+                // Notify UI callback if registered
+                if (onModuleRemoved_) {
+                    onModuleRemoved_(name);
+                }
+            },
             config_.masterAudioOutName,
             config_.masterVideoOutName
         );
-        notifyStateChange();
+        // CRITICAL FIX: Use deferred notification pattern to prevent recursive notifications
+        enqueueStateNotification();
+    });
+    
+    // Set parameter change notification callback for script sync
+    // This will automatically update all existing modules' callbacks (including master outputs)
+    moduleRegistry_.setParameterChangeNotificationCallback([this]() {
+        
+        // Increment counter to track parameter modification in progress
+        parametersBeingModified_.fetch_add(1);
+        
+        // Defer notification - will be processed after parameter modification completes
+        // This prevents building snapshots while parameters are being modified
+        enqueueStateNotification();
+        
+        // Decrement counter
+        parametersBeingModified_.fetch_sub(1);
+        
+        ofLogVerbose("Engine") << "[PARAM_CHANGE] Parameter changed, deferring state notification";
     });
 }
 
@@ -310,9 +395,12 @@ function pattern(name, steps)
 end
 
 -- System module helpers (for cleaner syntax)
+-- IDEMPOTENT: System modules already exist, we just configure them
+-- These functions match the SWIG-wrapped functions in videoTracker.i
 function audioOut(name, config)
     config = config or {}
-    execCommand("add AudioOutput " .. name)
+    -- System modules are created via ModuleFactory::ensureSystemModules()
+    -- We just need to configure parameters (idempotent for live-coding)
     for k, v in pairs(config) do
         execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
     end
@@ -321,7 +409,8 @@ end
 
 function videoOut(name, config)
     config = config or {}
-    execCommand("add VideoOutput " .. name)
+    -- System modules are created via ModuleFactory::ensureSystemModules()
+    -- We just need to configure parameters (idempotent for live-coding)
     for k, v in pairs(config) do
         execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
     end
@@ -330,7 +419,8 @@ end
 
 function oscilloscope(name, config)
     config = config or {}
-    execCommand("add Oscilloscope " .. name)
+    -- System modules are created via ModuleFactory::ensureSystemModules()
+    -- We just need to configure parameters (idempotent for live-coding)
     for k, v in pairs(config) do
         execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
     end
@@ -339,7 +429,8 @@ end
 
 function spectrogram(name, config)
     config = config or {}
-    execCommand("add Spectrogram " .. name)
+    -- System modules are created via ModuleFactory::ensureSystemModules()
+    -- We just need to configure parameters (idempotent for live-coding)
     for k, v in pairs(config) do
         execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
     end
@@ -445,6 +536,7 @@ void Engine::initializeProjectAndSession() {
         connectionManager_.connectVideo("masterSpectrogram", config_.masterVideoOutName);
     }
     
+    
     // Enable auto-save if configured
     if (config_.enableAutoSave) {
         sessionManager_.enableAutoSave(config_.autoSaveInterval, onUpdateWindowTitle_);
@@ -460,88 +552,6 @@ void Engine::setupAudio(int sampleRate, int bufferSize) {
     }
 }
 
-void Engine::setupGUIManagers(GUIManager* guiManager, ViewManager* viewManager) {
-    guiManager_ = guiManager;
-    
-    if (guiManager) {
-        guiManager->setRegistry(&moduleRegistry_);
-        guiManager->setParameterRouter(&parameterRouter_);
-        guiManager->setConnectionManager(&connectionManager_);
-        sessionManager_.setGUIManager(guiManager);
-        
-        // Set parameter change notification callback for script sync
-        // This will automatically update all existing modules' callbacks (including master outputs)
-        moduleRegistry_.setParameterChangeNotificationCallback([this]() {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    int paramModCount = parametersBeingModified_.load();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SIMPLIFIED\",\"hypothesisId\":\"GUI\",\"location\":\"Engine.cpp:parameterChangeCallback\",\"message\":\"parameterChangeCallback ENTRY\",\"data\":{\"parametersBeingModified\":" << paramModCount << "},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
-            
-            // Increment counter to track parameter modification in progress
-            parametersBeingModified_.fetch_add(1);
-            
-            // Defer notification - will be processed after parameter modification completes
-            // This prevents building snapshots while parameters are being modified
-            stateNeedsNotification_.store(true);
-            
-            // Decrement counter
-            parametersBeingModified_.fetch_sub(1);
-            
-            ofLogVerbose("Engine") << "[PARAM_CHANGE] Parameter changed, deferring state notification";
-        });
-        
-        // Subscribe to Clock BPM changes (proper event-based architecture)
-        // Note: This is safe to call multiple times - ofAddListener handles duplicates
-        ofAddListener(clock_.bpmChangedEvent, this, &Engine::onBPMChanged);
-        
-        // Update CommandExecutor with GUIManager
-        commandExecutor_.setup(&moduleRegistry_, guiManager, &connectionManager_, &assetLibrary_, &clock_, &patternRuntime_, this);
-        
-        // Update callbacks to include GUIManager
-        commandExecutor_.setOnAddModule([this, guiManager](const std::string& moduleType) {
-            moduleRegistry_.addModule(
-                moduleFactory_,
-                moduleType,
-                &clock_,
-                &connectionManager_,
-                &parameterRouter_,
-                &patternRuntime_,
-                guiManager,
-                config_.masterAudioOutName,
-                config_.masterVideoOutName
-            );
-            notifyStateChange();
-        });
-        
-        commandExecutor_.setOnRemoveModule([this, guiManager](const std::string& instanceName) {
-            moduleRegistry_.removeModule(
-                instanceName,
-                &connectionManager_,
-                guiManager,
-                config_.masterAudioOutName,
-                config_.masterVideoOutName
-            );
-            notifyStateChange();
-        });
-    }
-    
-    if (viewManager) {
-        sessionManager_.setViewManager(viewManager);
-    }
-    
-    // Setup GUI coordination (initializes all modules)
-    if (guiManager) {
-        sessionManager_.setupGUI(guiManager);
-    }
-}
 
 Engine::Result Engine::executeCommand(const std::string& command) {
     try {
@@ -563,8 +573,15 @@ Engine::Result Engine::executeCommand(const std::string& command) {
         // Restore old callback
         commandExecutor_.setOutputCallback(oldCallback);
         
-        // Notify state change after command execution
-        notifyStateChange();
+        // CRITICAL FIX: Update state snapshot immediately after command execution
+        // This ensures state is synchronized before notifications are sent
+        // This matches the pattern used by executeCommandImmediate()
+        updateStateSnapshot();  // Create new immutable JSON snapshot
+        
+        // CRITICAL FIX: Use deferred notification pattern instead of calling notifyStateChange() directly
+        // This prevents recursive notifications when commands are executed during state notifications.
+        // Notifications are enqueued and processed on main thread, ensuring thread safety and preventing infinite recursion.
+        enqueueStateNotification();
         
         // Return captured output (or success message if no output)
         if (!capturedOutput.empty()) {
@@ -594,19 +611,23 @@ Engine::Result Engine::eval(const std::string& script) {
         return Result(false, "Lua not initialized", "Failed to initialize Lua state");
     }
     
-    // Set script execution flag to prevent recursive state updates
-    isExecutingScript_.store(true);
+    // CRITICAL FIX: Lock script execution mutex FIRST to completely block state snapshot building
+    // This prevents ANY thread from building state snapshots during script execution
+    // Even if they somehow bypass the flag check, the mutex will block them
+    std::lock_guard<std::mutex> scriptLock(scriptExecutionMutex_);
     
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"J\",\"location\":\"Engine.cpp:549\",\"message\":\"eval - before doString\",\"data\":{\"scriptLength\":" << script.length() << "},\"timestamp\":" << now << "}\n";
-            logFile.close();
-        }
-    }
-    // #endregion
+    
+    // CRITICAL FIX: Set script execution flag BEFORE any script execution begins
+    // This must be set as early as possible to prevent any code path from calling
+    // getState() or buildStateSnapshot() during script execution
+    // This prevents crashes when script execution triggers state changes or callbacks
+    setUnsafeState(UnsafeState::SCRIPT_EXECUTING, true);
+    
+    // CRITICAL: Ensure flag is visible to all threads immediately
+    // Use memory barrier to ensure flag is set before any script execution
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    
+    
     
     try {
         // Set error callback to capture errors
@@ -615,16 +636,6 @@ Engine::Result Engine::eval(const std::string& script) {
             luaError = msg;
         });
         
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"J\",\"location\":\"Engine.cpp:558\",\"message\":\"eval - calling doString\",\"data\":{},\"timestamp\":" << now << "}\n";
-                logFile.close();
-            }
-        }
-        // #endregion
         
         // Execute Lua script with additional safety
         // Wrap in try-catch to handle any C++ exceptions from SWIG wrappers
@@ -633,50 +644,22 @@ Engine::Result Engine::eval(const std::string& script) {
             success = lua_->doString(script);
         } catch (const std::bad_alloc& e) {
             // Memory allocation failure
-            isExecutingScript_.store(false);
+            setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
             return Result(false, "Lua execution failed", "Memory allocation error: " + std::string(e.what()));
         } catch (const std::exception& e) {
             // Other C++ exceptions from SWIG wrappers
-            isExecutingScript_.store(false);
+            setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
             return Result(false, "Lua execution failed", "C++ exception: " + std::string(e.what()));
         } catch (...) {
             // Unknown exceptions
-            isExecutingScript_.store(false);
+            setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
             return Result(false, "Lua execution failed", "Unknown C++ exception during script execution");
         }
         
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"J\",\"location\":\"Engine.cpp:560\",\"message\":\"eval - doString returned\",\"data\":{\"success\":" << (success ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-                logFile.close();
-            }
-        }
-        // #endregion
         
         // Clear script execution flag before returning
-        isExecutingScript_.store(false);
+        setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
         
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                bool stateNeedsNotification = stateNeedsNotification_.load();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,B\",\"location\":\"Engine.cpp:eval\",\"message\":\"eval - script execution complete\",\"data\":{\"success\":" << (success ? "true" : "false") << ",\"stateNeedsNotification\":" << (stateNeedsNotification ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
-        
-        // SIMPLIFIED: Request ScriptManager update after script execution
-        // getState() will handle unsafe periods by returning cached state
-        if (success) {
-            scriptManager_.requestUpdate();
-        }
         
         // State notifications will happen automatically when commands are processed
         // No need to manually trigger them here
@@ -705,12 +688,401 @@ Engine::Result Engine::eval(const std::string& script) {
         }
     } catch (const std::exception& e) {
         // Clear flag on exception
-        isExecutingScript_.store(false);
+        setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
         return Result(false, "Lua execution failed", e.what());
     } catch (...) {
         // Clear flag on unknown exception
-        isExecutingScript_.store(false);
+        setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
         return Result(false, "Lua execution failed", "Unknown error");
+    }
+}
+
+void Engine::scriptExecutionThreadFunction() {
+    // Initialize separate Lua state for background thread
+    asyncLua_ = std::make_unique<ofxLua>();
+    bool success = asyncLua_->init(false, true, false);
+    
+    if (!success) {
+        ofLogError("Engine") << "Failed to initialize async Lua state";
+        asyncLua_.reset();
+        return;
+    }
+    
+    // Set global engine pointer for helper functions (same as main Lua state)
+    vt::lua::setGlobalEngine(this);
+    
+    // Register exec() function and helper functions (same as main Lua state)
+    if (asyncLua_ && asyncLua_->isValid()) {
+        lua_State* L = *asyncLua_;
+        lua_register(L, "exec", lua_execCommand);
+        
+        // Register helper functions (same as main Lua state setup)
+        // Use the same full helper registration for consistency
+        std::string registerHelpers = R"(
+-- Simple command execution helper
+local function execCommand(cmd)
+    local result = exec(cmd)
+    if result and result.success then
+        return true
+    else
+        local errorMsg = result and result.error or "Unknown error"
+        error("Command failed: " .. cmd .. " - " .. errorMsg)
+    end
+end
+
+-- Create sampler module with optional config table
+function sampler(name, config)
+    if not name or name == "" then
+        error("sampler() requires a name")
+    end
+    execCommand("add MultiSampler " .. name)
+    
+    -- Apply configuration if provided
+    if config then
+        for k, v in pairs(config) do
+            execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
+        end
+    end
+    
+    return name
+end
+
+-- Create sequencer module with optional config table
+function sequencer(name, config)
+    if not name or name == "" then
+        error("sequencer() requires a name")
+    end
+    execCommand("add TrackerSequencer " .. name)
+    
+    -- Apply configuration if provided
+    if config then
+        for k, v in pairs(config) do
+            execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
+        end
+    end
+    
+    return name
+end
+
+-- Connect modules
+function connect(source, target, connType)
+    connType = connType or "audio"
+    local cmd = "route " .. source .. " " .. target
+    if connType == "event" then
+        cmd = cmd .. " event"
+    end
+    return execCommand(cmd)
+end
+
+-- Set parameter
+function setParam(moduleName, paramName, value)
+    local cmd = "set " .. moduleName .. " " .. paramName .. " " .. tostring(value)
+    return execCommand(cmd)
+end
+
+-- Get parameter (placeholder - will be improved)
+function getParam(moduleName, paramName)
+    -- TODO: Implement via command or SWIG
+    return 0
+end
+
+-- Create pattern
+function pattern(name, steps)
+    steps = steps or 16
+    local cmd = "pattern create " .. name .. " " .. tostring(steps)
+    return execCommand(cmd)
+end
+
+-- System module helpers (for cleaner syntax)
+-- IDEMPOTENT: System modules already exist, we just configure them
+-- These functions match the SWIG-wrapped functions in videoTracker.i
+function audioOut(name, config)
+    config = config or {}
+    -- System modules are created via ModuleFactory::ensureSystemModules()
+    -- We just need to configure parameters (idempotent for live-coding)
+    for k, v in pairs(config) do
+        execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
+    end
+    return name
+end
+
+function videoOut(name, config)
+    config = config or {}
+    -- System modules are created via ModuleFactory::ensureSystemModules()
+    -- We just need to configure parameters (idempotent for live-coding)
+    for k, v in pairs(config) do
+        execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
+    end
+    return name
+end
+
+function oscilloscope(name, config)
+    config = config or {}
+    -- System modules are created via ModuleFactory::ensureSystemModules()
+    -- We just need to configure parameters (idempotent for live-coding)
+    for k, v in pairs(config) do
+        execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
+    end
+    return name
+end
+
+function spectrogram(name, config)
+    config = config or {}
+    -- System modules are created via ModuleFactory::ensureSystemModules()
+    -- We just need to configure parameters (idempotent for live-coding)
+    for k, v in pairs(config) do
+        execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
+    end
+    return name
+end
+
+-- Engine wrapper for clock control
+-- This provides a simple interface for clock operations
+local engine = {
+    getClock = function()
+        return {
+            setBPM = function(bpm)
+                return execCommand("bpm " .. tostring(bpm))
+            end,
+            getBPM = function()
+                -- TODO: Implement via command or SWIG
+                return 120
+            end,
+            start = function()
+                return execCommand("start")
+            end,
+            stop = function()
+                return execCommand("stop")
+            end,
+            pause = function()
+                return execCommand("stop")  -- pause uses stop for now
+            end,
+            play = function()
+                return execCommand("start")
+            end,
+            isPlaying = function()
+                -- TODO: Implement via command or SWIG
+                return false
+            end
+        }
+    end,
+    executeCommand = function(cmd)
+        local result = exec(cmd)
+        return result
+    end
+}
+
+-- Make engine global
+_G.engine = engine
+)";
+        asyncLua_->doString(registerHelpers);
+        ofLogNotice("Engine") << "Async Lua state initialized successfully";
+    }
+    
+    // Process script execution requests
+    ScriptExecutionRequest req;
+    while (scriptExecutionThreadRunning_.load()) {
+        // Blocking wait with timeout (wakes up every 100ms to check running_)
+        if (scriptExecutionQueue_.wait_dequeue_timed(req, std::chrono::milliseconds(100))) {
+            // Execute script in background thread
+            Result result = executeScriptInBackground(req.script, req.timeoutMs);
+            
+            // Post callback to main thread (via message queue)
+            postScriptResultToMainThread(req.id, result, req.callback);
+        }
+    }
+    
+    // Cleanup async Lua state
+    asyncLua_.reset();
+    ofLogNotice("Engine") << "Script execution thread stopped";
+}
+
+Engine::Result Engine::executeScriptInBackground(const std::string& script, int timeoutMs) {
+    if (!asyncLua_ || !asyncLua_->isValid()) {
+        return Result(false, "Async Lua not initialized", "Failed to initialize async Lua state");
+    }
+    
+    // Set execution flag (coordinate with main thread)
+    setUnsafeState(UnsafeState::SCRIPT_EXECUTING, true);
+    
+    auto startTime = std::chrono::steady_clock::now();
+    
+    try {
+        // Set error callback
+        std::string luaError;
+        asyncLua_->setErrorCallback([&luaError](std::string& msg) {
+            luaError = msg;
+        });
+        
+        // Execute script
+        bool success = asyncLua_->doString(script);
+        
+        auto elapsed = std::chrono::steady_clock::now() - startTime;
+        
+        // Check timeout (if specified)
+        if (timeoutMs > 0 && std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() > timeoutMs) {
+            setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
+            return Result(false, "Script execution timed out", 
+                         "Execution exceeded timeout of " + std::to_string(timeoutMs) + "ms");
+        }
+        
+        // Clear execution flag
+        setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
+        
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+        
+        if (success) {
+            // CRITICAL: Wait for command queue to be processed before returning
+            // This ensures state is updated before callback fires
+            // Commands from async execution are enqueued during script execution
+            // Audio thread processes commands asynchronously at ~86Hz (44.1kHz / 512 samples)
+            ofLogVerbose("Engine") << "Script execution completed successfully (elapsed: " << elapsedMs << "ms), waiting for command processing...";
+            
+            auto startWait = std::chrono::steady_clock::now();
+            const int MAX_WAIT_MS = 1000;  // 1 second max wait
+            
+            // Wait for commands to be processed by audio thread
+            // Since ReaderWriterQueue doesn't have empty() method, we use a timeout-based approach
+            // Audio thread runs at ~86Hz, so 100ms gives ~8-9 cycles to process commands
+            int waitIterations = 0;
+            while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - startWait).count() < MAX_WAIT_MS) {
+                // Check if commands are being processed (audio thread is active)
+                // If commands are not being processed and we've waited a bit, commands are likely processed
+                if (!hasUnsafeState(UnsafeState::COMMANDS_PROCESSING) && waitIterations > 5) {
+                    // Commands not being processed and we've waited a bit - likely all processed
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                waitIterations++;
+            }
+            
+            auto waitTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - startWait).count();
+            
+            // Give audio thread one more cycle to update state snapshots
+            // Audio thread runs at ~86Hz, so 50ms is ~4-5 cycles
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            
+            if (waitTime < MAX_WAIT_MS) {
+                ofLogVerbose("Engine") << "Command processing wait completed after " << waitTime << "ms (" << waitIterations << " iterations)";
+            } else {
+                ofLogWarning("Engine") << "Command processing wait timed out after " << waitTime << "ms - some commands may not be processed";
+            }
+            
+            return Result(true, "Script executed successfully");
+        } else {
+            std::string errorMsg = luaError.empty() ? asyncLua_->getErrorMessage() : luaError;
+            ofLogVerbose("Engine") << "Script execution failed (elapsed: " << elapsedMs << "ms): " << errorMsg;
+            return Result(false, "Lua execution failed", errorMsg);
+        }
+    } catch (const std::exception& e) {
+        setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
+        return Result(false, "Script execution failed", e.what());
+    } catch (...) {
+        setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
+        return Result(false, "Script execution failed", "Unknown error");
+    }
+}
+
+void Engine::postScriptResultToMainThread(uint64_t id, Result result, std::function<void(Result)> callback) {
+    // Store callback for execution on main thread
+    // This will be processed in Engine::update() method
+    pendingScriptCallbacks_.enqueue({id, result, callback});
+}
+
+void Engine::syncScriptToEngine(const std::string& script, std::function<void(bool success)> callback) {
+    // Execute script with sync contract (Script → Engine synchronization)
+    // Guarantees script changes are reflected in engine state before callback fires
+    
+    
+    // Get current state version before execution
+    uint64_t currentVersion = stateVersion_.load();
+    uint64_t targetVersion = currentVersion + 1;  // Expect version to increment after script execution
+    
+    // Execute script asynchronously
+    uint64_t executionId = evalAsync(script, [this, callback, currentVersion, targetVersion](Result result) {
+        // Script execution completed - now wait for state to be updated
+        
+        if (!result.success) {
+            // Script execution failed - call callback with failure
+            if (callback) {
+                callback(false);
+            }
+            return;
+        }
+        
+        // Script executed successfully - wait for command queue to be processed
+        // Commands are already processed by evalAsync callback (from Phase 7.7)
+        // Now wait for state version to be updated
+        
+        // Wait for state version to reach target version
+        // This ensures state snapshot is updated with script changes
+        waitForStateVersion(targetVersion, 1000);  // 1 second timeout
+        
+        // Verify state version was updated
+        uint64_t finalVersion = stateVersion_.load();
+        bool syncComplete = (finalVersion >= targetVersion);
+        
+        
+        if (syncComplete) {
+            ofLogVerbose("Engine") << "Script → Engine sync complete (version: " << currentVersion << " → " << finalVersion << ")";
+        } else {
+            ofLogWarning("Engine") << "Script → Engine sync incomplete (version: " << currentVersion << " → " << finalVersion << ", expected: " << targetVersion << ")";
+        }
+        
+        // Call callback with sync status
+        if (callback) {
+            callback(syncComplete);
+        }
+    }, 0);  // No timeout for sync contract
+    
+    if (executionId == 0) {
+        // Fallback to synchronous execution (queue full or thread not running)
+        Result result = eval(script);
+        
+        // Wait for state version to be updated
+        waitForStateVersion(targetVersion, 1000);
+        
+        // Verify state version was updated
+        uint64_t finalVersion = stateVersion_.load();
+        bool syncComplete = (finalVersion >= targetVersion);
+        
+        if (callback) {
+            callback(syncComplete && result.success);
+        }
+    }
+}
+
+uint64_t Engine::evalAsync(const std::string& script, std::function<void(Result)> callback, int timeoutMs) {
+    if (!scriptExecutionThreadRunning_.load()) {
+        // Background thread not running - fallback to synchronous execution
+        if (callback) {
+            Result result = eval(script);  // Synchronous fallback
+            callback(result);
+        }
+        return 0;
+    }
+    
+    // Create execution request
+    ScriptExecutionRequest req;
+    req.script = script;
+    req.callback = callback;
+    req.id = nextScriptExecutionId_.fetch_add(1);
+    req.timestamp = std::chrono::steady_clock::now();
+    req.timeoutMs = timeoutMs;
+    
+    // Queue request (non-blocking)
+    if (scriptExecutionQueue_.try_enqueue(req)) {
+        return req.id;
+    } else {
+        // Queue full - fallback to synchronous execution
+        ofLogWarning("Engine") << "Script execution queue full, falling back to synchronous execution";
+        if (callback) {
+            Result result = eval(script);  // Synchronous fallback
+            callback(result);
+        }
+        return 0;
     }
 }
 
@@ -747,38 +1119,36 @@ Engine::Result Engine::evalFile(const std::string& path) {
 }
 
 EngineState Engine::getState() const {
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            bool isExecuting = isExecutingScript_.load();
-            bool commandsProcessing = commandsBeingProcessed_.load();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"SIMPLIFIED\",\"location\":\"Engine.cpp:getState\",\"message\":\"getState ENTRY\",\"data\":{\"isExecutingScript\":" << (isExecuting ? "true" : "false") << ",\"commandsBeingProcessed\":" << (commandsProcessing ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
+    
+    // CRITICAL FIX: Check unsafe state flags FIRST
+    // If script is executing, return cached state immediately
+    // This prevents state snapshot building during script execution
+    if (hasUnsafeState(UnsafeState::SCRIPT_EXECUTING)) {
+        // Script is executing - return cached state immediately
+        std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
+        if (cachedState_) {
+            ofLogVerbose("Engine") << "getState() BLOCKED by script execution - returning cached state";
+            return *cachedState_;
         }
+        ofLogError("Engine") << "getState() blocked but no cached state available";
+        return EngineState();
     }
-    // #endregion
     
     // CRITICAL FIX: If unsafe period, return last known good cached state (only updated during safe periods)
     // Never build snapshots during unsafe periods - this prevents race conditions
     // Cached state is always initialized during setup, so it should always be available
-    if (isExecutingScript_.load() || commandsBeingProcessed_.load()) {
+    // CRITICAL: Use isInUnsafeState() to match buildStateSnapshot() behavior
+    // This ensures consistent checking across all code paths
+    if (isInUnsafeState()) {
         std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
         if (cachedState_) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SIMPLIFIED\",\"hypothesisId\":\"SIMPLIFIED\",\"location\":\"Engine.cpp:getState\",\"message\":\"getState - returning last good cached state (unsafe period)\",\"data\":{},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
-            return *cachedState_;
+            // CRITICAL FIX: Update version of cached state before returning
+            // Cached state may have been built earlier with version 0, but we need current version
+            // This ensures observers receive state with correct version for consistency tracking
+            EngineState result = *cachedState_;
+            result.version = stateVersion_.load();
+            
+            return result;
         }
         // CRITICAL FIX: Cached state should always be initialized during setup
         // If it's not available, initialize it now (shouldn't happen, but safety fallback)
@@ -787,7 +1157,9 @@ EngineState Engine::getState() const {
         if (!cachedState_) {
             cachedState_ = std::make_unique<EngineState>();
         }
-        return *cachedState_;
+        EngineState result = *cachedState_;
+        result.version = stateVersion_.load();
+        return result;
     }
     
     // Safe period: build snapshot and cache it (only update cache during safe periods)
@@ -823,10 +1195,29 @@ EngineState::ModuleState Engine::getModuleState(const std::string& name) const {
     return EngineState::ModuleState();
 }
 
+// ═══════════════════════════════════════════════════════════
+// SHELL-SAFE API (for ScriptManager operations)
+// ═══════════════════════════════════════════════════════════
+
+void Engine::setScriptUpdateCallback(std::function<void(const std::string&)> callback) {
+    scriptManager_.setScriptUpdateCallback(callback);
+}
+
+void Engine::setScriptAutoUpdate(bool enabled) {
+    
+    scriptManager_.setAutoUpdate(enabled);
+}
+
+bool Engine::isScriptAutoUpdateEnabled() const {
+    return scriptManager_.isAutoUpdateEnabled();
+}
+
 size_t Engine::subscribe(StateObserver callback) {
     std::unique_lock<std::shared_mutex> lock(stateMutex_);
     size_t id = nextObserverId_.fetch_add(1);
     observers_.emplace_back(id, callback);
+    // Observers are notified in registration order (FIFO)
+    // This ensures deterministic notification order
     return id;
 }
 
@@ -837,131 +1228,106 @@ void Engine::unsubscribe(size_t id) {
             [id](const auto& pair) { return pair.first == id; }),
         observers_.end()
     );
+    // Note: If unsubscribe() is called during notification, it will block
+    // until the current notification completes. The observer will still receive
+    // the current notification, then be removed. This is safe and expected behavior.
 }
 
 void Engine::notifyStateChange() {
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            bool isExecuting = isExecutingScript_.load();
-            bool commandsProcessing = commandsBeingProcessed_.load();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SIMPLIFIED\",\"hypothesisId\":\"SIMPLIFIED\",\"location\":\"Engine.cpp:notifyStateChange\",\"message\":\"notifyStateChange ENTRY\",\"data\":{\"isExecutingScript\":" << (isExecuting ? "true" : "false") << ",\"commandsBeingProcessed\":" << (commandsProcessing ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
-        }
+    
+    // CRITICAL: Prevent recursive notifications
+    // If an observer calls notifyStateChange() during notification, ignore it
+    // This prevents infinite loops and ensures observers only read state, never modify
+    bool expected = false;
+    if (!notifyingObservers_.compare_exchange_strong(expected, true)) {
+        // Already notifying - recursive call detected, ignore it
+        ofLogWarning("Engine") << "Recursive notifyStateChange() call detected and ignored";
+        return;
     }
-    // #endregion
+    
+    // CRITICAL FIX: Defer notifications during rendering
+    // This prevents state observers from firing during ImGui rendering, which causes crashes
+    // State updates during rendering can corrupt ImGui state and cause segmentation faults
+    if (isRendering_.load()) {
+        ofLogVerbose("Engine") << "Deferring state notification - rendering in progress";
+        // Queue notification to be processed on main thread event loop (in update())
+        // This ensures notifications happen after rendering completes, not during it
+        notificationQueue_.enqueue([this]() {
+            this->notifyObserversWithState();
+        });
+        // Release recursive notification guard before returning
+        notifyingObservers_.store(false);
+        return;
+    }
     
     // CRITICAL FIX: Don't skip notifications during command processing
     // getState() now handles unsafe periods by returning cached state
     // This ensures observers always receive state updates, even during command processing
     // Observers will see the last known good state, which is acceptable
-    // The stateNeedsNotification_ flag ensures notifications happen after commands complete
+    // Notification queue ensures notifications happen on main thread after commands complete
     
     // CRITICAL FIX: Throttle expensive state snapshot building
     // Prevents main thread blocking from excessive snapshot generation
     // which was causing engine to appear frozen
+    // BUT: Always notify observers - use cached state when throttled
     uint64_t now = getCurrentTimestamp();
     uint64_t lastTime = lastStateSnapshotTime_.load();
+    bool shouldBuildSnapshot = (now - lastTime >= STATE_SNAPSHOT_THROTTLE_MS);
     
-    // Only build snapshot if enough time has passed since last one
-    if (now - lastTime < STATE_SNAPSHOT_THROTTLE_MS) {
-        // Skip this notification - too soon since last snapshot
-        // This prevents excessive "MultiSampler: Serialized..." log spam
-        // and prevents main thread blocking
-        return;
-    }
-    
-    lastStateSnapshotTime_.store(now);
-    
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,B,D\",\"location\":\"Engine.cpp:notifyStateChange\",\"message\":\"notifyStateChange - calling getState\",\"data\":{},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
+    EngineState state;
+    if (shouldBuildSnapshot) {
+        // Enough time has passed - build fresh snapshot
+        lastStateSnapshotTime_.store(now);
+        
+        
+        // CRITICAL FIX: Use getState() instead of buildStateSnapshot() directly
+        // getState() handles unsafe periods by returning cached state
+        // This prevents crashes when notifyStateChange() is called during script execution
+        state = getState();
+    } else {
+        // Throttled - use cached state to avoid expensive snapshot building
+        // This ensures observers still get updates, but we don't block the main thread
+        std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
+        if (cachedState_) {
+            // CRITICAL FIX: Update version of cached state before using
+            // Cached state may have been built earlier with version 0, but we need current version
+            // This ensures observers receive state with correct version for consistency tracking
+            state = *cachedState_;
+            state.version = stateVersion_.load();
+            
+        } else {
+            // No cached state available - build snapshot anyway (shouldn't happen, but safety fallback)
+            ofLogWarning("Engine") << "notifyStateChange() throttled but no cached state available - building snapshot anyway";
+            state = getState();
         }
     }
-    // #endregion
     
-    // CRITICAL FIX: Use getState() instead of buildStateSnapshot() directly
-    // getState() handles unsafe periods by returning cached state
-    // This prevents crashes when notifyStateChange() is called during script execution
-    EngineState state = getState();
     
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:notifyStateChange\",\"message\":\"BEFORE calling observers - about to iterate\",\"data\":{\"observerCount\":" << observers_.size() << "},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
-        }
-    }
-    // #endregion
     
     // CRITICAL FIX: Collect broken observers during iteration, remove after
     // This prevents iterator invalidation and ensures all observers are called
+    // Also handles edge cases:
+    // - Observer exceptions: caught, logged, observer removed after iteration
+    // - Observer unsubscription during notification: blocks until iteration completes (safe)
+    // - Multiple observers: all called in registration order (FIFO)
     std::vector<size_t> brokenObservers;
     
     std::shared_lock<std::shared_mutex> lock(stateMutex_);
     size_t observerIndex = 0;
+    // Iterate in registration order (FIFO) - ensures deterministic notification order
     for (const auto& [id, observer] : observers_) {
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:notifyStateChange\",\"message\":\"BEFORE calling observer\",\"data\":{\"observerId\":" << id << ",\"observerIndex\":" << observerIndex << "},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         try {
+            // CRITICAL: Log immediately before calling observer
+            {
+            }
             observer(state);
-            // #region agent log
+            // CRITICAL: Log immediately after calling observer
             {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:notifyStateChange\",\"message\":\"AFTER calling observer - SUCCESS\",\"data\":{\"observerId\":" << id << ",\"observerIndex\":" << observerIndex << "},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
             }
-            // #endregion
         } catch (const std::exception& e) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:notifyStateChange\",\"message\":\"EXCEPTION in observer callback - CRASH POINT\",\"data\":{\"observerId\":" << id << ",\"observerIndex\":" << observerIndex << ",\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "Error in state observer " << id << ": " << e.what();
             brokenObservers.push_back(id);
         } catch (...) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:notifyStateChange\",\"message\":\"UNKNOWN EXCEPTION in observer callback - CRASH POINT\",\"data\":{\"observerId\":" << id << ",\"observerIndex\":" << observerIndex << "},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "Unknown error in state observer " << id;
             brokenObservers.push_back(id);
         }
@@ -987,60 +1353,192 @@ void Engine::notifyStateChange() {
         }
     }
     
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:notifyStateChange\",\"message\":\"AFTER all observers - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
+    
+    // Release recursive notification guard
+    notifyingObservers_.store(false);
+}
+
+void Engine::notifyObserversWithState() {
+    // Helper method that actually calls all observers with current state
+    // Called from queued notification callbacks (event-driven pattern)
+    // Includes all safety checks (recursive guard, throttling, etc.)
+    
+    // CRITICAL: Prevent recursive notifications
+    bool expected = false;
+    if (!notifyingObservers_.compare_exchange_strong(expected, true)) {
+        // Already notifying - recursive call detected, ignore it
+        ofLogWarning("Engine") << "Recursive notifyObserversWithState() call detected and ignored";
+        return;
+    }
+    
+    // Get current state (with throttling and caching)
+    uint64_t now = getCurrentTimestamp();
+    uint64_t lastTime = lastStateSnapshotTime_.load();
+    bool shouldBuildSnapshot = (now - lastTime >= STATE_SNAPSHOT_THROTTLE_MS);
+    
+    EngineState state;
+    if (shouldBuildSnapshot) {
+        lastStateSnapshotTime_.store(now);
+        state = getState();
+    } else {
+        // Throttled - use cached state
+        std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
+        if (cachedState_) {
+            state = *cachedState_;
+        } else {
+            // No cached state available - build snapshot anyway
+            ofLogWarning("Engine") << "notifyObserversWithState() throttled but no cached state available - building snapshot anyway";
+            state = getState();
         }
     }
-    // #endregion
+    
+    // Call all observers
+    std::vector<size_t> brokenObservers;
+    
+    std::shared_lock<std::shared_mutex> lock(stateMutex_);
+    size_t observerIndex = 0;
+    for (const auto& [id, observer] : observers_) {
+        try {
+            observer(state);
+        } catch (const std::exception& e) {
+            ofLogError("Engine") << "Error in state observer " << id << ": " << e.what();
+            brokenObservers.push_back(id);
+        } catch (...) {
+            ofLogError("Engine") << "Unknown error in state observer " << id;
+            brokenObservers.push_back(id);
+        }
+        observerIndex++;
+    }
+    lock.unlock();
+    
+    // Remove broken observers
+    if (!brokenObservers.empty()) {
+        std::unique_lock<std::shared_mutex> writeLock(stateMutex_);
+        std::set<size_t> brokenIds(brokenObservers.begin(), brokenObservers.end());
+        observers_.erase(
+            std::remove_if(observers_.begin(), observers_.end(),
+                [&brokenIds](const std::pair<size_t, StateObserver>& p) {
+                    return brokenIds.find(p.first) != brokenIds.end();
+                }),
+            observers_.end()
+        );
+        for (size_t id : brokenObservers) {
+            ofLogWarning("Engine") << "Removed broken observer " << id;
+        }
+    }
+    
+    // Release recursive notification guard
+    notifyingObservers_.store(false);
+}
+
+void Engine::syncEngineToEditor(std::function<void(const EngineState&)> callback) {
+    // Sync engine state to editor shells with completion guarantee (Engine → Editor Shell synchronization)
+    // Ensures editor shells receive state updates with completion guarantee
+    // Uses event-driven notification queue for proper ordering
+    
+    // Get current state snapshot (ensure it's up-to-date)
+    EngineState state = getState();
+    uint64_t currentVersion = state.version;
+    
+    // Queue notification to editor shells via notification queue
+    // This ensures notifications happen on event loop, not during rendering
+    notificationQueue_.enqueue([this, callback, state, currentVersion]() {
+        // Notification is being delivered - verify state is current
+        uint64_t actualVersion = stateVersion_.load();
+        
+        if (actualVersion >= currentVersion) {
+            // State is current (or newer) - call callback with state snapshot
+            if (callback) {
+                callback(state);
+            }
+            ofLogVerbose("Engine") << "Engine → Editor Shell sync complete (version: " << currentVersion << ")";
+        } else {
+            // State is stale - get fresh state snapshot
+            EngineState freshState = getState();
+            if (callback) {
+                callback(freshState);
+            }
+            ofLogWarning("Engine") << "Engine → Editor Shell sync used stale state (version: " << currentVersion << ", actual: " << actualVersion << ") - provided fresh state";
+        }
+    });
+}
+
+void Engine::enqueueStateNotification() {
+    // Enqueue state notification to be processed on main thread
+    // This replaces the stateNeedsNotification_ flag pattern - queue is single source of truth
+    notificationQueue_.enqueue([this]() {
+        // Update snapshot before notifying (ensures state is current)
+        updateStateSnapshot();
+        // Notify observers with current state
+        notifyObserversWithState();
+    });
+}
+
+void Engine::processNotificationQueue() {
+    
+    // Process queued notifications from notificationQueue_
+    // Called from update() (main thread event loop) to ensure notifications happen on event loop, not during rendering
+    // Use non-blocking dequeue with per-frame limit to avoid blocking the event loop
+    // Limit prevents processing too many notifications in one frame, which could delay window rendering
+    
+    // Progressive limit: start conservative, increase over time
+    size_t frameCount = updateFrameCount_.load();
+    size_t MAX_NOTIFICATIONS_PER_FRAME;
+    if (frameCount < 20) {
+        MAX_NOTIFICATIONS_PER_FRAME = 1;  // Very conservative for first 20 frames
+    } else if (frameCount < 50) {
+        MAX_NOTIFICATIONS_PER_FRAME = 3;  // Moderate for next 30 frames
+    } else {
+        MAX_NOTIFICATIONS_PER_FRAME = 10; // Normal limit after 50 frames
+    }
+    
+    
+    std::function<void()> callback;
+    size_t processed = 0;
+    while (processed < MAX_NOTIFICATIONS_PER_FRAME && notificationQueue_.try_dequeue(callback)) {
+        if (callback) {
+            try {
+                callback();  // Execute callback (calls notifyObserversWithState() or syncEngineToEditor callback)
+                processed++;
+            } catch (const std::exception& e) {
+                ofLogError("Engine") << "Error processing notification callback: " << e.what();
+            } catch (...) {
+                ofLogError("Engine") << "Unknown error processing notification callback";
+            }
+        }
+    }
+    
+    
+    // Log if we hit the limit (indicates many notifications queued)
+    if (processed >= MAX_NOTIFICATIONS_PER_FRAME) {
+        size_t remaining = notificationQueue_.size_approx();
+        if (remaining > 0) {
+            ofLogVerbose("Engine") << "Notification queue processing limit reached (" << processed 
+                                   << " processed, ~" << remaining << " remaining)";
+        }
+    }
 }
 
 void Engine::notifyParameterChanged() {
     // SIMPLIFIED: If parameters are being modified, defer state notification
     // This prevents crashes when GUI changes parameters and triggers callbacks
     if (parametersBeingModified_.load() > 0) {
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SIMPLIFIED\",\"hypothesisId\":\"GUI\",\"location\":\"Engine.cpp:notifyParameterChanged\",\"message\":\"notifyParameterChanged - deferring (parameter modification in progress)\",\"data\":{},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         ofLogVerbose("Engine") << "notifyParameterChanged() deferred - parameter modification in progress";
-        stateNeedsNotification_.store(true);
+        enqueueStateNotification();
         return;
     }
     
-    // SIMPLIFIED: Direct state change notification (no complex chain)
-    // Observers can use dirty flags to avoid unnecessary work
-    notifyStateChange();
+    // CRITICAL FIX: Use deferred notification pattern to prevent recursive notifications
+    // notifyParameterChanged() can be called during state notifications (e.g., when observers trigger parameter changes)
+    // Using deferred pattern ensures notifications happen on main thread and prevents infinite recursion
+    enqueueStateNotification();
 }
 
 void Engine::onBPMChanged(float& newBpm) {
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            bool isExecuting = isExecutingScript_.load();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\",\"location\":\"Engine.cpp:687\",\"message\":\"onBPMChanged - event received\",\"data\":{\"newBpm\":" << newBpm << ",\"isExecutingScript\":" << (isExecuting ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-            logFile.close();
-        }
-    }
-    // #endregion
     
     // Defer state update if script is executing (prevents recursive updates)
     // The state will be updated after script execution completes
-    if (isExecutingScript_.load()) {
+    if (hasUnsafeState(UnsafeState::SCRIPT_EXECUTING)) {
         ofLogVerbose("Engine") << "[BPM_CHANGE] BPM changed to " << newBpm << " during script execution - deferring state update";
         // Don't notify during script execution - it will be notified after execution completes
         return;
@@ -1051,28 +1549,83 @@ void Engine::onBPMChanged(float& newBpm) {
 }
 
 EngineState Engine::buildStateSnapshot() const {
-    // CRITICAL FIX: Only check commandsBeingProcessed_ and parametersBeingModified_
-    // Script execution doesn't prevent snapshots - it just queues commands
-    // Commands are processed atomically, so state is stable after commands are done
-    // Only block if commands are actively processing or parameters are being modified
-    if (commandsBeingProcessed_.load() || parametersBeingModified_.load() > 0) {
+    // CRITICAL FIX: Set thread-local flag to prevent recursive snapshot building
+    // This prevents getCurrentScript() from calling getState() during snapshot building
+    // Use RAII to ensure flag is always restored, even on exceptions or early returns
+    struct SnapshotGuard {
+        bool& flag_;
+        bool wasBuilding_;
+        SnapshotGuard(bool& flag) : flag_(flag), wasBuilding_(flag) {
+            flag_ = true;
+        }
+        ~SnapshotGuard() {
+            flag_ = wasBuilding_;
+        }
+    };
+    SnapshotGuard guard(isBuildingSnapshot_);
+    
+    // CRITICAL FIX: Check unsafe state flags FIRST
+    // If script is executing, return cached state immediately
+    // This prevents state snapshot building during script execution
+    // Note: Serialization no longer uses buildStateSnapshot() (uses getStateSnapshot() instead - lock-free)
+    if (hasUnsafeState(UnsafeState::SCRIPT_EXECUTING)) {
+        // Script is executing - return cached state immediately
+        // Still needed: Yes - getState() needs fallback during unsafe periods
+        // Can be simplified: Potentially - If Shells migrate to snapshots, getState() may become unused
+        // Note: Serialization no longer uses cachedState_ (uses getStateSnapshot() instead - lock-free)
+        std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
+        if (cachedState_) {
+            // CRITICAL FIX: Update version of cached state before returning
+            // Cached state may have been built earlier with version 0, but we need current version
+            // This ensures observers receive state with correct version for consistency tracking
+            EngineState result = *cachedState_;
+            result.version = stateVersion_.load();
+            
+            // CRITICAL: If cached state is empty (no modules), log a warning
+            // This indicates the initial snapshot was built before modules were loaded
+            if (cachedState_->modules.empty() && cachedState_->connections.empty()) {
+                ofLogWarning("Engine") << "buildStateSnapshot() BLOCKED by script execution - returning EMPTY cached state (modules: " 
+                                      << cachedState_->modules.size() << ", connections: " << cachedState_->connections.size() << ")";
+            } else {
+                ofLogVerbose("Engine") << "buildStateSnapshot() BLOCKED by script execution - returning cached state (modules: " 
+                                      << cachedState_->modules.size() << ", connections: " << cachedState_->connections.size() << ")";
+            }
+            return result;
+        }
+        ofLogError("Engine") << "buildStateSnapshot() blocked but no cached state available";
+        return EngineState();
+    }
+    
+    // CRITICAL FIX: Check ALL unsafe conditions using isInUnsafeState()
+    // Still needed: Yes - Must detect unsafe periods before building snapshots
+    // Can be simplified: No - Multiple flags needed to detect all unsafe conditions
+    // Script execution CAN directly modify module state (via Lua bindings), not just queue commands
+    // So we must check unsafe state flags (script executing, commands processing) as well as parametersBeingModified_
+    // This prevents buildModuleStates() from aborting mid-iteration and leaving partial state
+    
+    // CRITICAL: Use memory barrier to ensure we see latest flag values
+    // Still needed: Yes - Ensures we see latest atomic flag values
+    // Can be simplified: No - Memory barrier is necessary for correctness
+    std::atomic_thread_fence(std::memory_order_acquire);
+    bool isExecuting = hasUnsafeState(UnsafeState::SCRIPT_EXECUTING);
+    bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
+    int paramsModifying = parametersBeingModified_.load();
+    
+    if (isExecuting || commandsProcessing || paramsModifying > 0) {
         // CRITICAL FIX: Never return empty state - return cached state instead
         // This ensures observers always receive valid state, even during unsafe periods
         std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
         if (cachedState_) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SIMPLIFIED\",\"hypothesisId\":\"SIMPLIFIED\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"buildStateSnapshot - returning cached state (unsafe period)\",\"data\":{},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
-            ofLogVerbose("Engine") << "buildStateSnapshot() called during unsafe period - returning cached state";
-            return *cachedState_;
+            // CRITICAL FIX: Update version of cached state before returning
+            // Cached state may have been built earlier with version 0, but we need current version
+            // This ensures observers receive state with correct version for consistency tracking
+            EngineState result = *cachedState_;
+            result.version = stateVersion_.load();
+            
+            ofLogWarning("Engine") << "buildStateSnapshot() BLOCKED during unsafe period - returning cached state (isExecutingScript: " 
+                                   << isExecuting << ", commandsProcessing: " << commandsProcessing 
+                                   << ", parametersModifying: " << paramsModifying << ")";
+            return result;
         }
         // CRITICAL FIX: Cached state should always be initialized during setup
         // If it's not available, initialize it now (shouldn't happen, but safety fallback)
@@ -1085,215 +1638,89 @@ EngineState Engine::buildStateSnapshot() const {
     }
     
     // CRITICAL FIX: Prevent concurrent snapshot building
+    // Use mutex for exclusive access during snapshot building
+    // Note: Serialization no longer uses buildStateSnapshot() (uses getStateSnapshot() instead - lock-free)
     // This prevents crashes when multiple threads try to build snapshots simultaneously
     // (e.g., when ScriptManager observer fires while another snapshot is being built)
-    
-    // Try to acquire exclusive access (non-blocking check first)
-    bool expected = false;
-    if (!snapshotInProgress_.compare_exchange_strong(expected, true)) {
-        // Another snapshot is in progress - return cached state to prevent crash
-        std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
-        if (cachedState_) {
-            ofLogVerbose("Engine") << "buildStateSnapshot() called concurrently - returning cached state";
-            return *cachedState_;
-        }
-        // If no cached state, wait briefly for the other snapshot to complete
-        // This is a fallback - should rarely happen
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        std::shared_lock<std::shared_mutex> retryLock(cachedStateMutex_);
-        if (cachedState_) {
-            return *cachedState_;
-        }
-        // Last resort: wait for mutex (should be very rare)
-        std::lock_guard<std::mutex> guard(snapshotMutex_);
-        if (cachedState_) {
-            return *cachedState_;
-        }
-    }
-    
-    // RAII guard to ensure flag is released even on exception
-    struct SnapshotGuard {
-        std::atomic<bool>& flag_;
-        SnapshotGuard(std::atomic<bool>& flag) : flag_(flag) {}
-        ~SnapshotGuard() { flag_.store(false); }
-    };
-    SnapshotGuard guard(snapshotInProgress_);
-    
-    // Acquire mutex for exclusive access during snapshot building
     std::lock_guard<std::mutex> mutexGuard(snapshotMutex_);
     
     EngineState state;
     
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"BEFORE buildTransportState()\",\"data\":{},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
-        }
-    }
-    // #endregion
     try {
         buildTransportState(state);
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"AFTER buildTransportState() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
     } catch (const std::exception& e) {
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"EXCEPTION in buildTransportState()\",\"data\":{\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         throw;
     } catch (...) {
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"UNKNOWN EXCEPTION in buildTransportState()\",\"data\":{},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         throw;
     }
     
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"BEFORE buildModuleStates()\",\"data\":{},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
+    
+    // CRITICAL FIX: Double-check unsafe state RIGHT BEFORE calling buildModuleStates()
+    // State can change from safe to unsafe between the initial check and this point
+    // (e.g., script execution can start on main thread while we're building snapshot)
+    // This prevents buildModuleStates() from being called during script execution
+    if (isInUnsafeState()) {
+        ofLogVerbose("Engine") << "buildStateSnapshot() - unsafe state detected before buildModuleStates() - returning cached state";
+        std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
+        if (cachedState_) {
+            return *cachedState_;
         }
+        // If no cached state, return empty state (shouldn't happen)
+        ofLogError("Engine") << "buildStateSnapshot() - unsafe state but no cached state available";
+        return EngineState();
     }
-    // #endregion
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            bool isExecuting = isExecutingScript_.load();
-            bool commandsProcessing = commandsBeingProcessed_.load();
-            int paramsModifying = parametersBeingModified_.load();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SIMPLIFIED\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"BEFORE buildModuleStates()\",\"data\":{\"isExecutingScript\":" << (isExecuting ? "true" : "false") << ",\"commandsBeingProcessed\":" << (commandsProcessing ? "true" : "false") << ",\"parametersBeingModified\":" << paramsModifying << "},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
-        }
-    }
-    // #endregion
     
     try {
-        buildModuleStates(state);
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SIMPLIFIED\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"AFTER buildModuleStates() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
+        // CRITICAL FIX: Check if buildModuleStates() completed successfully
+        // If it returns false, it aborted due to unsafe period and left partial state
+        // In this case, return cached state instead of partial state to prevent crashes
+        bool buildSuccess = buildModuleStates(state);
+        if (!buildSuccess) {
+            // buildModuleStates() aborted - return cached state instead of partial state
+            std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
+            if (cachedState_) {
+                ofLogWarning("Engine") << "buildModuleStates() aborted due to unsafe period - returning cached state instead of partial state";
+                ofLogWarning("Engine") << "Cached state has " << cachedState_->modules.size() << " modules, " 
+                                      << cachedState_->connections.size() << " connections";
+                return *cachedState_;
+            } else {
+                ofLogError("Engine") << "buildModuleStates() aborted but no cached state available - returning partial state";
+                // Return partial state as fallback (better than empty state)
             }
+        } else {
+            ofLogVerbose("Engine") << "buildModuleStates() completed successfully - state has " 
+                                   << state.modules.size() << " modules, " 
+                                   << state.connections.size() << " connections";
         }
-        // #endregion
+        
     } catch (const std::exception& e) {
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"EXCEPTION in buildModuleStates()\",\"data\":{\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         throw;
     } catch (...) {
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"UNKNOWN EXCEPTION in buildModuleStates()\",\"data\":{},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         throw;
     }
     
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"BEFORE buildConnectionStates()\",\"data\":{},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
-        }
-    }
-    // #endregion
     try {
         buildConnectionStates(state);
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"AFTER buildConnectionStates() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
     } catch (const std::exception& e) {
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"EXCEPTION in buildConnectionStates()\",\"data\":{\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         throw;
     } catch (...) {
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"UNKNOWN EXCEPTION in buildConnectionStates()\",\"data\":{},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         throw;
     }
+    
+    // Build script state (from ScriptManager)
+    // CRITICAL FIX: During snapshot building, only use cached script if available
+    // Don't trigger script generation (which would call getState() and cause deadlock)
+    // If script is empty, that's okay - it will be populated after snapshot completes
+    if (scriptManager_.hasCachedScript()) {
+        state.script.currentScript = scriptManager_.getCachedScript();
+    } else {
+        // Script not cached yet - use empty string (will be populated later)
+        state.script.currentScript = "";
+    }
+    state.script.autoUpdateEnabled = scriptManager_.isAutoUpdateEnabled();
+    
+    // Set state version for consistency tracking
+    state.version = stateVersion_.load();
     
     // Cache the result before releasing lock
     {
@@ -1304,365 +1731,272 @@ EngineState Engine::buildStateSnapshot() const {
         *cachedState_ = state;
     }
     
-    // Note: snapshotInProgress_ flag is released by RAII guard on function exit
+    // Note: snapshotMutex_ is released automatically by lock_guard on function exit
     
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildStateSnapshot\",\"message\":\"buildStateSnapshot() EXIT - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
-        }
-    }
-    // #endregion
     return state;
+}
+
+void Engine::waitForStateVersion(uint64_t targetVersion, uint64_t timeoutMs) {
+    // Wait for state to reach target version (for future sync contracts)
+    // Uses std::this_thread::yield() in wait loop (non-blocking)
+    // Returns when stateVersion_ >= targetVersion or timeout occurs
+    uint64_t startTime = getCurrentTimestamp();
+    uint64_t timeoutTime = startTime + timeoutMs;
+    
+    while (stateVersion_.load() < targetVersion) {
+        uint64_t now = getCurrentTimestamp();
+        if (now >= timeoutTime) {
+            // Timeout reached
+            ofLogWarning("Engine") << "waitForStateVersion() timed out waiting for version " << targetVersion 
+                                   << " (current: " << stateVersion_.load() << ", timeout: " << timeoutMs << "ms)";
+            return;
+        }
+        // Yield to other threads (non-blocking)
+        std::this_thread::yield();
+    }
+}
+
+void Engine::updateStateSnapshot() {
+    // Increment version number (atomic)
+    uint64_t versionBefore = stateVersion_.load();
+    uint64_t version = stateVersion_.fetch_add(1) + 1;
+    
+    
+    // Get transport state (clock_ is Engine member, no lock needed)
+    EngineState::Transport transport;
+    transport.isPlaying = clock_.isPlaying();
+    transport.bpm = clock_.getTargetBPM();  // Use getTargetBPM() like buildTransportState()
+    transport.currentBeat = 0;  // TODO: Get from Clock if available
+    
+    // CRITICAL: Update all module snapshots before reading them
+    // Module snapshots need to be refreshed after parameter changes
+    // This ensures we have current state when aggregating snapshots
+    moduleRegistry_.forEachModule([](const std::string& uuid, const std::string& humanName, std::shared_ptr<Module> module) {
+        if (module) {
+            module->updateSnapshot();  // Update snapshot with current module state
+        }
+    });
+    
+    // Get module snapshots (lock-free - Module::getSnapshot() uses mutex, but forEachModule handles registry locking)
+    // This is the key difference from buildStateSnapshot() - we use module snapshots instead of building from scratch
+    ofJson modulesJson;
+    // forEachModule() handles registry locking internally
+    moduleRegistry_.forEachModule([&modulesJson](const std::string& uuid, const std::string& humanName, std::shared_ptr<Module> module) {
+        if (module) {
+            // Hold shared_ptr reference to prevent destruction during copy
+            auto moduleSnapshot = module->getSnapshot();  // Fast read with mutex (C++17 compatible)
+            if (moduleSnapshot) {
+                // CRITICAL: Make a safe copy by serializing and deserializing
+                // This prevents memory corruption if the original JSON is being destroyed
+                try {
+                    std::string jsonStr = moduleSnapshot->dump();
+                    modulesJson[humanName] = ofJson::parse(jsonStr);
+                } catch (...) {
+                    // If parsing fails, skip this module (safer than crashing)
+                    ofLogWarning("Engine") << "Failed to copy module snapshot for " << humanName;
+                }
+            }
+        }
+    });
+    
+    // Get connections (connectionManager_ is Engine member, no lock needed)
+    std::vector<ConnectionInfo> connections;
+    auto cmConnections = connectionManager_.getConnections();
+    for (const auto& conn : cmConnections) {
+        ConnectionInfo info;
+        info.sourceModule = conn.sourceModule;
+        info.targetModule = conn.targetModule;
+        info.connectionType = (conn.type == ConnectionManager::ConnectionType::AUDIO) ? "AUDIO" :
+                             (conn.type == ConnectionManager::ConnectionType::VIDEO) ? "VIDEO" :
+                             (conn.type == ConnectionManager::ConnectionType::PARAMETER) ? "PARAMETER" : "EVENT";
+        info.sourcePath = conn.sourcePath;
+        info.targetPath = conn.targetPath;
+        info.eventName = conn.eventName;
+        info.active = conn.active;
+        connections.push_back(info);
+    }
+    
+    // Get script state (from ScriptManager)
+    EngineState::ScriptState scriptState;
+    scriptState.currentScript = scriptManager_.getCurrentScript();
+    scriptState.autoUpdateEnabled = scriptManager_.isAutoUpdateEnabled();
+    
+    // Build JSON snapshot (similar to EngineState::toJson() but includes version)
+    ofJson json;
+    
+    // Transport state
+    ofJson transportJson;
+    transportJson["isPlaying"] = transport.isPlaying;
+    transportJson["bpm"] = transport.bpm;
+    transportJson["currentBeat"] = transport.currentBeat;
+    json["transport"] = transportJson;
+    
+    // Module snapshots (already JSON from Phase 7.1)
+    json["modules"] = modulesJson;
+    
+    // Connections
+    ofJson connectionsJson = ofJson::array();
+    for (const auto& conn : connections) {
+        connectionsJson.push_back(conn.toJson());
+    }
+    json["connections"] = connectionsJson;
+    
+    // Script state
+    ofJson scriptJson;
+    scriptJson["currentScript"] = scriptState.currentScript;
+    scriptJson["autoUpdateEnabled"] = scriptState.autoUpdateEnabled;
+    json["script"] = scriptJson;
+    
+    // Version (for conflict detection)
+    json["version"] = version;
+    
+    // Create immutable JSON snapshot and update pointer with mutex (C++17 compatible)
+    {
+        std::lock_guard<std::mutex> lock(snapshotJsonMutex_);
+        snapshotJson_ = std::make_shared<const ofJson>(std::move(json));
+    }
 }
 
 void Engine::buildTransportState(EngineState& state) const {
     state.transport.isPlaying = clock_.isPlaying();
-    float bpm = clock_.getBPM();
+    // CRITICAL FIX: Use getTargetBPM() instead of getBPM() for state snapshots
+    // getBPM() returns smoothed currentBpm (for audio/display), but for script generation
+    // we want the target BPM (the value that was set, not the smoothed value)
+    float bpm = clock_.getTargetBPM();
     state.transport.bpm = bpm;
     state.transport.currentBeat = 0;  // TODO: Get from Clock if available
     
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"B\",\"location\":\"Engine.cpp:680\",\"message\":\"buildTransportState - BPM captured\",\"data\":{\"bpm\":" << bpm << "},\"timestamp\":" << now << "}\n";
-            logFile.close();
-        }
-    }
-    // #endregion
 }
 
-void Engine::buildModuleStates(EngineState& state) const {
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            bool isExecuting = isExecutingScript_.load();
-            bool commandsProcessing = commandsBeingProcessed_.load();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SIMPLIFIED\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"buildModuleStates() ENTRY\",\"data\":{\"isExecutingScript\":" << (isExecuting ? "true" : "false") << ",\"commandsBeingProcessed\":" << (commandsProcessing ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
-        }
+bool Engine::buildModuleStates(EngineState& state) const {
+    // CRITICAL: This function should NEVER be called during script execution
+    // If it is, it means our guards failed - log extensively and abort immediately
+    std::atomic_thread_fence(std::memory_order_acquire);
+    bool isExecuting = hasUnsafeState(UnsafeState::SCRIPT_EXECUTING);
+    bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
+    int paramsModifying = parametersBeingModified_.load();
+    
+    
+    // CRITICAL: If we're here during script execution, something is very wrong
+    if (isExecuting) {
+        ofLogError("Engine") << "CRITICAL: buildModuleStates() called during script execution! This should never happen! Aborting immediately.";
+        // Log stack trace if possible
+        return false;
     }
-    // #endregion
     
     // CRITICAL: Check unsafe periods at the point of module access
     // Even if buildStateSnapshot() checked, state can change between check and module access
+    // CRITICAL FIX: Use memory barrier to ensure we see the latest unsafe state flags
+    // This prevents race conditions where script execution starts but flag isn't visible yet
+    std::atomic_thread_fence(std::memory_order_acquire);
     if (isInUnsafeState()) {
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SIMPLIFIED\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"buildModuleStates - ABORTING (unsafe period detected)\",\"data\":{},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
-        ofLogError("Engine") << "buildModuleStates() called during unsafe period - ABORTING to prevent crash";
-        return;  // Don't access modules - return empty state
+        ofLogError("Engine") << "buildModuleStates() called during unsafe period - ABORTING to prevent crash (isExecutingScript: " 
+                             << hasUnsafeState(UnsafeState::SCRIPT_EXECUTING) << ", commandsProcessing: " << hasUnsafeState(UnsafeState::COMMANDS_PROCESSING) 
+                             << ", parametersModifying: " << parametersBeingModified_.load() << ")";
+        return false;  // Aborted - return false to indicate failure
     }
+    // Flag to track if we aborted due to unsafe state
+    bool aborted = false;
+    
+    // Counters for diagnostic logging
+    size_t modulesProcessed = 0;
+    size_t modulesSkipped = 0;
+    
     moduleRegistry_.forEachModule([&](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
+        modulesProcessed++;
         // CRITICAL: Check for unsafe periods INSIDE the loop
         // State can change from safe to unsafe while iterating over modules
+        // CRITICAL FIX: Use memory barrier to ensure we see the latest value
+        std::atomic_thread_fence(std::memory_order_acquire);
+        bool isExecuting = hasUnsafeState(UnsafeState::SCRIPT_EXECUTING);
+        bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
+        int paramsModifying = parametersBeingModified_.load();
         if (isInUnsafeState()) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SIMPLIFIED\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"buildModuleStates - ABORTING in loop (unsafe period)\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "buildModuleStates() detected unsafe period while processing module " << name << " - ABORTING";
-            return;  // Abort iteration - don't access this or any remaining modules
+            aborted = true;
+            return;  // Abort iteration - can't return bool from void callback
         }
         
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SIMPLIFIED\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"forEachModule callback - processing module\",\"data\":{\"moduleName\":\"" << name << "\",\"uuid\":\"" << uuid << "\",\"moduleValid\":" << (module ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         if (!module) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"forEachModule callback - module is null, skipping\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
+            modulesSkipped++;
             return;
         }
         
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"BEFORE getTypeName()\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
+        
+        // CRITICAL: Check unsafe state again right before accessing module
+        // Commands can start processing between the loop check and module access
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (isInUnsafeState()) {
+            aborted = true;
+            return;
         }
-        // #endregion
+        
         EngineState::ModuleState moduleState;
         moduleState.name = name;
         std::string moduleType;
         try {
             moduleType = module->getTypeName();
             moduleState.type = moduleType;
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"AFTER getTypeName() - SUCCESS\",\"data\":{\"moduleName\":\"" << name << "\",\"type\":\"" << moduleType << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
         } catch (const std::exception& e) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"EXCEPTION in getTypeName()\",\"data\":{\"moduleName\":\"" << name << "\",\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "Exception in getTypeName() for module " << name << ": " << e.what();
             return;
         } catch (...) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"UNKNOWN EXCEPTION in getTypeName()\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "Unknown exception in getTypeName() for module " << name;
             return;
         }
         
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"BEFORE isEnabled()\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
+        
+        // CRITICAL: Check unsafe state again right before isEnabled() call
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (isInUnsafeState()) {
+            aborted = true;
+            return;
         }
-        // #endregion
+        
         try {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"BEFORE isEnabled() - about to call\",\"data\":{\"moduleName\":\"" << name << "\",\"moduleType\":\"" << moduleType << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             try {
                 moduleState.enabled = module->isEnabled();
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"AFTER isEnabled() - SUCCESS\",\"data\":{\"moduleName\":\"" << name << "\",\"enabled\":" << (moduleState.enabled ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
             } catch (const std::exception& e) {
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"EXCEPTION in isEnabled() - CRASH POINT\",\"data\":{\"moduleName\":\"" << name << "\",\"moduleType\":\"" << moduleType << "\",\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 ofLogError("Engine") << "Exception in isEnabled() for module " << name << " (" << moduleType << "): " << e.what();
                 moduleState.enabled = true;  // Default to enabled on error
             } catch (...) {
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"UNKNOWN EXCEPTION in isEnabled() - CRASH POINT\",\"data\":{\"moduleName\":\"" << name << "\",\"moduleType\":\"" << moduleType << "\"},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 ofLogError("Engine") << "Unknown exception in isEnabled() for module " << name << " (" << moduleType << ")";
                 moduleState.enabled = true;  // Default to enabled on error
             }
         } catch (const std::exception& e) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"EXCEPTION in isEnabled()\",\"data\":{\"moduleName\":\"" << name << "\",\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "Exception in isEnabled() for module " << name << ": " << e.what();
             return;
         } catch (...) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"UNKNOWN EXCEPTION in isEnabled()\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "Unknown exception in isEnabled() for module " << name;
             return;
         }
         
         // Get state snapshot as JSON (clean separation: JSON for serialization)
         // Modules control their own serialization format, which is more robust
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"BEFORE getStateSnapshot()\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
+        
+        // CRITICAL: Check unsafe state again right before getStateSnapshot() call
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (isInUnsafeState()) {
+            aborted = true;
+            return;
         }
-        // #endregion
+        
         ofJson moduleSnapshot;
         try {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"BEFORE getStateSnapshot() - about to call\",\"data\":{\"moduleName\":\"" << name << "\",\"moduleType\":\"" << moduleType << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             
             moduleSnapshot = module->getStateSnapshot();
             
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"AFTER getStateSnapshot() - SUCCESS\",\"data\":{\"moduleName\":\"" << name << "\",\"isObject\":" << (moduleSnapshot.is_object() ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
         } catch (const std::exception& e) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"EXCEPTION in getStateSnapshot() - CRASH POINT\",\"data\":{\"moduleName\":\"" << name << "\",\"moduleType\":\"" << moduleType << "\",\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "Exception in getStateSnapshot() for module " << name << " (" << moduleType << "): " << e.what();
             return;
         } catch (...) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"UNKNOWN EXCEPTION in getStateSnapshot() - CRASH POINT\",\"data\":{\"moduleName\":\"" << name << "\",\"moduleType\":\"" << moduleType << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "Unknown exception in getStateSnapshot() for module " << name << " (" << moduleType << ")";
             return;
         }
         
         // Extract parameters from JSON snapshot
         // This approach is cleaner: modules serialize their own state, Engine extracts what it needs
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"BEFORE JSON parameter extraction\",\"data\":{\"moduleName\":\"" << name << "\",\"isObject\":" << (moduleSnapshot.is_object() ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         if (moduleSnapshot.is_object()) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"BEFORE JSON iteration loop\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             // Extract top-level numeric fields as parameters
             try {
                 for (auto it = moduleSnapshot.begin(); it != moduleSnapshot.end(); ++it) {
@@ -1683,42 +2017,9 @@ void Engine::buildModuleStates(EngineState& state) const {
                         ofLogVerbose("Engine") << "[STATE_SYNC] Extracted " << name << "::" << key << " = " << paramValue << " from JSON";
                     }
                 }
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"AFTER JSON iteration loop - SUCCESS\",\"data\":{\"moduleName\":\"" << name << "\",\"paramCount\":" << moduleState.parameters.size() << "},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
             } catch (const std::exception& e) {
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"EXCEPTION in JSON iteration loop\",\"data\":{\"moduleName\":\"" << name << "\",\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 ofLogError("Engine") << "Exception in JSON iteration for module " << name << ": " << e.what();
             } catch (...) {
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"UNKNOWN EXCEPTION in JSON iteration loop\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 ofLogError("Engine") << "Unknown exception in JSON iteration for module " << name;
             }
             
@@ -1726,17 +2027,6 @@ void Engine::buildModuleStates(EngineState& state) const {
             if (moduleSnapshot.contains("connections") && moduleSnapshot["connections"].is_array()) {
                 const auto& connections = moduleSnapshot["connections"];
                 
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        int connCount = connections.size();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"F\",\"location\":\"Engine.cpp:712\",\"message\":\"processing connections array\",\"data\":{\"moduleName\":\"" << name << "\",\"connectionCount\":" << connCount << "},\"timestamp\":" << now << "}\n";
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 
                 for (size_t i = 0; i < connections.size(); ++i) {
                     const auto& conn = connections[i];
@@ -1747,16 +2037,6 @@ void Engine::buildModuleStates(EngineState& state) const {
                             float opacity = conn["opacity"].get<float>();
                             moduleState.parameters[paramName] = opacity;
                             
-                            // #region agent log
-                            {
-                                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                                if (logFile.is_open()) {
-                                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"F\",\"location\":\"Engine.cpp:720\",\"message\":\"extracted connectionOpacity\",\"data\":{\"moduleName\":\"" << name << "\",\"paramName\":\"" << paramName << "\",\"opacity\":" << opacity << ",\"index\":" << i << "},\"timestamp\":" << now << "}\n";
-                                    logFile.close();
-                                }
-                            }
-                            // #endregion
                             
                             ofLogVerbose("Engine") << "[STATE_SYNC] Extracted " << name << "::" << paramName << " = " << opacity << " from connections array";
                         }
@@ -1775,250 +2055,69 @@ void Engine::buildModuleStates(EngineState& state) const {
         // Fallback: For modules that don't serialize runtime parameters in JSON (e.g., MultiSampler),
         // use getParameters() to get current runtime values
         // This hybrid approach ensures we capture both serialized state and runtime parameters
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"BEFORE getParameters()\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         std::vector<ParameterDescriptor> params;
         try {
             params = module->getParameters();
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"AFTER getParameters() - SUCCESS\",\"data\":{\"moduleName\":\"" << name << "\",\"paramCount\":" << params.size() << "},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
         } catch (const std::exception& e) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"EXCEPTION in getParameters() - CRASH POINT\",\"data\":{\"moduleName\":\"" << name << "\",\"moduleType\":\"" << moduleType << "\",\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "Exception in getParameters() for module " << name << " (" << moduleType << "): " << e.what();
             params.clear();  // Use empty params on error
         } catch (...) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"UNKNOWN EXCEPTION in getParameters() - CRASH POINT\",\"data\":{\"moduleName\":\"" << name << "\",\"moduleType\":\"" << moduleType << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "Unknown exception in getParameters() for module " << name << " (" << moduleType << ")";
             params.clear();  // Use empty params on error
         }
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"BEFORE parameter iteration loop\",\"data\":{\"moduleName\":\"" << name << "\",\"paramCount\":" << params.size() << "},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         for (const auto& param : params) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"Processing parameter\",\"data\":{\"moduleName\":\"" << name << "\",\"paramName\":\"" << param.name << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             
             // Skip if already extracted from JSON
             if (moduleState.parameters.count(param.name) > 0) {
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"Parameter already in moduleState, skipping\",\"data\":{\"moduleName\":\"" << name << "\",\"paramName\":\"" << param.name << "\"},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 continue;
             }
             
             // Skip connection-based parameters (already extracted from JSON connections array)
             if (param.name.find("connectionOpacity_") == 0 || param.name.find("connectionVolume_") == 0) {
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"Parameter is connection-based, skipping\",\"data\":{\"moduleName\":\"" << name << "\",\"paramName\":\"" << param.name << "\"},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 continue;
             }
             
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"BEFORE getParameter() call\",\"data\":{\"moduleName\":\"" << name << "\",\"paramName\":\"" << param.name << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
+            
+            // CRITICAL: Check unsafe state again right before getParameter() call
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (isInUnsafeState()) {
+                aborted = true;
+                return;
             }
-            // #endregion
+            
             try {
                 float paramValue = module->getParameter(param.name);
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"AFTER getParameter() - SUCCESS\",\"data\":{\"moduleName\":\"" << name << "\",\"paramName\":\"" << param.name << "\",\"paramValue\":" << paramValue << "},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 moduleState.parameters[param.name] = paramValue;
                 ofLogVerbose("Engine") << "[STATE_SYNC] Fallback: captured " << name << "::" << param.name << " = " << paramValue << " from getParameter()";
             } catch (const std::exception& e) {
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"EXCEPTION in getParameter() - CRASH POINT\",\"data\":{\"moduleName\":\"" << name << "\",\"moduleType\":\"" << moduleType << "\",\"paramName\":\"" << param.name << "\",\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 ofLogWarning("Engine") << "Error getting parameter '" << param.name << "' from module '" << name << " (" << moduleType << ")': " << e.what();
             } catch (...) {
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"UNKNOWN EXCEPTION in getParameter() - CRASH POINT\",\"data\":{\"moduleName\":\"" << name << "\",\"moduleType\":\"" << moduleType << "\",\"paramName\":\"" << param.name << "\"},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 ofLogWarning("Engine") << "Unknown error getting parameter '" << param.name << "' from module '" << name << " (" << moduleType << ")'";
             }
         }
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"AFTER parameter iteration loop - SUCCESS\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         
         // SIMPLIFIED: Store module snapshot JSON directly (no variant type checking)
         // Modules control their own serialization, Engine just stores it
         // This eliminates variant complexity and makes serialization straightforward
         moduleState.typeSpecificData = moduleSnapshot;
         
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"BEFORE storing moduleState in state.modules\",\"data\":{\"moduleName\":\"" << name << "\",\"paramCount\":" << moduleState.parameters.size() << "},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         try {
             state.modules[name] = moduleState;
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"AFTER storing moduleState - SUCCESS\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
         } catch (const std::exception& e) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"EXCEPTION storing moduleState\",\"data\":{\"moduleName\":\"" << name << "\",\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "Exception storing module state for " << name << ": " << e.what();
         } catch (...) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"UNKNOWN EXCEPTION storing moduleState\",\"data\":{\"moduleName\":\"" << name << "\"},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            // #endregion
             ofLogError("Engine") << "Unknown exception storing module state for " << name;
         }
     });
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"Engine.cpp:buildModuleStates\",\"message\":\"buildModuleStates() EXIT - SUCCESS\",\"data\":{\"moduleCount\":" << state.modules.size() << "},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
-        }
-    }
-    // #endregion
+    
+    // Log summary
+    ofLogNotice("Engine") << "buildModuleStates() completed - processed: " << modulesProcessed 
+                         << ", skipped: " << modulesSkipped 
+                         << ", added to state: " << state.modules.size()
+                         << ", aborted: " << (aborted ? "yes" : "no");
+    
+    // Return false if we aborted due to unsafe state, true if completed successfully
+    return !aborted;
 }
 
 void Engine::buildConnectionStates(EngineState& state) const {
@@ -2042,7 +2141,15 @@ void Engine::audioOut(ofSoundBuffer& buffer) {
     // CRITICAL: Process unified command queue (all commands: parameters, structural changes, etc.)
     // This handles all state mutations in a single, unified queue
     // Parameter changes (SetParameterCommand) and structural changes all go through here
-    processCommands();
+    // CRITICAL FIX: Don't process commands during script execution - defer until after script completes
+    // This prevents state changes during script execution which cause buildModuleStates() to abort and crash
+    if (!hasUnsafeState(UnsafeState::SCRIPT_EXECUTING)) {
+        processCommands();
+    } else {
+        // Script is executing - defer command processing until after script completes
+        // Commands will be processed on next audio buffer after script execution finishes
+        ofLogVerbose("Engine") << "Deferring command processing - script execution in progress";
+    }
     
     // CRITICAL: Process Clock first to generate timing events
     clock_.audioOut(buffer);
@@ -2057,21 +2164,29 @@ void Engine::audioOut(ofSoundBuffer& buffer) {
 }
 
 void Engine::update(float deltaTime) {
-    // CRITICAL FIX: Check if state needs notification (set by audio thread or parameter changes)
-    // This ensures state notifications happen on main thread, not audio thread
-    // Prevents thread safety issues with buildStateSnapshot() and crashes
-    if (stateNeedsNotification_.load()) {
-        // CRITICAL FIX: Only defer if commands are actively processing
-        // If commands are done, state is stable and we can notify (even if script is executing)
-        // Commands are processed atomically, so state is stable after commands are done
-        if (commandsBeingProcessed_.load()) {
-            // Commands still processing - defer
-            stateNeedsNotification_.store(true);
-        } else {
-            // Commands are done - safe to notify
-            // Note: Script might still be executing, but that's OK - commands are done, state is stable
-            stateNeedsNotification_.store(false);
-            notifyStateChange();
+    
+    // Increment frame counter
+    size_t frameCount = updateFrameCount_.fetch_add(1) + 1;
+    
+    
+    // CRITICAL: Skip notification processing for first 10 frames to allow window to appear
+    // During initialization, many notifications may be queued, and processing them
+    // before the window is visible can delay window appearance
+    // Window needs several frames to become visible and stable
+    if (frameCount > 10) {
+        // Process notification queue (after window has appeared)
+        // This ensures deferred notifications are delivered on main thread event loop
+        // Notifications are delivered before any other update logic
+        // Process with limit to prevent blocking the event loop
+        processNotificationQueue();
+    }
+    
+    
+    // Process pending script execution callbacks (from background thread)
+    PendingCallback callback;
+    while (pendingScriptCallbacks_.try_dequeue(callback)) {
+        if (callback.callback) {
+            callback.callback(callback.result);  // Execute on main thread
         }
     }
     
@@ -2086,24 +2201,58 @@ void Engine::update(float deltaTime) {
     
     // Process deferred script updates (with frame delay to ensure state is stable)
     // ScriptManager::update() handles the frame delay and safety checks
-    scriptManager_.update();
+    // NOTE: Removed scriptManager_.update() - observer callback handles all updates immediately now
+    
+    // CRITICAL FIX: Don't update modules while commands are processing
+    // Commands modify module state, and updating modules concurrently causes race conditions
+    // This prevents crashes when modules access state that's being modified by commands
+    bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
+    if (commandsProcessing) {
+        // Commands are still processing - skip module updates this frame
+        // They'll be updated next frame after commands complete
+        ofLogVerbose("Engine") << "Skipping module updates - commands still processing";
+        return;
+    }
     
     // Update all modules
+    {
+    }
+    
     moduleRegistry_.forEachModule([&](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
+        {
+        }
+        
         if (module) {
             try {
                 module->update();
+                
+                {
+                }
             } catch (const std::exception& e) {
+                {
+                }
                 ofLogError("Engine") << "Error updating module '" << name << "': " << e.what();
+            } catch (...) {
+                {
+                }
+                ofLogError("Engine") << "Unknown exception updating module '" << name << "'";
             }
         }
     });
+    
+    {
+    }
+    
+    {
+    }
 }
 
 bool Engine::loadSession(const std::string& path) {
     bool result = sessionManager_.loadSession(path);
     if (result) {
-        notifyStateChange();
+        // CRITICAL FIX: Use deferred notification pattern to prevent recursive notifications
+        // Session loading can trigger state changes that might occur during notifications
+        enqueueStateNotification();
     }
     return result;
 }
@@ -2141,6 +2290,10 @@ bool Engine::enqueueCommand(std::unique_ptr<Command> cmd) {
     // Set timestamp
     cmd->setTimestamp(getCurrentTimestamp());
     
+    // Capture command description before moving
+    std::string cmdDescription = cmd->describe();
+    
+    
     // Try to enqueue (lock-free)
     if (commandQueue_.try_enqueue(std::move(cmd))) {
         return true;
@@ -2165,7 +2318,8 @@ bool Engine::enqueueCommand(std::unique_ptr<Command> cmd) {
 int Engine::processCommands() {
     // CRITICAL FIX: Set flag to prevent state snapshots during command execution
     // This prevents crashes when commands trigger state changes (e.g., clock:start())
-    commandsBeingProcessed_.store(true);
+    setUnsafeState(UnsafeState::COMMANDS_PROCESSING, true);
+    
     
     int processed = 0;
     std::unique_ptr<Command> cmd;
@@ -2173,24 +2327,38 @@ int Engine::processCommands() {
     // Process all queued commands (lock-free, called from audio thread)
     while (commandQueue_.try_dequeue(cmd)) {
         try {
+            uint64_t versionBefore = stateVersion_.load();
+            EngineState stateBefore = getState();
+            
             cmd->execute(*this);
             commandStats_.commandsProcessed++;
             processed++;
             
+            uint64_t versionAfter = stateVersion_.load();
+            EngineState stateAfter = getState();
+            
+            // NOTE: Removed onCommandExecuted() callback - state observer handles all sync now
+            
         } catch (const std::exception& e) {
             ofLogError("Engine") << "Command execution failed: " << e.what()
                                 << " (" << cmd->describe() << ")";
+            // Don't notify ScriptManager on error - state didn't change
         }
     }
     
     // Clear flag after all commands are processed
-    commandsBeingProcessed_.store(false);
+    setUnsafeState(UnsafeState::COMMANDS_PROCESSING, false);
     
-    // CRITICAL FIX: Don't call notifyStateChange() from audio thread
-    // Set flag instead - main thread will check and notify in update()
-    // This prevents thread safety issues with buildStateSnapshot()
+    // Video drawing now relies on event-driven state updates via notification queue
+    // No cooldown needed - state updates are deferred to main thread event loop
+    
+    
+    // CRITICAL FIX: Don't call notifyStateChange() or updateStateSnapshot() from audio thread
+    // Enqueue notification instead - main thread will process queue in update()
+    // This prevents thread safety issues with buildStateSnapshot() and module registry access
+    // updateStateSnapshot() accesses moduleRegistry_ which is not safe from audio thread
     if (processed > 0) {
-        stateNeedsNotification_.store(true);
+        enqueueStateNotification();
     }
     
     return processed;
@@ -2204,7 +2372,18 @@ void Engine::executeCommandImmediate(std::unique_ptr<Command> cmd) {
     
     try {
         cmd->execute(*this);
-        notifyStateChange();
+        // CRITICAL FIX: Update state snapshot immediately after command execution
+        // This ensures state is synchronized before notifications are sent
+        // This matches the pattern used by processCommands()
+        updateStateSnapshot();  // Create new immutable JSON snapshot
+        
+        // CRITICAL FIX: Use deferred notification pattern instead of calling notifyStateChange() directly
+        // This prevents recursive notifications when commands are executed during state notifications
+        // (e.g., when an observer triggers a command). Notifications are enqueued and processed on main thread,
+        // ensuring thread safety and preventing infinite recursion.
+        enqueueStateNotification();
+        
+        // NOTE: Removed onCommandExecuted() callback - state observer handles all sync now
     } catch (const std::exception& e) {
         ofLogError("Engine") << "Immediate command execution failed: " << e.what()
                             << " (" << cmd->describe() << ")";

@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <mutex>
+#include <shared_mutex>
 #include <atomic>
 #include <array>
 #include <thread>
@@ -78,15 +79,16 @@ struct SampleRef {
     float defaultVolume = 1.0f;           // Default volume
     float defaultGrainSize = 0.0f;        // Default grain size in seconds (0 = use full region)
     
-    // GUI STATE: Current values for waveform display and parameter editing
+    // PARAMETER STATE CACHE: Current parameter values (used by getParameter() API and GUI visualization)
     // Synced from active voice during playback, editable when idle
-    float guiPlayheadPosition = 0.0f;     // Current playhead position (absolute, 0.0-1.0)
-    float guiStartPosition = 0.0f;        // Current start position (relative to region)
-    float guiSpeed = 1.0f;                // Current playback speed
-    float guiVolume = 1.0f;               // Current volume level
-    float guiRegionStart = 0.0f;          // Current region start (for display)
-    float guiRegionEnd = 1.0f;            // Current region end (for display)
-    float guiGrainSize = 0.0f;            // Current grain size (for display)
+    // These serve as cached state for the Module parameter API, not just GUI display
+    float currentPlayheadPosition = 0.0f;     // Current playhead position (absolute, 0.0-1.0)
+    float currentStartPosition = 0.0f;        // Current start position (relative to region)
+    float currentSpeed = 1.0f;                // Current playback speed
+    float currentVolume = 1.0f;               // Current volume level
+    float currentRegionStart = 0.0f;          // Current region start
+    float currentRegionEnd = 1.0f;            // Current region end
+    float currentGrainSize = 0.0f;            // Current grain size
     
     // PREVIEW PLAYER: Created on-demand for scrubbing/preview (not always present)
     // Only exists when user is actively scrubbing or previewing
@@ -115,8 +117,8 @@ struct SampleRef {
     // Get the audio buffer for waveform display
     const ofSoundBuffer& getAudioBuffer() const;
     
-    // Reset GUI state to defaults
-    void resetGuiState();
+    // Reset parameter state cache to defaults
+    void resetParameterState();
 };
 
 // Voice: A playback slot with its own audio and video players
@@ -242,24 +244,9 @@ public:
     const SampleRef& getSample(size_t index) const;
     SampleRef& getSampleMutable(size_t index);
     
-    // Display management: Which sample is shown in GUI
-    // Display index is "sticky" - it updates automatically when a sample is triggered,
-    // but can also be set manually for navigation
-    size_t getDisplayIndex() const { return displayIndex_; }
-    void setDisplayIndex(size_t index);  // Set display index (does NOT trigger playback)
-    
-    // Get the currently displayed sample (for GUI state access)
-    // Use this to read gui* fields (guiPlayheadPosition, guiSpeed, etc.) for display
-    // Returns nullptr if no sample is displayed
-    SampleRef* getDisplaySample();
-    const SampleRef* getDisplaySample() const;
-    
-    // Get preview player (only available when scrubbing)
-    // NOTE: This returns nullptr unless the sample is actively being scrubbed.
-    // For normal playback, use getVoicesForSample() to access voice players.
-    // For GUI state, use getDisplaySample()->gui* fields instead.
-    MediaPlayer* getDisplayPlayer();
-    const MediaPlayer* getDisplayPlayer() const;
+    // NOTE: Display index management has been moved to MultiSamplerGUI
+    // The GUI now manages its own selectedSampleIndex_ state
+    // Use getSample(index) to access sample data directly
     
     // ========================================================================
     // VOICE MANAGEMENT API - For Playback Control
@@ -349,32 +336,14 @@ public:
     std::vector<std::string> getPlayerFileNames() const;    // Actual file names
     
     // ========================================================================
-    // LEGACY API (Backward Compatibility)
+    // LEGACY API (Preview Players Only)
     // ========================================================================
-    // These methods are kept for backward compatibility but are deprecated.
-    // New code should use the Sample Bank API and Voice Management API above.
+    // These methods are for internal use and preview player management.
+    // Normal playback uses the voice pool which handles connections automatically.
     
-    // DEPRECATED: Use getDisplaySample() and getVoicesForSample() instead
-    // These methods only return preview players when scrubbing, which is confusing.
-    // For normal playback, voices are managed internally and accessed via Voice API.
     MediaPlayer* getMediaPlayer(size_t index);  // Returns preview player only when scrubbing
     MediaPlayer* getMediaPlayerByName(const std::string& name);
-    MediaPlayer* getCurrentPlayer();  // DEPRECATED: Use getDisplayPlayer() instead
-    
-    // DEPRECATED: Use setDisplayIndex() and getDisplayIndex() instead
-    void setCurrentIndex(size_t index) { setDisplayIndex(index); }
-    size_t getCurrentIndex() const { return getDisplayIndex(); }
-    size_t getNumPlayers() const { return getSampleCount(); }  // Alias
-    
-    // DEPRECATED: Navigation methods that modify state and return preview player
-    // Use setDisplayIndex() for navigation instead
-    MediaPlayer* getNextPlayer();      // Modifies displayIndex_, returns preview player
-    MediaPlayer* getPreviousPlayer(); // Modifies displayIndex_, returns preview player
-    void nextPlayer() { setDisplayIndex((getDisplayIndex() + 1) % getSampleCount()); }
-    void previousPlayer() { 
-        size_t idx = getDisplayIndex();
-        setDisplayIndex(idx == 0 ? getSampleCount() - 1 : idx - 1);
-    }
+    size_t getNumPlayers() const { return getSampleCount(); }  // Alias for getSampleCount()
     
     
     // ========================================================================
@@ -395,9 +364,9 @@ public:
     std::vector<ModuleCapability> getCapabilities() const override;
     
     // Module parameters (for sequencer/modulator control)
-    std::vector<ParameterDescriptor> getParameters() const override;
-    void setParameter(const std::string& paramName, float value, bool notify = true) override;
-    float getParameter(const std::string& paramName) const override;
+    std::vector<ParameterDescriptor> getParametersImpl() const override;
+    void setParameterImpl(const std::string& paramName, float value, bool notify = true) override;
+    float getParameterImpl(const std::string& paramName) const override;
     
     // Module event handling
     void onTrigger(TriggerEvent& event) override;  // Called from audio thread - queues events
@@ -410,7 +379,7 @@ public:
     std::vector<Port> getOutputPorts() const override;
     
     // Module state
-    void setEnabled(bool enabled) override;  // Stops all playback when disabled
+    void setEnabledImpl(bool enabled) override;  // Stops all playback when disabled
     
     // Module serialization
     ofJson toJson(class ModuleRegistry* registry = nullptr) const override;
@@ -430,17 +399,6 @@ public:
         onDirectoryChanged = callback; 
     }
     
-    // ========================================================================
-    // INTERNAL API (For Preview Players Only)
-    // ========================================================================
-    // These methods are for internal use and preview player management.
-    // Normal playback uses the voice pool which handles connections automatically.
-    
-    // DEPRECATED: Use setDisplayIndex() instead
-    void setActivePlayer(size_t index) { setDisplayIndex(index); }
-    
-    // DEPRECATED: Use getDisplayPlayer() instead (same behavior)
-    MediaPlayer* getActivePlayer() { return getDisplayPlayer(); }
     
     // Internal connection management (for preview players only)
     // Voice connections are handled automatically during allocation/release
@@ -467,8 +425,6 @@ private:
     std::vector<std::string> audioFiles;
     std::vector<std::string> videoFiles;
     
-    // Display index: which sample is shown in GUI (sticky after trigger, manually changeable)
-    size_t displayIndex_ = 0;
     std::string dataDirectory;
     bool isSetup;
     
@@ -478,7 +434,7 @@ private:
     ofxVideoMixer internalVideoMixer_;
     
     // Thread safety
-    mutable std::mutex stateMutex;
+    mutable std::shared_mutex stateMutex;
     std::atomic<bool> isDestroying_{false};  // Prevent update() after destruction starts
     
     // Lock-free event queue for audio thread -> GUI thread communication
@@ -586,8 +542,8 @@ private:
     void applyEventParameters(MediaPlayer* player, const TriggerEvent& event, 
                              const std::vector<ParameterDescriptor>& descriptors);
     
-    // GUI state synchronization
-    void syncGuiStateFromVoice(size_t sampleIndex, Voice* voice);  // Sync GUI state from active voice
+    // Parameter state cache synchronization
+    void syncParameterStateFromVoice(size_t sampleIndex, Voice* voice);  // Sync parameter state cache from active voice
     
     // Position validation helper - clamps position for playback with play style awareness
     float clampPositionForPlayback(float position, PlayStyle playStyle) const;

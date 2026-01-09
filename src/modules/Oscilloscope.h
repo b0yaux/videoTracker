@@ -51,10 +51,10 @@ public:
     // Module interface implementation
     std::string getName() const override;
     ModuleType getType() const override;
-    std::vector<ParameterDescriptor> getParameters() const override;
+    std::vector<ParameterDescriptor> getParametersImpl() const override;
     void onTrigger(TriggerEvent& event) override;
-    void setParameter(const std::string& paramName, float value, bool notify = true) override;
-    float getParameter(const std::string& paramName) const override;
+    void setParameterImpl(const std::string& paramName, float value, bool notify = true) override;
+    float getParameterImpl(const std::string& paramName) const override;
     ModuleMetadata getMetadata() const override;
     
     // Routing interface - Oscilloscope produces video output
@@ -157,5 +157,17 @@ private:
     void updateVbo();
     void loadShaders();
     void updateNormalizedColor();  // Update cached color values
+    
+    // Extended rendering snapshot for Oscilloscope-specific parameters
+    struct OscilloscopeRenderingSnapshot : public Module::RenderingSnapshot {
+        const ofColor color;
+        const ofColor backgroundColor;
+        
+        OscilloscopeRenderingSnapshot(bool enabled, float s, float ps, const ofColor& c, const ofColor& bg)
+            : RenderingSnapshot(enabled, s, ps), color(c), backgroundColor(bg) {}
+    };
+    
+    // Override to include Oscilloscope-specific parameters
+    void updateRenderingSnapshot() override;
 };
 

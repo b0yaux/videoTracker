@@ -188,6 +188,10 @@ private:
     // Scroll sync state - track previous index to only sync when it changes
     size_t previousMediaIndex = SIZE_MAX;  // Initialize to invalid value
     
+    // GUI state: which sample is currently selected/displayed (moved from MultiSampler)
+    // This is purely GUI presentation state, not part of the module's serialized state
+    size_t selectedSampleIndex_ = 0;
+    
     // Helper methods for focus management (using unified state)
     bool isCellFocused() const { return cellFocusState.hasFocus(); }
     

@@ -21,6 +21,9 @@ Oscilloscope::Oscilloscope()
     
     // Initialize cached color values
     updateNormalizedColor();
+    
+    // Initialize rendering snapshot
+    updateRenderingSnapshot();
 }
 
 Oscilloscope::~Oscilloscope() {
@@ -35,7 +38,7 @@ ModuleType Oscilloscope::getType() const {
     return ModuleType::UTILITY;
 }
 
-std::vector<ParameterDescriptor> Oscilloscope::getParameters() const {
+std::vector<ParameterDescriptor> Oscilloscope::getParametersImpl() const {
     std::vector<ParameterDescriptor> params;
     
     params.push_back(ParameterDescriptor(
@@ -72,7 +75,7 @@ void Oscilloscope::onTrigger(TriggerEvent& event) {
     // Oscilloscope doesn't respond to triggers
 }
 
-void Oscilloscope::setParameter(const std::string& paramName, float value, bool notify) {
+void Oscilloscope::setParameterImpl(const std::string& paramName, float value, bool notify) {
     if (paramName == "enabled") {
         setEnabled(value > 0.5f);
         if (notify && parameterChangeCallback) {
@@ -92,7 +95,7 @@ void Oscilloscope::setParameter(const std::string& paramName, float value, bool 
     // Background color is handled via GUI color picker, not as a float parameter
 }
 
-float Oscilloscope::getParameter(const std::string& paramName) const {
+float Oscilloscope::getParameterImpl(const std::string& paramName) const {
     if (paramName == "enabled") {
         return getEnabled() ? 1.0f : 0.0f;
     } else if (paramName == "scale") {
@@ -100,7 +103,9 @@ float Oscilloscope::getParameter(const std::string& paramName) const {
     } else if (paramName == "pointSize") {
         return getPointSize();
     }
-    return Module::getParameter(paramName);
+    // Unknown parameter - return default (base class default is 0.0f)
+    // NOTE: Cannot call Module::getParameter() here as it would deadlock (lock already held)
+    return 0.0f;
 }
 
 Module::ModuleMetadata Oscilloscope::getMetadata() const {
@@ -470,14 +475,34 @@ void Oscilloscope::updateVbo() {
     }
 }
 
+void Oscilloscope::updateRenderingSnapshot() {
+    // NOTE: Must be called with moduleMutex_ lock already held (shared or exclusive)
+    // Called from setParameter() or updateSnapshot() which already hold the lock
+    auto snapshot = std::make_shared<const OscilloscopeRenderingSnapshot>(
+        enabled_.load(),  // Atomic read (safe even with lock held)
+        scale_,
+        pointSize_,
+        color_,
+        backgroundColor_
+    );
+    {
+        std::lock_guard<std::mutex> snapshotLock(renderingSnapshotMutex_);
+        renderingSnapshot_ = snapshot;
+    }
+}
+
 void Oscilloscope::renderLissajous() {
     if (!outputFbo_.isAllocated()) {
         ensureOutputFbo(fboWidth_, fboHeight_);
     }
     
-    if (!isEnabled()) {
+    // Get rendering snapshot (lock-free read)
+    auto snapshot = std::dynamic_pointer_cast<const OscilloscopeRenderingSnapshot>(
+        getRenderingSnapshot()
+    );
+    if (!snapshot || !snapshot->enabled) {
         outputFbo_.begin();
-        ofClear(backgroundColor_);
+        ofClear(snapshot ? snapshot->backgroundColor : backgroundColor_);
         outputFbo_.end();
         return;
     }
@@ -510,7 +535,7 @@ void Oscilloscope::renderLissajous() {
     ofGetCurrentRenderer()->loadIdentityMatrix();
     
     // Clear with opaque background color
-    ofClear(backgroundColor_);
+    ofClear(snapshot->backgroundColor);
     
     ofEnableBlendMode(OF_BLENDMODE_ALPHA);
     glEnable(GL_BLEND);
@@ -532,7 +557,7 @@ void Oscilloscope::renderLissajous() {
     
     // Use cached normalized color values
     updateNormalizedColor();
-    shader_.setUniform1f("scale", scale_);
+    shader_.setUniform1f("scale", snapshot->scale);  // Use snapshot->scale instead of scale_
     shader_.setUniform4f("drawColor", normalizedColorR_, normalizedColorG_, normalizedColorB_, 1.0f);
     
     vbo_.bind();

@@ -300,31 +300,36 @@ bool InputRouter::handleKeyPress(ofKeyEventArgs& keyEvent) {
 
     // Priority 1: Window Navigation - Ctrl+Arrow Keys or Cmd+Arrow Keys (spatial navigation)
     // Support both Ctrl (cross-platform) and Cmd (macOS) modifiers
-    // CRITICAL: Only handle if ImGui is NOT capturing keyboard input (to avoid breaking ImGui navigation)
-    // When ImGui wants keyboard input, let it handle arrow keys for its own navigation
-    ImGuiIO& io = ImGui::GetIO();
-    bool imGuiWantsKeyboard = io.WantCaptureKeyboard;
-    
-    if ((ctrlPressed || cmdPressed) && viewManager && !imGuiWantsKeyboard) {
-        if (key == OF_KEY_LEFT) {
-            viewManager->previousWindow();
-            logKeyPress(key, "Navigation: Ctrl/Cmd+Left Arrow - Previous Window");
-            return true;
-        }
-        if (key == OF_KEY_RIGHT) {
-            viewManager->nextWindow();
-            logKeyPress(key, "Navigation: Ctrl/Cmd+Right Arrow - Next Window");
-            return true;
-        }
-        if (key == OF_KEY_UP) {
-            viewManager->upWindow();
-            logKeyPress(key, "Navigation: Ctrl/Cmd+Up Arrow - Up Window");
-            return true;
-        }
-        if (key == OF_KEY_DOWN) {
-            viewManager->downWindow();
-            logKeyPress(key, "Navigation: Ctrl/Cmd+Down Arrow - Down Window");
-            return true;
+    // CRITICAL: Only handle if ImGui is NOT actively editing (to avoid breaking ImGui navigation)
+    // Cmd+Arrow should work when cells are focused but not being edited
+    // Use IsAnyItemActive() instead of WantCaptureKeyboard for more precise control
+    if ((ctrlPressed || cmdPressed) && viewManager) {
+        ImGuiIO& io = ImGui::GetIO();
+        // Only skip Cmd+Arrow if something is actively being edited (text input, etc.)
+        // WantCaptureKeyboard can be true even when just navigating, which is fine
+        bool isActivelyEditing = ImGui::IsAnyItemActive() || io.WantTextInput;
+        
+        if (!isActivelyEditing) {
+            if (key == OF_KEY_LEFT) {
+                viewManager->previousWindow();
+                logKeyPress(key, "Navigation: Ctrl/Cmd+Left Arrow - Previous Window");
+                return true;
+            }
+            if (key == OF_KEY_RIGHT) {
+                viewManager->nextWindow();
+                logKeyPress(key, "Navigation: Ctrl/Cmd+Right Arrow - Next Window");
+                return true;
+            }
+            if (key == OF_KEY_UP) {
+                viewManager->upWindow();
+                logKeyPress(key, "Navigation: Ctrl/Cmd+Up Arrow - Up Window");
+                return true;
+            }
+            if (key == OF_KEY_DOWN) {
+                viewManager->downWindow();
+                logKeyPress(key, "Navigation: Ctrl/Cmd+Down Arrow - Down Window");
+                return true;
+            }
         }
     }
 

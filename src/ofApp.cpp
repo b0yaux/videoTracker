@@ -35,6 +35,18 @@ ofApp::~ofApp() noexcept {
 
 //--------------------------------------------------------------
 void ofApp::setup() {
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:setup\",\"message\":\"setup() ENTRY\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
+    
     // Window and app configuration
     ofSetFrameRate(0);
     ofSetVerticalSync(true);
@@ -48,10 +60,49 @@ void ofApp::setup() {
     // Setup Engine with callbacks
     engine_.setOnProjectOpened([this]() { onProjectOpened(); });
     engine_.setOnUpdateWindowTitle([this]() { updateWindowTitle(); });
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:setup\",\"message\":\"BEFORE engine_.setup()\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     engine_.setup();
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:setup\",\"message\":\"AFTER engine_.setup() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     
-    // Setup GUI managers (before session load so GUIs can be restored)
-    engine_.setupGUIManagers(&guiManager, &viewManager);
+    // Setup GUIManager with Engine components (no longer done via setupGUIManagers)
+    guiManager.setRegistry(&engine_.getModuleRegistry());
+    guiManager.setParameterRouter(&engine_.getParameterRouter());
+    guiManager.setConnectionManager(&engine_.getConnectionManager());
+    guiManager.setEngine(&engine_);  // Set Engine reference for command queue routing
+    
+    // Register UI callbacks with Engine for module operations
+    engine_.setOnModuleAdded([this](const std::string& name) {
+        guiManager.syncWithRegistry();
+    });
+    engine_.setOnModuleRemoved([this](const std::string& name) {
+        guiManager.syncWithRegistry();
+    });
+    
+    // Set CommandExecutor callback for checking if module has GUI
+    engine_.getCommandExecutor().setHasGUICallback([this](const std::string& name) {
+        auto* gui = guiManager.getGUI(name);
+        return (gui != nullptr);
+    });
     
     // Ensure GUIs are created for all modules (including master oscilloscope and spectrogram)
     // This must happen after modules are created
@@ -66,7 +117,29 @@ void ofApp::setup() {
     // ============================================================
     
     // Setup GUI
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:setup\",\"message\":\"BEFORE setupGUI()\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     setupGUI();
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:setup\",\"message\":\"AFTER setupGUI() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     
     // Setup ViewManager with all required dependencies
     viewManager.setup(
@@ -79,6 +152,9 @@ void ofApp::setup() {
         &commandBar,
         &assetLibraryGUI
     );
+    
+    // Set Engine reference on ClockGUI for command queue routing
+    clockGUI.setEngine(&engine_);
     
     // Setup InputRouter
     inputRouter.setup(
@@ -122,10 +198,54 @@ void ofApp::setup() {
     // ============================================================
     
     // Setup audio (after session load so audio device preferences are restored)
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:setup\",\"message\":\"BEFORE setupSoundObjects()\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     setupSoundObjects();
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:setup\",\"message\":\"AFTER setupSoundObjects() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     
     // Setup visual objects
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:setup\",\"message\":\"BEFORE setupVisualObjects()\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     setupVisualObjects();
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:setup\",\"message\":\"AFTER setupVisualObjects() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     
     // CRITICAL: Set audio output for AssetLibrary preview routing
     // This must be done after masterAudioOut is available
@@ -138,7 +258,29 @@ void ofApp::setup() {
     // PHASE 5: Shell Setup (UI interaction modes)
     // ============================================================
     
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:setup\",\"message\":\"BEFORE setupShells()\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     setupShells();
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:setup\",\"message\":\"AFTER setupShells() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     
     // ============================================================
     // PHASE 6: Final Configuration
@@ -151,21 +293,81 @@ void ofApp::setup() {
     
     // Update window title
     updateWindowTitle();
+    
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:setup\",\"message\":\"setup() EXIT - event loop should start\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
 }
 
 //--------------------------------------------------------------
 void ofApp::update() {
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:update\",\"message\":\"update() ENTRY\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
+    
     // Performance monitoring: Start update timing
     float updateStartTime = ofGetElapsedTimef();
     
     // Update Engine (handles session manager, asset library, command executor, and all modules)
     float engineStartTime = ofGetElapsedTimef();
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:update\",\"message\":\"BEFORE engine_.update()\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
     engine_.update(ofGetLastFrameTime());
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"ofApp.cpp:update\",\"message\":\"AFTER engine_.update() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
     float engineTime = (ofGetElapsedTimef() - engineStartTime) * 1000.0f;
     
     // Update active shell
     if (activeShell_) {
+        {
+            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (logFile.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"ofApp.cpp:update\",\"message\":\"BEFORE activeShell_->update()\",\"data\":{},\"timestamp\":" << now << "}\n";
+                logFile.flush();
+                logFile.close();
+            }
+        }
         activeShell_->update(ofGetLastFrameTime());
+        {
+            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (logFile.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"ofApp.cpp:update\",\"message\":\"AFTER activeShell_->update() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+                logFile.flush();
+                logFile.close();
+            }
+        }
         
         // Check if CLI shell wants to exit
         if (activeShell_->getName() == "CLI") {
@@ -192,6 +394,22 @@ void ofApp::update() {
 
 //--------------------------------------------------------------
 void ofApp::draw() {
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:draw\",\"message\":\"draw() ENTRY\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
+    
+    // CRITICAL: Set render guard to prevent state updates during rendering
+    // This prevents state observers from firing during ImGui rendering, which causes crashes
+    engine_.setRendering(true);
+    
     // Performance monitoring: Start frame timing
     float frameStartTime = ofGetElapsedTimef();
     
@@ -199,29 +417,93 @@ void ofApp::draw() {
     ofClear(0, 0, 0, 255);
     
     // Draw video output (fills entire window, drawn behind GUI)
+    // CRITICAL FIX: Skip drawing during script execution and brief cooldown after command processing
+    // - Script execution: Can take longer and modify many things, so skip for safety
+    // - Command processing cooldown: Very short (1 frame) to let module state settle after parameter changes
+    // Video drawing relies on event-driven state updates via notification queue
+    // No cooldown needed - state updates are deferred to main thread event loop
     float videoStartTime = ofGetElapsedTimef();
-    auto masterVideoOut = engine_.getMasterVideoOut();
-    if (masterVideoOut) {
-        masterVideoOut->draw();
+    bool scriptExecuting = engine_.isExecutingScript();
+    if (!scriptExecuting) {
+        auto masterVideoOut = engine_.getMasterVideoOut();
+        if (masterVideoOut) {
+            {
+                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                if (logFile.is_open()) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"ofApp.cpp:draw\",\"message\":\"BEFORE masterVideoOut->draw()\",\"data\":{},\"timestamp\":" << now << "}\n";
+                    logFile.flush();
+                    logFile.close();
+                }
+            }
+            masterVideoOut->draw();
+            {
+                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                if (logFile.is_open()) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"ofApp.cpp:draw\",\"message\":\"AFTER masterVideoOut->draw() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+                    logFile.flush();
+                    logFile.close();
+                }
+            }
+        }
+    } else {
+        // Unsafe state - skip drawing to prevent race condition
+        if (scriptExecuting) {
+            ofLogVerbose("ofApp") << "Skipping video output draw - script executing";
+        }
     }
     float videoTime = (ofGetElapsedTimef() - videoStartTime) * 1000.0f;
     
     // Draw active shell (or fall back to legacy GUI)
     float guiStartTime = ofGetElapsedTimef();
     if (activeShell_) {
+        {
+            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (logFile.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"ofApp.cpp:draw\",\"message\":\"BEFORE activeShell_->draw()\",\"data\":{\"shellName\":\"" << activeShell_->getName() << "\"},\"timestamp\":" << now << "}\n";
+                logFile.flush();
+                logFile.close();
+            }
+        }
         // CommandShell uses custom rendering (no ImGui needed)
-        // EditorShell handles ImGui internally via drawGUI()
         if (activeShell_->getName() == "Command") {
             // Custom rendering - no ImGui wrapping needed
             activeShell_->draw();
-        } else {
+        } else if (activeShell_->getName() == "Editor") {
+            // EditorShell calls drawGUI() which already has gui.begin()/gui.end()
             activeShell_->draw();
+        } else {
+            // CodeShell needs ImGui frame (EditorShell doesn't need wrapping)
+            gui.begin();
+            activeShell_->draw();
+            gui.end();
+        }
+        {
+            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (logFile.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"ofApp.cpp:draw\",\"message\":\"AFTER activeShell_->draw() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+                logFile.flush();
+                logFile.close();
+            }
         }
     } else if (showGUI) {
         // Fallback to legacy GUI if no shell is active
         drawGUI();
     }
     float guiTime = (ofGetElapsedTimef() - guiStartTime) * 1000.0f;
+    
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"ofApp.cpp:draw\",\"message\":\"draw() EXITING - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
     
     // Calculate total frame time
     float frameTime = (ofGetElapsedTimef() - frameStartTime) * 1000.0f; // Convert to ms
@@ -230,6 +512,10 @@ void ofApp::draw() {
     // Accumulate for FPS calculation
     frameTimeAccumulator_ += frameTime;
     frameCount_++;
+    
+    // CRITICAL: Unset render guard after rendering completes
+    // This allows state notifications to proceed after rendering
+    engine_.setRendering(false);
     
     // Log performance stats periodically
     float currentTime = ofGetElapsedTimef();
@@ -266,9 +552,32 @@ void ofApp::exit() {
     engine_.getClock().stop();
     
     // Step 2: Auto-save session FIRST (before any modifications)
+    // Use new approach: merge core + UI state
     try {
-        if (engine_.saveSession("session.json")) {
-            ofLogNotice("ofApp") << "Session saved to file";
+        // Get core state from Engine
+        ofJson coreJson = engine_.getSessionManager().serializeCore();
+        
+        // Get UI state from EditorShell
+        ofJson uiJson;
+        if (editorShell_) {
+            uiJson = editorShell_->serializeUIState();
+        }
+        
+        // Merge core + UI state
+        ofJson completeJson = coreJson;
+        if (uiJson.contains("gui")) {
+            completeJson["gui"] = uiJson["gui"];
+        }
+        
+        // Save to file
+        std::string sessionPath = "session.json";
+        ofFile file(sessionPath, ofFile::WriteOnly);
+        if (file.is_open()) {
+            file << completeJson.dump(4);
+            file.close();
+            ofLogNotice("ofApp") << "Session saved to file (core + UI state)";
+        } else {
+            ofLogWarning("ofApp") << "Failed to save session during exit";
         }
     } catch (...) {
         ofLogWarning("ofApp") << "Error saving session during exit";
@@ -309,7 +618,7 @@ void ofApp::keyPressed(ofKeyEventArgs& keyEvent) {
         return;  // Shell switching handled the key
     }
     
-    // Delegate to active shell or input router
+    // Delegate to active shell
     if (activeShell_) {
         // For CommandShell, we need to pass modifier info for copy/paste
         // Check if it's CommandShell and pass full keyEvent if needed
@@ -319,13 +628,16 @@ void ofApp::keyPressed(ofKeyEventArgs& keyEvent) {
                 return;  // Shell handled the key
             }
         } else {
+            // For EditorShell, it delegates to InputRouter via callback
+            // InputRouter already checks WantCaptureKeyboard internally
             if (activeShell_->handleKeyPress(keyEvent.key)) {
-                return;  // Shell handled the key
+                return;  // Shell handled the key - don't call InputRouter again
             }
         }
     }
     
     // Fall back to input router (for Editor shell compatibility)
+    // InputRouter will check WantCaptureKeyboard internally for keys that need it
     inputRouter.handleKeyPress(keyEvent);
 }
 
@@ -450,7 +762,9 @@ void ofApp::setupGUI() {
                 &engine_.getConnectionManager(),
                 &engine_.getParameterRouter(),
                 &engine_.getPatternRuntime(),
-                &guiManager,
+                [this](const std::string& name) {
+                    guiManager.syncWithRegistry();
+                },
                 "masterAudioOut",
                 "masterVideoOut"
             );
@@ -460,13 +774,80 @@ void ofApp::setupGUI() {
         [this]() { viewManager.setConsoleVisible(!viewManager.isConsoleVisible()); }, // onToggleConsole
         [this]() { viewManager.setAssetLibraryVisible(!viewManager.isAssetLibraryVisible()); }, // onToggleAssetLibrary
         [this]() { showDemoWindow = !showDemoWindow; }, // onToggleDemoWindow
-        [this]() { engine_.saveSession("session"); }, // onSaveSession
+        [this]() { 
+            // Get core state from Engine
+            ofJson coreJson = engine_.getSessionManager().serializeCore();
+            
+            // Get UI state from EditorShell
+            ofJson uiJson;
+            if (editorShell_) {
+                uiJson = editorShell_->serializeUIState();
+            }
+            
+            // Merge core + UI state
+            ofJson completeJson = coreJson;
+            if (uiJson.contains("gui")) {
+                completeJson["gui"] = uiJson["gui"];
+            }
+            
+            // Save to file
+            std::string sessionPath = engine_.getProjectManager().isProjectOpen() 
+                ? engine_.getProjectManager().getSessionPath("session")
+                : "session.json";
+            
+            ofFile file(sessionPath, ofFile::WriteOnly);
+            if (file.is_open()) {
+                file << completeJson.dump(4);
+                file.close();
+                ofLogNotice("ofApp") << "Session saved (core + UI state)";
+            } else {
+                ofLogError("ofApp") << "Failed to save session";
+            }
+        }, // onSaveSession
         [this]() { /* TODO: Save session as */ }, // onSaveSessionAs
         [this]() { 
-            engine_.loadSession("session");
-            // Trigger layout loading after session load
-            layoutNeedsLoad_ = true;
-            layoutLoaded_ = false;
+            // Load JSON from file
+            std::string sessionPath = engine_.getProjectManager().isProjectOpen() 
+                ? engine_.getProjectManager().getSessionPath("session")
+                : "session.json";
+            
+            ofFile file(sessionPath, ofFile::ReadOnly);
+            if (!file.is_open()) {
+                ofLogError("ofApp") << "Failed to open session file: " << sessionPath;
+                return;
+            }
+            
+            std::string jsonString = file.readToBuffer().getText();
+            file.close();
+            
+            ofJson json;
+            try {
+                json = ofJson::parse(jsonString);
+            } catch (const std::exception& e) {
+                ofLogError("ofApp") << "Failed to parse session JSON: " << e.what();
+                return;
+            }
+            
+            // Extract core state and UI state
+            ofJson coreJson = json;
+            if (coreJson.contains("gui")) {
+                coreJson.erase("gui");  // Remove UI state from core JSON
+            }
+            
+            // Load core state
+            if (!engine_.getSessionManager().loadCore(coreJson)) {
+                ofLogError("ofApp") << "Failed to load core state";
+                return;
+            }
+            
+            // Load UI state
+            if (editorShell_ && json.contains("gui")) {
+                if (!editorShell_->loadUIState(json)) {
+                    ofLogWarning("ofApp") << "Failed to load UI state";
+                }
+            }
+            
+            ofLogNotice("ofApp") << "Session loaded (core + UI state)";
         }, // onOpenSession
         [this](const std::string& sessionPath) { /* TODO: Open recent session */ }, // onOpenRecentSession
         [this]() { /* TODO: New session */ }, // onNewSession
@@ -493,10 +874,44 @@ void ofApp::setupGUI() {
         [this](const std::string& sessionName) { 
             std::string sessionPath = engine_.getProjectManager().getSessionPath(sessionName);
             if (!sessionPath.empty()) {
-                engine_.loadSession(sessionPath);
-                // Trigger layout loading after session load
-                layoutNeedsLoad_ = true;
-                layoutLoaded_ = false;
+                // Load JSON from file
+                ofFile file(sessionPath, ofFile::ReadOnly);
+                if (!file.is_open()) {
+                    ofLogError("ofApp") << "Failed to open session file: " << sessionPath;
+                    return;
+                }
+                
+                std::string jsonString = file.readToBuffer().getText();
+                file.close();
+                
+                ofJson json;
+                try {
+                    json = ofJson::parse(jsonString);
+                } catch (const std::exception& e) {
+                    ofLogError("ofApp") << "Failed to parse session JSON: " << e.what();
+                    return;
+                }
+                
+                // Extract core state and UI state
+                ofJson coreJson = json;
+                if (coreJson.contains("gui")) {
+                    coreJson.erase("gui");  // Remove UI state from core JSON
+                }
+                
+                // Load core state
+                if (!engine_.getSessionManager().loadCore(coreJson)) {
+                    ofLogError("ofApp") << "Failed to load core state";
+                    return;
+                }
+                
+                // Load UI state
+                if (editorShell_ && json.contains("gui")) {
+                    if (!editorShell_->loadUIState(json)) {
+                        ofLogWarning("ofApp") << "Failed to load UI state";
+                    }
+                }
+                
+                ofLogNotice("ofApp") << "Session loaded (core + UI state)";
             }
         }, // onOpenProjectSession
         [this]() { engine_.getAssetLibrary().importFile(""); }, // onImportFile
@@ -556,18 +971,14 @@ void ofApp::drawGUI() {
         ImGuiID dockspace_id = ImGui::GetID("MyDockSpace");
         ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
         
-        // #region agent log
-        ImGuiContext* ctx = ImGui::GetCurrentContext();
-        if (ctx) {
-            ImGuiDockNode* node = ImGui::DockContextFindNodeByID(ctx, dockspace_id);
-            int windowCount = node ? node->Windows.Size : 0;
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                logFile << "{\"location\":\"ofApp.cpp:492\",\"message\":\"DockSpace created\",\"data\":{\"dockspaceId\":" << dockspace_id << ",\"nodeExists\":" << (node ? "true" : "false") << ",\"windowCount\":" << windowCount << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"F\"}\n";
-                logFile.close();
-            }
+        // Load pending ImGui state AFTER dockspace is created
+        // This handles the case where session was loaded before dockspace was ready
+        // CRITICAL: Must be called after DockSpace() so docking state can be properly restored
+        if (editorShell_ && editorShell_->isActive()) {
+            editorShell_->loadPendingImGuiState();
         }
-        // #endregion
+        
+        
         
         // Layout loading logic: Wait for windows to be drawn first, then load layout
         // This ensures windows are registered with ImGui before layout is applied
@@ -603,30 +1014,9 @@ void ofApp::drawGUI() {
         // Ensure all windows are synced before loading layout
         guiManager.syncWithRegistry();
         
-        // Try to load layout from session (loadPendingImGuiState handles session layout or imgui.ini fallback)
-        engine_.getSessionManager().loadPendingImGuiState();
-        
-        // Check if layout was actually loaded using SessionManager's tracking flag
-        // This is more reliable than checking docked windows, especially when Command Shell is active
-        // and Editor Shell windows aren't drawn yet
-        bool layoutWasLoaded = engine_.getSessionManager().wasSessionLayoutLoaded();
-        
-        if (layoutWasLoaded) {
-            ofLogNotice("ofApp") << "Layout loaded successfully from session";
-        } else {
-            ofLogNotice("ofApp") << "No layout loaded from session";
-        }
-        
-        // Only setup default layout if no layout was actually loaded AND Editor Shell is active
-        // If Command Shell is active, don't setup default layout (windows aren't drawn yet)
-        if (!layoutWasLoaded) {
-            if (activeShell_ && activeShell_->getName() == "Editor") {
-                setupDefaultLayout(false);
-                ofLogNotice("ofApp") << "Setup default layout (no saved layout found)";
-            } else {
-                ofLogNotice("ofApp") << "Skipping default layout setup (Command Shell active, Editor Shell not active)";
-            }
-        }
+        // Note: UI state loading is now handled by EditorShell's loadUIState() method
+        // This is called during session load in the menu bar callback
+        // Pending ImGui state is loaded in drawGUI() when EditorShell is active
         
         layoutLoaded_ = true;
         layoutNeedsLoad_ = false;
@@ -761,8 +1151,7 @@ void ofApp::saveLayout() {
     ImGui::SaveIniSettingsToDisk(layoutPath.c_str());
     ofLogNotice("ofApp") << "Session layout saved to " << layoutPath;
     
-    // Also update ImGui state in current session JSON
-    engine_.getSessionManager().updateImGuiStateInSession();
+    // Note: UI state updates are now handled by EditorShell's serializeUIState() method
 }
 
 //--------------------------------------------------------------
@@ -795,7 +1184,7 @@ void ofApp::loadLayout() {
             ofLogNotice("ofApp") << "Session layout loaded from " << layoutPath;
             
             // Update session with loaded layout
-            engine_.getSessionManager().updateImGuiStateInSession();
+            // Note: UI state updates are now handled by EditorShell's serializeUIState() method
         } catch (const std::exception& e) {
             ofLogError("ofApp") << "Failed to load layout: " << e.what();
         }
@@ -872,7 +1261,7 @@ void ofApp::loadDefaultLayout() {
             ofLogNotice("ofApp") << "Default layout loaded from " << defaultLayoutPath;
             
             // Update session with loaded default layout
-            engine_.getSessionManager().updateImGuiStateInSession();
+            // Note: UI state updates are now handled by EditorShell's serializeUIState() method
         } catch (const std::exception& e) {
             ofLogError("ofApp") << "Failed to load default layout: " << e.what();
         }
@@ -914,19 +1303,118 @@ void ofApp::updateWindowTitle() {
 
 //--------------------------------------------------------------
 void ofApp::onProjectOpened() {
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:onProjectOpened\",\"message\":\"ENTRY\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:onProjectOpened\",\"message\":\"BEFORE checking if project is open\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     if (!engine_.getProjectManager().isProjectOpen()) {
         return;
     }
     
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:onProjectOpened\",\"message\":\"BEFORE getting project root\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     std::string projectRoot = engine_.getProjectManager().getProjectRoot();
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:onProjectOpened\",\"message\":\"AFTER getting project root - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     
     // Set FileBrowser to project root directory
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:onProjectOpened\",\"message\":\"BEFORE setting FileBrowser directory\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     fileBrowser.setProjectDirectory(projectRoot);
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:onProjectOpened\",\"message\":\"AFTER setting FileBrowser directory - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     ofLogNotice("ofApp") << "FileBrowser set to project directory: " << projectRoot;
     
     // Initialize AssetLibrary with project assets
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:onProjectOpened\",\"message\":\"BEFORE initializing AssetLibrary\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     engine_.getAssetLibrary().initialize();
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:onProjectOpened\",\"message\":\"AFTER initializing AssetLibrary - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     ofLogNotice("ofApp") << "AssetLibrary initialized for project: " << engine_.getProjectManager().getProjectName();
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"startup-debug\",\"hypothesisId\":\"C\",\"location\":\"ofApp.cpp:onProjectOpened\",\"message\":\"EXIT - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
 }
 
 //--------------------------------------------------------------
@@ -979,17 +1467,29 @@ void ofApp::setupShells(const std::string& cliCommandOrFile) {
     });
     editorShell->setHandleKeyPressCallback([this](int key) {
         ofKeyEventArgs keyEvent(ofKeyEventArgs::Pressed, key);
-        inputRouter.handleKeyPress(keyEvent);
-        return false;  // Let other handlers process if needed
+        bool handled = inputRouter.handleKeyPress(keyEvent);
+        return handled;  // Return true if InputRouter handled it, false otherwise
     });
+    
+    // Set UI managers for state serialization
+    editorShell->setViewManager(&viewManager);
+    editorShell->setGUIManager(&guiManager);
     
     editorShell->setup();
     editorShell_ = editorShell.get();
     editorShell_->setActive(false);  // Start inactive
     shells_.push_back(std::move(editorShell));
     
+    // Create Code shell (available via F2)
+    auto codeShell = std::make_unique<vt::shell::CodeShell>(&engine_);
+    codeShell->setup();
+    codeShell_ = codeShell.get();
+    codeShell_->setActive(false);  // Start inactive
+    shells_.push_back(std::move(codeShell));
+    
     ofLogNotice("ofApp") << "Command shell activated (default)";
     ofLogNotice("ofApp") << "Editor shell ready (press F3 to activate)";
+    ofLogNotice("ofApp") << "Code shell ready (press F2 to activate)";
 }
 
 void ofApp::switchShell(vt::shell::Shell* shell) {
@@ -1008,28 +1508,21 @@ void ofApp::switchShell(vt::shell::Shell* shell) {
 }
 
 void ofApp::switchToEditor() {
+    
+    
     if (editorShell_) {
-        // If layout was never loaded (e.g., Command Shell was active), try to load it now
-        // This ensures Editor Shell gets the proper layout with docking
-        if (!layoutLoaded_ && !engine_.getSessionManager().wasSessionLayoutLoaded()) {
-            ofLogNotice("ofApp") << "Editor Shell activated - attempting to load layout from session";
-            
-            // Ensure windows are synced before loading layout
+        // Note: UI state loading is now handled by EditorShell's loadUIState() method
+        // Pending ImGui state is loaded in drawGUI() when EditorShell is active
+        // Ensure windows are synced when Editor Shell is activated
+        if (activeShell_ && activeShell_->getName() == "Editor") {
             guiManager.syncWithRegistry();
-            
-            // Try to load layout (this will use preserved pendingImGuiState_ if available)
-            engine_.getSessionManager().loadPendingImGuiState();
-            
-            // Check if layout was successfully loaded
-            if (engine_.getSessionManager().wasSessionLayoutLoaded()) {
-                ofLogNotice("ofApp") << "Layout loaded successfully when Editor Shell activated";
-                layoutLoaded_ = true;
-            } else {
-                ofLogNotice("ofApp") << "No layout available to load for Editor Shell";
-            }
         }
         
+        
+        
         switchShell(editorShell_);
+        
+        
     }
 }
 
@@ -1046,6 +1539,19 @@ void ofApp::switchToCommand() {
     }
 }
 
+void ofApp::switchToCodeShell() {
+    if (codeShell_) {
+        switchShell(codeShell_);
+    } else {
+        // Create Code shell on first use
+        auto codeShell = std::make_unique<vt::shell::CodeShell>(&engine_);
+        codeShell->setup();
+        codeShell_ = codeShell.get();
+        shells_.push_back(std::move(codeShell));
+        switchShell(codeShell_);
+    }
+}
+
 bool ofApp::handleShellKeyPress(int key) {
     // F1: Command Shell (toggle)
     if (key == OF_KEY_F1) {
@@ -1059,9 +1565,9 @@ bool ofApp::handleShellKeyPress(int key) {
         return true;
     }
     
-    // F2: Patcher Shell (not implemented yet)
+    // F2: Code Shell (Live-coding)
     if (key == OF_KEY_F2) {
-        ofLogNotice("ofApp") << "F2 pressed - Patcher shell (not yet implemented)";
+        switchToCodeShell();
         return true;
     }
     

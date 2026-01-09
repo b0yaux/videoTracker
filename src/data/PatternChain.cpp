@@ -73,13 +73,23 @@ void PatternChain::removeEntry(int chainIndex) {
 }
 
 void PatternChain::clear() {
+    // CRITICAL: Preserve enabled state during playback
+    // Only clear entries, don't reset enabled flag if chain is active
+    // This prevents chain from being disabled during edits
+    bool wasEnabled = enabled;
+    
     chain.clear();
     repeatCounts.clear();
     disabled.clear();
     currentIndex = 0;
     currentRepeat = 0;
-    enabled = false;
-    ofLogNotice("PatternChain") << "Pattern chain cleared";
+    
+    // Restore enabled state (chain editing shouldn't disable chain)
+    enabled = wasEnabled;
+    // Note: currentIndex is reset to 0 since chain is empty, but enabled state is preserved
+    // This prevents chain from being disabled during edits
+    
+    ofLogNotice("PatternChain") << "Pattern chain cleared (enabled state preserved: " << (enabled ? "true" : "false") << ")";
 }
 
 std::string PatternChain::getEntry(int chainIndex) const {
@@ -183,6 +193,8 @@ std::string PatternChain::peekNextPattern() const {
 }
 
 std::string PatternChain::getNextPattern() {
+    
+    
     if (!enabled || chain.empty()) {
         return "";  // Chain disabled or empty
     }
@@ -193,8 +205,12 @@ std::string PatternChain::getNextPattern() {
     // Get repeat count for current chain entry (default to 1 if not set)
     int repeatCount = getRepeatCount(currentIndex);
     
+    
+    
     // Check if we've finished all repeats for current chain entry
     if (currentRepeat >= repeatCount) {
+        
+        
         // Move to next chain entry (skip disabled entries)
         currentRepeat = 0;
         int startIndex = currentIndex;
@@ -203,11 +219,16 @@ std::string PatternChain::getNextPattern() {
             // If we've looped back to start and all are disabled, break to avoid infinite loop
             if (currentIndex == startIndex) break;
         } while (isEntryDisabled(currentIndex) && currentIndex != startIndex);
+        
+        
     }
     
     // Return the next pattern name (only if not disabled)
     if (!isEntryDisabled(currentIndex)) {
         std::string nextPatternName = chain[currentIndex];
+        
+        
+        
         if (!nextPatternName.empty()) {
             ofLogVerbose("PatternChain") << "Pattern finished, advancing to pattern '" << nextPatternName 
                                          << "' (chain position " << currentIndex 
@@ -215,6 +236,8 @@ std::string PatternChain::getNextPattern() {
             return nextPatternName;
         }
     }
+    
+    
     
     return "";  // No valid pattern to advance to
 }

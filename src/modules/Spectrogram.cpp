@@ -24,6 +24,9 @@ Spectrogram::Spectrogram() {
     updateHistorySize();
     ensureOutputFbo();
     
+    // Initialize rendering snapshot
+    updateRenderingSnapshot();
+    
     // Initialize quad VBO for fullscreen rendering (like Oscilloscope)
     // Triangle strip order: bottom-left, bottom-right, top-left, top-right
     quadVertices_ = {
@@ -54,7 +57,7 @@ ModuleType Spectrogram::getType() const {
     return ModuleType::UTILITY;
 }
 
-std::vector<ParameterDescriptor> Spectrogram::getParameters() const {
+std::vector<ParameterDescriptor> Spectrogram::getParametersImpl() const {
     std::vector<ParameterDescriptor> params;
     
     params.push_back(ParameterDescriptor(
@@ -109,7 +112,7 @@ void Spectrogram::onTrigger(TriggerEvent& event) {
     // Spectrogram doesn't respond to triggers
 }
 
-void Spectrogram::setParameter(const std::string& paramName, float value, bool notify) {
+void Spectrogram::setParameterImpl(const std::string& paramName, float value, bool notify) {
     if (paramName == "enabled") {
         setEnabled(value > 0.5f);
         if (notify && parameterChangeCallback) {
@@ -150,7 +153,7 @@ void Spectrogram::setParameter(const std::string& paramName, float value, bool n
     }
 }
 
-float Spectrogram::getParameter(const std::string& paramName) const {
+float Spectrogram::getParameterImpl(const std::string& paramName) const {
     if (paramName == "enabled") {
         return getEnabled() ? 1.0f : 0.0f;
     } else if (paramName == "fftSize") {
@@ -168,7 +171,9 @@ float Spectrogram::getParameter(const std::string& paramName) const {
     } else if (paramName == "fftScale") {
         return static_cast<float>(getFftScale());
     }
-    return Module::getParameter(paramName);
+    // Unknown parameter - return default (base class default is 0.0f)
+    // NOTE: Cannot call Module::getParameter() here as it would deadlock (lock already held)
+    return 0.0f;
 }
 
 Module::ModuleMetadata Spectrogram::getMetadata() const {
@@ -658,6 +663,12 @@ void main() {
     }
 }
 
+void Spectrogram::updateRenderingSnapshot() {
+    // Spectrogram doesn't have rendering-specific parameters, just use base class
+    // Base class captures enabled_ (atomic, lock-free)
+    Module::updateRenderingSnapshot();
+}
+
 void Spectrogram::updateTexture() {
     // Only update if texture is dirty (new FFT data arrived)
     if (!textureDirty_) {
@@ -745,7 +756,9 @@ void Spectrogram::renderSpectrogram() {
         ensureOutputFbo(fboWidth_, fboHeight_);
     }
     
-    if (!isEnabled()) {
+    // Get rendering snapshot (lock-free read)
+    auto snapshot = getRenderingSnapshot();
+    if (!snapshot || !snapshot->enabled) {
         // Clear FBO if disabled
         outputFbo_.begin();
         ofClear(0, 0, 0, 0);

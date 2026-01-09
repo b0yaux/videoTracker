@@ -50,6 +50,13 @@ public:
     std::string getName() const override { return "Command"; }
     std::string getDescription() const override { return "Interactive command terminal for quick commands"; }
     
+    // Embedding support (for use in CodeShell)
+    void setEmbeddedMode(bool embedded) { embeddedMode_ = embedded; }
+    bool isEmbeddedMode() const { return embeddedMode_; }
+    void setEmbeddedBounds(float x, float y, float w, float h);
+    void appendOutput(const std::string& text);  // Make public for CodeShell
+    void appendError(const std::string& text);   // Make public for CodeShell
+    
 private:
     // Terminal state
     std::string currentInput_;              // Current input text
@@ -89,10 +96,15 @@ private:
     float outputAreaHeight_ = 0.0f;          // Output area height (above input line)
     float inputLineY_ = 0.0f;                // Input line Y position
     
+    // Embedding support
+    bool embeddedMode_ = false;              // Whether running in embedded mode
+    float embeddedX_ = 0.0f;                 // Embedded X position
+    float embeddedY_ = 0.0f;                 // Embedded Y position
+    float embeddedW_ = 0.0f;                 // Embedded width
+    float embeddedH_ = 0.0f;                 // Embedded height
+    
     // Command execution
     void executeCommand(const std::string& command);
-    void appendOutput(const std::string& text);
-    void appendError(const std::string& text);
     void resetInput();
     void clearOutput();  // Clear all output lines
     
@@ -133,6 +145,12 @@ private:
     void handleArrowKeys(int key);
     void handleEnter();
     void handleTab();
+    
+    // State change handler (override from Shell base class)
+    void onStateChanged(const EngineState& state) override;
+    
+    // Cached state for thread-safe access
+    EngineState cachedState_;
 };
 
 } // namespace shell

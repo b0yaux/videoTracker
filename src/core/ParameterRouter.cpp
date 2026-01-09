@@ -1,4 +1,6 @@
 #include "ParameterRouter.h"
+#include "Command.h"  // For SetParameterCommand
+#include "Engine.h"
 #include "ofLog.h"
 #include "ofJson.h"
 #include <cmath>
@@ -238,34 +240,34 @@ std::vector<std::shared_ptr<Module>> ParameterRouter::getConnectedModules(const 
 }
 
 void ParameterRouter::notifyParameterChange(Module* module, const std::string& paramName, float value) {
-    if (!registry || !module) {
+    if (!registry || !module || !engine_) {
         return;
     }
     
-    // Find module identifier (UUID or human name) for command queue
-    std::string moduleIdentifier;
+    // Find module human name for SetParameterCommand
+    std::string moduleName;
     registry->forEachModule([&](const std::string& uuid, const std::string& humanName, std::shared_ptr<Module> m) {
         if (m.get() == module) {
-            moduleIdentifier = uuid;  // Use UUID as identifier
+            moduleName = humanName;  // Use human name for command
         }
     });
     
-    if (moduleIdentifier.empty()) {
+    if (moduleName.empty()) {
         ofLogWarning("ParameterRouter") << "Module not found in registry for parameter change notification";
         return;
     }
     
-    // Enqueue parameter command for lock-free processing in audio thread
-    ParameterCommand cmd(moduleIdentifier, paramName, value);
-    if (!commandQueue.try_enqueue(cmd)) {
-        // Queue is full - log warning but don't block
+    // UNIFIED APPROACH: Enqueue SetParameterCommand to Engine's unified queue
+    // This ensures all parameter changes go through the same command processing path
+    // SetParameterCommand will handle both parameter setting and routing
+    auto cmd = std::make_unique<vt::SetParameterCommand>(moduleName, paramName, value);
+    if (!engine_->enqueueCommand(std::move(cmd))) {
         ofLogWarning("ParameterRouter") << "Command queue full, dropping parameter change: " 
-                                        << moduleIdentifier << "." << paramName << " = " << value;
+                                        << moduleName << "." << paramName << " = " << value;
     }
     
-    // Also process routing immediately for GUI updates (non-blocking, GUI thread only)
-    // This ensures UI stays responsive while audio thread processes commands separately
-    processRoutingImmediate(module, paramName, value);
+    // NOTE: Routing is handled by SetParameterCommand::execute() which calls
+    // processRoutingImmediate() in the audio thread after setting the parameter
 }
 
 void ParameterRouter::update() {
@@ -274,28 +276,10 @@ void ParameterRouter::update() {
 }
 
 int ParameterRouter::processCommands() {
-    if (!registry) {
-        return 0;
-    }
-    
-    int processed = 0;
-    ParameterCommand cmd;
-    
-    // Process all queued commands (lock-free, called from audio thread)
-    while (commandQueue.try_dequeue(cmd)) {
-        // Resolve module from identifier
-        auto module = registry->getModule(cmd.moduleIdentifier);
-        if (!module) {
-            ofLogWarning("ParameterRouter") << "Module not found for command: " << cmd.moduleIdentifier;
-            continue;
-        }
-        
-        // Process routing for this parameter change
-        processRoutingImmediate(module.get(), cmd.paramName, cmd.value);
-        processed++;
-    }
-    
-    return processed;
+    // DEPRECATED: Commands are now processed via Engine's unified queue
+    // This method is kept for backward compatibility but does nothing
+    // All parameter changes are handled by SetParameterCommand in Engine's queue
+    return 0;
 }
 
 std::shared_ptr<Module> ParameterRouter::resolvePath(const ParameterPath& path) const {

@@ -3,7 +3,6 @@
 #include "ParameterPath.h"
 #include "modules/Module.h"
 #include "ModuleRegistry.h"
-#include "readerwriterqueue.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -12,25 +11,22 @@
 #include <memory>
 #include "ofJson.h"
 
-/**
- * ParameterRouter - Path-based parameter routing system (replaces ParameterSync)
- * 
- * Features:
- * - TouchDesigner-style hierarchical paths: "tracker1.step[4].position"
- * - Resolves paths to module instances via ModuleRegistry
- * - Bidirectional parameter synchronization
- * - Prevents feedback loops
- * - Supports conditional routing
- * 
- * Usage:
- *   ParameterRouter router(&registry);
- *   router.connect("tracker1.currentStepPosition", "multisampler2.position",
- *                  [this]() { return !clock.isPlaying(); });
- */
+// Forward declaration
+namespace vt {
+    class Engine;
+    class Command;
+}
+
 class ParameterRouter {
 public:
     ParameterRouter(ModuleRegistry* registry = nullptr);
     ~ParameterRouter();
+    
+    /**
+     * Set Engine reference (for state synchronization notifications)
+     * Must be called before notifyParameterChange() can notify Engine
+     */
+    void setEngine(vt::Engine* engine) { engine_ = engine; }
     
     /**
      * Connect two parameters with bidirectional binding
@@ -129,10 +125,19 @@ public:
     
     /**
      * Process parameter commands from GUI thread (call from audio thread)
-     * This processes queued parameter changes in a lock-free manner
-     * @return Number of commands processed
+     * @deprecated This method is no longer used - commands are processed via Engine's unified queue
+     * @return Number of commands processed (always 0 now)
      */
     int processCommands();
+    
+    /**
+     * Process routing immediately (called from audio thread or commands)
+     * This routes parameter changes to connected modules
+     * @param module Source module
+     * @param paramName Parameter name
+     * @param value Parameter value
+     */
+    void processRoutingImmediate(Module* module, const std::string& paramName, float value);
     
     /**
      * Set the module registry (can be changed after construction)
@@ -160,19 +165,6 @@ public:
     bool fromJson(const ofJson& json);
 
 private:
-    /**
-     * Parameter command for lock-free queue (GUI → Audio)
-     */
-    struct ParameterCommand {
-        std::string moduleIdentifier;  // UUID or human name
-        std::string paramName;
-        float value;
-        
-        ParameterCommand() : value(0.0f) {}
-        ParameterCommand(const std::string& id, const std::string& param, float val)
-            : moduleIdentifier(id), paramName(param), value(val) {}
-    };
-    
     struct Connection {
         ParameterPath sourcePath;
         ParameterPath targetPath;
@@ -206,12 +198,9 @@ private:
     
     std::vector<Connection> connections;
     ModuleRegistry* registry;
+    vt::Engine* engine_ = nullptr;  // Reference to Engine for unified command queue
     
-    // Lock-free command queue for parameter changes (GUI → Audio)
-    // Producer: GUI thread (notifyParameterChange)
-    // Consumer: Audio thread (processCommands)
-    // Capacity: 128 commands (should be more than enough)
-    moodycamel::ReaderWriterQueue<ParameterCommand> commandQueue{128};
+    // NOTE: ParameterRouter no longer has its own queue - all commands go through Engine's unified queue
     
     /**
      * Resolve a ParameterPath to a module instance
@@ -262,10 +251,5 @@ private:
     float getIndexedParameterValue(std::shared_ptr<Module> module, const ParameterPath& path) const;
     void setIndexedParameterValue(std::shared_ptr<Module> module, const ParameterPath& path, float value);
     
-    /**
-     * Process routing immediately (used by both notifyParameterChange and processCommands)
-     * This is the actual routing logic that applies parameter changes
-     */
-    void processRoutingImmediate(Module* module, const std::string& paramName, float value);
 };
 

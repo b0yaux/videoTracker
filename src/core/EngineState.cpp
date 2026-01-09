@@ -261,19 +261,10 @@ ofJson EngineState::ModuleState::toJson() const {
     }
     json["parameters"] = paramsJson;
     
-    // Serialize type-specific state
-    if (std::holds_alternative<TrackerSequencerState>(typeSpecific)) {
-        json["typeSpecific"] = std::get<TrackerSequencerState>(typeSpecific).toJson();
-        json["typeSpecific"]["_type"] = "TrackerSequencer";
-    } else if (std::holds_alternative<MultiSamplerState>(typeSpecific)) {
-        json["typeSpecific"] = std::get<MultiSamplerState>(typeSpecific).toJson();
-        json["typeSpecific"]["_type"] = "MultiSampler";
-    } else if (std::holds_alternative<AudioMixerState>(typeSpecific)) {
-        json["typeSpecific"] = std::get<AudioMixerState>(typeSpecific).toJson();
-        json["typeSpecific"]["_type"] = "AudioMixer";
-    } else if (std::holds_alternative<VideoMixerState>(typeSpecific)) {
-        json["typeSpecific"] = std::get<VideoMixerState>(typeSpecific).toJson();
-        json["typeSpecific"]["_type"] = "VideoMixer";
+    // SIMPLIFIED: Direct JSON assignment (no variant type checking)
+    // Modules serialize their own state, we just store it
+    if (!typeSpecificData.is_null()) {
+        json["typeSpecific"] = typeSpecificData;
     }
     
     return json;
@@ -291,28 +282,12 @@ void EngineState::ModuleState::fromJson(const ofJson& json) {
         }
     }
     
-    // Deserialize type-specific state
+    // SIMPLIFIED: Direct JSON assignment (no variant type checking)
+    // Modules deserialize their own state when needed
     if (json.contains("typeSpecific")) {
-        const auto& typeSpecificJson = json["typeSpecific"];
-        std::string typeName = typeSpecificJson.value("_type", "");
-        
-        if (typeName == "TrackerSequencer") {
-            TrackerSequencerState state;
-            state.fromJson(typeSpecificJson);
-            typeSpecific = state;
-        } else if (typeName == "MultiSampler") {
-            MultiSamplerState state;
-            state.fromJson(typeSpecificJson);
-            typeSpecific = state;
-        } else if (typeName == "AudioMixer") {
-            AudioMixerState state;
-            state.fromJson(typeSpecificJson);
-            typeSpecific = state;
-        } else if (typeName == "VideoMixer") {
-            VideoMixerState state;
-            state.fromJson(typeSpecificJson);
-            typeSpecific = state;
-        }
+        typeSpecificData = json["typeSpecific"];
+    } else {
+        typeSpecificData = ofJson();  // Empty JSON
     }
 }
 
@@ -383,6 +358,38 @@ EngineState EngineState::fromJson(const ofJson& json) {
     }
     
     return state;
+}
+
+void EngineState::applyDelta(const StateDelta& delta) {
+    // Apply transport changes
+    if (delta.transport.isPlayingChanged) {
+        transport.isPlaying = delta.transport.isPlaying;
+    }
+    if (delta.transport.bpmChanged) {
+        transport.bpm = delta.transport.bpm;
+    }
+    if (delta.transport.currentBeatChanged) {
+        transport.currentBeat = delta.transport.currentBeat;
+    }
+    
+    // Apply module changes
+    for (const auto& [moduleName, moduleDelta] : delta.moduleChanges) {
+        auto it = modules.find(moduleName);
+        if (it != modules.end()) {
+            // Apply enabled change
+            if (moduleDelta.enabledChanged) {
+                it->second.enabled = moduleDelta.enabled;
+            }
+            
+            // Apply parameter changes
+            for (const auto& paramChange : moduleDelta.parameterChanges) {
+                it->second.parameters[paramChange.parameterName] = paramChange.value;
+            }
+        }
+    }
+    
+    // Note: connectionsChanged flag indicates full connection list needs to be rebuilt
+    // This is handled by the observer, not by applying the delta
 }
 
 } // namespace vt

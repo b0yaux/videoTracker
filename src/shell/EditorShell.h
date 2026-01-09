@@ -36,10 +36,48 @@ public:
     void setDrawGUICallback(std::function<void()> callback) { drawGUICallback_ = callback; }
     void setHandleKeyPressCallback(std::function<bool(int)> callback) { handleKeyPressCallback_ = callback; }
     
+    // Set UI managers for state serialization
+    void setViewManager(class ViewManager* viewManager) { viewManager_ = viewManager; }
+    void setGUIManager(class GUIManager* guiManager) { guiManager_ = guiManager; }
+    
+    /**
+     * Serialize UI state (view state, visibility, ImGui layout)
+     * @return JSON with UI state
+     */
+    ofJson serializeUIState() const;
+    
+    /**
+     * Deserialize UI state
+     * @param json JSON with UI state
+     * @return true if successful, false otherwise
+     */
+    bool loadUIState(const ofJson& json);
+    
+    /**
+     * Load pending ImGui state (call this after ImGui is initialized)
+     * This should be called from ofApp::drawGUI() or after ImGui setup
+     * @return true if layout was loaded, false otherwise
+     */
+    bool loadPendingImGuiState();
+    
 private:
     // Callbacks to ofApp's GUI components (set during setup)
     std::function<void()> drawGUICallback_;
     std::function<bool(int)> handleKeyPressCallback_;
+    
+    // UI managers for state serialization
+    class ViewManager* viewManager_ = nullptr;
+    class GUIManager* guiManager_ = nullptr;
+    
+    // Pending ImGui state (loaded from session but ImGui not initialized yet)
+    std::string pendingImGuiState_;
+    bool imguiStateLoaded_ = false;
+    
+    // State change handler (override from Shell base class)
+    void onStateChanged(const EngineState& state) override;
+    
+    // Cached state for thread-safe access
+    EngineState cachedState_;
 };
 
 } // namespace shell

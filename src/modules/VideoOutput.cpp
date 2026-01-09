@@ -1,4 +1,6 @@
 #include "VideoOutput.h"
+#include <fstream>
+#include <chrono>
 #include "core/ModuleRegistry.h"
 #include "core/ModuleFactory.h"
 #include "ofLog.h"
@@ -51,7 +53,7 @@ ModuleType VideoOutput::getType() const {
     return ModuleType::UTILITY;
 }
 
-std::vector<ParameterDescriptor> VideoOutput::getParameters() const {
+std::vector<ParameterDescriptor> VideoOutput::getParametersImpl() const {
     std::vector<ParameterDescriptor> params;
     
     // Master opacity parameter
@@ -85,8 +87,11 @@ std::vector<ParameterDescriptor> VideoOutput::getParameters() const {
     ));
     
     // Per-connection opacities (dynamic based on number of connections)
+    // CRITICAL: Use actual connection index, not loop index, to match getParameter() behavior
     std::lock_guard<std::mutex> lock(connectionMutex_);
     for (size_t i = 0; i < connectedModules_.size(); i++) {
+        // Only generate parameter if connection is still valid (not expired)
+        // Use the actual index 'i' which matches sourceOpacities_[i]
         if (!connectedModules_[i].expired()) {
             std::string paramName = "connectionOpacity_" + std::to_string(i);
             params.push_back(ParameterDescriptor(
@@ -107,7 +112,7 @@ void VideoOutput::onTrigger(TriggerEvent& event) {
     // Outputs don't receive triggers
 }
 
-void VideoOutput::setParameter(const std::string& paramName, float value, bool notify) {
+void VideoOutput::setParameterImpl(const std::string& paramName, float value, bool notify) {
     if (paramName == "masterOpacity") {
         setMasterOpacity(value);
         if (notify && parameterChangeCallback) {
@@ -130,31 +135,76 @@ void VideoOutput::setParameter(const std::string& paramName, float value, bool n
         }
     } else if (paramName.find("connectionOpacity_") == 0) {
         // Extract source index from parameter name
-        // FIX: Check if paramName is long enough before calling substr
-        if (paramName.length() <= 19) {
+        // "connectionOpacity_" is 19 chars, so we need at least 20 chars for "connectionOpacity_0"
+        const size_t prefixLength = 19; // "connectionOpacity_".length()
+        if (paramName.length() <= prefixLength) {
             // Parameter name is too short - it's just "connectionOpacity_" without index
-            ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name (too short): " << paramName << " (length: " << paramName.length() << ")";
+            ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name (missing index): " << paramName << " (length: " << paramName.length() << ", need > " << prefixLength << ")";
             return;
         }
         
-        std::string indexStr = paramName.substr(19); // "connectionOpacity_".length() == 19
+        std::string indexStr = paramName.substr(prefixLength);
         if (indexStr.empty()) {
             ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name (missing index): " << paramName;
             return;
         }
         try {
             size_t index = std::stoul(indexStr);
-            setSourceOpacity(index, value);
-            if (notify && parameterChangeCallback) {
-                parameterChangeCallback(paramName, value);
+            
+            // #region agent log
+            {
+                std::lock_guard<std::mutex> lock(connectionMutex_);
+                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                if (logFile.is_open()) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    size_t currentSize = sourceOpacities_.size();
+                    size_t connectedSize = connectedModules_.size();
+                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"VideoOutput.cpp:136\",\"message\":\"setParameter connectionOpacity\",\"data\":{\"paramName\":\"" << paramName << "\",\"index\":" << index << ",\"value\":" << value << ",\"sourceOpacitiesSize\":" << currentSize << ",\"connectedModulesSize\":" << connectedSize << "},\"timestamp\":" << now << "}\n";
+                    logFile.close();
+                    
+                    // Validate index before calling setSourceOpacity (check while we have the lock)
+                    if (index >= currentSize) {
+                        ofLogWarning("VideoOutput") << "Invalid connection opacity index: " << index << " (max: " << (currentSize > 0 ? currentSize - 1 : 0) << ")";
+                        
+                        // #region agent log
+                        {
+                            std::ofstream logFile2("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                            if (logFile2.is_open()) {
+                                auto now2 = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                                logFile2 << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"VideoOutput.cpp:151\",\"message\":\"setParameter - index out of bounds\",\"data\":{\"index\":" << index << ",\"sourceOpacitiesSize\":" << currentSize << "},\"timestamp\":" << now2 << "}\n";
+                                logFile2.close();
+                            }
+                        }
+                        // #endregion
+                        
+                        return;
+                    }
+                }
             }
+            // #endregion
+            
+            // setSourceOpacity() already triggers parameterChangeCallback, so we don't need to call it again here
+            setSourceOpacity(index, value);
+            // Note: setSourceOpacity() always triggers parameterChangeCallback, so we don't need to call it again
+            // even if notify is true, because setSourceOpacity() handles the notification
         } catch (const std::exception& e) {
             ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name: " << paramName << " (" << e.what() << ")";
+            
+            // #region agent log
+            {
+                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                if (logFile.is_open()) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"VideoOutput.cpp:168\",\"message\":\"setParameter - exception\",\"data\":{\"paramName\":\"" << paramName << "\",\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
+                    logFile.close();
+                }
+            }
+            // #endregion
         }
     }
 }
 
-float VideoOutput::getParameter(const std::string& paramName) const {
+float VideoOutput::getParameterImpl(const std::string& paramName) const {
     if (paramName == "masterOpacity") {
         return getMasterOpacity();
     } else if (paramName == "blendMode") {
@@ -167,29 +217,75 @@ float VideoOutput::getParameter(const std::string& paramName) const {
         return getAutoNormalize() ? 1.0f : 0.0f;
     } else if (paramName.find("connectionOpacity_") == 0) {
         // Extract connection index from parameter name
-        // FIX: Check if paramName is long enough before calling substr
         // "connectionOpacity_" is 19 chars, so we need at least 20 chars for "connectionOpacity_0"
-        if (paramName.length() <= 19) {
+        const size_t prefixLength = 19; // "connectionOpacity_".length()
+        if (paramName.length() <= prefixLength) {
             // Parameter name is too short - it's just "connectionOpacity_" without index
-            ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name (too short): " << paramName << " (length: " << paramName.length() << ")";
+            ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name (missing index): " << paramName << " (length: " << paramName.length() << ", need > " << prefixLength << ")";
             return 0.0f;
         }
         
-        std::string indexStr = paramName.substr(19); // "connectionOpacity_".length() == 19
+        std::string indexStr = paramName.substr(prefixLength);
         if (indexStr.empty()) {
             ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name (missing index): " << paramName;
             return 0.0f;
         }
         try {
             size_t index = std::stoul(indexStr);
-            return getSourceOpacity(index);
+            float opacity = getSourceOpacity(index);
+            ofLogVerbose("VideoOutput") << "[OPACITY_READ] getParameter(" << paramName << ") = " << opacity << " (index: " << index << ")";
+            return opacity;
         } catch (const std::exception& e) {
             ofLogWarning("VideoOutput") << "Invalid connection opacity parameter name: " << paramName << " (" << e.what() << ")";
             return 0.0f;
         }
     }
-    // Unknown parameter - return default
-    return Module::getParameter(paramName);
+    // Unknown parameter - return default (base class default is 0.0f)
+    // NOTE: Cannot call Module::getParameter() here as it would deadlock (lock already held)
+    return 0.0f;
+}
+
+// Indexed parameter support for connection-based parameters
+std::vector<std::pair<std::string, int>> VideoOutput::getIndexedParameterRanges() const {
+    std::vector<std::pair<std::string, int>> ranges;
+    
+    std::lock_guard<std::mutex> lock(connectionMutex_);
+    size_t numConnections = connectedModules_.size();
+    
+    // Count valid (non-expired) connections
+    size_t validConnections = 0;
+    for (size_t i = 0; i < numConnections; i++) {
+        if (!connectedModules_[i].expired()) {
+            validConnections = i + 1; // Update max index
+        }
+    }
+    
+    if (validConnections > 0) {
+        // Return max index (validConnections - 1) since indices are 0-based
+        ranges.push_back({"connectionOpacity", static_cast<int>(validConnections - 1)});
+    }
+    
+    return ranges;
+}
+
+float VideoOutput::getIndexedParameter(const std::string& baseName, int index) const {
+    if (baseName == "connectionOpacity") {
+        if (index < 0) {
+            return 0.0f;
+        }
+        return getSourceOpacity(static_cast<size_t>(index));
+    }
+    return 0.0f;
+}
+
+void VideoOutput::setIndexedParameter(const std::string& baseName, int index, float value, bool notify) {
+    if (baseName == "connectionOpacity") {
+        if (index < 0) {
+            return;
+        }
+        setSourceOpacity(static_cast<size_t>(index), value);
+        // Note: setSourceOpacity() already triggers parameterChangeCallback
+    }
 }
 
 Module::ModuleMetadata VideoOutput::getMetadata() const {
@@ -240,7 +336,19 @@ ofJson VideoOutput::toJson(class ModuleRegistry* registry) const {
                 }
             }
             
-            connJson["opacity"] = (i < sourceOpacities_.size()) ? sourceOpacities_[i] : 1.0f;
+            float opacity = (i < sourceOpacities_.size()) ? sourceOpacities_[i] : 1.0f;
+            connJson["opacity"] = opacity;
+            
+            // #region agent log
+            {
+                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                if (logFile.is_open()) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"F\",\"location\":\"VideoOutput.cpp:292\",\"message\":\"serializing connection opacity\",\"data\":{\"index\":" << i << ",\"opacity\":" << opacity << ",\"sourceOpacitiesSize\":" << sourceOpacities_.size() << "},\"timestamp\":" << now << "}\n";
+                    logFile.close();
+                }
+            }
+            // #endregion
             
             ofBlendMode mode = (i < sourceBlendModes_.size()) ? sourceBlendModes_[i] : getBlendMode();
             int blendModeIndex = 0;
@@ -672,14 +780,72 @@ int VideoOutput::getConnectionIndex(std::shared_ptr<Module> module) const {
 void VideoOutput::setSourceOpacity(size_t sourceIndex, float opacity) {
     opacity = ofClamp(opacity, 0.0f, 1.0f);
     
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"G\",\"location\":\"VideoOutput.cpp:735\",\"message\":\"setSourceOpacity called\",\"data\":{\"sourceIndex\":" << sourceIndex << ",\"opacity\":" << opacity << "},\"timestamp\":" << now << "}\n";
+            logFile.close();
+        }
+    }
+    // #endregion
+    
     std::lock_guard<std::mutex> lock(connectionMutex_);
     if (sourceIndex >= sourceOpacities_.size()) {
         ofLogWarning("VideoOutput") << "Invalid source index: " << sourceIndex;
         return;
     }
     
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            float oldValue = sourceOpacities_[sourceIndex];
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"G\",\"location\":\"VideoOutput.cpp:744\",\"message\":\"updating sourceOpacities_\",\"data\":{\"sourceIndex\":" << sourceIndex << ",\"oldValue\":" << oldValue << ",\"newValue\":" << opacity << ",\"sourceOpacitiesSize\":" << sourceOpacities_.size() << "},\"timestamp\":" << now << "}\n";
+            logFile.close();
+        }
+    }
+    // #endregion
+    
     sourceOpacities_[sourceIndex] = opacity;
     videoMixer_.setSourceOpacity(sourceIndex, opacity);
+    
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            std::string paramName = "connectionOpacity_" + std::to_string(sourceIndex);
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"VideoOutput.cpp:767\",\"message\":\"setSourceOpacity - before callback\",\"data\":{\"sourceIndex\":" << sourceIndex << ",\"opacity\":" << opacity << ",\"paramName\":\"" << paramName << "\",\"hasCallback\":" << (parameterChangeCallback ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+            logFile.close();
+        }
+    }
+    // #endregion
+    
+    // Trigger parameter change callback to notify Engine for script sync
+    // This ensures state changes from GUI are captured in script generation
+    if (parameterChangeCallback) {
+        std::string paramName = "connectionOpacity_" + std::to_string(sourceIndex);
+        ofLogNotice("VideoOutput") << "[OPACITY_SYNC] setSourceOpacity(" << sourceIndex << ") = " << opacity 
+                                   << ", triggering callback for " << paramName;
+        parameterChangeCallback(paramName, opacity);
+        
+        // #region agent log
+        {
+            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (logFile.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"VideoOutput.cpp:776\",\"message\":\"setSourceOpacity - callback triggered\",\"data\":{\"paramName\":\"" << paramName << "\",\"opacity\":" << opacity << "},\"timestamp\":" << now << "}\n";
+                logFile.close();
+            }
+        }
+        // #endregion
+    } else {
+        ofLogWarning("VideoOutput") << "[OPACITY_SYNC] setSourceOpacity(" << sourceIndex << ") = " << opacity 
+                                    << ", but parameterChangeCallback is not set!";
+    }
 }
 
 float VideoOutput::getSourceOpacity(size_t sourceIndex) const {

@@ -14,6 +14,7 @@
 #include <set>
 #include <map>
 #include <chrono>
+#include <fstream>
 
 // Helper to sync playback position to edit position when paused
 // Uses public methods since static functions don't have friend class access
@@ -2073,6 +2074,119 @@ void TrackerSequencerGUI::setupStateSyncCallbacks(CellGridCallbacks& callbacks, 
         if (fromHeaderRow || stepChanged) {
             syncPlaybackToEditIfPaused(sequencer, row, stepChanged, fromHeaderRow, lastTriggeredStepWhenPaused);
         }
+    };
+    
+    // CRITICAL: Setup onEditModeChanged callback for pattern grid cells
+    // This manages ImGui keyboard navigation state when entering/exiting edit mode
+    // Uses the same logic as setupStandardCellGridCallbacks to ensure consistent behavior
+    callbacks.onEditModeChanged = [this](int row, int col, bool editing) {
+        // #region agent log
+        {
+            std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (log.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"G\",\"location\":\"TrackerSequencerGUI.cpp:2080\",\"message\":\"Pattern grid onEditModeChanged called\",\"data\":{\"row\":" << row << ",\"col\":" << col << ",\"editing\":" << (editing ? "true" : "false") << ",\"focusedRow\":" << cellFocusState.row << ",\"focusedCol\":" << cellFocusState.column << "},\"timestamp\":" << now << "}\n";
+            }
+        }
+        // #endregion
+        ImGuiIO& io = ImGui::GetIO();
+        bool navWasEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+        
+        // CRITICAL FIX: If cellFocusState is stale (no cell focused) but we're being called for edit mode,
+        // it means the cell IS focused but cellFocusState wasn't updated (e.g., when Enter is pressed
+        // on an already-focused cell). Update cellFocusState to match the actual focused cell.
+        // This fixes the issue where Enter disables navigation but cellFocusState shows no cell is focused.
+        if (!cellFocusState.hasFocus() && row >= 0 && col >= 0) {
+            // #region agent log
+            {
+                std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                if (log.is_open()) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"G\",\"location\":\"TrackerSequencerGUI.cpp:2090\",\"message\":\"Fixing stale cellFocusState in pattern grid\",\"data\":{\"oldRow\":" << cellFocusState.row << ",\"oldCol\":" << cellFocusState.column << ",\"newRow\":" << row << ",\"newCol\":" << col << "},\"timestamp\":" << now << "}\n";
+                }
+            }
+            // #endregion
+            cellFocusState.row = row;
+            cellFocusState.column = col;
+        }
+        
+        // Update editing state
+        bool isFocusedCell = (cellFocusState.row == row && cellFocusState.column == col);
+        if (isFocusedCell) {
+            cellFocusState.isEditing = editing;
+        }
+        
+        // CRITICAL FIX: Check if navigation is currently disabled (indicates we were in edit mode)
+        // This fixes the issue where navigation is disabled but editing_ is reset, leaving navigation stuck
+        bool navCurrentlyDisabled = !(io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard);
+        
+        if (editing) {
+            // Disable ImGui keyboard navigation when entering edit mode
+            // Only manage navigation for the focused cell to prevent incorrect state changes
+            if (isFocusedCell) {
+                io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+                bool navNowEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+                // #region agent log
+                {
+                    std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                    if (log.is_open()) {
+                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"G\",\"location\":\"TrackerSequencerGUI.cpp:2121\",\"message\":\"Pattern grid disabling navigation\",\"data\":{\"navWasEnabled\":" << (navWasEnabled ? "true" : "false") << ",\"navNowEnabled\":" << (navNowEnabled ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+                    }
+                }
+                // #endregion
+                ofLogNotice("TrackerSequencerGUI") << "[EDIT_MODE] Pattern grid entering edit mode (row=" << row << ", col=" << col 
+                                                   << ") - Navigation " << (navWasEnabled ? "was ENABLED, disabled" : "already disabled");
+            }
+        } else {
+            // CRITICAL: Restore navigation when exiting edit mode
+            // Restore navigation if:
+            // 1. This is the focused cell, OR
+            // 2. Navigation is currently disabled (indicating we were in edit mode, even if cellFocusState is stale)
+            // This fixes the issue where navigation is disabled but editing_ is reset, leaving navigation stuck
+            if (isFocusedCell || navCurrentlyDisabled) {
+                io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+                bool navNowEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+                // #region agent log
+                {
+                    std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                    if (log.is_open()) {
+                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"G\",\"location\":\"TrackerSequencerGUI.cpp:2140\",\"message\":\"Pattern grid re-enabling navigation\",\"data\":{\"navWasEnabled\":" << (navWasEnabled ? "true" : "false") << ",\"navNowEnabled\":" << (navNowEnabled ? "true" : "false") << ",\"isFocusedCell\":" << (isFocusedCell ? "true" : "false") << ",\"navCurrentlyDisabled\":" << (navCurrentlyDisabled ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+                    }
+                }
+                // #endregion
+                ofLogNotice("TrackerSequencerGUI") << "[EDIT_MODE] Pattern grid exiting edit mode (row=" << row << ", col=" << col 
+                                                   << ", isFocused=" << isFocusedCell << ", navWasDisabled=" << navCurrentlyDisabled
+                                                   << ") - Navigation " << (navWasEnabled ? "was already enabled" : "restored")
+                                                   << ", now " << (navNowEnabled ? "ENABLED" : "DISABLED");
+            } else {
+                // #region agent log
+                {
+                    std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                    if (log.is_open()) {
+                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"G\",\"location\":\"TrackerSequencerGUI.cpp:2150\",\"message\":\"Pattern grid edit mode changed for non-focused cell - skipping navigation management\",\"data\":{\"row\":" << row << ",\"col\":" << col << ",\"editing\":" << (editing ? "true" : "false") << ",\"focusedRow\":" << cellFocusState.row << ",\"focusedCol\":" << cellFocusState.column << "},\"timestamp\":" << now << "}\n";
+                    }
+                }
+                // #endregion
+                ofLogVerbose("TrackerSequencerGUI") << "[EDIT_MODE] Pattern grid edit mode changed for non-focused cell (row=" << row 
+                                                    << ", col=" << col << ", editing=" << editing 
+                                                    << ") - Navigation state unchanged";
+            }
+        }
+        
+        // #region agent log
+        {
+            std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (log.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                ImGuiIO& ioFinal = ImGui::GetIO();
+                bool navFinal = (ioFinal.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+                log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"G\",\"location\":\"TrackerSequencerGUI.cpp:2160\",\"message\":\"Pattern grid callback completed\",\"data\":{\"navFinal\":" << (navFinal ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+            }
+        }
+        // #endregion
     };
     
     // Note: Edit buffer and edit mode are managed by CellWidget internally

@@ -25,7 +25,7 @@ ModuleType AudioMixer::getType() const {
     return ModuleType::UTILITY;
 }
 
-std::vector<ParameterDescriptor> AudioMixer::getParameters() const {
+std::vector<ParameterDescriptor> AudioMixer::getParametersImpl() const {
     std::vector<ParameterDescriptor> params;
     
     // Master volume parameter
@@ -62,7 +62,7 @@ void AudioMixer::onTrigger(TriggerEvent& event) {
     // This method exists to satisfy Module interface
 }
 
-void AudioMixer::setParameter(const std::string& paramName, float value, bool notify) {
+void AudioMixer::setParameterImpl(const std::string& paramName, float value, bool notify) {
     if (paramName == "masterVolume") {
         setMasterVolume(value);
         if (notify && parameterChangeCallback) {
@@ -93,7 +93,7 @@ void AudioMixer::setParameter(const std::string& paramName, float value, bool no
     }
 }
 
-float AudioMixer::getParameter(const std::string& paramName) const {
+float AudioMixer::getParameterImpl(const std::string& paramName) const {
     if (paramName == "masterVolume") {
         return getMasterVolume();
     } else if (paramName.find("connectionVolume_") == 0) {
@@ -117,8 +117,9 @@ float AudioMixer::getParameter(const std::string& paramName) const {
             return 0.0f;
         }
     }
-    // Unknown parameter - return default
-    return Module::getParameter(paramName);
+    // Unknown parameter - return default (base class default is 0.0f)
+    // NOTE: Cannot call Module::getParameter() here as it would deadlock (lock already held)
+    return 0.0f;
 }
 
 Module::ModuleMetadata AudioMixer::getMetadata() const {

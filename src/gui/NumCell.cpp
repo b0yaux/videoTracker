@@ -8,6 +8,8 @@
 #include <sstream>
 #include <cctype>
 #include <limits>
+#include <fstream>
+#include <chrono>
 
 // Static clipboard definition (shared across all NumCell instances)
 std::string NumCell::cellClipboard;
@@ -198,7 +200,25 @@ void NumCell::setEditBuffer(const std::string& buffer, bool initialized) {
 }
 
 void NumCell::enterEditMode() {
+    // #region agent log
+    {
+        std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (log.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,B,D\",\"location\":\"NumCell.cpp:200\",\"message\":\"enterEditMode called\",\"data\":{\"wasEditing\":" << (editing_ ? "true" : "false") << ",\"editing_\":" << (editing_ ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+        }
+    }
+    // #endregion
     bool wasEditing = editing_;
+    // #region agent log
+    {
+        std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (log.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"J\",\"location\":\"NumCell.cpp:213\",\"message\":\"Setting editing_ to true\",\"data\":{\"wasEditing\":" << (wasEditing ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+        }
+    }
+    // #endregion
     editing_ = true;
     
     // Store original value for fallback
@@ -213,23 +233,69 @@ void NumCell::enterEditMode() {
     // Disable ImGui navigation when entering edit mode
     if (!wasEditing) {
         ImGuiIO& io = ImGui::GetIO();
+        bool navWasEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
         io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+        // #region agent log
+        {
+            std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (log.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"NumCell.cpp:216\",\"message\":\"Navigation disabled in enterEditMode\",\"data\":{\"navWasEnabled\":" << (navWasEnabled ? "true" : "false") << ",\"navNowEnabled\":false},\"timestamp\":" << now << "}\n";
+            }
+        }
+        // #endregion
         ofLogNotice("CellWidget") << "[ENTER_EDIT] Disabled navigation for edit mode";
     }
     
     // Notify GUI layer of edit mode change
     if (!wasEditing && onEditModeChanged) {
+        // #region agent log
+        {
+            std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (log.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"C\",\"location\":\"NumCell.cpp:222\",\"message\":\"Calling onEditModeChanged(true)\",\"data\":{},\"timestamp\":" << now << "}\n";
+            }
+        }
+        // #endregion
         onEditModeChanged(true);
     }
+    // #region agent log
+    {
+        std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (log.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,B\",\"location\":\"NumCell.cpp:224\",\"message\":\"enterEditMode completed\",\"data\":{\"editing_\":true},\"timestamp\":" << now << "}\n";
+        }
+    }
+    // #endregion
 }
 
 void NumCell::exitEditMode() {
+    // #region agent log
+    {
+        std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (log.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"B\",\"location\":\"NumCell.cpp:226\",\"message\":\"exitEditMode called\",\"data\":{\"wasEditing\":" << (editing_ ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+        }
+    }
+    // #endregion
     bool wasEditing = editing_;
     if (!wasEditing) {
         // Not in edit mode - nothing to do
         return;
     }
     
+    // #region agent log
+    {
+        std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (log.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"J\",\"location\":\"NumCell.cpp:281\",\"message\":\"Setting editing_ to false in exitEditMode\",\"data\":{\"wasEditing\":" << (wasEditing ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+        }
+    }
+    // #endregion
     editing_ = false;
     editBuffer_.clear();
     bufferState_ = EditBufferState::None;  // Reset buffer state when exiting edit mode
@@ -239,13 +305,44 @@ void NumCell::exitEditMode() {
     
     // Re-enable ImGui navigation when exiting edit mode
     ImGuiIO& io = ImGui::GetIO();
+    bool navWasEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    bool navNowEnabled = (io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+    // #region agent log
+    {
+        std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (log.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"NumCell.cpp:242\",\"message\":\"Navigation re-enabled in exitEditMode\",\"data\":{\"navWasEnabled\":" << (navWasEnabled ? "true" : "false") << ",\"navNowEnabled\":" << (navNowEnabled ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+        }
+    }
+    // #endregion
     ofLogNotice("CellWidget") << "[EXIT_EDIT] Re-enabled navigation after edit mode";
     
     // Notify GUI layer of edit mode change
     if (onEditModeChanged) {
+        // #region agent log
+        {
+            std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (log.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"C\",\"location\":\"NumCell.cpp:248\",\"message\":\"Calling onEditModeChanged(false)\",\"data\":{},\"timestamp\":" << now << "}\n";
+            }
+        }
+        // #endregion
         ofLogNotice("CellWidget") << "[EXIT_EDIT] Calling onEditModeChanged(false)";
         onEditModeChanged(false);
+        // #region agent log
+        {
+            std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (log.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                ImGuiIO& ioAfter = ImGui::GetIO();
+                bool navAfterCallback = (ioAfter.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+                log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"NumCell.cpp:260\",\"message\":\"After onEditModeChanged(false) callback\",\"data\":{\"navAfterCallback\":" << (navAfterCallback ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+            }
+        }
+        // #endregion
     }
     
     // Note: Immediate refocus is handled in drawSliderMode() when cell is still focused
@@ -255,6 +352,15 @@ void NumCell::exitEditMode() {
 bool NumCell::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
     // Enter key behavior
     if (key == OF_KEY_RETURN) {
+        // #region agent log
+        {
+            std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (log.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,E\",\"location\":\"NumCell.cpp:257\",\"message\":\"Enter key detected in handleKeyPress\",\"data\":{\"editing_\":" << (editing_ ? "true" : "false") << ",\"ctrlPressed\":" << (ctrlPressed ? "true" : "false") << ",\"shiftPressed\":" << (shiftPressed ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+            }
+        }
+        // #endregion
         if (ctrlPressed || shiftPressed) {
             // Ctrl+Enter or Shift+Enter: Exit edit mode
             exitEditMode();
@@ -263,13 +369,42 @@ bool NumCell::handleKeyPress(int key, bool ctrlPressed, bool shiftPressed) {
         
         if (editing_) {
             // In edit mode: Confirm and exit edit mode
+            // #region agent log
+            {
+                std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                if (log.is_open()) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"I\",\"location\":\"NumCell.cpp:265\",\"message\":\"Enter in edit mode - will exit\",\"data\":{\"editing_\":true},\"timestamp\":" << now << "}\n";
+                }
+            }
+            // #endregion
             shouldRefocus_ = true;  // Flag to maintain focus after exit
             applyValue();
             exitEditMode();
+            // #region agent log
+            {
+                std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                if (log.is_open()) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    ImGuiIO& ioAfter = ImGui::GetIO();
+                    bool navAfter = (ioAfter.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) != 0;
+                    log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"I\",\"location\":\"NumCell.cpp:275\",\"message\":\"After exitEditMode in handleKeyPress\",\"data\":{\"editing_\":" << (editing_ ? "true" : "false") << ",\"navEnabled\":" << (navAfter ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+                }
+            }
+            // #endregion
             // Refocus will be handled in draw() based on shouldRefocus_ flag
             return true;
         } else {
             // Enter edit mode if cell is focused (checked by caller via processInputInDraw)
+            // #region agent log
+            {
+                std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                if (log.is_open()) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"I\",\"location\":\"NumCell.cpp:283\",\"message\":\"Enter NOT in edit mode - will enter (editing_ was false)\",\"data\":{\"editing_\":false},\"timestamp\":" << now << "}\n";
+                }
+            }
+            // #endregion
             enterEditMode();
             return true;
         }
@@ -1135,6 +1270,16 @@ void NumCell::processInputInDraw(bool actuallyFocused) {
     // Process keyboard input directly in draw() when cell is focused
     // This makes CellWidget self-contained and reusable across all modules
     
+    // #region agent log
+    {
+        std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (log.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"J\",\"location\":\"NumCell.cpp:1240\",\"message\":\"processInputInDraw called\",\"data\":{\"actuallyFocused\":" << (actuallyFocused ? "true" : "false") << ",\"editing_\":" << (editing_ ? "true" : "false") << ",\"thisPtr\":" << (void*)this << "},\"timestamp\":" << now << "}\n";
+        }
+    }
+    // #endregion
+    
     // CRITICAL: Allow input processing if:
     // 1. Cell is actually focused, OR
     // 2. Cell is already in edit mode (handles focus detection edge cases)
@@ -1158,14 +1303,39 @@ void NumCell::processInputInDraw(bool actuallyFocused) {
     
     // CRITICAL: Check for Enter key BEFORE navigation check
     // Enter should enter/edit mode even when navigation is active
+    // IMPORTANT: Only process Enter if cell is actually focused (not just when editing)
+    // This prevents Enter from being processed when cell isn't focused, which would disable navigation without entering edit mode
     bool enterPressed = (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
-    if (enterPressed && (actuallyFocused || editing_)) {
-        // Allow Enter key when focused OR when already in edit mode (fixes buffer validation issue)
-        bool ctrlPressed = io.KeyCtrl;
-        bool shiftPressed = io.KeyShift;
-        if (this->handleKeyPress(OF_KEY_RETURN, ctrlPressed, shiftPressed)) {
-            return;  // Handled
+    if (enterPressed) {
+        // #region agent log
+        {
+            std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+            if (log.is_open()) {
+                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,E\",\"location\":\"NumCell.cpp:1163\",\"message\":\"Enter key detected in processInputInDraw\",\"data\":{\"actuallyFocused\":" << (actuallyFocused ? "true" : "false") << ",\"editing_\":" << (editing_ ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
+            }
         }
+        // #endregion
+        // Only process Enter if cell is actually focused OR already in edit mode
+        // If cell is not focused and not editing, let Enter pass through to ImGui
+        if (actuallyFocused || editing_) {
+            bool ctrlPressed = io.KeyCtrl;
+            bool shiftPressed = io.KeyShift;
+            // #region agent log
+            {
+                std::ofstream log("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+                if (log.is_open()) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    log << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\",\"location\":\"NumCell.cpp:1170\",\"message\":\"Calling handleKeyPress for Enter\",\"data\":{},\"timestamp\":" << now << "}\n";
+                }
+            }
+            // #endregion
+            if (this->handleKeyPress(OF_KEY_RETURN, ctrlPressed, shiftPressed)) {
+                return;  // Handled
+            }
+        }
+        // If cell is not focused and not editing, return false to let Enter pass through
+        // This prevents navigation from being disabled when Enter is pressed on a non-focused cell
     }
     
     // CRITICAL: Process InputQueueCharacters FIRST (typed characters)

@@ -40,8 +40,24 @@ void PatternRuntime::evaluatePatterns(ofSoundBuffer& buffer) {
     {
         std::shared_lock<std::shared_mutex> lock(patternMutex_);
         
-        // Evaluate all playing patterns
+        // CRITICAL FIX: Build set of patterns that are bound to at least one sequencer
+        // Only evaluate patterns that are bound to sequencers (prevents orphaned patterns from playing)
+        std::set<std::string> boundPatternNames;
+        for (const auto& [seqName, binding] : sequencerBindings_) {
+            if (!binding.patternName.empty()) {
+                boundPatternNames.insert(binding.patternName);
+            }
+        }
+        
+        // Evaluate only patterns that are:
+        // 1. Bound to at least one sequencer, AND
+        // 2. Currently playing
         for (auto& [name, pattern] : patterns_) {
+            // Skip if pattern is not bound to any sequencer
+            if (boundPatternNames.find(name) == boundPatternNames.end()) {
+                continue;
+            }
+            
             auto stateIt = playbackStates_.find(name);
             if (stateIt == playbackStates_.end()) {
                 continue;  // No playback state for this pattern
@@ -49,61 +65,33 @@ void PatternRuntime::evaluatePatterns(ofSoundBuffer& buffer) {
             
             PatternPlaybackState& state = stateIt->second;
             
-            // Only evaluate if pattern is playing
-            if (state.isPlaying) {
+            // SIMPLIFIED: Only evaluate if pattern is playing AND transport is running AND bound to sequencer
+            // Transport state drives playback - if transport stops, patterns pause automatically
+            bool transportRunning = clock_ && clock_->isPlaying();
+            if (state.isPlaying && transportRunning) {
                 bool patternFinished = evaluatePattern(name, pattern, state, buffer);
                 
-                // #region agent log
-                if (patternFinished) {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\",\"location\":\"PatternRuntime.cpp:54\",\"message\":\"Pattern finished\",\"data\":{\"patternName\":\"" << name << "\",\"playbackStep\":" << state.playbackStep << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                    logFile.close();
-                }
-                // #endregion
+                
                 
                 // If pattern finished, check for chain progression
                 if (patternFinished) {
-                    // #region agent log
-                    {
-                        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"B\",\"location\":\"PatternRuntime.cpp:57\",\"message\":\"Checking sequencer bindings\",\"data\":{\"patternName\":\"" << name << "\",\"sequencerBindingsCount\":" << sequencerBindings_.size() << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                        logFile.close();
-                    }
-                    // #endregion
+                    
                     
                     // Find sequencers bound to this pattern with chain enabled
                     for (const auto& [seqName, binding] : sequencerBindings_) {
-                        // #region agent log
-                        {
-                            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"C\",\"location\":\"PatternRuntime.cpp:60\",\"message\":\"Checking sequencer binding\",\"data\":{\"sequencerName\":\"" << seqName << "\",\"bindingPatternName\":\"" << binding.patternName << "\",\"currentPatternName\":\"" << name << "\",\"chainName\":\"" << binding.chainName << "\",\"chainEnabled\":" << (binding.chainEnabled ? "true" : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                            logFile.close();
-                        }
-                        // #endregion
+                        
                         
                         if (binding.patternName == name && binding.chainEnabled && !binding.chainName.empty()) {
                             // Sequencer is bound to this pattern and has chain enabled
                             PatternChain* chain = getChain(binding.chainName);
                             
-                            // #region agent log
-                            {
-                                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"PatternRuntime.cpp:63\",\"message\":\"Chain found\",\"data\":{\"sequencerName\":\"" << seqName << "\",\"chainName\":\"" << binding.chainName << "\",\"chainFound\":" << (chain ? "true" : "false") << ",\"chainEnabled\":" << (chain ? (chain->isEnabled() ? "true" : "false") : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                                logFile.close();
-                            }
-                            // #endregion
+                            
                             
                             if (chain && chain->isEnabled()) {
                                 // CRITICAL: Use peekNextPattern() to avoid modifying chain state while holding shared lock
                                 std::string nextPatternName = chain->peekNextPattern();
                                 
-                                // #region agent log
-                                {
-                                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"E\",\"location\":\"PatternRuntime.cpp:97\",\"message\":\"peekNextPattern result\",\"data\":{\"sequencerName\":\"" << seqName << "\",\"chainName\":\"" << binding.chainName << "\",\"currentPattern\":\"" << name << "\",\"nextPatternName\":\"" << nextPatternName << "\",\"patternExists\":" << (patternExists(nextPatternName) ? "true" : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                                    logFile.close();
-                                }
-                                // #endregion
+                                
                                 
                                 // Only queue pattern change if:
                                 // 1. Next pattern name is valid and exists
@@ -113,13 +101,7 @@ void PatternRuntime::evaluatePatterns(ofSoundBuffer& buffer) {
                                     // Queue pattern change (apply after releasing shared lock)
                                     pendingChanges.push_back({seqName, name, nextPatternName});
                                     
-                                    // #region agent log
-                                    {
-                                        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"F\",\"location\":\"PatternRuntime.cpp:108\",\"message\":\"Queued pattern change\",\"data\":{\"sequencerName\":\"" << seqName << "\",\"oldPattern\":\"" << name << "\",\"newPattern\":\"" << nextPatternName << "\"},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                                        logFile.close();
-                                    }
-                                    // #endregion
+                                    
                                 } else if (nextPatternName == name) {
                                     // Pattern should repeat - increment chain repeat counter but don't change pattern
                                     // We need to increment currentRepeat in the chain, but we can't do it here (shared lock)
@@ -127,13 +109,7 @@ void PatternRuntime::evaluatePatterns(ofSoundBuffer& buffer) {
                                     // Actually, we should increment the repeat counter now, but we need unique lock
                                     // For now, let's just log and handle repeat in the change application phase
                                     
-                                    // #region agent log
-                                    {
-                                        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"F2\",\"location\":\"PatternRuntime.cpp:115\",\"message\":\"Pattern should repeat\",\"data\":{\"sequencerName\":\"" << seqName << "\",\"patternName\":\"" << name << "\"},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                                        logFile.close();
-                                    }
-                                    // #endregion
+                                    
                                     
                                     // Queue a "repeat" change (same pattern, but increment repeat counter)
                                     // We'll use a special marker to indicate this is a repeat, not a switch
@@ -149,17 +125,13 @@ void PatternRuntime::evaluatePatterns(ofSoundBuffer& buffer) {
     
     // Apply pending pattern changes (need unique lock for modifications)
     if (!pendingChanges.empty()) {
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"G\",\"location\":\"PatternRuntime.cpp:128\",\"message\":\"Applying pending changes\",\"data\":{\"pendingChangesCount\":" << pendingChanges.size() << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-            logFile.close();
-        }
-        // #endregion
+        
         
         std::unique_lock<std::shared_mutex> uniqueLock(patternMutex_);
         
-        for (const auto& change : pendingChanges) {
+        for (size_t i = 0; i < pendingChanges.size(); ++i) {
+            const auto& change = pendingChanges[i];
+            bool isLastChange = (i == pendingChanges.size() - 1);
             // Update sequencer binding
             auto it = sequencerBindings_.find(change.sequencerName);
             if (it != sequencerBindings_.end()) {
@@ -167,21 +139,20 @@ void PatternRuntime::evaluatePatterns(ofSoundBuffer& buffer) {
                 std::string actualNewPattern = change.newPatternName;  // May be updated if repeat completes
                 
                 if (isRepeat) {
+                    
+                    
                     // Pattern should repeat - increment repeat counter and restart pattern
                     if (!it->second.chainName.empty()) {
                         PatternChain* chain = getChain(it->second.chainName);
+                        
+                        
+                        
                         if (chain) {
                             // Call getNextPattern() - it will increment the counter and return the same pattern
                             // if we haven't completed all repeats, or advance if we have
                             std::string advancedPattern = chain->getNextPattern();
                             
-                            // #region agent log
-                            {
-                                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"R\",\"location\":\"PatternRuntime.cpp:166\",\"message\":\"Pattern repeat check\",\"data\":{\"sequencerName\":\"" << change.sequencerName << "\",\"patternName\":\"" << change.newPatternName << "\",\"advancedPattern\":\"" << advancedPattern << "\"},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                                logFile.close();
-                            }
-                            // #endregion
+                            
                             
                             // If getNextPattern() returned a different pattern, it means we completed all repeats
                             // and should advance (this shouldn't happen if peekNextPattern() was correct, but handle it)
@@ -190,14 +161,22 @@ void PatternRuntime::evaluatePatterns(ofSoundBuffer& buffer) {
                                 it->second.patternName = advancedPattern;
                                 actualNewPattern = advancedPattern;  // Update for state handling below
                                 isRepeat = false;  // Treat as pattern change, not repeat
+                                
+                                
+                                
                                 ofLogVerbose("PatternRuntime") << "Chain progression: sequencer '" << change.sequencerName 
                                                                << "' pattern '" << change.oldPatternName << "' -> '" << advancedPattern << "'";
                             } else {
                                 // Still repeating - just reset pattern state (don't change binding)
+                                
+                                
+                                
                                 ofLogVerbose("PatternRuntime") << "Pattern repeat: sequencer '" << change.sequencerName 
                                                                << "' pattern '" << change.newPatternName << "' (repeat)";
                             }
                         }
+                    } else {
+                        
                     }
                 } else {
                     // Pattern should advance - update binding and chain state
@@ -220,59 +199,96 @@ void PatternRuntime::evaluatePatterns(ofSoundBuffer& buffer) {
                     
                     it->second.patternName = change.newPatternName;
                     
-                    // #region agent log
-                    {
-                        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H\",\"location\":\"PatternRuntime.cpp:195\",\"message\":\"Chain progression applied\",\"data\":{\"sequencerName\":\"" << change.sequencerName << "\",\"oldPattern\":\"" << change.oldPatternName << "\",\"newPattern\":\"" << change.newPatternName << "\"},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                        logFile.close();
-                    }
-                    // #endregion
+                    
                     ofLogVerbose("PatternRuntime") << "Chain progression: sequencer '" << change.sequencerName 
                                                    << "' pattern '" << change.oldPatternName << "' -> '" << change.newPatternName << "'";
                 }
+                
+                
                 
                 // CRITICAL: Ensure playback state exists for pattern
                 // Access playbackStates_ directly (we already hold unique lock)
                 auto nextStateIt = playbackStates_.find(actualNewPattern);
                 if (nextStateIt == playbackStates_.end()) {
+                    
+                    
                     // Create playback state if it doesn't exist
                     playbackStates_[actualNewPattern] = PatternPlaybackState();
                     nextStateIt = playbackStates_.find(actualNewPattern);
                 }
                 
+                
+                
                 PatternPlaybackState& nextState = nextStateIt->second;
                 
-                // Reset pattern state (for both repeat and advance - always restart from step 0)
-                nextState.isPlaying = true;
+                // SIMPLIFIED: Reset pattern state and start playing if transport is running
+                // Transport state drives playback - patterns only play when transport is running
+                bool transportRunning = clock_ && clock_->isPlaying();
+                
+                
+                
+                nextState.isPlaying = transportRunning;  // Only play if transport is running
                 nextState.playbackStep = 0;
                 nextState.patternCycleCount = 0;
                 nextState.sampleAccumulator = 0;
                 nextState.clearPlayingStep();
                 
-                // #region agent log
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"I\",\"location\":\"PatternRuntime.cpp:230\",\"message\":\"Reset pattern state\",\"data\":{\"sequencerName\":\"" << change.sequencerName << "\",\"patternName\":\"" << actualNewPattern << "\",\"isRepeat\":" << (isRepeat ? "true" : "false") << ",\"isPlaying\":true},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                    logFile.close();
+                
+                
+                if (transportRunning) {
+                    ofLogVerbose("PatternRuntime") << "Started pattern '" << actualNewPattern 
+                                                   << "' after chain progression (transport running)";
+                } else {
+                    ofLogVerbose("PatternRuntime") << "Pattern '" << actualNewPattern 
+                                                   << "' ready but not playing (transport stopped)";
                 }
-                // #endregion
+                
+                
                 
                 // Stop the old pattern only if we're actually switching (not repeating)
+                // CRITICAL FIX: Only stop old pattern if it's no longer bound to any sequencer
                 if (!isRepeat && change.oldPatternName != actualNewPattern) {
-                    auto oldStateIt = playbackStates_.find(change.oldPatternName);
-                    if (oldStateIt != playbackStates_.end()) {
-                        PatternPlaybackState& oldState = oldStateIt->second;
-                        oldState.isPlaying = false;
-                        oldState.clearPlayingStep();
-                        
-                        // #region agent log
-                        {
-                            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"I\",\"location\":\"PatternRuntime.cpp:245\",\"message\":\"Stopped old pattern\",\"data\":{\"sequencerName\":\"" << change.sequencerName << "\",\"oldPatternName\":\"" << change.oldPatternName << "\"},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-                            logFile.close();
+                    // Check if old pattern is still bound to other sequencers
+                    bool stillBound = false;
+                    for (const auto& [seqName, binding] : sequencerBindings_) {
+                        if (seqName != change.sequencerName && binding.patternName == change.oldPatternName) {
+                            stillBound = true;
+                            break;
                         }
-                        // #endregion
                     }
+                    
+                    // Only stop if pattern is no longer bound to any sequencer
+                    if (!stillBound) {
+                        auto oldStateIt = playbackStates_.find(change.oldPatternName);
+                        if (oldStateIt != playbackStates_.end()) {
+                            PatternPlaybackState& oldState = oldStateIt->second;
+                            oldState.isPlaying = false;
+                            oldState.clearPlayingStep();
+                            
+                            
+                ofLogVerbose("PatternRuntime") << "Stopped unbound pattern '" << change.oldPatternName 
+                                                           << "' after chain progression from sequencer '" << change.sequencerName << "'";
+                        }
+                    } else {
+                        ofLogVerbose("PatternRuntime") << "Pattern '" << change.oldPatternName 
+                                                       << "' still bound to other sequencers, not stopping";
+                    }
+                }
+                
+                
+                
+                // CRITICAL FIX: Notify sequencer of binding change so it can sync its state
+                // This ensures the sequencer knows about the pattern change and can update its GUI
+                // IMPORTANT: Unlock before notifying to avoid deadlock - event handlers may call PatternRuntime methods
+                std::string nameCopy = change.sequencerName;
+                uniqueLock.unlock();  // Release lock before notifying (event handlers may need to acquire locks)
+                ofNotifyEvent(sequencerBindingChangedEvent, nameCopy);
+                
+                
+                
+                // Re-acquire lock for next iteration (if not the last change)
+                if (!isLastChange) {
+                    uniqueLock.lock();
                 }
             }
         }
@@ -386,6 +402,19 @@ bool PatternRuntime::patternExists(const std::string& name) const {
     return patterns_.find(name) != patterns_.end();
 }
 
+int PatternRuntime::getPatternStepCount(const std::string& name) const {
+    // Thread-safe read access - copy value while lock is held
+    std::shared_lock<std::shared_mutex> lock(patternMutex_);
+    
+    auto it = patterns_.find(name);
+    if (it == patterns_.end()) {
+        return -1;
+    }
+    
+    // Copy step count while lock is held (safe)
+    return it->second.getStepCount();
+}
+
 PatternPlaybackState* PatternRuntime::getPlaybackState(const std::string& name) {
     // Thread-safe read access
     std::shared_lock<std::shared_mutex> lock(patternMutex_);
@@ -411,19 +440,30 @@ const PatternPlaybackState* PatternRuntime::getPlaybackState(const std::string& 
 }
 
 void PatternRuntime::playPattern(const std::string& name) {
+    
+    
     if (!patternExists(name)) {
         ofLogError("PatternRuntime") << "Pattern not found: " << name;
         return;
     }
     
+    
+    
     PatternPlaybackState* state = getPlaybackState(name);
+    
+    
+    
     if (!state) {
         return;
     }
     
+    
+    
     // Reset playback state when starting (always reset on play for clean start)
     state->reset();
     state->isPlaying = true;
+    
+    
     
     ofLogVerbose("PatternRuntime") << "Playing pattern: " << name << " (reset to step 0)";
 }
@@ -588,6 +628,24 @@ void PatternRuntime::chainRemovePattern(const std::string& chainName, int index)
     chain->removeEntry(index);
 }
 
+void PatternRuntime::chainSetEntry(const std::string& chainName, int index, const std::string& patternName) {
+    PatternChain* chain = getChain(chainName);
+    if (!chain) {
+        ofLogError("PatternRuntime") << "Chain '" << chainName << "' not found";
+        return;
+    }
+    
+    if (!patternExists(patternName)) {
+        ofLogError("PatternRuntime") << "Pattern '" << patternName << "' not found";
+        return;
+    }
+    
+    // CRITICAL: Direct entry update preserves chain state (enabled, currentIndex, currentRepeat)
+    // This ensures patterns continue playing during chain edits
+    chain->setEntry(index, patternName);
+    ofLogVerbose("PatternRuntime") << "Set chain '" << chainName << "' entry " << index << " to pattern '" << patternName << "' (state preserved)";
+}
+
 void PatternRuntime::chainSetRepeat(const std::string& chainName, int index, int repeatCount) {
     PatternChain* chain = getChain(chainName);
     if (!chain) {
@@ -657,6 +715,30 @@ void PatternRuntime::bindSequencerPattern(const std::string& sequencerName, cons
         return;
     }
     
+    // CRITICAL FIX: Stop old pattern if it's no longer bound to any sequencer
+    auto oldBindingIt = sequencerBindings_.find(sequencerName);
+    if (oldBindingIt != sequencerBindings_.end() && !oldBindingIt->second.patternName.empty()) {
+        std::string oldPatternName = oldBindingIt->second.patternName;
+        
+        // Check if old pattern is still bound to other sequencers
+        bool stillBound = false;
+        for (const auto& [seqName, binding] : sequencerBindings_) {
+            if (seqName != sequencerName && binding.patternName == oldPatternName) {
+                stillBound = true;
+                break;
+            }
+        }
+        
+        // Stop old pattern if it's no longer bound to any sequencer
+        if (!stillBound) {
+            PatternPlaybackState* oldState = getPlaybackState(oldPatternName);
+            if (oldState && oldState->isPlaying) {
+                stopPattern(oldPatternName);
+                ofLogVerbose("PatternRuntime") << "Stopped unbound pattern '" << oldPatternName << "'";
+            }
+        }
+    }
+    
     sequencerBindings_[sequencerName].patternName = patternName;
     ofLogVerbose("PatternRuntime") << "Bound sequencer '" << sequencerName << "' to pattern '" << patternName << "'";
     
@@ -671,12 +753,7 @@ void PatternRuntime::bindSequencerChain(const std::string& sequencerName, const 
         return;
     }
     
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"PatternRuntime.cpp:432\",\"message\":\"bindSequencerChain called\",\"data\":{\"sequencerName\":\"" << sequencerName << "\",\"chainName\":\"" << chainName << "\"},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-    }
-    // #endregion
+    
     
     sequencerBindings_[sequencerName].chainName = chainName;
     ofLogVerbose("PatternRuntime") << "Bound sequencer '" << sequencerName << "' to chain '" << chainName << "'";
@@ -689,6 +766,26 @@ void PatternRuntime::bindSequencerChain(const std::string& sequencerName, const 
 void PatternRuntime::unbindSequencerPattern(const std::string& sequencerName) {
     auto it = sequencerBindings_.find(sequencerName);
     if (it != sequencerBindings_.end()) {
+        std::string oldPatternName = it->second.patternName;
+        
+        // Check if pattern is still bound to other sequencers
+        bool stillBound = false;
+        for (const auto& [seqName, binding] : sequencerBindings_) {
+            if (seqName != sequencerName && binding.patternName == oldPatternName) {
+                stillBound = true;
+                break;
+            }
+        }
+        
+        // Stop pattern if it's no longer bound to any sequencer
+        if (!stillBound && !oldPatternName.empty()) {
+            PatternPlaybackState* state = getPlaybackState(oldPatternName);
+            if (state && state->isPlaying) {
+                stopPattern(oldPatternName);
+                ofLogVerbose("PatternRuntime") << "Stopped unbound pattern '" << oldPatternName << "'";
+            }
+        }
+        
         it->second.patternName.clear();
         ofLogVerbose("PatternRuntime") << "Unbound pattern from sequencer '" << sequencerName << "'";
         
@@ -772,12 +869,7 @@ ofJson PatternRuntime::toJson() const {
     if (!sequencerBindings_.empty()) {
         json["sequencerBindings"] = ofJson::object();
         for (const auto& [seqName, binding] : sequencerBindings_) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"PatternRuntime.cpp:509\",\"message\":\"Saving sequencer binding\",\"data\":{\"sequencerName\":\"" << seqName << "\",\"patternName\":\"" << binding.patternName << "\",\"chainName\":\"" << binding.chainName << "\",\"chainEnabled\":" << (binding.chainEnabled ? "true" : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-            }
-            // #endregion
+            
             ofJson bindingJson;
             bindingJson["patternName"] = binding.patternName;
             bindingJson["chainName"] = binding.chainName;
@@ -841,12 +933,7 @@ void PatternRuntime::fromJson(const ofJson& json) {
             if (bindingJson.contains("chainEnabled")) {
                 binding.chainEnabled = bindingJson["chainEnabled"].get<bool>();
             }
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\",\"location\":\"PatternRuntime.cpp:564\",\"message\":\"Loading sequencer binding\",\"data\":{\"sequencerName\":\"" << seqName << "\",\"patternName\":\"" << binding.patternName << "\",\"chainName\":\"" << binding.chainName << "\",\"chainEnabled\":" << (binding.chainEnabled ? "true" : "false") << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-            }
-            // #endregion
+            
             sequencerBindings_[seqName] = binding;
         }
     }
@@ -1072,13 +1159,7 @@ bool PatternRuntime::advanceStep(Pattern& pattern, PatternPlaybackState& state) 
         patternFinished = (state.playbackStep == 0 && previousStep == stepCount - 1);
     }
     
-    // #region agent log
-    if (patternFinished) {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\",\"location\":\"PatternRuntime.cpp:932\",\"message\":\"Pattern finished in advanceStep\",\"data\":{\"previousStep\":" << previousStep << ",\"currentStep\":" << state.playbackStep << ",\"stepCount\":" << stepCount << ",\"patternCycleCount\":" << state.patternCycleCount << "},\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << "}\n";
-        logFile.close();
-    }
-    // #endregion
+    
     
     // Increment pattern cycle count when pattern wraps (one pattern repeat = one cycle)
     if (patternFinished) {

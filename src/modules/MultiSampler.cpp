@@ -16,6 +16,7 @@
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <shared_mutex>
 
 // ============================================================================
 // SAMPLEREF IMPLEMENTATIONS
@@ -48,8 +49,8 @@ bool SampleRef::loadSharedAudio() {
         }
     }
     
-    // Reset GUI state to defaults
-    resetGuiState();
+    // Reset parameter state cache to defaults
+    resetParameterState();
     
     return true;
 }
@@ -60,17 +61,17 @@ void SampleRef::unloadSharedAudio() {
     isScrubbing = false;
     metadataLoaded = false;
     duration = 0.0f;
-    resetGuiState();
+    resetParameterState();
 }
 
-void SampleRef::resetGuiState() {
-    guiPlayheadPosition = 0.0f;
-    guiStartPosition = 0.0f;
-    guiSpeed = 1.0f;
-    guiVolume = 1.0f;
-    guiRegionStart = 0.0f;
-    guiRegionEnd = 1.0f;
-    guiGrainSize = 0.0f;
+void SampleRef::resetParameterState() {
+    currentPlayheadPosition = 0.0f;
+    currentStartPosition = 0.0f;
+    currentSpeed = 1.0f;
+    currentVolume = 1.0f;
+    currentRegionStart = 0.0f;
+    currentRegionEnd = 1.0f;
+    currentGrainSize = 0.0f;
 }
 
 const ofSoundBuffer& SampleRef::getAudioBuffer() const {
@@ -249,7 +250,7 @@ void Voice::setPosition(float pos) {
 }
 
 MultiSampler::MultiSampler(const std::string& dataDir) 
-    : displayIndex_(0), dataDirectory(dataDir), isSetup(false), 
+    : dataDirectory(dataDir), isSetup(false),
       currentMode(PlaybackMode::IDLE), currentPlayStyle(PlayStyle::ONCE), 
       clock(nullptr), polyphonyMode_(PolyphonyMode::MONOPHONIC),  // Default to monophonic for backward compatibility
       voiceManager_() {  // VoiceManager uses template size (MAX_VOICES)
@@ -419,7 +420,7 @@ SampleRef& MultiSampler::getSampleMutable(size_t index) {
     return sampleBank_[index];
 }
 
-// Note: getVoiceForSample() implementation is below, after setDisplayIndex()
+// Note: getVoiceForSample() implementation is below
 
 std::vector<Voice*> MultiSampler::getActiveVoices() {
     // Use VoiceManager's getActiveVoices() for unified voice query
@@ -495,17 +496,6 @@ Voice* MultiSampler::triggerSamplePreview(int sampleIndex, float gateDuration) {
     return voice;
 }
 
-// ============================================================================
-// DISPLAY INDEX METHODS (GUI focus, sticky after trigger)
-// ============================================================================
-
-void MultiSampler::setDisplayIndex(size_t index) {
-    if (index < sampleBank_.size()) {
-        displayIndex_ = index;
-        ofLogVerbose("MultiSampler") << "Display index set to: " << index << " (" << sampleBank_[index].displayName << ")";
-    }
-}
-
 // Get first voice playing a sample (convenience method)
 Voice* MultiSampler::getVoiceForSample(int sampleIndex) {
     // Return first voice that is playing this sample
@@ -531,45 +521,21 @@ const Voice* MultiSampler::getVoiceForSample(int sampleIndex) const {
     return nullptr;
 }
 
-MediaPlayer* MultiSampler::getDisplayPlayer() {
-    if (displayIndex_ >= sampleBank_.size()) return nullptr;
 
-    // Return preview player if scrubbing, otherwise nullptr
-    // GUI should read from SampleRef.gui* fields, not from a player
-    auto& sample = sampleBank_[displayIndex_];
-    return sample.isScrubbing ? sample.previewPlayer.get() : nullptr;
-}
-
-const MediaPlayer* MultiSampler::getDisplayPlayer() const {
-    if (displayIndex_ >= sampleBank_.size()) return nullptr;
-
-    const auto& sample = sampleBank_[displayIndex_];
-    return sample.isScrubbing ? sample.previewPlayer.get() : nullptr;
-}
-
-SampleRef* MultiSampler::getDisplaySample() {
-    if (displayIndex_ >= sampleBank_.size()) return nullptr;
-    return &sampleBank_[displayIndex_];
-}
-
-const SampleRef* MultiSampler::getDisplaySample() const {
-    if (displayIndex_ >= sampleBank_.size()) return nullptr;
-    return &sampleBank_[displayIndex_];
-}
-
-void MultiSampler::syncGuiStateFromVoice(size_t sampleIndex, Voice* voice) {
+void MultiSampler::syncParameterStateFromVoice(size_t sampleIndex, Voice* voice) {
     if (sampleIndex >= sampleBank_.size() || !voice) return;
     
     SampleRef& sample = sampleBank_[sampleIndex];
-    // Sync GUI state from MediaPlayer (single source of truth for position)
+    // Sync parameter state cache from MediaPlayer (single source of truth for position)
     // CRITICAL: Use MediaPlayer's playheadPosition which freezes when stopped
-    sample.guiPlayheadPosition = voice->player.playheadPosition.get();
-    sample.guiSpeed = voice->player.speed.get();
-    sample.guiVolume = voice->player.volume.get();
-    sample.guiStartPosition = voice->player.startPosition.get();
-    sample.guiRegionStart = voice->player.regionStart.get();
-    sample.guiRegionEnd = voice->player.regionEnd.get();
-    sample.guiGrainSize = voice->player.loopSize.get();
+    // This updates the cached parameter values used by getParameter() API
+    sample.currentPlayheadPosition = voice->player.playheadPosition.get();
+    sample.currentSpeed = voice->player.speed.get();
+    sample.currentVolume = voice->player.volume.get();
+    sample.currentStartPosition = voice->player.startPosition.get();
+    sample.currentRegionStart = voice->player.regionStart.get();
+    sample.currentRegionEnd = voice->player.regionEnd.get();
+    sample.currentGrainSize = voice->player.loopSize.get();
 }
 
 std::string MultiSampler::computeDisplayName(const SampleRef& sample) const {
@@ -587,13 +553,13 @@ void MultiSampler::addSampleToBank(const std::string& audioPath, const std::stri
     sample.duration = 0.0f;  // Will be updated when played
     sample.metadataLoaded = false;
     
-    // Initialize GUI state to match defaults (for display)
-    sample.guiSpeed = sample.defaultSpeed;
-    sample.guiVolume = sample.defaultVolume;
-    sample.guiStartPosition = sample.defaultStartPosition;
-    sample.guiRegionStart = sample.defaultRegionStart;
-    sample.guiRegionEnd = sample.defaultRegionEnd;
-    sample.guiGrainSize = sample.defaultGrainSize;
+    // Initialize parameter state cache to match defaults
+    sample.currentSpeed = sample.defaultSpeed;
+    sample.currentVolume = sample.defaultVolume;
+    sample.currentStartPosition = sample.defaultStartPosition;
+    sample.currentRegionStart = sample.defaultRegionStart;
+    sample.currentRegionEnd = sample.defaultRegionEnd;
+    sample.currentGrainSize = sample.defaultGrainSize;
     
     sampleBank_.push_back(sample);
 }
@@ -768,10 +734,9 @@ void MultiSampler::pairByIndex() {
 // ========================================================================
 
 MediaPlayer* MultiSampler::getMediaPlayer(size_t index) {
-    // DEPRECATED: Use getDisplaySample() and getVoicesForSample() instead
-    // This method only returns preview player when scrubbing, which is confusing.
-    // For normal playback, voices are managed internally - use Voice API to access them.
-    std::lock_guard<std::mutex> lock(stateMutex);
+    // Returns preview player only when scrubbing
+    // For normal playback, voices are managed internally - use Voice API to access them
+    std::shared_lock<std::shared_mutex> lock(stateMutex);
     
     if (index >= sampleBank_.size()) return nullptr;
     
@@ -781,7 +746,7 @@ MediaPlayer* MultiSampler::getMediaPlayer(size_t index) {
 
 MediaPlayer* MultiSampler::getMediaPlayerByName(const std::string& name) {
     // Find sample by display name and return preview player if scrubbing
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::shared_lock<std::shared_mutex> lock(stateMutex);
     for (size_t i = 0; i < sampleBank_.size(); i++) {
         if (sampleBank_[i].displayName == name) {
             auto& sample = sampleBank_[i];
@@ -791,34 +756,6 @@ MediaPlayer* MultiSampler::getMediaPlayerByName(const std::string& name) {
     return nullptr;
 }
 
-MediaPlayer* MultiSampler::getCurrentPlayer() {
-    // DEPRECATED: Use getDisplayPlayer() instead (same behavior)
-    return getDisplayPlayer();
-}
-
-MediaPlayer* MultiSampler::getNextPlayer() {
-    // DEPRECATED: Use setDisplayIndex() for navigation instead
-    // This method modifies displayIndex_ and returns preview player (confusing API)
-    if (sampleBank_.empty()) return nullptr;
-    
-    displayIndex_ = (displayIndex_ + 1) % sampleBank_.size();
-    
-    auto& sample = sampleBank_[displayIndex_];
-    return sample.isScrubbing ? sample.previewPlayer.get() : nullptr;
-}
-
-MediaPlayer* MultiSampler::getPreviousPlayer() {
-    // DEPRECATED: Use setDisplayIndex() for navigation instead
-    // This method modifies displayIndex_ and returns preview player (confusing API)
-    if (sampleBank_.empty()) return nullptr;
-    
-    displayIndex_ = (displayIndex_ == 0) ? sampleBank_.size() - 1 : displayIndex_ - 1;
-    
-    auto& sample = sampleBank_[displayIndex_];
-    return sample.isScrubbing ? sample.previewPlayer.get() : nullptr;
-}
-
-// DEPRECATED methods are defined inline in header (setCurrentIndex, nextPlayer, previousPlayer, getCurrentIndex)
 
 std::vector<std::string> MultiSampler::getPlayerNames() const {
     // Return display names from sample bank
@@ -903,8 +840,6 @@ void MultiSampler::clear() {
     audioFiles.clear();
     videoFiles.clear();
     
-    displayIndex_ = 0;
-    
     // Note: Mixers are member objects - their destructors will safely clear
     // internal connections with proper locking. Routers already disconnected
     // external connections (AudioOutput/VideoOutput side).
@@ -917,7 +852,7 @@ void MultiSampler::refresh() {
 
 //--------------------------------------------------------------
 bool MultiSampler::removeSample(size_t index) {
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::unique_lock<std::shared_mutex> lock(stateMutex);
     
     if (index >= sampleBank_.size()) {
         ofLogWarning("MultiSampler") << "Cannot remove sample: index " << index << " out of range";
@@ -953,16 +888,8 @@ bool MultiSampler::removeSample(size_t index) {
     // Remove the sample from the bank
     sampleBank_.erase(sampleBank_.begin() + index);
     
-    // Adjust displayIndex_ if needed
-    if (displayIndex_ >= sampleBank_.size() && !sampleBank_.empty()) {
-        displayIndex_ = sampleBank_.size() - 1;
-    } else if (displayIndex_ > index) {
-        displayIndex_--;
-    }
-    
-    // If we removed the last sample, reset displayIndex_
+    // GUI will manage selection state when samples are removed
     if (sampleBank_.empty()) {
-        displayIndex_ = 0;
         currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
     }
     
@@ -991,7 +918,7 @@ bool MultiSampler::addMediaFile(const std::string& filePath) {
         return false;
     }
     
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::unique_lock<std::shared_mutex> lock(stateMutex);
     
     // Check if file is already in sample bank (avoid duplicates)
     for (const auto& sample : sampleBank_) {
@@ -1088,7 +1015,6 @@ bool MultiSampler::isVideoFile(const std::string& filename) {
 }
 
 
-// DEPRECATED methods are defined inline in header (getMediaDirectory, setActivePlayer, getActivePlayer)
         
 
 // DEPRECATED methods removed - voice pool architecture handles connections automatically
@@ -1102,7 +1028,7 @@ Voice* MultiSampler::triggerSample(int sampleIndex, const TriggerEvent* event) {
     // Allocates a voice from the pool, loads the sample, and starts playback
     // Returns the allocated voice, or nullptr if allocation failed
     
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::unique_lock<std::shared_mutex> lock(stateMutex);
 
     // Validate sample index
     if (sampleIndex < 0 || sampleIndex >= static_cast<int>(sampleBank_.size())) {
@@ -1249,7 +1175,6 @@ Voice* MultiSampler::triggerSample(int sampleIndex, const TriggerEvent* event) {
     voice->play();
     
     // Update display to triggered sample (sticky behavior)
-    displayIndex_ = sampleIndex;
     currentMode.store(PlaybackMode::PLAYING, std::memory_order_relaxed);
 
     ofLogVerbose("MultiSampler") << "Triggered sample " << sampleIndex << " (" << sample.displayName << ")";
@@ -1279,7 +1204,7 @@ bool MultiSampler::playMediaManual(size_t index) {
 void MultiSampler::startScrubbingPlayback(size_t index, float position) {
     if (index >= sampleBank_.size()) return;
     
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::unique_lock<std::shared_mutex> lock(stateMutex);
     
     SampleRef& sample = sampleBank_[index];
     
@@ -1293,12 +1218,12 @@ void MultiSampler::startScrubbingPlayback(size_t index, float position) {
         }
     }
     
-    // Sync parameters from GUI state to match normal playback
-    sample.previewPlayer->speed.set(sample.guiSpeed);
-    sample.previewPlayer->volume.set(sample.guiVolume);
-    sample.previewPlayer->regionStart.set(sample.guiRegionStart);
-    sample.previewPlayer->regionEnd.set(sample.guiRegionEnd);
-    sample.previewPlayer->loopSize.set(sample.guiGrainSize);
+    // Sync parameters from parameter state cache to match normal playback
+    sample.previewPlayer->speed.set(sample.currentSpeed);
+    sample.previewPlayer->volume.set(sample.currentVolume);
+    sample.previewPlayer->regionStart.set(sample.currentRegionStart);
+    sample.previewPlayer->regionEnd.set(sample.currentRegionEnd);
+    sample.previewPlayer->loopSize.set(sample.currentGrainSize);
     
     // Set position and play
     sample.previewPlayer->setPosition(position);
@@ -1307,14 +1232,14 @@ void MultiSampler::startScrubbingPlayback(size_t index, float position) {
     }
     
     sample.isScrubbing = true;
-    sample.guiPlayheadPosition = position;
+    sample.currentPlayheadPosition = position;
     
     // Connect preview player to mixers for audio feedback
     connectPlayerToInternalMixers(sample.previewPlayer.get());
 }
 
 void MultiSampler::stopScrubbingPlayback() {
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::unique_lock<std::shared_mutex> lock(stateMutex);
     
     // Stop all preview players and ensure video is properly disconnected
     for (auto& sample : sampleBank_) {
@@ -1340,7 +1265,7 @@ void MultiSampler::stopScrubbingPlayback() {
 
 //--------------------------------------------------------------
 void MultiSampler::stopAllMedia() {
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::unique_lock<std::shared_mutex> lock(stateMutex);
     
     // Clear lock-free event queue (drain all pending events)
     TriggerEvent dummy;
@@ -1363,7 +1288,7 @@ void MultiSampler::setDataDirectory(const std::string& path) {
     
     // CRITICAL: Lock mutex to prevent GUI/update loop from accessing players during directory change
     // This prevents race conditions where GUI tries to access players while they're being cleared/recreated
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::unique_lock<std::shared_mutex> lock(stateMutex);
     
     try {
         ofDirectory dir(path);
@@ -1379,7 +1304,6 @@ void MultiSampler::setDataDirectory(const std::string& path) {
         mediaPair();
         
         if (!sampleBank_.empty()) {
-            displayIndex_ = 0;
             ofLogNotice("MultiSampler") << "Sample bank ready with " << sampleBank_.size() << " samples";
         } else {
             ofLogWarning("MultiSampler") << "No samples created from directory: " << path;
@@ -1468,14 +1392,14 @@ bool MultiSampler::isPlaying() const {
 void MultiSampler::setModeIdle() {
     // Thread-safe transition to IDLE mode
     // Used by button handlers to immediately transition when stopping
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::unique_lock<std::shared_mutex> lock(stateMutex);
     currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
 }
 
 //--------------------------------------------------------------
 // Play style control (applies to both manual preview and sequencer playback)
 void MultiSampler::setPlayStyle(PlayStyle style) {
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::unique_lock<std::shared_mutex> lock(stateMutex);
     currentPlayStyle = style;
     ofLogNotice("MultiSampler") << "Play style set to: " << (int)style;
     
@@ -1494,7 +1418,7 @@ void MultiSampler::setPlayStyle(PlayStyle style) {
 }
 
 PlayStyle MultiSampler::getPlayStyle() const {
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::shared_lock<std::shared_mutex> lock(stateMutex);
     return currentPlayStyle;
 }
 
@@ -1516,8 +1440,6 @@ void MultiSampler::update() {
     
     // Update all active voices and check for playback completion
     bool anyVoicePlaying = false;
-    Voice* activeVoiceForDisplay = nullptr;  // Track voice playing the displayed sample for GUI sync
-    float latestStartTime = -1.0f;  // Track most recent start time for voice selection in polyphonic mode
     
     // Use VoiceManager's voice pool for iteration
     for (auto& voice : voiceManager_.getVoicePool()) {
@@ -1585,14 +1507,6 @@ void MultiSampler::update() {
                 } else if (voice.state == Voice::PLAYING) {
                     anyVoicePlaying = true;
                     
-                    // Track the voice playing the currently displayed sample for playhead sync
-                    if (voice.sampleIndex == static_cast<int>(displayIndex_)) {
-                        if (!activeVoiceForDisplay || voice.startTime > latestStartTime) {
-                            activeVoiceForDisplay = &voice;
-                            latestStartTime = voice.startTime;
-                        }
-                    }
-                    
                     // ONCE mode boundary check: auto-release before sample ends to prevent clicks
                     // Modern sampler practice: start release phase while audio is still available
                     if (currentPlayStyle == PlayStyle::ONCE) {
@@ -1624,10 +1538,9 @@ void MultiSampler::update() {
                         if (rawPosition >= regEnd - ONCE_MODE_EPSILON) {
                             voice.setPosition(regEnd);
                             
-                            // Update GUI state before releasing
-                            if (voice.sampleIndex == static_cast<int>(displayIndex_) && 
-                                static_cast<size_t>(voice.sampleIndex) < sampleBank_.size()) {
-                                sampleBank_[voice.sampleIndex].guiPlayheadPosition = regEnd;
+                            // Update GUI state before releasing (GUI will sync based on its selection)
+                            if (static_cast<size_t>(voice.sampleIndex) < sampleBank_.size()) {
+                                sampleBank_[voice.sampleIndex].currentPlayheadPosition = regEnd;
                             }
                             
                             // If not already releasing, trigger release now (may be too late, but better than nothing)
@@ -1644,40 +1557,27 @@ void MultiSampler::update() {
         }
     }
     
-    // Sync GUI state from active voice for waveform display
-    // This ensures the waveform playhead updates correctly during playback
-    // When no voice is playing, GUI state remains editable for idle interaction
-    // CRITICAL: Only sync when voice is actually PLAYING - freeze playhead when playback stops
-    if (activeVoiceForDisplay && displayIndex_ < sampleBank_.size()) {
-        // Validate voice is still playing before syncing
-        if (activeVoiceForDisplay->state == Voice::PLAYING) {
-            syncGuiStateFromVoice(displayIndex_, activeVoiceForDisplay);
-        } else {
-            // Voice stopped or released - clear reference and freeze playhead at last position
-            // guiPlayheadPosition will remain at the last synced value (frozen at stop position)
-            activeVoiceForDisplay = nullptr;
-        }
-    }
-    
     // Sync GUI state when scrubbing (from voice if reused, otherwise from preview player)
-    if (displayIndex_ < sampleBank_.size()) {
-        auto& sample = sampleBank_[displayIndex_];
+    // Note: GUI state sync for playing samples is handled in GUI layer (MultiSamplerGUI)
+    for (size_t i = 0; i < sampleBank_.size(); ++i) {
+        auto& sample = sampleBank_[i];
+        
         if (sample.isScrubbing) {
             // Check if we're reusing a voice for scrubbing
-            Voice* scrubbingVoice = getVoiceForSample(static_cast<int>(displayIndex_));
+            Voice* scrubbingVoice = getVoiceForSample(static_cast<int>(i));
             if (scrubbingVoice && scrubbingVoice->state == Voice::PLAYING) {
-                // Reusing voice - sync from voice (already handled above, but ensure it's synced)
-                syncGuiStateFromVoice(displayIndex_, scrubbingVoice);
+                // Reusing voice - sync from voice (scrubbing is backend state management)
+                syncParameterStateFromVoice(i, scrubbingVoice);
             } else if (sample.previewPlayer) {
                 // Using preview player - sync from preview player
                 sample.previewPlayer->update();
-                sample.guiPlayheadPosition = sample.previewPlayer->playheadPosition.get();
-                sample.guiSpeed = sample.previewPlayer->speed.get();
-                sample.guiVolume = sample.previewPlayer->volume.get();
-                sample.guiStartPosition = sample.previewPlayer->startPosition.get();
-                sample.guiRegionStart = sample.previewPlayer->regionStart.get();
-                sample.guiRegionEnd = sample.previewPlayer->regionEnd.get();
-                sample.guiGrainSize = sample.previewPlayer->loopSize.get();
+                sample.currentPlayheadPosition = sample.previewPlayer->playheadPosition.get();
+                sample.currentSpeed = sample.previewPlayer->speed.get();
+                sample.currentVolume = sample.previewPlayer->volume.get();
+                sample.currentStartPosition = sample.previewPlayer->startPosition.get();
+                sample.currentRegionStart = sample.previewPlayer->regionStart.get();
+                sample.currentRegionEnd = sample.previewPlayer->regionEnd.get();
+                sample.currentGrainSize = sample.previewPlayer->loopSize.get();
                 
                 // Stop scrubbing if preview player finished
                 if (!sample.previewPlayer->isPlaying()) {
@@ -1799,11 +1699,14 @@ std::string MultiSampler::getName() const {
 
 // getTypeName() uses default implementation from Module base class (returns getName())
 
-void MultiSampler::setEnabled(bool enabled) {
-    Module::setEnabled(enabled);
+void MultiSampler::setEnabledImpl(bool enabled) {
+    // Base class handles enabled_ state (lock already held)
+    // We can directly access enabled_ since lock is held by wrapper
+    bool wasEnabled = enabled_;
+    enabled_ = enabled;
     
     // Stop all media when disabled
-    if (!enabled) {
+    if (wasEnabled && !enabled) {
         stopAllMedia();
     }
 }
@@ -1815,7 +1718,7 @@ ofJson MultiSampler::toJson(class ModuleRegistry* registry) const {
     json["enabled"] = isEnabled();
     
     // Save current sample index
-    json["displayIndex_"] = displayIndex_;
+    // NOTE: displayIndex_ serialization removed - GUI now manages selectedSampleIndex_
     
     // Save play style
     json["playStyle"] = static_cast<int>(currentPlayStyle);
@@ -1895,13 +1798,13 @@ void MultiSampler::fromJson(const ofJson& json) {
             sample.defaultGrainSize = sampleJson.value("defaultGrainSize", 
                                                        sampleJson.value("defaultLoopSize", 0.0f));
             
-            // Initialize GUI state to match defaults
-            sample.guiSpeed = sample.defaultSpeed;
-            sample.guiVolume = sample.defaultVolume;
-            sample.guiStartPosition = sample.defaultStartPosition;
-            sample.guiRegionStart = sample.defaultRegionStart;
-            sample.guiRegionEnd = sample.defaultRegionEnd;
-            sample.guiGrainSize = sample.defaultGrainSize;
+            // Initialize parameter state cache to match defaults
+            sample.currentSpeed = sample.defaultSpeed;
+            sample.currentVolume = sample.defaultVolume;
+            sample.currentStartPosition = sample.defaultStartPosition;
+            sample.currentRegionStart = sample.defaultRegionStart;
+            sample.currentRegionEnd = sample.defaultRegionEnd;
+            sample.currentGrainSize = sample.defaultGrainSize;
             
             if (sample.hasMedia()) {
                 sampleBank_.push_back(sample);
@@ -1938,18 +1841,8 @@ void MultiSampler::fromJson(const ofJson& json) {
     }
     
     // Restore current index
-    if (json.contains("displayIndex_")) {
-        displayIndex_ = json["displayIndex_"].get<size_t>();
-        if (displayIndex_ >= sampleBank_.size() && !sampleBank_.empty()) {
-            displayIndex_ = 0;
-        }
-    } else if (json.contains("activePlayerIndex")) {
-        // Legacy field name
-        displayIndex_ = json["activePlayerIndex"].get<size_t>();
-        if (displayIndex_ >= sampleBank_.size() && !sampleBank_.empty()) {
-            displayIndex_ = 0;
-        }
-    }
+    // NOTE: displayIndex_ serialization removed - GUI now manages selectedSampleIndex_
+    // Legacy fields are ignored (GUI will handle selection state)
 }
 
 ModuleType MultiSampler::getType() const {
@@ -1976,8 +1869,8 @@ std::vector<ModuleCapability> MultiSampler::getCapabilities() const {
 }
 
 //--------------------------------------------------------------
-// REMOVED: getIndexRange() - use parameter system instead
-// Query getParameters() for "index" parameter's max value
+// REMOVED: getIndexRange() - use getSampleCount() instead
+    // NOTE: "index" is NOT a parameter - it's GUI display state (GUI manages selectedSampleIndex_)
 
 //--------------------------------------------------------------
 Module::ModuleMetadata MultiSampler::getMetadata() const {
@@ -1989,7 +1882,7 @@ Module::ModuleMetadata MultiSampler::getMetadata() const {
     return metadata;
 }
 
-std::vector<ParameterDescriptor> MultiSampler::getParameters() const {
+std::vector<ParameterDescriptor> MultiSampler::getParametersImpl() const {
     std::vector<ParameterDescriptor> params;
     
     // MultiSampler parameters that can be controlled by TrackerSequencer
@@ -1997,11 +1890,8 @@ std::vector<ParameterDescriptor> MultiSampler::getParameters() const {
     // MultiSampler maps these to MediaPlayer parameters
     
     // Core playback parameters
-    // "index" parameter with dynamic range based on number of players
-    int maxIndex = static_cast<int>(getNumPlayers()) - 1;
-    if (maxIndex < 0) maxIndex = 0;  // Safety: at least 0
-    params.push_back(ParameterDescriptor("index", ParameterType::INT, 0.0f, static_cast<float>(maxIndex), 0.0f, "Media Index"));
-    // Note: "note" is still handled in trigger events for backward compatibility, but not exposed as a parameter
+    // NOTE: "index" is NOT a parameter - it's GUI display state (use getDisplayIndex() / setDisplayIndex() directly)
+    // NOTE: "note" is handled in trigger events for playback selection, but not exposed as a parameter
     // to avoid conflicts with TrackerSequencer's internal "note" parameter (musical notes)
     params.push_back(ParameterDescriptor("position", ParameterType::FLOAT, 0.0f, 1.0f, 0.0f, "Position"));
     params.push_back(ParameterDescriptor("speed", ParameterType::FLOAT, -10.0f, 10.0f, 1.0f, "Speed"));
@@ -2028,10 +1918,10 @@ std::vector<ParameterDescriptor> MultiSampler::getParameters() const {
     return params;
 }
 
-void MultiSampler::setParameter(const std::string& paramName, float value, bool notify) {
+void MultiSampler::setParameterImpl(const std::string& paramName, float value, bool notify) {
     // Handle polyphonyMode parameter (module-level, not player-level)
     if (paramName == "polyphonyMode") {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
         PolyphonyMode oldMode = polyphonyMode_;
         polyphonyMode_ = (value >= 0.5f) ? PolyphonyMode::POLYPHONIC : PolyphonyMode::MONOPHONIC;
         
@@ -2066,7 +1956,7 @@ void MultiSampler::setParameter(const std::string& paramName, float value, bool 
     // These update the default ADSR values for new voices
     // FUTURE: Apply to all active voices in real-time (currently only affects new voices)
     if (paramName == "attackMs") {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
         defaultAttackMs_ = std::max(0.0f, value);
         if (notify && parameterChangeCallback) {
             parameterChangeCallback(paramName, value);
@@ -2074,7 +1964,7 @@ void MultiSampler::setParameter(const std::string& paramName, float value, bool 
         return;
     }
     if (paramName == "decayMs") {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
         defaultDecayMs_ = std::max(0.0f, value);
         if (notify && parameterChangeCallback) {
             parameterChangeCallback(paramName, value);
@@ -2082,7 +1972,7 @@ void MultiSampler::setParameter(const std::string& paramName, float value, bool 
         return;
     }
     if (paramName == "sustain") {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
         defaultSustain_ = ofClamp(value, 0.0f, 1.0f);
         if (notify && parameterChangeCallback) {
             parameterChangeCallback(paramName, value);
@@ -2090,7 +1980,7 @@ void MultiSampler::setParameter(const std::string& paramName, float value, bool 
         return;
     }
     if (paramName == "releaseMs") {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
         defaultReleaseMs_ = std::max(ANTI_CLICK_FADE_MS, value);  // Enforce minimum release time
         if (notify && parameterChangeCallback) {
             parameterChangeCallback(paramName, value);
@@ -2100,7 +1990,7 @@ void MultiSampler::setParameter(const std::string& paramName, float value, bool 
     
     // Handle granular synthesis parameters (GRAIN mode)
     if (paramName == "grainEnvelope") {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
         defaultGrainEnvelope_ = static_cast<int>(std::max(0.0f, std::min(4.0f, value)));  // Clamp to 0-4
         if (notify && parameterChangeCallback) {
             parameterChangeCallback(paramName, value);
@@ -2109,11 +1999,12 @@ void MultiSampler::setParameter(const std::string& paramName, float value, bool 
     }
     
     // Continuous parameter modulation (for modulators, envelopes, etc.)
-    // For MultiSampler, we apply this to GUI state (synced to voices on next trigger)
-    std::lock_guard<std::mutex> lock(stateMutex);
+    // For MultiSampler, we apply this to parameter state cache (synced to voices on next trigger)
+    // NOTE: Parameters operate on sample at index 0 as default (GUI manages selection)
+    std::unique_lock<std::shared_mutex> lock(stateMutex);
     
-    if (displayIndex_ >= sampleBank_.size()) return;
-    SampleRef& displaySample = sampleBank_[displayIndex_];
+    if (sampleBank_.empty()) return;
+    SampleRef& displaySample = sampleBank_[0];  // Use index 0 as default
     
     // Get parameter descriptor to validate range
     auto paramDescriptors = getParameters();
@@ -2134,16 +2025,16 @@ void MultiSampler::setParameter(const std::string& paramName, float value, bool 
     float oldValue = 0.0f;
     bool valueChanged = false;
     
-    // Update both SampleRef default parameters (for next trigger) and GUI state (for display)
+        // Update both SampleRef default parameters (for next trigger) and parameter state cache (for getParameter API)
     if (paramName == "volume") {
         oldValue = displaySample.defaultVolume;
         displaySample.defaultVolume = clampedValue;  // Update default (for next trigger)
-        displaySample.guiVolume = clampedValue;      // Update GUI state (for display)
+        displaySample.currentVolume = clampedValue;      // Update GUI state (for display)
         valueChanged = std::abs(oldValue - clampedValue) > PARAMETER_EPSILON;
     } else if (paramName == "speed") {
         oldValue = displaySample.defaultSpeed;
         displaySample.defaultSpeed = clampedValue;
-        displaySample.guiSpeed = clampedValue;
+        displaySample.currentSpeed = clampedValue;
         valueChanged = std::abs(oldValue - clampedValue) > PARAMETER_EPSILON;
     } else if (paramName == "grainSize" || paramName == "loopSize") {
         // Support both new name (grainSize) and old name (loopSize) for backward compatibility
@@ -2154,39 +2045,39 @@ void MultiSampler::setParameter(const std::string& paramName, float value, bool 
         // Allow 0.0 to mean "use full region", otherwise clamp to valid range
         float clampedVal = (clampedValue <= 0.0f) ? 0.0f : std::max(MIN_LOOP_SIZE, std::min(maxAllowed, clampedValue));
         displaySample.defaultGrainSize = clampedVal;
-        displaySample.guiGrainSize = clampedVal;
+        displaySample.currentGrainSize = clampedVal;
         valueChanged = std::abs(oldValue - clampedVal) > PARAMETER_EPSILON;
     } else if (paramName == "regionStart" || paramName == "loopStart") {
         // Support both new name (regionStart) and old name (loopStart) for backward compatibility
         oldValue = displaySample.defaultRegionStart;
         displaySample.defaultRegionStart = clampedValue;
-        displaySample.guiRegionStart = clampedValue;
+        displaySample.currentRegionStart = clampedValue;
         valueChanged = std::abs(oldValue - clampedValue) > PARAMETER_EPSILON;
         
         // CRITICAL: When regionStart changes, recalculate playheadPosition from current relative position
         // This ensures the playhead stays at the same relative position within the new region bounds
         // BUT: Only update playheadPosition if we have a valid relative position
-        if (valueChanged && displaySample.guiStartPosition >= 0.0f && displaySample.guiStartPosition <= 1.0f) {
-            float regionSize = displaySample.guiRegionEnd - clampedValue;
+        if (valueChanged && displaySample.currentStartPosition >= 0.0f && displaySample.currentStartPosition <= 1.0f) {
+            float regionSize = displaySample.currentRegionEnd - clampedValue;
             if (regionSize > MIN_REGION_SIZE) {
-                float absolutePos = clampedValue + displaySample.guiStartPosition * regionSize;
-                displaySample.guiPlayheadPosition = absolutePos;
+                float absolutePos = clampedValue + displaySample.currentStartPosition * regionSize;
+                displaySample.currentPlayheadPosition = absolutePos;
             }
         }
     } else if (paramName == "regionEnd" || paramName == "loopEnd") {
         // Support both new name (regionEnd) and old name (loopEnd) for backward compatibility
         oldValue = displaySample.defaultRegionEnd;
         displaySample.defaultRegionEnd = clampedValue;
-        displaySample.guiRegionEnd = clampedValue;
+        displaySample.currentRegionEnd = clampedValue;
         valueChanged = std::abs(oldValue - clampedValue) > PARAMETER_EPSILON;
         
         // CRITICAL: When regionEnd changes, recalculate playheadPosition from current relative position
         // This ensures the playhead stays at the same relative position within the new region bounds
-        if (valueChanged && displaySample.guiStartPosition >= 0.0f && displaySample.guiStartPosition <= 1.0f) {
-            float regionSize = clampedValue - displaySample.guiRegionStart;
+        if (valueChanged && displaySample.currentStartPosition >= 0.0f && displaySample.currentStartPosition <= 1.0f) {
+            float regionSize = clampedValue - displaySample.currentRegionStart;
             if (regionSize > MIN_REGION_SIZE) {
-                float absolutePos = displaySample.guiRegionStart + displaySample.guiStartPosition * regionSize;
-                displaySample.guiPlayheadPosition = absolutePos;
+                float absolutePos = displaySample.currentRegionStart + displaySample.currentStartPosition * regionSize;
+                displaySample.currentPlayheadPosition = absolutePos;
             }
         }
     } else if (paramName == "position") {
@@ -2196,13 +2087,13 @@ void MultiSampler::setParameter(const std::string& paramName, float value, bool 
             // Clamp to valid relative range using helper (handles ONCE mode clamping)
             float relativePos = clampPositionForPlayback(clampedValue, currentPlayStyle);
             displaySample.defaultStartPosition = relativePos;
-            displaySample.guiStartPosition = relativePos;
+            displaySample.currentStartPosition = relativePos;
             
             // Update playheadPosition for UI display (map to absolute using helper function)
-            float regionStartVal = displaySample.guiRegionStart;
-            float regionEndVal = displaySample.guiRegionEnd;
+            float regionStartVal = displaySample.currentRegionStart;
+            float regionEndVal = displaySample.currentRegionEnd;
             float absolutePos = mapRelativeToAbsolute(relativePos, regionStartVal, regionEndVal);
-            displaySample.guiPlayheadPosition = absolutePos;
+            displaySample.currentPlayheadPosition = absolutePos;
             valueChanged = true;
         }
     }
@@ -2223,15 +2114,16 @@ void MultiSampler::setParameter(const std::string& paramName, float value, bool 
         } else if (paramName == "regionEnd" || paramName == "loopEnd") {
             previewPlayer->regionEnd.set(clampedValue);
         } else if (paramName == "position") {
-            previewPlayer->startPosition.set(displaySample.guiStartPosition);
-            previewPlayer->playheadPosition.set(displaySample.guiPlayheadPosition);
+            previewPlayer->startPosition.set(displaySample.currentStartPosition);
+            previewPlayer->playheadPosition.set(displaySample.currentPlayheadPosition);
         }
     }
     
-    // Also update any active Voice playing the displayed sample (for real-time modulation)
+    // Also update any active Voice playing sample at index 0 (for real-time modulation)
+    // NOTE: Parameters operate on index 0 as default (GUI manages which sample is selected)
     // Use VoiceManager's voice pool for iteration
     for (auto& voice : voiceManager_.getVoicePool()) {
-        if (voice.state == Voice::PLAYING && voice.sampleIndex == static_cast<int>(displayIndex_)) {
+        if (voice.state == Voice::PLAYING && voice.sampleIndex == 0) {
             if (paramName == "volume") {
                 voice.volume.set(clampedValue);
                 // Update MediaPlayer parameter (handles audio volume)
@@ -2313,72 +2205,91 @@ void MultiSampler::setParameter(const std::string& paramName, float value, bool 
     // Note: "note" parameter can't be set continuously - it's only for triggers
 }
 
-float MultiSampler::getParameter(const std::string& paramName) const {
+float MultiSampler::getParameterImpl(const std::string& paramName) const {
+    // #region agent log
+    {
+        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
+        if (logFile.is_open()) {
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"K\",\"location\":\"MultiSampler.cpp:getParameter\",\"message\":\"getParameter() ENTRY\",\"data\":{\"paramName\":\"" << paramName << "\",\"thisPtr\":\"" << this << "\"},\"timestamp\":" << now << "}\n";
+            logFile.flush();
+            logFile.close();
+        }
+    }
+    // #endregion
     
     // Handle "polyphonyMode" - module-level parameter
     if (paramName == "polyphonyMode") {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
         return (polyphonyMode_ == PolyphonyMode::POLYPHONIC) ? 1.0f : 0.0f;
     }
     
     // Handle ADSR envelope parameters
     if (paramName == "attackMs") {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
         return defaultAttackMs_;
     }
     if (paramName == "decayMs") {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
         return defaultDecayMs_;
     }
     if (paramName == "sustain") {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
         return defaultSustain_;
     }
     if (paramName == "releaseMs") {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
         return defaultReleaseMs_;
     }
     if (paramName == "grainEnvelope") {
-        std::lock_guard<std::mutex> lock(stateMutex);
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
         return static_cast<float>(defaultGrainEnvelope_);
     }
     
-    // Read from GUI state (synced from voice during playback, editable when idle)
-    std::lock_guard<std::mutex> lock(stateMutex);
+    // NOTE: "index" is NOT a parameter - it's GUI display state
+    // GUI manages selectedSampleIndex_ for navigation
+    // Use "note" in trigger events for playback selection
     
-    if (displayIndex_ >= sampleBank_.size()) {
-        // No sample displayed - return default value
-        auto paramDescriptors = getParameters();
-        for (const auto& param : paramDescriptors) {
-            if (param.name == paramName) {
-                return param.defaultValue;
-            }
+    // Read from parameter state cache (synced from voice during playback, editable when idle)
+    // NOTE: Parameters operate on sample at index 0 as default (GUI manages selection)
+    std::shared_lock<std::shared_mutex> lock(stateMutex);
+    
+    // Safety check: ensure sampleBank_ is not empty
+    if (sampleBank_.empty()) {
+        // No samples - return default value
+        if (paramName == "position" || paramName == "speed" || paramName == "volume" ||
+            paramName == "regionStart" || paramName == "loopStart" ||
+            paramName == "regionEnd" || paramName == "loopEnd" ||
+            paramName == "grainSize" || paramName == "loopSize") {
+            return 0.0f;  // Default values for these parameters
         }
         return 0.0f;
     }
     
-    const SampleRef& displaySample = sampleBank_[displayIndex_];
+    // Use index 0 as default (GUI manages which sample is selected for editing)
+    const SampleRef& displaySample = sampleBank_[0];
     
-    // Read from GUI state
+    // Read from parameter state cache
     if (paramName == "position") {
-        return displaySample.guiStartPosition;
+        return displaySample.currentStartPosition;
     } else if (paramName == "speed") {
-        return displaySample.guiSpeed;
+        return displaySample.currentSpeed;
     } else if (paramName == "volume") {
-        return displaySample.guiVolume;
+        return displaySample.currentVolume;
     } else if (paramName == "regionStart" || paramName == "loopStart") {
-        return displaySample.guiRegionStart;
+        return displaySample.currentRegionStart;
     } else if (paramName == "regionEnd" || paramName == "loopEnd") {
-        return displaySample.guiRegionEnd;
+        return displaySample.currentRegionEnd;
     } else if (paramName == "grainSize" || paramName == "loopSize") {
-        return displaySample.guiGrainSize;
+        return displaySample.currentGrainSize;
     } else if (paramName == "note") {
         // Note parameter represents the media index (not a continuous parameter)
         return 0.0f;
     }
     
-    // Unknown parameter - return default
-    return Module::getParameter(paramName);
+    // Unknown parameter - return default (base class default is 0.0f)
+    // NOTE: Cannot call Module::getParameter() here as it would deadlock (lock already held)
+    return 0.0f;
 }
 
 void MultiSampler::onTrigger(TriggerEvent& event) {
@@ -2410,7 +2321,7 @@ void MultiSampler::onTrigger(TriggerEvent& event) {
 //--------------------------------------------------------------
 // Position scan mode control
 PolyphonyMode MultiSampler::getPolyphonyMode() const {
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::shared_lock<std::shared_mutex> lock(stateMutex);
     return polyphonyMode_;
 }
 
