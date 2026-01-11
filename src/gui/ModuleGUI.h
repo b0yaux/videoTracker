@@ -388,6 +388,7 @@ protected:
     class ConnectionManager* connectionManager = nullptr;
     class GUIManager* guiManager = nullptr;
     vt::Engine* engine_ = nullptr;  // For command queue routing
+    mutable std::string cachedTypeName_;  // Cached module type name (to avoid locks during command processing)
     
     // Module popup menu state
     char renameBuffer_[256] = {0};  // Buffer for rename input field

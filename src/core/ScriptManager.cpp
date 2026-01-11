@@ -40,21 +40,25 @@ void ScriptManager::setup() {
             return;
         }
         
+        // CRITICAL FIX (Phase 7.9 Plan 6 Task 3): Don't skip updates - use deferred updates instead
+        // Track missed state changes during script execution and command processing
+        // Apply updates when safe (after script execution completes)
+        // This ensures all state changes are eventually reflected in script
         
-        // CRITICAL FIX: Completely skip script updates during script execution
-        // This prevents the callback from being called during script execution,
-        // which could cause crashes when SetText() is called at unsafe times
-        // The state observer will fire again after script execution completes
-        if (engine_ && engine_->isExecutingScript()) {
-            ofLogVerbose("ScriptManager") << "Skipping script update - script execution in progress";
-            return;  // Don't update at all during script execution
+        bool isExecutingScript = engine_ && engine_->isExecutingScript();
+        bool commandsProcessing = engine_ && engine_->commandsBeingProcessed();
+        
+        if (isExecutingScript || commandsProcessing) {
+            // Queue state change for deferred processing
+            ofLogVerbose("ScriptManager") << "Deferring script update - " 
+                                          << (isExecutingScript ? "script execution" : "command processing") 
+                                          << " in progress (state version: " << state.version << ")";
+            deferredUpdates_.push_back({state, state.version});
+            return;  // Don't update now, but queue for later
         }
         
-        // Also skip during command processing to be extra safe
-        if (engine_ && engine_->commandsBeingProcessed()) {
-            ofLogVerbose("ScriptManager") << "Skipping script update - commands processing";
-            return;  // Don't update during command processing either
-        }
+        // State is safe - apply any deferred updates first, then update immediately
+        applyDeferredUpdates();
         
         // State version verification handles pending command detection:
         // State version only increments AFTER commands are processed by audio thread (in updateStateSnapshot())
@@ -578,6 +582,52 @@ bool ScriptManager::hasStateChanged(
     // Simple comparison using JSON serialization
     // Can be optimized later with more granular comparison
     return oldState.toJson() != newState.toJson();
+}
+
+void ScriptManager::applyDeferredUpdates() {
+    // CRITICAL FIX (Phase 7.9 Plan 6 Task 3): Apply queued state changes when safe
+    // This ensures all state changes are eventually reflected in script, even if they
+    // occurred during script execution or command processing
+    
+    if (deferredUpdates_.empty()) {
+        return;  // No deferred updates to apply
+    }
+    
+    // Check if it's safe to apply updates (script execution and command processing complete)
+    bool isExecutingScript = engine_ && engine_->isExecutingScript();
+    bool commandsProcessing = engine_ && engine_->commandsBeingProcessed();
+    
+    if (isExecutingScript || commandsProcessing) {
+        // Still unsafe - wait for next notification
+        ofLogVerbose("ScriptManager") << "Deferred updates still unsafe - " 
+                                      << (isExecutingScript ? "script execution" : "command processing") 
+                                      << " in progress (" << deferredUpdates_.size() << " updates queued)";
+        return;
+    }
+    
+    // Safe to apply updates - process all queued state changes
+    // Apply updates in order (oldest first) to ensure consistency
+    ofLogNotice("ScriptManager") << "Applying " << deferredUpdates_.size() << " deferred state updates";
+    
+    // Find the latest state version (most recent update)
+    uint64_t latestVersion = 0;
+    const EngineState* latestState = nullptr;
+    for (const auto& update : deferredUpdates_) {
+        if (update.stateVersion > latestVersion) {
+            latestVersion = update.stateVersion;
+            latestState = &update.state;
+        }
+    }
+    
+    // Apply the latest state (most recent update contains all changes)
+    if (latestState) {
+        ofLogNotice("ScriptManager") << "Applying deferred update (state version: " << latestVersion << ")";
+        updateScriptFromState(*latestState);
+    }
+    
+    // Clear deferred updates after applying
+    deferredUpdates_.clear();
+    ofLogVerbose("ScriptManager") << "Deferred updates applied and cleared";
 }
 
 void ScriptManager::setScriptUpdateCallback(ScriptUpdateCallback callback) {

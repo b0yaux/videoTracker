@@ -8,12 +8,29 @@ ClockGUI::ClockGUI() : observerId_(0), stateNeedsUpdate_(false) {
 }
 
 void ClockGUI::draw(Clock& clock) {
-    // Use cached state if available (updated via subscription), otherwise fallback to polling
+    // CRITICAL FIX (Phase 7.9 Plan 6 Task 4): Use cached state with version verification
+    // Verify state version matches engine version before using cached state
+    // If stale, fallback to polling to ensure fresh state
     vt::EngineState state;
     if (stateNeedsUpdate_ && engine_) {
         // Use cached state (updated via subscription)
         state = cachedState_;
-        stateNeedsUpdate_ = false;
+        
+        // CRITICAL FIX: Verify cached state version matches engine version
+        // If stale, fallback to polling to ensure fresh state
+        uint64_t currentEngineVersion = engine_->getStateVersion();
+        uint64_t cachedStateVersion = state.version;
+        
+        if (cachedStateVersion < currentEngineVersion) {
+            // Cached state is stale - fallback to polling
+            ofLogVerbose("ClockGUI") << "Cached state is stale (version: " << cachedStateVersion 
+                                     << ", engine: " << currentEngineVersion 
+                                     << ") - polling fresh state";
+            state = engine_->getState();
+        } else {
+            // Cached state is current - use it
+            stateNeedsUpdate_ = false;
+        }
         
         // #region agent log
         {

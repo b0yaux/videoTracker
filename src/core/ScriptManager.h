@@ -89,6 +89,16 @@ private:
     ScriptUpdateCallback updateCallback_;
     uint64_t lastRegeneratedVersion_ = 0;  // Track state version used for last successful regeneration
     
+    // CRITICAL FIX (Phase 7.9 Plan 6 Task 3): Deferred update mechanism
+    // Track missed state changes during script execution and command processing
+    // Apply updates when safe (after script execution completes)
+    struct DeferredUpdate {
+        EngineState state;
+        uint64_t stateVersion;
+    };
+    std::vector<DeferredUpdate> deferredUpdates_;  // Queue of missed state changes
+    void applyDeferredUpdates();  // Apply queued updates when safe
+    
     // Script generation helpers
     std::string generateTransportScript(const EngineState::Transport& transport) const;
     std::string generateModuleScript(const std::string& name, 

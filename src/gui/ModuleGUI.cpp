@@ -473,12 +473,37 @@ std::string ModuleGUI::getModuleTypeName() const {
         return "";
     }
     
+    // CRITICAL FIX (Phase 7.9.7.1): Check if commands are processing before calling module methods
+    // Commands hold exclusive locks on moduleMutex_, so getTypeName() would block
+    // Use cached type name if available, or skip if commands are processing
+    if (engine_) {
+        // Check if commands are processing (would cause deadlock)
+        bool commandsProcessing = engine_->commandsBeingProcessed();
+        if (commandsProcessing) {
+            // Commands processing - return cached type name if available, or empty string
+            // Module types don't change at runtime, so cached value is safe
+            if (!cachedTypeName_.empty()) {
+                return cachedTypeName_;
+            }
+            // No cached value - skip to prevent deadlock
+            ofLogVerbose("ModuleGUI") << "getModuleTypeName() - skipping (commands processing, no cache)";
+            return "";
+        }
+    }
+    
     auto module = registry->getModule(instanceName);
     if (!module) {
         return "";
     }
     
-    return module->getTypeName();
+    std::string typeName = module->getTypeName();
+    
+    // Cache the type name for future use (module types don't change at runtime)
+    if (!typeName.empty()) {
+        const_cast<ModuleGUI*>(this)->cachedTypeName_ = typeName;
+    }
+    
+    return typeName;
 }
 
 void ModuleGUI::setupWindow() {

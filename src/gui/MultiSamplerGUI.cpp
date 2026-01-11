@@ -5,6 +5,7 @@
 #include "modules/MediaPlayer.h"
 #include "modules/Module.h"
 #include "core/ModuleRegistry.h"
+#include "core/Engine.h"  // For commandsBeingProcessed()
 #include "gui/GUIConstants.h"
 #include "gui/MediaPreview.h"
 #include "gui/GUIManager.h"
@@ -143,13 +144,39 @@ void MultiSamplerGUI::drawContent() {
     }
     // If not playing, keep the current selectedSampleIndex_ (user's manual selection)
     
+    // CRITICAL FIX (Phase 7.9.7.1): Cache PlayStyle at start of draw to avoid multiple lock acquisitions
+    // Check if commands are processing before calling getPlayStyle() to prevent deadlock
+    PlayStyle currentPlayStyle = PlayStyle::ONCE;  // Default fallback
+    if (sampler) {
+        // Check if commands are processing before calling getPlayStyle() to prevent deadlock
+        bool commandsProcessing = false;
+        if (engine_) {
+            commandsProcessing = engine_->commandsBeingProcessed();
+        }
+        if (commandsProcessing) {
+            // Commands processing - use cached value if available, otherwise use default
+            if (hasCachedPlayStyle_) {
+                currentPlayStyle = cachedPlayStyle_;
+            } else {
+                // No cache - use default to prevent deadlock
+                ofLogVerbose("MultiSamplerGUI") << "getPlayStyle() - using default (commands processing, no cache)";
+                currentPlayStyle = PlayStyle::ONCE;
+            }
+        } else {
+            // Safe to call - update cache
+            currentPlayStyle = sampler->getPlayStyle();
+            cachedPlayStyle_ = currentPlayStyle;
+            hasCachedPlayStyle_ = true;
+        }
+    }
+    
     // Global Controls (Simple Button Bar - NOT in child window)
-    drawGlobalControls();
+    drawGlobalControls(currentPlayStyle);
     ImGui::Spacing(); // Add spacing after global controls
     
     // ADSR Parameters (ONCE/LOOP modes) or Granular Controls (GRAIN mode)
-    drawADSRParameters();
-    drawGranularControls();
+    drawADSRParameters(currentPlayStyle);
+    drawGranularControls(currentPlayStyle);
     ImGui::Spacing(); // Add spacing after ADSR/granular controls
     
     // Child 1: Parameter table (auto-size to fit content, no extra space)
@@ -207,7 +234,7 @@ void MultiSamplerGUI::drawContent() {
 
 /// MARK: - GLOBAL CONTROLS
 /// @brief Draw simple button bar for global controls (PLAY, PLAY STYLE, POLYPHONY)
-void MultiSamplerGUI::drawGlobalControls() {
+void MultiSamplerGUI::drawGlobalControls(PlayStyle currentPlayStyle) {
     MultiSampler* sampler = getMultiSampler();
     if (!sampler) return;
     
@@ -262,9 +289,9 @@ void MultiSamplerGUI::drawGlobalControls() {
     ImGui::SameLine();
     
     // 2. PLAY STYLE Button (enum - cycles ONCE/LOOP/GRAIN/NEXT)
-    PlayStyle currentStyle = sampler->getPlayStyle();
+    // Use cached PlayStyle passed as parameter (avoids lock acquisition during command processing)
     const char* styleLabel;
-    switch (currentStyle) {
+    switch (currentPlayStyle) {
         case PlayStyle::ONCE: styleLabel = "ONCE"; break;
         case PlayStyle::LOOP: styleLabel = "LOOP"; break;
         case PlayStyle::GRAIN: styleLabel = "GRAIN"; break;
@@ -276,7 +303,7 @@ void MultiSamplerGUI::drawGlobalControls() {
     if (ImGui::Button(styleLabel, ImVec2(buttonWidth, 0))) {
         // Cycle play style: ONCE → LOOP → GRAIN → NEXT → ONCE
         PlayStyle nextStyle;
-        switch (currentStyle) {
+        switch (currentPlayStyle) {
             case PlayStyle::ONCE: nextStyle = PlayStyle::LOOP; break;
             case PlayStyle::LOOP: nextStyle = PlayStyle::GRAIN; break;
             case PlayStyle::GRAIN: nextStyle = PlayStyle::NEXT; break;
@@ -288,7 +315,7 @@ void MultiSamplerGUI::drawGlobalControls() {
     
     if (ImGui::IsItemHovered()) {
         const char* tooltip;
-        switch (currentStyle) {
+        switch (currentPlayStyle) {
             case PlayStyle::ONCE:
                 tooltip = "Play Style: ONCE\nClick to cycle: ONCE → LOOP → GRAIN → NEXT";
                 break;
@@ -1004,13 +1031,13 @@ void MultiSamplerGUI::drawParameters() {
     }
 }
 
-void MultiSamplerGUI::drawADSRParameters() {
+void MultiSamplerGUI::drawADSRParameters(PlayStyle currentPlayStyle) {
     MultiSampler* sampler = getMultiSampler();
     if (!sampler) return;
     
     // Only show ADSR in ONCE and LOOP modes
-    PlayStyle currentStyle = sampler->getPlayStyle();
-    if (currentStyle != PlayStyle::ONCE && currentStyle != PlayStyle::LOOP) {
+    // Use cached PlayStyle passed as parameter (avoids lock acquisition during command processing)
+    if (currentPlayStyle != PlayStyle::ONCE && currentPlayStyle != PlayStyle::LOOP) {
         return;
     }
     
@@ -1101,13 +1128,13 @@ void MultiSamplerGUI::drawADSRParameters() {
     ImGui::EndChild();
 }
 
-void MultiSamplerGUI::drawGranularControls() {
+void MultiSamplerGUI::drawGranularControls(PlayStyle currentPlayStyle) {
     MultiSampler* sampler = getMultiSampler();
     if (!sampler) return;
     
     // Only show granular controls in GRAIN mode
-    PlayStyle currentStyle = sampler->getPlayStyle();
-    if (currentStyle != PlayStyle::GRAIN) {
+    // Use cached PlayStyle passed as parameter (avoids lock acquisition during command processing)
+    if (currentPlayStyle != PlayStyle::GRAIN) {
         return;
     }
     
@@ -2215,7 +2242,25 @@ void MultiSamplerGUI::drawWaveformControls(const ImVec2& canvasPos, const ImVec2
     }
     
     // Draw loop range visualization (when in LOOP play style with loopSize > 0)
-    PlayStyle currentPlayStyle = getMultiSampler()->getPlayStyle();
+    // CRITICAL FIX (Phase 7.9.7.1): Use cached PlayStyle to avoid deadlock
+    // Note: sampler is already declared at the start of drawWaveform()
+    PlayStyle currentPlayStyle = PlayStyle::ONCE;  // Default fallback
+    if (sampler) {
+        if (engine_ && engine_->commandsBeingProcessed()) {
+            // Commands processing - use cached value if available
+            if (hasCachedPlayStyle_) {
+                currentPlayStyle = cachedPlayStyle_;
+            } else {
+                // No cache - use default to prevent deadlock
+                currentPlayStyle = PlayStyle::ONCE;
+            }
+        } else {
+            // Safe to call - update cache
+            currentPlayStyle = sampler->getPlayStyle();
+            cachedPlayStyle_ = currentPlayStyle;
+            hasCachedPlayStyle_ = true;
+        }
+    }
     if (currentPlayStyle == PlayStyle::GRAIN) {
         float grainSizeSeconds = displaySample->currentGrainSize;
         if (grainSizeSeconds > 0.001f) {

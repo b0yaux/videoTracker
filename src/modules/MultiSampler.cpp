@@ -2007,7 +2007,11 @@ void MultiSampler::setParameterImpl(const std::string& paramName, float value, b
     SampleRef& displaySample = sampleBank_[0];  // Use index 0 as default
     
     // Get parameter descriptor to validate range
-    auto paramDescriptors = getParameters();
+    // CRITICAL: Use getParametersImpl() directly instead of getParameters() to avoid deadlock.
+    // setParameterImpl() is called with moduleMutex_ already locked exclusively by Module::setParameter(),
+    // so we cannot acquire a shared lock via getParameters(). getParametersImpl() is safe to call
+    // directly since the lock is already held.
+    auto paramDescriptors = getParametersImpl();
     const ParameterDescriptor* paramDesc = nullptr;
     for (const auto& param : paramDescriptors) {
         if (param.name == paramName) {

@@ -9,9 +9,14 @@
 #include <map>
 #include <utility>  // For std::pair
 
+// Forward declarations
 class MultiSampler;   // Forward declaration
 class MediaPlayer;    // Forward declaration
 class ModuleRegistry; // Forward declaration
+
+// Include MultiSampler.h for PlayStyle enum (needed in header for method signatures)
+// This is safe because MultiSampler.h doesn't include MultiSamplerGUI.h
+#include "modules/MultiSampler.h"  // For PlayStyle enum
 
 // MultiSamplerGUI: GUI for the MultiSampler module (AV sample playback instrument)
 // Formerly known as MediaPoolGUI
@@ -196,13 +201,13 @@ private:
     bool isCellFocused() const { return cellFocusState.hasFocus(); }
     
     // GUI section methods
-    void drawGlobalControls();  // Simple button bar for global controls (PLAY, PLAY STYLE, POLYPHONY) - NOT in child window
+    void drawGlobalControls(PlayStyle currentPlayStyle);  // Simple button bar for global controls (PLAY, PLAY STYLE, POLYPHONY) - NOT in child window
     void drawMediaList();
     void drawWaveform();
     void drawWaveformControls(const ImVec2& canvasPos, const ImVec2& canvasMax, float canvasWidth, float canvasHeight);  // Draw markers and controls on top of waveform
     void drawWaveformPreview(MediaPlayer* player, float width, float height);  // Draw waveform preview in tooltip
-    void drawADSRParameters();  // Draw ADSR envelope parameters in dedicated cellgrid (ONCE/LOOP modes only)
-    void drawGranularControls();  // Draw granular synthesis controls in dedicated cellgrid (GRAIN mode only)
+    void drawADSRParameters(PlayStyle currentPlayStyle);  // Draw ADSR envelope parameters in dedicated cellgrid (ONCE/LOOP modes only)
+    void drawGranularControls(PlayStyle currentPlayStyle);  // Draw granular synthesis controls in dedicated cellgrid (GRAIN mode only)
     void drawParameters();  // New: Draw parameter editing section as one-row table
     
     // Reusable envelope curve editor (for ADSR and future modulation envelopes)
@@ -328,6 +333,10 @@ private:
     std::vector<CellGridColumnConfig> lastColumnConfig;
     std::vector<CellGridColumnConfig> lastADSRColumnConfig;
     std::vector<CellGridColumnConfig> lastGranularColumnConfig;
+    
+    // CRITICAL FIX (Phase 7.9.7.1): Cache PlayStyle to avoid deadlocks during command processing
+    PlayStyle cachedPlayStyle_ = PlayStyle::ONCE;
+    bool hasCachedPlayStyle_ = false;
 };
 
 // Backward compatibility alias (deprecated - use MultiSamplerGUI)

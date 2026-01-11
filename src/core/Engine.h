@@ -29,12 +29,57 @@
 #include <cstdint>
 #include <thread>
 #include <chrono>
+#include <cassert>
 
 // Forward declarations
 class GUIManager;
 class ViewManager;
 
 namespace vt {
+
+// ═══════════════════════════════════════════════════════════
+// THREAD SAFETY ASSERTIONS (Phase 7.9 Plan 5)
+// ═══════════════════════════════════════════════════════════
+
+// Thread safety assertion macros
+// These verify thread safety contracts at runtime to catch violations during development
+
+#ifdef NDEBUG
+    // Release mode: assertions disabled (no performance overhead)
+    #define ASSERT_MAIN_THREAD() ((void)0)
+    #define ASSERT_AUDIO_THREAD() ((void)0)
+    #define ASSERT_THREAD_SAFE() ((void)0)
+#else
+    // Debug mode: assertions enabled
+    // Note: Thread ID comparison is fast (single atomic read + comparison)
+    #define ASSERT_MAIN_THREAD() \
+        do { \
+            if (!Engine::isMainThread()) { \
+                ofLogError("Engine") << "ASSERT_MAIN_THREAD failed: called from thread " \
+                    << std::this_thread::get_id() << ", expected main thread " \
+                    << Engine::getMainThreadId(); \
+                assert(false && "Must be called from main thread"); \
+            } \
+        } while(0)
+    
+    #define ASSERT_AUDIO_THREAD() \
+        do { \
+            if (!Engine::isAudioThread()) { \
+                ofLogError("Engine") << "ASSERT_AUDIO_THREAD failed: called from thread " \
+                    << std::this_thread::get_id() << ", expected audio thread " \
+                    << Engine::getAudioThreadId(); \
+                assert(false && "Must be called from audio thread"); \
+            } \
+        } while(0)
+    
+    #define ASSERT_THREAD_SAFE() \
+        do { \
+            // Thread-safe operations can be called from any thread
+            // This assertion is a placeholder for future thread-safe verification
+            // Currently, thread-safe operations are verified by design (lock-free)
+        } while(0)
+#endif
+
 
 struct EngineConfig {
     std::string masterAudioOutName = "masterAudioOut";
@@ -84,7 +129,15 @@ public:
             : success(s), message(msg), error(err) {}
     };
     
-    // Execute any command - returns result with success/error
+    /**
+     * Execute a command string (e.g., "start", "bpm 120").
+     * 
+     * THREAD-SAFE: Can be called from any thread (main thread or script execution thread).
+     * State updates are enqueued to main thread via notification queue to ensure thread safety.
+     * 
+     * @param command Command string to execute
+     * @return Result indicating success/failure
+     */
     Result executeCommand(const std::string& command);
     
     /**
@@ -176,6 +229,9 @@ public:
      * @return Shared pointer to immutable JSON snapshot, or nullptr if snapshot not yet created
      */
     std::shared_ptr<const ofJson> getStateSnapshot() const {
+        // CRITICAL FIX (Phase 7.9 Plan 6 Task 5): Add memory barrier for snapshot reads
+        // Memory barrier ensures we see the latest snapshot update
+        std::atomic_thread_fence(std::memory_order_acquire);
         std::lock_guard<std::mutex> lock(snapshotJsonMutex_);
         return snapshotJson_;  // Fast read with mutex (C++17 compatible)
     }
@@ -257,7 +313,11 @@ public:
     int processCommands();
     
     /**
-     * Execute a command immediately (synchronous, for non-audio operations)
+     * Execute a command immediately (synchronous, for non-audio operations).
+     * 
+     * THREAD-SAFE: Can be called from any thread (main thread via ClockGUI, or script execution thread via SWIG).
+     * State updates are enqueued to main thread via notification queue to ensure thread safety.
+     * 
      * @param cmd Command to execute (takes ownership)
      */
     void executeCommandImmediate(std::unique_ptr<Command> cmd);
@@ -360,6 +420,50 @@ public:
      * @return true if buildStateSnapshot() is currently executing on this thread
      */
     static bool isBuildingSnapshot() { return isBuildingSnapshot_; }
+    
+    // ═══════════════════════════════════════════════════════════
+    // THREAD ID TRACKING (Phase 7.9 Plan 5)
+    // ═══════════════════════════════════════════════════════════
+    
+    /**
+     * Set main thread ID (called during Engine::setup())
+     * @param threadId Main thread ID
+     */
+    static void setMainThreadId(std::thread::id threadId) { mainThreadId_ = threadId; }
+    
+    /**
+     * Set audio thread ID (called during Engine::setupAudio())
+     * @param threadId Audio thread ID
+     */
+    static void setAudioThreadId(std::thread::id threadId) { audioThreadId_ = threadId; }
+    
+    /**
+     * Get main thread ID
+     * @return Main thread ID
+     */
+    static std::thread::id getMainThreadId() { return mainThreadId_; }
+    
+    /**
+     * Get audio thread ID
+     * @return Audio thread ID
+     */
+    static std::thread::id getAudioThreadId() { return audioThreadId_; }
+    
+    /**
+     * Check if current thread is main thread
+     * @return true if current thread is main thread
+     */
+    static bool isMainThread() {
+        return std::this_thread::get_id() == mainThreadId_;
+    }
+    
+    /**
+     * Check if current thread is audio thread
+     * @return true if current thread is audio thread
+     */
+    static bool isAudioThread() {
+        return std::this_thread::get_id() == audioThreadId_;
+    }
     bool commandsBeingProcessed() const { return hasUnsafeState(UnsafeState::COMMANDS_PROCESSING); }
     bool hasPendingCommands() const { return commandQueue_.size_approx() > 0; }
     bool isInUnsafeState() const { 
@@ -556,6 +660,13 @@ private:
     // When used: buildStateSnapshot() sets this flag, getCurrentScript() checks it
     // Still needed: Yes - Prevents deadlock when buildStateSnapshot() calls getCurrentScript()
     static thread_local bool isBuildingSnapshot_;
+    
+    // Thread ID tracking (Phase 7.9 Plan 5)
+    // Purpose: Track main and audio thread IDs for thread safety assertions
+    // When used: ASSERT_MAIN_THREAD() and ASSERT_AUDIO_THREAD() macros
+    // Still needed: Yes - Enables runtime thread safety verification
+    static std::thread::id mainThreadId_;
+    static std::thread::id audioThreadId_;
     
     // Immutable JSON snapshot for lock-free serialization
     // Purpose: Lock-free JSON snapshot for serialization (from Phase 7.2)

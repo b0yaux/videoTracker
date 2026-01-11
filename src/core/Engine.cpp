@@ -17,6 +17,10 @@ namespace vt {
 // Thread-local flag to detect recursive snapshot building
 thread_local bool Engine::isBuildingSnapshot_ = false;
 
+// Thread ID tracking (Phase 7.9 Plan 5)
+std::thread::id Engine::mainThreadId_;
+std::thread::id Engine::audioThreadId_;
+
 // Helper methods for unsafe state management
 void Engine::setUnsafeState(UnsafeState state, bool active) {
     uint8_t flag = static_cast<uint8_t>(state);
@@ -54,6 +58,8 @@ Engine::~Engine() {
 }
 
 void Engine::setup(const EngineConfig& config) {
+    // Track main thread ID for thread safety assertions (Phase 7.9 Plan 5)
+    setMainThreadId(std::this_thread::get_id());
     
     if (isSetup_) {
         ofLogWarning("Engine") << "Engine already setup, skipping";
@@ -542,10 +548,16 @@ void Engine::initializeProjectAndSession() {
         sessionManager_.enableAutoSave(config_.autoSaveInterval, onUpdateWindowTitle_);
     }
     
-    notifyStateChange();
+    // Use deferred notification pattern for consistency with all other state changes
+    // This ensures notifications happen on main thread event loop, not during setup
+    enqueueStateNotification();
 }
 
 void Engine::setupAudio(int sampleRate, int bufferSize) {
+    // Track audio thread ID for thread safety assertions (Phase 7.9 Plan 5)
+    // Note: Audio thread ID is set when audioOut() is first called (from audio thread)
+    // This method is called from main thread, so we can't set it here
+    // Audio thread ID will be set in audioOut() on first call
     if (masterAudioOut_) {
         // AudioOutput manages its own soundStream internally
         // This is a placeholder for future audio setup if needed
@@ -573,15 +585,13 @@ Engine::Result Engine::executeCommand(const std::string& command) {
         // Restore old callback
         commandExecutor_.setOutputCallback(oldCallback);
         
-        // CRITICAL FIX: Update state snapshot immediately after command execution
-        // This ensures state is synchronized before notifications are sent
-        // This matches the pattern used by executeCommandImmediate()
-        updateStateSnapshot();  // Create new immutable JSON snapshot
-        
-        // CRITICAL FIX: Use deferred notification pattern instead of calling notifyStateChange() directly
-        // This prevents recursive notifications when commands are executed during state notifications.
-        // Notifications are enqueued and processed on main thread, ensuring thread safety and preventing infinite recursion.
-        enqueueStateNotification();
+        // CRITICAL FIX (Phase 7.9.7): Don't call updateStateSnapshot() directly
+        // executeCommand() can be called from any thread (main thread or script execution thread)
+        // updateStateSnapshot() must only be called from main thread (has ASSERT_MAIN_THREAD())
+        // enqueueStateNotification() will call updateStateSnapshot() on main thread via notification queue
+        // This prevents race conditions where both threads try to serialize modules simultaneously
+        // This matches the pattern used by processCommands() (line 2436)
+        enqueueStateNotification();  // Enqueues updateStateSnapshot() to main thread
         
         // Return captured output (or success message if no output)
         if (!capturedOutput.empty()) {
@@ -932,43 +942,14 @@ Engine::Result Engine::executeScriptInBackground(const std::string& script, int 
         auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
         
         if (success) {
-            // CRITICAL: Wait for command queue to be processed before returning
-            // This ensures state is updated before callback fires
-            // Commands from async execution are enqueued during script execution
-            // Audio thread processes commands asynchronously at ~86Hz (44.1kHz / 512 samples)
-            ofLogVerbose("Engine") << "Script execution completed successfully (elapsed: " << elapsedMs << "ms), waiting for command processing...";
-            
-            auto startWait = std::chrono::steady_clock::now();
-            const int MAX_WAIT_MS = 1000;  // 1 second max wait
-            
-            // Wait for commands to be processed by audio thread
-            // Since ReaderWriterQueue doesn't have empty() method, we use a timeout-based approach
-            // Audio thread runs at ~86Hz, so 100ms gives ~8-9 cycles to process commands
-            int waitIterations = 0;
-            while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                       std::chrono::steady_clock::now() - startWait).count() < MAX_WAIT_MS) {
-                // Check if commands are being processed (audio thread is active)
-                // If commands are not being processed and we've waited a bit, commands are likely processed
-                if (!hasUnsafeState(UnsafeState::COMMANDS_PROCESSING) && waitIterations > 5) {
-                    // Commands not being processed and we've waited a bit - likely all processed
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                waitIterations++;
-            }
-            
-            auto waitTime = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - startWait).count();
-            
-            // Give audio thread one more cycle to update state snapshots
-            // Audio thread runs at ~86Hz, so 50ms is ~4-5 cycles
+            // CRITICAL FIX (Phase 7.9.6 Crash Fix): Commands are now processed even during script execution
+            // No need to wait - commands are processed immediately by audio thread
+            // Audio thread runs at ~86Hz (44.1kHz / 512 samples), so commands are processed quickly
+            // Give audio thread a few cycles to process commands and update state snapshots
+            // Audio thread runs at ~86Hz, so 50ms is ~4-5 cycles (enough for command processing)
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             
-            if (waitTime < MAX_WAIT_MS) {
-                ofLogVerbose("Engine") << "Command processing wait completed after " << waitTime << "ms (" << waitIterations << " iterations)";
-            } else {
-                ofLogWarning("Engine") << "Command processing wait timed out after " << waitTime << "ms - some commands may not be processed";
-            }
+            ofLogVerbose("Engine") << "Script execution completed successfully (elapsed: " << elapsedMs << "ms)";
             
             return Result(true, "Script executed successfully");
         } else {
@@ -1016,9 +997,13 @@ void Engine::syncScriptToEngine(const std::string& script, std::function<void(bo
         // Commands are already processed by evalAsync callback (from Phase 7.7)
         // Now wait for state version to be updated
         
-        // Wait for state version to reach target version
-        // This ensures state snapshot is updated with script changes
+        // CRITICAL FIX (Phase 7.9 Plan 6 Task 2): Wait for state version to reach target version
+        // This ensures state snapshot is updated with script changes BEFORE callback fires
+        // State version increments in updateStateSnapshot() which is called after commands are processed
         waitForStateVersion(targetVersion, 1000);  // 1 second timeout
+        
+        // Add memory barrier to ensure state snapshot is visible
+        std::atomic_thread_fence(std::memory_order_acquire);
         
         // Verify state version was updated
         uint64_t finalVersion = stateVersion_.load();
@@ -1234,6 +1219,7 @@ void Engine::unsubscribe(size_t id) {
 }
 
 void Engine::notifyStateChange() {
+    ASSERT_MAIN_THREAD();
     
     // CRITICAL: Prevent recursive notifications
     // If an observer calls notifyStateChange() during notification, ignore it
@@ -1270,6 +1256,7 @@ void Engine::notifyStateChange() {
     // Prevents main thread blocking from excessive snapshot generation
     // which was causing engine to appear frozen
     // BUT: Always notify observers - use cached state when throttled
+    // MEMORY SAFETY (Phase 7.9 Plan 4): getState() returns deep copies via buildStateSnapshot()
     uint64_t now = getCurrentTimestamp();
     uint64_t lastTime = lastStateSnapshotTime_.load();
     bool shouldBuildSnapshot = (now - lastTime >= STATE_SNAPSHOT_THROTTLE_MS);
@@ -1283,6 +1270,7 @@ void Engine::notifyStateChange() {
         // CRITICAL FIX: Use getState() instead of buildStateSnapshot() directly
         // getState() handles unsafe periods by returning cached state
         // This prevents crashes when notifyStateChange() is called during script execution
+        // MEMORY SAFETY: getState() returns deep copies (no shared references)
         state = getState();
     } else {
         // Throttled - use cached state to avoid expensive snapshot building
@@ -1363,6 +1351,13 @@ void Engine::notifyObserversWithState() {
     // Called from queued notification callbacks (event-driven pattern)
     // Includes all safety checks (recursive guard, throttling, etc.)
     
+    // MEMORY SAFETY (Phase 7.9 Plan 4): Observers receive deep copies of state
+    // - getState() calls buildStateSnapshot() which creates deep copies of module snapshots
+    // - Cached state is also built via buildStateSnapshot() with deep copies
+    // - EngineState is passed by value to observers (copy of struct)
+    // - All JSON data (typeSpecificData) is deep copied, no shared references
+    // - Safe even if modules/connections are deleted after observer receives state
+    
     // CRITICAL: Prevent recursive notifications
     bool expected = false;
     if (!notifyingObservers_.compare_exchange_strong(expected, true)) {
@@ -1370,6 +1365,11 @@ void Engine::notifyObserversWithState() {
         ofLogWarning("Engine") << "Recursive notifyObserversWithState() call detected and ignored";
         return;
     }
+    
+    // CRITICAL FIX (Phase 7.9 Plan 6 Task 2): Ensure state version matches engine version
+    // State version only increments AFTER commands are processed and snapshot is updated
+    // If state version is stale, rebuild snapshot to ensure observers see fresh state
+    uint64_t currentEngineVersion = stateVersion_.load();
     
     // Get current state (with throttling and caching)
     uint64_t now = getCurrentTimestamp();
@@ -1379,20 +1379,37 @@ void Engine::notifyObserversWithState() {
     EngineState state;
     if (shouldBuildSnapshot) {
         lastStateSnapshotTime_.store(now);
-        state = getState();
+        state = getState();  // Deep copy via buildStateSnapshot()
+        // Ensure state version matches engine version (should match after getState())
+        state.version = currentEngineVersion;
     } else {
-        // Throttled - use cached state
+        // Throttled - use cached state (also deep copied when cached)
         std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
         if (cachedState_) {
-            state = *cachedState_;
+            state = *cachedState_;  // Copy of cached state (deep copies preserved)
+            // CRITICAL FIX: Verify cached state version matches engine version
+            // If stale, rebuild snapshot to ensure observers see fresh state
+            if (state.version < currentEngineVersion) {
+                // Cached state is stale - rebuild snapshot
+                lock.unlock();  // Release lock before calling getState()
+                ofLogVerbose("Engine") << "Cached state is stale (version: " << state.version 
+                                       << ", engine: " << currentEngineVersion 
+                                       << ") - rebuilding snapshot";
+                state = getState();  // Deep copy via buildStateSnapshot()
+                state.version = currentEngineVersion;
+            } else {
+                // Cached state is current - update version to match engine
+                state.version = currentEngineVersion;
+            }
         } else {
             // No cached state available - build snapshot anyway
             ofLogWarning("Engine") << "notifyObserversWithState() throttled but no cached state available - building snapshot anyway";
-            state = getState();
+            state = getState();  // Deep copy via buildStateSnapshot()
+            state.version = currentEngineVersion;
         }
     }
     
-    // Call all observers
+    // Call all observers with deep-copied state (passed by value)
     std::vector<size_t> brokenObservers;
     
     std::shared_lock<std::shared_mutex> lock(stateMutex_);
@@ -1467,9 +1484,15 @@ void Engine::enqueueStateNotification() {
     // Enqueue state notification to be processed on main thread
     // This replaces the stateNeedsNotification_ flag pattern - queue is single source of truth
     notificationQueue_.enqueue([this]() {
-        // Update snapshot before notifying (ensures state is current)
+        // CRITICAL FIX (Phase 7.9 Plan 6 Task 2): Update snapshot before notifying
+        // This ensures state snapshot reflects processed commands before observers are notified
+        // State version increments in updateStateSnapshot(), ensuring observers see fresh state
         updateStateSnapshot();
-        // Notify observers with current state
+        
+        // Add memory barrier to ensure snapshot update is visible to observers
+        std::atomic_thread_fence(std::memory_order_release);
+        
+        // Notify observers with current state (state version verified in notifyObserversWithState())
         notifyObserversWithState();
     });
 }
@@ -1549,6 +1572,8 @@ void Engine::onBPMChanged(float& newBpm) {
 }
 
 EngineState Engine::buildStateSnapshot() const {
+    ASSERT_MAIN_THREAD();
+    
     // CRITICAL FIX: Set thread-local flag to prevent recursive snapshot building
     // This prevents getCurrentScript() from calling getState() during snapshot building
     // Use RAII to ensure flag is always restored, even on exceptions or early returns
@@ -1757,6 +1782,7 @@ void Engine::waitForStateVersion(uint64_t targetVersion, uint64_t timeoutMs) {
 }
 
 void Engine::updateStateSnapshot() {
+    ASSERT_MAIN_THREAD();
     // Increment version number (atomic)
     uint64_t versionBefore = stateVersion_.load();
     uint64_t version = stateVersion_.fetch_add(1) + 1;
@@ -1768,14 +1794,26 @@ void Engine::updateStateSnapshot() {
     transport.bpm = clock_.getTargetBPM();  // Use getTargetBPM() like buildTransportState()
     transport.currentBeat = 0;  // TODO: Get from Clock if available
     
-    // CRITICAL: Update all module snapshots before reading them
-    // Module snapshots need to be refreshed after parameter changes
-    // This ensures we have current state when aggregating snapshots
-    moduleRegistry_.forEachModule([](const std::string& uuid, const std::string& humanName, std::shared_ptr<Module> module) {
-        if (module) {
-            module->updateSnapshot();  // Update snapshot with current module state
-        }
-    });
+    // CRITICAL FIX (Phase 7.9.7.1): Check if commands are processing before updating snapshots
+    // Commands hold exclusive locks on moduleMutex_, so updateSnapshot() would block
+    // Skip snapshot update if commands are processing (will be updated after commands complete)
+    bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
+    
+    if (!commandsProcessing) {
+        // Safe to update snapshots - no exclusive locks held
+        // CRITICAL: Update all module snapshots before reading them
+        // Module snapshots need to be refreshed after parameter changes
+        // This ensures we have current state when aggregating snapshots
+        moduleRegistry_.forEachModule([](const std::string& uuid, const std::string& humanName, std::shared_ptr<Module> module) {
+            if (module) {
+                module->updateSnapshot();  // ✅ Safe - no exclusive locks
+            }
+        });
+    } else {
+        // Commands processing - skip snapshot update (will be updated after commands complete)
+        // Use existing snapshots (they're still valid, just may be slightly stale)
+        ofLogVerbose("Engine") << "updateStateSnapshot() - skipping snapshot update (commands processing)";
+    }
     
     // Get module snapshots (lock-free - Module::getSnapshot() uses mutex, but forEachModule handles registry locking)
     // This is the key difference from buildStateSnapshot() - we use module snapshots instead of building from scratch
@@ -1786,8 +1824,10 @@ void Engine::updateStateSnapshot() {
             // Hold shared_ptr reference to prevent destruction during copy
             auto moduleSnapshot = module->getSnapshot();  // Fast read with mutex (C++17 compatible)
             if (moduleSnapshot) {
-                // CRITICAL: Make a safe copy by serializing and deserializing
+                // CRITICAL FIX (Phase 7.9 Plan 6 Task 5): Make a safe copy by serializing and deserializing
                 // This prevents memory corruption if the original JSON is being destroyed
+                // Add memory barrier to ensure snapshot is fully constructed before copying
+                std::atomic_thread_fence(std::memory_order_acquire);
                 try {
                     std::string jsonStr = moduleSnapshot->dump();
                     modulesJson[humanName] = ofJson::parse(jsonStr);
@@ -1850,10 +1890,14 @@ void Engine::updateStateSnapshot() {
     // Version (for conflict detection)
     json["version"] = version;
     
+    // CRITICAL FIX (Phase 7.9 Plan 6 Task 5): Ensure snapshot updates are atomic
     // Create immutable JSON snapshot and update pointer with mutex (C++17 compatible)
+    // Add memory barrier to ensure snapshot update is visible to all threads
     {
         std::lock_guard<std::mutex> lock(snapshotJsonMutex_);
         snapshotJson_ = std::make_shared<const ofJson>(std::move(json));
+        // Memory barrier ensures snapshot update is visible to all threads
+        std::atomic_thread_fence(std::memory_order_release);
     }
 }
 
@@ -1917,11 +1961,21 @@ bool Engine::buildModuleStates(EngineState& state) const {
             return;  // Abort iteration - can't return bool from void callback
         }
         
+        // MEMORY SAFETY (Phase 7.9 Plan 4): Validate module pointer before access
+        // shared_ptr ensures module won't be deleted during iteration, but validate anyway
         if (!module) {
             modulesSkipped++;
+            ofLogWarning("Engine") << "buildModuleStates() - null module pointer for " << name << " (skipping)";
             return;
         }
         
+        // MEMORY SAFETY: Validate module is still valid (shared_ptr check)
+        // This is defensive - shared_ptr should prevent deletion, but verify
+        if (module.use_count() == 0) {
+            ofLogError("Engine") << "MEMORY SAFETY VIOLATION: Module " << name << " has zero reference count";
+            modulesSkipped++;
+            return;
+        }
         
         // CRITICAL: Check unsafe state again right before accessing module
         // Commands can start processing between the loop check and module access
@@ -1935,6 +1989,11 @@ bool Engine::buildModuleStates(EngineState& state) const {
         moduleState.name = name;
         std::string moduleType;
         try {
+            // MEMORY SAFETY: Validate module before calling methods
+            if (!module) {
+                ofLogError("Engine") << "MEMORY SAFETY VIOLATION: Module " << name << " became null during processing";
+                return;
+            }
             moduleType = module->getTypeName();
             moduleState.type = moduleType;
         } catch (const std::exception& e) {
@@ -2096,10 +2155,31 @@ bool Engine::buildModuleStates(EngineState& state) const {
             }
         }
         
-        // SIMPLIFIED: Store module snapshot JSON directly (no variant type checking)
-        // Modules control their own serialization, Engine just stores it
-        // This eliminates variant complexity and makes serialization straightforward
-        moduleState.typeSpecificData = moduleSnapshot;
+        // CRITICAL FIX (Phase 7.9 Plan 4): Deep copy module snapshot JSON to prevent use-after-free
+        // If module is deleted during snapshot iteration, shallow copy would become invalid
+        // Deep copy via serialization/deserialization ensures snapshot is fully independent
+        // This matches the pattern used in updateStateSnapshot() (Phase 7.2)
+        ofJson deepCopiedSnapshot;
+        try {
+            if (moduleSnapshot.is_object() || moduleSnapshot.is_array()) {
+                // Serialize and deserialize to create deep copy
+                std::string jsonStr = moduleSnapshot.dump();
+                deepCopiedSnapshot = ofJson::parse(jsonStr);
+            } else {
+                // For primitive types, assignment is already a copy
+                deepCopiedSnapshot = moduleSnapshot;
+            }
+        } catch (const std::exception& e) {
+            ofLogError("Engine") << "Exception creating deep copy of module snapshot for " << name << ": " << e.what();
+            // Fallback to empty JSON if deep copy fails
+            deepCopiedSnapshot = ofJson();
+        } catch (...) {
+            ofLogError("Engine") << "Unknown exception creating deep copy of module snapshot for " << name;
+            deepCopiedSnapshot = ofJson();
+        }
+        
+        // Store deep-copied snapshot (fully independent, no shared references)
+        moduleState.typeSpecificData = deepCopiedSnapshot;
         
         try {
             state.modules[name] = moduleState;
@@ -2121,35 +2201,42 @@ bool Engine::buildModuleStates(EngineState& state) const {
 }
 
 void Engine::buildConnectionStates(EngineState& state) const {
+    // MEMORY SAFETY (Phase 7.9 Plan 4): Connection snapshots are already deep copies
+    // ConnectionInfo contains only value types (strings, bool) - all copied by value
+    // No shared references - snapshot is fully independent even if connection is deleted
     auto connections = connectionManager_.getConnections();
     for (const auto& conn : connections) {
         ConnectionInfo info;
-        info.sourceModule = conn.sourceModule;
-        info.targetModule = conn.targetModule;
+        info.sourceModule = conn.sourceModule;      // String copy (deep)
+        info.targetModule = conn.targetModule;     // String copy (deep)
         info.connectionType = (conn.type == ConnectionManager::ConnectionType::AUDIO) ? "AUDIO" :
                              (conn.type == ConnectionManager::ConnectionType::VIDEO) ? "VIDEO" :
                              (conn.type == ConnectionManager::ConnectionType::PARAMETER) ? "PARAMETER" : "EVENT";
-        info.sourcePath = conn.sourcePath;
-        info.targetPath = conn.targetPath;
-        info.eventName = conn.eventName;
-        info.active = conn.active;
+        info.sourcePath = conn.sourcePath;         // String copy (deep)
+        info.targetPath = conn.targetPath;         // String copy (deep)
+        info.eventName = conn.eventName;           // String copy (deep)
+        info.active = conn.active;                // Bool copy (value type)
         state.connections.push_back(info);
     }
 }
 
 void Engine::audioOut(ofSoundBuffer& buffer) {
+    // Track audio thread ID on first call (Phase 7.9 Plan 5)
+    static std::once_flag audioThreadIdSet;
+    std::call_once(audioThreadIdSet, [this]() {
+        setAudioThreadId(std::this_thread::get_id());
+    });
+    
+    ASSERT_AUDIO_THREAD();
+    
     // CRITICAL: Process unified command queue (all commands: parameters, structural changes, etc.)
     // This handles all state mutations in a single, unified queue
     // Parameter changes (SetParameterCommand) and structural changes all go through here
-    // CRITICAL FIX: Don't process commands during script execution - defer until after script completes
-    // This prevents state changes during script execution which cause buildModuleStates() to abort and crash
-    if (!hasUnsafeState(UnsafeState::SCRIPT_EXECUTING)) {
-        processCommands();
-    } else {
-        // Script is executing - defer command processing until after script completes
-        // Commands will be processed on next audio buffer after script execution finishes
-        ofLogVerbose("Engine") << "Deferring command processing - script execution in progress";
-    }
+    // CRITICAL FIX (Phase 7.9.6 Crash Fix): Process commands even during script execution
+    // Commands are safe to process - they're just state mutations in different threads
+    // buildModuleStates() already has unsafe state checks to prevent crashes
+    // Deferring command processing causes deadlock: script waits for commands that never get processed
+    processCommands();
     
     // CRITICAL: Process Clock first to generate timing events
     clock_.audioOut(buffer);
@@ -2164,6 +2251,7 @@ void Engine::audioOut(ofSoundBuffer& buffer) {
 }
 
 void Engine::update(float deltaTime) {
+    ASSERT_MAIN_THREAD();
     
     // Increment frame counter
     size_t frameCount = updateFrameCount_.fetch_add(1) + 1;
@@ -2316,6 +2404,8 @@ bool Engine::enqueueCommand(std::unique_ptr<Command> cmd) {
 }
 
 int Engine::processCommands() {
+    ASSERT_AUDIO_THREAD();
+    
     // CRITICAL FIX: Set flag to prevent state snapshots during command execution
     // This prevents crashes when commands trigger state changes (e.g., clock:start())
     setUnsafeState(UnsafeState::COMMANDS_PROCESSING, true);
@@ -2357,6 +2447,12 @@ int Engine::processCommands() {
     // Enqueue notification instead - main thread will process queue in update()
     // This prevents thread safety issues with buildStateSnapshot() and module registry access
     // updateStateSnapshot() accesses moduleRegistry_ which is not safe from audio thread
+    
+    // CRITICAL FIX (Phase 7.9 Plan 6 Task 2): Add memory barrier after command processing
+    // This ensures command execution is complete before notification is enqueued
+    // Prevents race conditions where notification fires before commands are fully processed
+    std::atomic_thread_fence(std::memory_order_release);
+    
     if (processed > 0) {
         enqueueStateNotification();
     }
@@ -2372,16 +2468,14 @@ void Engine::executeCommandImmediate(std::unique_ptr<Command> cmd) {
     
     try {
         cmd->execute(*this);
-        // CRITICAL FIX: Update state snapshot immediately after command execution
-        // This ensures state is synchronized before notifications are sent
-        // This matches the pattern used by processCommands()
-        updateStateSnapshot();  // Create new immutable JSON snapshot
         
-        // CRITICAL FIX: Use deferred notification pattern instead of calling notifyStateChange() directly
-        // This prevents recursive notifications when commands are executed during state notifications
-        // (e.g., when an observer triggers a command). Notifications are enqueued and processed on main thread,
-        // ensuring thread safety and preventing infinite recursion.
-        enqueueStateNotification();
+        // CRITICAL FIX (Phase 7.9.7): Don't call updateStateSnapshot() directly
+        // executeCommandImmediate() can be called from any thread (main thread via ClockGUI, or script execution thread via SWIG)
+        // updateStateSnapshot() must only be called from main thread (has ASSERT_MAIN_THREAD())
+        // enqueueStateNotification() will call updateStateSnapshot() on main thread via notification queue
+        // This prevents race conditions where both threads try to serialize modules simultaneously
+        // This matches the pattern used by processCommands() (line 2436)
+        enqueueStateNotification();  // Enqueues updateStateSnapshot() to main thread
         
         // NOTE: Removed onCommandExecuted() callback - state observer handles all sync now
     } catch (const std::exception& e) {
