@@ -40,43 +40,22 @@ void ScriptManager::setup() {
             return;
         }
         
-        // CRITICAL FIX (Phase 7.9 Plan 6 Task 3): Don't skip updates - use deferred updates instead
-        // Track missed state changes during script execution and command processing
-        // Apply updates when safe (after script execution completes)
-        // This ensures all state changes are eventually reflected in script
-        
-        bool isExecutingScript = engine_ && engine_->isExecutingScript();
-        bool commandsProcessing = engine_ && engine_->commandsBeingProcessed();
-        
-        if (isExecutingScript || commandsProcessing) {
-            // Queue state change for deferred processing
-            ofLogVerbose("ScriptManager") << "Deferring script update - " 
-                                          << (isExecutingScript ? "script execution" : "command processing") 
-                                          << " in progress (state version: " << state.version << ")";
-            deferredUpdates_.push_back({state, state.version});
-            return;  // Don't update now, but queue for later
+        // Single atomic guard replaces 4 nested guards
+        // Use compare_exchange_strong to atomically transition from IDLE to UPDATING
+        UpdateState expected = UpdateState::IDLE;
+        if (updateState_.compare_exchange_strong(expected, UpdateState::UPDATING)) {
+            // We acquired the lock - safe to update
+            try {
+                updateScriptFromState(state);
+            } catch (...) {
+                // Log error but don't crash
+                ofLogError("ScriptManager") << "Exception in updateScriptFromState";
+            }
+            // Release the lock
+            updateState_.store(UpdateState::IDLE);
         }
-        
-        // State is safe - apply any deferred updates first, then update immediately
-        applyDeferredUpdates();
-        
-        // State version verification handles pending command detection:
-        // State version only increments AFTER commands are processed by audio thread (in updateStateSnapshot())
-        // Therefore, if state.version < engine_->getStateVersion(), commands are pending → defer regeneration
-        // This is more reliable than hasPendingCommands() with size_approx() which has race conditions
-        // (confirmed by debug logs: commands enqueued but hasPendingCommands() returned false)
-        
-        // State is safe - update immediately (state version check happens in updateScriptFromState())
-        
-        // CRITICAL: Log immediately before calling updateScriptFromState
-        {
-        }
-        
-        updateScriptFromState(state);
-        
-        // CRITICAL: Log immediately after calling updateScriptFromState
-        {
-        }
+        // If compare_exchange failed, state was already UPDATING - skip this update
+        // This is correct: if we're already updating, the state will be refreshed when that update completes
     });
     
     // Generate initial script from CURRENT state (after session load)
@@ -89,9 +68,7 @@ void ScriptManager::setup() {
 }
 
 std::string ScriptManager::generateScriptFromState(const EngineState& state) const {
-    // CRITICAL FIX: Use passed state instead of calling getState() again
-    // This prevents double snapshot building and crashes
-    // The state is already provided by the observer callback
+    // Use passed state to avoid double snapshot building
     std::ostringstream script;
     
     script << "-- videoTracker Session Script\n\n";
@@ -446,10 +423,6 @@ std::string ScriptManager::generatePatternScript(
     try {
         auto& patternRuntime = engine_->getPatternRuntime();
         
-        
-        // CRITICAL FIX: Use thread-safe method that returns step count directly
-        // This ensures the value is copied while the lock is still held
-        
         int stepCount = patternRuntime.getPatternStepCount(patternName);
         
         
@@ -472,56 +445,20 @@ std::string ScriptManager::generatePatternScript(
 
 void ScriptManager::updateScriptFromState(const EngineState& state) {
     
-    // CRITICAL: Check if script is executing BEFORE any script generation
-    // If script is executing, defer update - script execution will complete, then observer will fire again
-    // This prevents ScriptManager from regenerating script during execution, which causes crashes
-    if (engine_ && engine_->isExecutingScript()) {
-        ofLogVerbose("ScriptManager") << "Deferring script update - script execution in progress";
-        return;  // Return immediately without calling generateScriptFromState()
-    }
-    
-    // CRITICAL FIX: Check render guard to prevent script updates during rendering
-    // This prevents crashes from script updates during ImGui rendering
-    // Script generation is now event-driven (via notification queue), not timing-based
-    if (engine_ && engine_->isRendering()) {
-        ofLogVerbose("ScriptManager") << "Deferring script update - rendering in progress";
-        return;  // Return immediately without calling generateScriptFromState()
-    }
-    
-    // CRITICAL: Verify state version is current (not stale)
-    // This ensures script generation sees consistent, up-to-date state
-    // State version should match or be close to current engine version
+    // State version verification handles pending command detection
+    // State version only increments AFTER commands are processed
+    // If state.version < engine_->getStateVersion(), commands are pending
+    // Exception: Allow version 0 during initialization
     uint64_t stateVersion = state.version;
     if (engine_) {
         uint64_t currentEngineVersion = engine_->getStateVersion();
         
-        
-        // CRITICAL: Reject ANY stale state to prevent feedback loops
-        // State version only increments AFTER commands are processed by audio thread
-        // If state.version < currentEngineVersion, commands are pending → defer regeneration
-        // Exception: Allow version 0 during initialization (valid initial state)
         if (stateVersion > 0 && stateVersion < currentEngineVersion) {
-            ofLogWarning("ScriptManager") << "State version is stale (state: " << stateVersion 
+            ofLogVerbose("ScriptManager") << "State version is stale (state: " << stateVersion 
                                           << ", engine: " << currentEngineVersion 
-                                          << ") - deferring script generation (commands pending)";
-            return;  // Defer until commands are processed and state version increments
+                                          << ") - deferring script generation";
+            return;
         }
-        
-        // Log when state version check passes (state is current)
-        if (stateVersion >= currentEngineVersion || stateVersion == 0) {
-            ofLogNotice("ScriptManager") << "State version check passed (state: " << stateVersion 
-                                         << ", engine: " << currentEngineVersion 
-                                         << ") - proceeding with script generation";
-        }
-    }
-    
-    // Don't defer during command processing - state is already consistent when this is called
-    
-    // Check if we've already regenerated from this state version (prevent redundant regenerations)
-    if (stateVersion > 0 && stateVersion <= lastRegeneratedVersion_) {
-        ofLogVerbose("ScriptManager") << "Skipping redundant script regeneration (state version: " << stateVersion 
-                                      << ", last regenerated: " << lastRegeneratedVersion_ << ")";
-        return;
     }
     
     // Check if state actually changed
@@ -529,19 +466,10 @@ void ScriptManager::updateScriptFromState(const EngineState& state) {
         return;
     }
     
-    
-    // CRITICAL FIX: Use passed state instead of calling getState() again
-    // This prevents double snapshot building and crashes
-    // The state is already provided by the observer callback
     try {
         std::string generatedScript = generateScriptFromState(state);
         currentScript_ = generatedScript;
-        
-        // Update lastRegeneratedVersion_ immediately after successful script generation
-        // This prevents redundant regenerations if callback triggers recursive state changes
-        lastRegeneratedVersion_ = stateVersion;
-        ofLogNotice("ScriptManager") << "Script successfully regenerated (state version: " << stateVersion 
-                                     << ", lastRegeneratedVersion updated to: " << lastRegeneratedVersion_ << ")";
+        ofLogVerbose("ScriptManager") << "Script regenerated (state version: " << stateVersion << ")";
         
     } catch (const std::exception& e) {
         ofLogError("ScriptManager") << "Exception in generateScriptFromState: " << e.what();
@@ -554,26 +482,17 @@ void ScriptManager::updateScriptFromState(const EngineState& state) {
     scriptNeedsUpdate_ = true;
     lastState_ = state;
     
-    
     // Notify callback (CodeShell will register this)
     if (updateCallback_) {
-        // CRITICAL: Log immediately before calling callback
-        {
-        }
-        
         try {
             updateCallback_(currentScript_);
-            
-            // CRITICAL: Log immediately after calling callback
-            {
-            }
         } catch (const std::exception& e) {
             ofLogError("ScriptManager") << "Exception in updateCallback: " << e.what();
         } catch (...) {
             ofLogError("ScriptManager") << "Unknown exception in updateCallback";
         }
     }
-    
+    }
 }
 
 bool ScriptManager::hasStateChanged(
@@ -584,98 +503,38 @@ bool ScriptManager::hasStateChanged(
     return oldState.toJson() != newState.toJson();
 }
 
-void ScriptManager::applyDeferredUpdates() {
-    // CRITICAL FIX (Phase 7.9 Plan 6 Task 3): Apply queued state changes when safe
-    // This ensures all state changes are eventually reflected in script, even if they
-    // occurred during script execution or command processing
-    
-    if (deferredUpdates_.empty()) {
-        return;  // No deferred updates to apply
-    }
-    
-    // Check if it's safe to apply updates (script execution and command processing complete)
-    bool isExecutingScript = engine_ && engine_->isExecutingScript();
-    bool commandsProcessing = engine_ && engine_->commandsBeingProcessed();
-    
-    if (isExecutingScript || commandsProcessing) {
-        // Still unsafe - wait for next notification
-        ofLogVerbose("ScriptManager") << "Deferred updates still unsafe - " 
-                                      << (isExecutingScript ? "script execution" : "command processing") 
-                                      << " in progress (" << deferredUpdates_.size() << " updates queued)";
-        return;
-    }
-    
-    // Safe to apply updates - process all queued state changes
-    // Apply updates in order (oldest first) to ensure consistency
-    ofLogNotice("ScriptManager") << "Applying " << deferredUpdates_.size() << " deferred state updates";
-    
-    // Find the latest state version (most recent update)
-    uint64_t latestVersion = 0;
-    const EngineState* latestState = nullptr;
-    for (const auto& update : deferredUpdates_) {
-        if (update.stateVersion > latestVersion) {
-            latestVersion = update.stateVersion;
-            latestState = &update.state;
-        }
-    }
-    
-    // Apply the latest state (most recent update contains all changes)
-    if (latestState) {
-        ofLogNotice("ScriptManager") << "Applying deferred update (state version: " << latestVersion << ")";
-        updateScriptFromState(*latestState);
-    }
-    
-    // Clear deferred updates after applying
-    deferredUpdates_.clear();
-    ofLogVerbose("ScriptManager") << "Deferred updates applied and cleared";
-}
-
 void ScriptManager::setScriptUpdateCallback(ScriptUpdateCallback callback) {
     updateCallback_ = callback;
     
-    // CRITICAL FIX: Immediately generate and call callback with current script
-    // This ensures CodeShell gets the FULL script (with modules/connections) when it registers
-    // We force regeneration from current state, not cached script, to ensure it's up-to-date
+    // Only use cached script - never call getState() which could cause issues
     if (updateCallback_ && engine_) {
         try {
-            // Force regeneration from current state (don't use cached script)
-            // This ensures we get modules/connections even if script was generated before they were loaded
-            EngineState currentState = engine_->getState();
-            std::string script = generateScriptFromState(currentState);
-            if (!script.empty()) {
-                // Update cached script and notify callback
-                currentScript_ = script;
-                updateCallback_(script);
-                ofLogNotice("ScriptManager") << "Immediately notified callback with regenerated script (" 
-                                            << script.length() << " chars, " 
-                                            << currentState.modules.size() << " modules, "
-                                            << currentState.connections.size() << " connections)";
+            if (!currentScript_.empty()) {
+                updateCallback_(currentScript_);
+                ofLogVerbose("ScriptManager") << "Immediately notified callback with cached script (" 
+                                             << currentScript_.length() << " chars)";
             } else {
-                ofLogVerbose("ScriptManager") << "No script generated yet - callback will be called when script is generated";
+                // No cached script yet - request update via observer
+                requestUpdate();
             }
         } catch (const std::exception& e) {
-            ofLogError("ScriptManager") << "Exception in immediate callback: " << e.what();
+            ofLogError("ScriptManager") << "Exception in callback registration: " << e.what();
         } catch (...) {
-            ofLogError("ScriptManager") << "Unknown exception in immediate callback";
+            ofLogError("ScriptManager") << "Unknown exception in callback registration";
         }
     }
 }
 
 std::string ScriptManager::getCurrentScript() const {
     
-    // CRITICAL FIX: Prevent recursive snapshot building
-    // If we're currently building a snapshot, return cached script without regenerating
-    // This prevents deadlock when buildStateSnapshot() calls getCurrentScript()
+    // Check if we're building a snapshot - return cached script to prevent deadlock
     if (engine_ && Engine::isBuildingSnapshot()) {
-        ofLogVerbose("ScriptManager") << "getCurrentScript() called during snapshot building - returning cached script to prevent deadlock";
-        // Return cached script (may be empty, but that's okay - it will be populated after snapshot completes)
+        ofLogVerbose("ScriptManager") << "getCurrentScript() called during snapshot building - returning cached script";
         return currentScript_;
     }
     
-    // SIMPLIFIED: getState() handles unsafe periods, so we can call it safely
-    // It will return cached state during unsafe periods
+    // Generate script if needed
     if (currentScript_.empty() && engine_) {
-        
         currentScript_ = generateScriptFromCurrentState();
     }
     return currentScript_;
@@ -707,17 +566,12 @@ std::string ScriptManager::formatLuaValue(const std::string& value) const {
 }
 
 void ScriptManager::requestUpdate() {
-    // CRITICAL FIX: Always defer update and use frame delay to ensure state is stable
-    // This prevents updating from potentially inconsistent state
     if (!engine_) {
         return;
     }
     
-    
-    // Request update - state observer will handle it when state is safe
     scriptNeedsUpdate_ = true;
-    
-    ofLogVerbose("ScriptManager") << "Requested script update - state observer will handle when safe";
+    ofLogVerbose("ScriptManager") << "Requested script update";
 }
 
 } // namespace vt
