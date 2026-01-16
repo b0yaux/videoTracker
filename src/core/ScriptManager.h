@@ -4,6 +4,7 @@
 #include <string>
 #include <functional>
 #include <memory>
+#include <atomic>
 
 namespace vt {
 
@@ -87,17 +88,11 @@ private:
     bool scriptNeedsUpdate_ = false;
     bool autoUpdateEnabled_ = true;
     ScriptUpdateCallback updateCallback_;
-    uint64_t lastRegeneratedVersion_ = 0;  // Track state version used for last successful regeneration
     
-    // CRITICAL FIX (Phase 7.9 Plan 6 Task 3): Deferred update mechanism
-    // Track missed state changes during script execution and command processing
-    // Apply updates when safe (after script execution completes)
-    struct DeferredUpdate {
-        EngineState state;
-        uint64_t stateVersion;
-    };
-    std::vector<DeferredUpdate> deferredUpdates_;  // Queue of missed state changes
-    void applyDeferredUpdates();  // Apply queued updates when safe
+    // Simple atomic state machine for update coordination
+    // Eliminates 3 layers of deferred updates with single atomic guard
+    enum class UpdateState { IDLE, UPDATING };
+    std::atomic<UpdateState> updateState_{UpdateState::IDLE};
     
     // Script generation helpers
     std::string generateTransportScript(const EngineState::Transport& transport) const;
