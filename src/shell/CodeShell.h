@@ -2,6 +2,7 @@
 
 #include "Shell.h"
 #include "CommandShell.h"
+#include <atomic>
 #include <memory>
 
 // Forward declaration - full definition in .cpp
@@ -102,6 +103,9 @@ private:
     bool autoEvalEnabled_ = true;  // Enabled by default - now safe with idempotency + incremental execution
     std::string lastEditorText_;  // Track text changes (what user typed, may not be executed yet)
     std::string lastExecutedScript_;  // Track executed script (for diffing with current text)
+    
+    // Exit guard - prevents callback from accessing object during destruction
+    std::atomic<bool> isExiting_{false};
     
     // Incremental execution configuration
     int maxIncrementalLines_ = 3;  // Max lines to execute incrementally (fallback to full execution if more)

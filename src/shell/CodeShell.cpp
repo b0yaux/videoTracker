@@ -51,6 +51,12 @@ void CodeShell::setup() {
     if (engine_) {
         // Use safe API method instead of direct ScriptManager access
         engine_->setScriptUpdateCallback([this](const std::string& script) {
+            // GUARD: Check if shell is exiting - if so, skip processing
+            // This prevents use-after-free if callback is invoked during exit()
+            if (isExiting_.load()) {
+                return;
+            }
+            
             // Defer script updates to prevent crashes
             // Don't call SetText() directly from callback - it might be called during
             // script execution, ImGui rendering, or from unsafe contexts
@@ -497,16 +503,17 @@ void CodeShell::draw() {
 }
 
 void CodeShell::exit() {
-    // CRITICAL: Unregister script update callback to prevent use-after-free crashes
-    // The callback captures 'this' (CodeShell pointer). If we don't clear it,
-    // ScriptManager may call the callback after CodeShell is destroyed, causing
-    // malloc corruption crashes.
+    // CRITICAL: Set exit flag FIRST, before any other cleanup
+    // This prevents the callback from accessing 'this' if it's invoked during exit
+    isExiting_.store(true);
+    
+    // Now unregister script update callback
     if (engine_) {
         engine_->clearScriptUpdateCallback();
-        ofLogVerbose("CodeShell") << "Script update callback cleared - preventing use-after-free";
+        ofLogVerbose("CodeShell") << "Script update callback cleared immediately on exit - preventing use-after-free";
     }
     
-    // Cleanup embedded REPL shell
+    // Now safe to cleanup embedded REPL shell
     if (replShell_) {
         replShell_->exit();
         replShell_.reset();
@@ -539,7 +546,16 @@ void CodeShell::refreshScriptFromState() {
 }
 
 void CodeShell::setActive(bool active) {
-    Shell::setActive(active);
+    if (active) {
+        // Activating - just set active flag
+        Shell::setActive(active);
+    } else {
+        // Deactivating - call exit() to cleanup callback registration
+        // Use isExiting_ guard to prevent calling exit() multiple times
+        if (!isExiting_.load() && active_) {
+            exit();
+        }
+    }
     
     // Don't call refreshScriptFromState() here
     // The callback mechanism (setScriptUpdateCallback) already handles script updates
