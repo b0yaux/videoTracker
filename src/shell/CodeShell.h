@@ -77,10 +77,11 @@ private:
     float resizeStartY_ = 0.0f;
     float resizeStartRatio_ = 0.0f;
     
-    // Script synchronization (SIMPLIFIED)
-    bool hasManualEdits_ = false;  // If true, user owns editor - no auto-sync
+    // Script synchronization with EditorMode enum (simplified to 2 states)
+    enum class EditorMode { VIEW, EDIT };
+    EditorMode editorMode_ = EditorMode::VIEW;  // Current editor mode
+    std::string userEditBuffer_;  // User's edits (not yet applied)
     bool wasActive_ = false;  // Track previous active state to detect activation
-    bool isExecutingScript_ = false;  // Guard against concurrent access during script execution
     
     // Deferred script update (to prevent crashes during script execution or ImGui rendering)
     std::string pendingScriptUpdate_;
@@ -139,11 +140,12 @@ private:
     // Helper to distinguish user input from command keys
     bool isUserInput(int key) const;
     
-    // State change handler (override from Shell base class)
-    void onStateChanged(const EngineState& state) override;
+    // Copy-on-read helper to prevent use-after-free crashes
+    // GetTextLines() returns a reference that becomes invalid when SetText() is called
+    std::vector<std::string> getTextLinesCopy() const;
     
-    // Cached state for thread-safe access
-    EngineState cachedState_;
+    // State change handler (override from Shell base class)
+    void onStateChanged(const EngineState& state, uint64_t stateVersion) override;
 };
 
 } // namespace shell

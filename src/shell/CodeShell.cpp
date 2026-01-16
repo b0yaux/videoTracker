@@ -12,66 +12,20 @@
 #include <chrono>
 #include <vector>
 #include <algorithm>
-#include <csignal>
-#include <execinfo.h>
-#include <cxxabi.h>
-#include <dlfcn.h>
 #include <thread>
-#include <unistd.h>  // For STDERR_FILENO on macOS
 
 namespace vt {
 namespace shell {
-
-// CRITICAL: Signal handler for crash debugging
-static void crashHandler(int sig) {
-    void *array[50];
-    size_t size = backtrace(array, 50);
-    
-    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/crash.log", std::ios::app);
-    if (logFile.is_open()) {
-        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-        logFile << "=== CRASH DETECTED (signal " << sig << ") at " << now << " ===\n";
-        logFile << "Stack trace:\n";
-        
-        char** messages = backtrace_symbols(array, size);
-        for (size_t i = 0; i < size; i++) {
-            logFile << "  [" << i << "] " << (messages[i] ? messages[i] : "???") << "\n";
-        }
-        free(messages);
-        logFile << "=== END CRASH LOG ===\n\n";
-        logFile.flush();
-        logFile.close();
-    }
-    
-    // Also write to stderr
-    fprintf(stderr, "CRASH: signal %d\n", sig);
-    backtrace_symbols_fd(array, size, STDERR_FILENO);
-    
-    // Re-raise signal to get default behavior
-    signal(sig, SIG_DFL);
-    raise(sig);
-}
 
 CodeShell::CodeShell(Engine* engine)
     : Shell(engine)
     , codeEditor_(std::make_unique<TextEditor>())
 {
-    // Install crash handlers for debugging
-    signal(SIGSEGV, crashHandler);
-    signal(SIGABRT, crashHandler);
-    signal(SIGBUS, crashHandler);
 }
 
 CodeShell::~CodeShell() = default;
 
 void CodeShell::setup() {
-    // Call parent setup() first to subscribe to state changes
-    Shell::setup();
-    
-    if (observerId_ > 0) {
-        ofLogNotice("CodeShell") << "Subscribed to state changes (ID: " << observerId_ << ")";
-    }
-    
     if (!codeEditor_) {
         ofLogError("CodeShell") << "Code editor not initialized in setup()";
         return;
@@ -97,70 +51,26 @@ void CodeShell::setup() {
     if (engine_) {
         // Use safe API method instead of direct ScriptManager access
         engine_->setScriptUpdateCallback([this](const std::string& script) {
-            // CRITICAL: Log immediately on callback entry
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"CodeShell.cpp:callback\",\"message\":\"CALLBACK ENTRY\",\"data\":{\"scriptLength\":" << script.length() << ",\"hasManualEdits\":" << (hasManualEdits_ ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            
-            // CRITICAL FIX: Defer script updates to prevent crashes
+            // Defer script updates to prevent crashes
             // Don't call SetText() directly from callback - it might be called during
             // script execution, ImGui rendering, or from unsafe contexts
             // Instead, store the script and apply it in update() when safe
             
-            // Check if we should update (user hasn't manually edited)
-            if (hasManualEdits_) {
-                ofLogVerbose("CodeShell") << "Script update deferred - user has manual edits";
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"CodeShell.cpp:callback\",\"message\":\"CALLBACK EXIT - manual edits\",\"data\":{},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                return;  // Don't update if user has edited
+            // Check editor mode to determine update behavior
+            if (editorMode_ == EditorMode::EDIT) {
+                // EDIT mode: Store synced script for later, don't update editor
+                // The script will be applied when user switches back to VIEW mode
+                pendingScriptUpdate_ = script;
+                hasPendingScriptUpdate_ = true;
+                return;  // Don't update editor when user is editing
             }
+            // VIEW mode: Continue to defer update (will be applied in update() when safe)
             
             // Defer the update - will be applied in update() when safe
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"CodeShell.cpp:callback\",\"message\":\"BEFORE setting pendingScriptUpdate_\",\"data\":{},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            
             pendingScriptUpdate_ = script;
             hasPendingScriptUpdate_ = true;
-            
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"CRASH\",\"location\":\"CodeShell.cpp:callback\",\"message\":\"CALLBACK EXIT - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
         });
         
-        // CRITICAL FIX: Don't try to load script from state here
-        // The callback will be called immediately by ScriptManager::setScriptUpdateCallback()
-        // if a script already exists, or later when the state observer fires
-        // This ensures we always get the script through the callback mechanism
-        // 
-        // If no script is available yet, the editor will remain empty until
-        // ScriptManager generates one (which happens in setup() after session load)
-        // The callback will then populate the editor automatically
         ofLogNotice("CodeShell") << "Callback registered - script will be populated via callback";
     } else {
         // Fallback if engine not available
@@ -189,6 +99,34 @@ void CodeShell::setup() {
     ofLogNotice("CodeShell") << "Code shell setup complete";
 }
 
+void CodeShell::onStateChanged(const EngineState& state, uint64_t stateVersion) {
+    // Call base class implementation to update lastStateVersion_
+    Shell::onStateChanged(state, stateVersion);
+    
+    // Check if state version is newer than last seen (prevent stale state processing)
+    if (stateVersion < lastStateVersion_) {
+        ofLogVerbose("CodeShell") << "Ignoring stale state update (version: " << stateVersion 
+                                   << ", last: " << lastStateVersion_ << ")";
+        return;
+    }
+    
+    // State version is current or newer - process update
+    ofLogNotice("CodeShell") << "State update received (version: " << stateVersion << ")";
+    
+    // In VIEW mode, script will be updated via ScriptManager callback (deferred update mechanism)
+    // In EDIT mode, store pending script update for later
+    if (editorMode_ == EditorMode::EDIT) {
+        // Store pending script for later (user is editing, don't overwrite)
+        pendingScriptUpdate_ = state.script.currentScript;
+        hasPendingScriptUpdate_ = true;
+        ofLogVerbose("CodeShell") << "State update stored in pendingScriptUpdate_ - user is editing";
+    } else {
+        // VIEW mode: Script will be updated via ScriptManager callback
+        // The callback mechanism handles script updates in VIEW mode
+        ofLogVerbose("CodeShell") << "State update received in VIEW mode - script will update via callback";
+    }
+}
+
 void CodeShell::update(float deltaTime) {
     if (!active_) return;
     
@@ -211,15 +149,47 @@ void CodeShell::update(float deltaTime) {
         editorInitialized_ = true;
     }
     
-    // CRITICAL FIX: Apply deferred script updates when safe
+    // Detect user editing (switch to EDIT mode when user types)
+    // Only detect in VIEW mode
+    // CRITICAL: Only call GetText() after editor is initialized to prevent crashes
+    if (codeEditor_ && editorInitialized_ && editorMode_ == EditorMode::VIEW) {
+        try {
+            std::string currentText = codeEditor_->GetText();
+            // Compare with last known editor text to detect changes
+            // Only detect if we have a previous text to compare (not on first update)
+            if (!lastEditorText_.empty() && currentText != lastEditorText_) {
+                // Text changed and we're in VIEW mode - user started editing
+                editorMode_ = EditorMode::EDIT;
+                userEditBuffer_ = currentText;  // Store current text as user edit
+                ofLogNotice("CodeShell") << "Switched to EDIT mode - user started editing";
+                if (engine_) {
+                    engine_->setScriptAutoUpdate(false);  // Disable auto-update when editing
+                }
+            }
+            // Update lastEditorText_ for next comparison (but only if we're still in VIEW mode)
+            // If we switched to EDIT mode, lastEditorText_ will be updated in the auto-evaluation section
+            if (editorMode_ == EditorMode::VIEW) {
+                lastEditorText_ = currentText;
+            }
+        } catch (const std::exception& e) {
+            ofLogError("CodeShell") << "Exception in mode detection: " << e.what();
+            // Don't crash - just skip mode detection this frame
+        } catch (...) {
+            ofLogError("CodeShell") << "Unknown exception in mode detection";
+            // Don't crash - just skip mode detection this frame
+        }
+    }
+    
+    // Apply deferred script updates when safe
     // This prevents crashes from calling SetText() during script execution or ImGui rendering
     // We need to be very careful - only apply when absolutely safe
     // NEVER call SetText() during draw() - it causes crashes!
-    if (hasPendingScriptUpdate_ && codeEditor_ && !hasManualEdits_) {
+    if (hasPendingScriptUpdate_ && codeEditor_ && editorMode_ == EditorMode::VIEW) {
         // Multiple safety checks - only apply when ALL conditions are safe
         bool isSafe = true;
         
-        if (engine_) {
+        // Trust Engine's unsafe state flags instead of local flag
+        if (engine_ && isSafe) {
             // Check if script is executing
             if (engine_->isExecutingScript()) {
                 isSafe = false;
@@ -231,90 +201,25 @@ void CodeShell::update(float deltaTime) {
                 isSafe = false;
                 ofLogVerbose("CodeShell") << "Deferred update blocked - commands processing";
             }
-            
-            // CRITICAL FIX: Check render guard to prevent updates during rendering
-            // This prevents crashes from script updates during ImGui rendering
-            if (isSafe && engine_->isRendering()) {
-                isSafe = false;
-                ofLogVerbose("CodeShell") << "Deferred update blocked - rendering in progress";
-            }
         }
         
         // Only apply if all safety checks pass
         if (isSafe) {
             try {
-                // #region agent log - Enhanced crash logging
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        bool isExecuting = engine_ ? engine_->isExecutingScript() : false;
-                        bool commandsProcessing = engine_ ? engine_->commandsBeingProcessed() : false;
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"SETTEXT\",\"location\":\"CodeShell.cpp:update\",\"message\":\"BEFORE SetText()\",\"data\":{\"scriptLength\":" << pendingScriptUpdate_.length() << ",\"isExecutingScript\":" << (isExecuting ? "true" : "false") << ",\"commandsProcessing\":" << (commandsProcessing ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
-                
-                // Update lastEditorText_ BEFORE SetText to prevent recursive updates
+                // Update lastEditorText_ BEFORE SetText to prevent mode detection from triggering EDIT mode
+                // This ensures that when SetText() is called, GetText() will match lastEditorText_
+                // and mode detection won't think the user edited
                 lastEditorText_ = pendingScriptUpdate_;
                 
-                // CRITICAL: Log thread ID and ImGui context before SetText
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        void* imguiContext = ImGui::GetCurrentContext();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"SETTEXT\",\"location\":\"CodeShell.cpp:update\",\"message\":\"IMMEDIATELY BEFORE SetText()\",\"data\":{\"threadId\":\"" << std::this_thread::get_id() << "\",\"imguiContext\":" << (imguiContext ? "valid" : "null") << ",\"scriptLength\":" << pendingScriptUpdate_.length() << "},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                
                 codeEditor_->SetText(pendingScriptUpdate_);
-                
-                // #region agent log - Success
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"SETTEXT\",\"location\":\"CodeShell.cpp:update\",\"message\":\"AFTER SetText() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 
                 editorInitialized_ = true;
                 hasPendingScriptUpdate_ = false;
                 ofLogVerbose("CodeShell") << "Applied deferred script update (" << pendingScriptUpdate_.length() << " chars)";
             } catch (const std::exception& e) {
-                // #region agent log - Exception caught
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"SETTEXT\",\"location\":\"CodeShell.cpp:update\",\"message\":\"EXCEPTION in SetText() - CRASH POINT\",\"data\":{\"error\":\"" << e.what() << "\"},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 ofLogError("CodeShell") << "Exception applying deferred script update: " << e.what();
                 hasPendingScriptUpdate_ = false;  // Clear to prevent retry loop
             } catch (...) {
-                // #region agent log - Unknown exception
-                {
-                    std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                    if (logFile.is_open()) {
-                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                        logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"SETTEXT\",\"location\":\"CodeShell.cpp:update\",\"message\":\"UNKNOWN EXCEPTION in SetText() - CRASH POINT\",\"data\":{},\"timestamp\":" << now << "}\n";
-                        logFile.flush();
-                        logFile.close();
-                    }
-                }
-                // #endregion
                 ofLogError("CodeShell") << "Unknown exception applying deferred script update";
                 hasPendingScriptUpdate_ = false;  // Clear to prevent retry loop
             }
@@ -331,16 +236,29 @@ void CodeShell::update(float deltaTime) {
         }
     }
     
-    // CRITICAL FIX: Disable auto-update when user is actively editing
+    // Disable auto-update when user is actively editing
     // This prevents ScriptManager from overwriting user's edits
     // Use safe API instead of direct ScriptManager access
-    if (codeEditor_ && hasManualEdits_ && engine_) {
+    if (codeEditor_ && editorMode_ == EditorMode::EDIT && engine_) {
         engine_->setScriptAutoUpdate(false);
+    } else if (codeEditor_ && editorMode_ == EditorMode::VIEW && engine_) {
+        // VIEW mode: Enable auto-update to allow script updates
+        engine_->setScriptAutoUpdate(true);
     }
     
-    // Check for text changes and trigger auto-evaluation
-    if (codeEditor_ && autoEvalEnabled_ && hasManualEdits_) {
-        std::string currentText = codeEditor_->GetText();
+    // Check for text changes and trigger auto-evaluation (only in EDIT mode)
+    // CRITICAL: Only call GetText() after editor is initialized to prevent crashes
+    if (codeEditor_ && editorInitialized_ && autoEvalEnabled_ && editorMode_ == EditorMode::EDIT) {
+        std::string currentText;
+        try {
+            currentText = codeEditor_->GetText();
+        } catch (const std::exception& e) {
+            ofLogError("CodeShell") << "Exception getting editor text for auto-eval: " << e.what();
+            return;  // Skip auto-evaluation this frame
+        } catch (...) {
+            ofLogError("CodeShell") << "Unknown exception getting editor text for auto-eval";
+            return;  // Skip auto-evaluation this frame
+        }
         
         // Detect text changes
         if (currentText != lastEditorText_) {
@@ -355,11 +273,22 @@ void CodeShell::update(float deltaTime) {
         float currentTime = ofGetElapsedTimef();
         if (currentTime - lastEditTime_ > autoEvalDebounce_ && lastEditTime_ > 0.0f) {
             // User stopped typing, auto-evaluate script
-            // Only if there were actual changes
-            if (hasManualEdits_) {
+            // Only if in EDIT mode (redundant check, but preserves existing logic)
+            if (editorMode_ == EditorMode::EDIT) {
                 // Safety checks before execution
-                if (engine_ && !engine_->isExecutingScript() && !engine_->commandsBeingProcessed()) {
-                    std::string currentText = codeEditor_->GetText();
+                if (engine_ && editorInitialized_ && !engine_->isExecutingScript() && !engine_->commandsBeingProcessed()) {
+                    std::string currentText;
+                    try {
+                        currentText = codeEditor_->GetText();
+                    } catch (const std::exception& e) {
+                        ofLogError("CodeShell") << "Exception getting editor text for auto-eval debounce: " << e.what();
+                        lastEditTime_ = 0.0f;  // Reset to prevent retry
+                        return;  // Skip auto-evaluation this frame
+                    } catch (...) {
+                        ofLogError("CodeShell") << "Unknown exception getting editor text for auto-eval debounce";
+                        lastEditTime_ = 0.0f;  // Reset to prevent retry
+                        return;  // Skip auto-evaluation this frame
+                    }
                     
                     // Use incremental execution if enabled and changes are small
                     if (incrementalEvalEnabled_ && !lastExecutedScript_.empty() && !currentText.empty()) {
@@ -512,33 +441,10 @@ void CodeShell::draw() {
                 drawList->AddRectFilled(lineStart, lineEnd, lineBgColor);
             }
             
-            // CRITICAL: Log before Render() to catch crashes during rendering
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    void* imguiContext = ImGui::GetCurrentContext();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"RENDER\",\"location\":\"CodeShell.cpp:draw\",\"message\":\"BEFORE TextEditor::Render()\",\"data\":{\"threadId\":\"" << std::this_thread::get_id() << "\",\"imguiContext\":" << (imguiContext ? "valid" : "null") << ",\"totalLines\":" << totalLines << "},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
-            
             // Use public Render() method - it creates its own child window
             // Pass the content size so it fills the available space
             // The line backgrounds drawn above will show through the transparent child background
             codeEditor_->Render("##CodeEditor", contentSize, false);
-            
-            // CRITICAL: Log after Render() to confirm it completed
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"RENDER\",\"location\":\"CodeShell.cpp:draw\",\"message\":\"AFTER TextEditor::Render() - SUCCESS\",\"data\":{},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
-            }
         } else {
             ImGui::Text("Code editor not created");
         }
@@ -594,35 +500,26 @@ void CodeShell::draw() {
 }
 
 void CodeShell::exit() {
-    if (observerId_ > 0) {
-        ofLogNotice("CodeShell") << "Unsubscribing from state changes (ID: " << observerId_ << ")";
-    }
-    // Call parent exit() last to unsubscribe from state changes
-    Shell::exit();
     // Cleanup if needed
+}
+
+std::vector<std::string> CodeShell::getTextLinesCopy() const {
+    if (!codeEditor_) return {};
+    auto linesRef = codeEditor_->GetTextLines();
+    // CRITICAL: Copy immediately to prevent use-after-free
+    // GetTextLines() returns a reference that becomes invalid when SetText() is called
+    return std::vector<std::string>(linesRef.begin(), linesRef.end());
 }
 
 void CodeShell::refreshScriptFromState() {
     if (!engine_ || !codeEditor_) return;
     
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"C\",\"location\":\"CodeShell.cpp:refreshScriptFromState\",\"message\":\"refreshScriptFromState ENTRY\",\"data\":{\"hasManualEdits\":" << (hasManualEdits_ ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
-        }
-    }
-    // #endregion
-    
     // Get current script from state snapshot (instead of direct ScriptManager access)
     EngineState state = engine_->getState();
     std::string currentScript = state.script.currentScript;
     
-    // Only update if user hasn't manually edited
-    if (!hasManualEdits_ && !currentScript.empty()) {
+    // Only update if in VIEW mode (user wants to see current state)
+    if (editorMode_ == EditorMode::VIEW && !currentScript.empty()) {
         codeEditor_->SetText(currentScript);
         lastEditorText_ = currentScript;  // Update tracking
         editorInitialized_ = true;
@@ -661,13 +558,13 @@ bool CodeShell::handleKeyPress(int key) {
     bool aKeyPressed = ImGui::IsKeyPressed(ImGuiKey_A, false) || (key == 'a' || key == 'A');
     if (cmdOrCtrlPressed && aKeyPressed) {
         // Select all text in editor
-        auto lines = codeEditor_->GetTextLines();
+        auto lines = getTextLinesCopy();
         if (!lines.empty()) {
             TextEditor::Coordinates start(0, 0);
             TextEditor::Coordinates end(static_cast<int>(lines.size() - 1), 
                                        static_cast<int>(lines.back().length()));
             codeEditor_->SetSelection(start, end);
-            // Don't set hasManualEdits_ for command keys
+            // Command keys don't switch to EDIT mode
             return true;
         }
         return false;
@@ -698,7 +595,7 @@ bool CodeShell::handleKeyPress(int key) {
                 ImGui::SetClipboardText(selectedText.c_str());
                 // Delete selected text
                 codeEditor_->Delete();
-                // Don't set hasManualEdits_ for command keys (cut is a command)
+                // Command keys don't switch to EDIT mode (cut is a command)
                 ofLogVerbose("CodeShell") << "Cut " << selectedText.length() << " characters";
                 return true;
             }
@@ -718,8 +615,18 @@ bool CodeShell::handleKeyPress(int key) {
             }
             // Insert clipboard text
             codeEditor_->InsertText(clipboardText);
-            // Paste IS user input (user chose to paste), so set hasManualEdits_
-            hasManualEdits_ = true;
+            // Paste IS user input (user chose to paste), so switch to EDIT mode
+            editorMode_ = EditorMode::EDIT;
+            // Store current text as user edit (only if editor is initialized)
+            if (editorInitialized_) {
+                try {
+                    userEditBuffer_ = codeEditor_->GetText();
+                } catch (const std::exception& e) {
+                    ofLogError("CodeShell") << "Exception getting editor text after paste: " << e.what();
+                } catch (...) {
+                    ofLogError("CodeShell") << "Unknown exception getting editor text after paste";
+                }
+            }
             if (engine_) {
                 engine_->setScriptAutoUpdate(false);  // Use safe API
             }
@@ -755,10 +662,20 @@ bool CodeShell::handleKeyPress(int key) {
         return true;
     }
     
-    // Mark as manually edited only for actual user input (not command keys)
+    // Switch to EDIT mode only for actual user input (not command keys)
     // This prevents auto-sync from overwriting user edits
     if (isUserInput(key)) {
-        hasManualEdits_ = true;
+        editorMode_ = EditorMode::EDIT;
+        // Store current text as user edit (only if editor is initialized)
+        if (editorInitialized_) {
+            try {
+                userEditBuffer_ = codeEditor_->GetText();
+            } catch (const std::exception& e) {
+                ofLogError("CodeShell") << "Exception getting editor text for user input: " << e.what();
+            } catch (...) {
+                ofLogError("CodeShell") << "Unknown exception getting editor text for user input";
+            }
+        }
         // Disable auto-updates when user is editing
         if (engine_) {
             engine_->setScriptAutoUpdate(false);  // Use safe API
@@ -795,18 +712,31 @@ bool CodeShell::handleWindowResize(int w, int h) {
 }
 
 void CodeShell::executeSelection() {
+    if (!codeEditor_ || !editorInitialized_) {
+        ofLogWarning("CodeShell") << "Cannot execute selection - editor not initialized";
+        return;
+    }
+    
     std::string text;
     
-    if (codeEditor_->HasSelection()) {
-        // Execute selected text
-        text = codeEditor_->GetSelectedText();
-    } else {
-        // Execute current line
-        auto cursorPos = codeEditor_->GetCursorPosition();
-        auto lines = codeEditor_->GetTextLines();
-        if (cursorPos.mLine >= 0 && cursorPos.mLine < (int)lines.size()) {
-            text = lines[cursorPos.mLine];
+    try {
+        if (codeEditor_->HasSelection()) {
+            // Execute selected text
+            text = codeEditor_->GetSelectedText();
+        } else {
+            // Execute current line
+            auto cursorPos = codeEditor_->GetCursorPosition();
+            auto lines = getTextLinesCopy();
+            if (cursorPos.mLine >= 0 && cursorPos.mLine < (int)lines.size()) {
+                text = lines[cursorPos.mLine];
+            }
         }
+    } catch (const std::exception& e) {
+        ofLogError("CodeShell") << "Exception getting selection text: " << e.what();
+        return;
+    } catch (...) {
+        ofLogError("CodeShell") << "Unknown exception getting selection text";
+        return;
     }
     
     if (!text.empty()) {
@@ -815,7 +745,22 @@ void CodeShell::executeSelection() {
 }
 
 void CodeShell::executeAll() {
-    std::string text = codeEditor_->GetText();
+    if (!codeEditor_ || !editorInitialized_) {
+        ofLogWarning("CodeShell") << "Cannot execute - editor not initialized";
+        return;
+    }
+    
+    std::string text;
+    try {
+        text = codeEditor_->GetText();
+    } catch (const std::exception& e) {
+        ofLogError("CodeShell") << "Exception getting editor text for execution: " << e.what();
+        return;
+    } catch (...) {
+        ofLogError("CodeShell") << "Unknown exception getting editor text for execution";
+        return;
+    }
+    
     if (!text.empty()) {
         executeLuaScript(text);
         lastExecutedScript_ = text;  // Update after execution
@@ -843,7 +788,7 @@ void CodeShell::executeChangedLines(const std::vector<int>& changedLines) {
                     bool isComplete = true;
                     if (block.type == Block::FUNCTION) {
                         // Check if function has matching end (simple check)
-                        auto lines = codeEditor_->GetTextLines();
+                        auto lines = getTextLinesCopy();
                         if (block.endLine < (int)lines.size()) {
                             std::string endLine = lines[block.endLine];
                             if (endLine.find("end") == std::string::npos) {
@@ -868,7 +813,7 @@ void CodeShell::executeChangedLines(const std::vector<int>& changedLines) {
     }
     
     // No blocks detected or block execution failed - execute lines individually
-    auto lines = codeEditor_->GetTextLines();
+    auto lines = getTextLinesCopy();
     
     // Execute each changed line individually
     // Preserves state from unchanged lines (they're not executed)
@@ -893,7 +838,7 @@ void CodeShell::executeBlock(int startLine, int endLine) {
     }
     
     // Get all lines from editor
-    auto lines = codeEditor_->GetTextLines();
+    auto lines = getTextLinesCopy();
     
     if (endLine >= (int)lines.size()) {
         ofLogWarning("CodeShell") << "Block end line out of range: " << endLine;
@@ -922,88 +867,125 @@ void CodeShell::executeBlock(int startLine, int endLine) {
     }
 }
 
-void CodeShell::executeLuaScript(const std::string& script) {
+    void CodeShell::executeLuaScript(const std::string& script) {
     if (!engine_) return;
-    
-    // #region agent log
-    {
-        std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-        if (logFile.is_open()) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"A,C\",\"location\":\"CodeShell.cpp:executeLuaScript\",\"message\":\"executeLuaScript ENTRY\",\"data\":{\"scriptLength\":" << script.length() << "},\"timestamp\":" << now << "}\n";
-            logFile.flush();
-            logFile.close();
-        }
-    }
-    // #endregion
     
     // Clear previous errors
     clearErrors();
     
     // CRITICAL FIX: Prevent feedback loop during script execution
     // Disable auto-update to prevent ScriptManager from overwriting editor
-    // Don't reset hasManualEdits_ - keep user's edits protected
+    // After successful execution, switch to VIEW mode to allow script updates
     bool wasAutoUpdate = false;
     if (engine_) {
         wasAutoUpdate = engine_->isScriptAutoUpdateEnabled();  // Use safe API
-        
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"SYNC_DEBUG\",\"hypothesisId\":\"E\",\"location\":\"CodeShell.cpp:executeLuaScript\",\"message\":\"Disabling auto-update\",\"data\":{\"wasAutoUpdate\":" << (wasAutoUpdate ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
-        
         engine_->setScriptAutoUpdate(false);  // Prevent script overwrite - use safe API
     }
     
-    // Execute via Engine with sync contract (Script → Engine synchronization)
-    // Guarantees script changes are reflected in engine state before callback fires
-    // Still non-blocking (async), but with completion guarantees
-    std::string scriptCopy = script;
-    engine_->syncScriptToEngine(scriptCopy, [this, wasAutoUpdate](bool success) {
-        // Callback executed when sync is complete (from Engine::syncScriptToEngine())
+    // CRITICAL FIX: Capture state version before execution (don't copy full state - causes memory corruption)
+    // Only capture version number - don't copy EngineState as it can access module data being modified
+    uint64_t stateVersionBefore = engine_->getStateVersion();
+    uint64_t targetVersion = stateVersionBefore + 1;  // Expect version to increment after execution
+    // NOTE: Don't capture full state here - copying EngineState can cause memory corruption during script execution
+    // We'll verify state changes by checking version increment only
+    
+    // Execute via Engine
+    Engine::Result result = engine_->eval(script);
+    
+    // CRITICAL FIX (Phase 7.9.2 Plan 2 Task 1): Wait for state update after execution
+    // Script execution may enqueue commands that need to be processed before state updates
+    // Wait for state version to increment (with timeout to prevent infinite waiting)
+    bool stateUpdated = false;
+    if (result.success) {
+        // Wait for state version to increment (max 1 second timeout)
+        // Poll every 10ms (100 checks per second, max 100 checks = 1 second timeout)
+        const uint64_t timeoutMs = 1000;
+        const uint64_t pollIntervalMs = 10;
+        uint64_t maxChecks = timeoutMs / pollIntervalMs;
+        uint64_t checks = 0;
         
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"CRASH_DEBUG\",\"hypothesisId\":\"A,C\",\"location\":\"CodeShell.cpp:executeLuaScript\",\"message\":\"executeLuaScript - sync contract callback\",\"data\":{\"success\":" << (success ? "true" : "false") << "},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
+        while (checks < maxChecks) {
+            uint64_t currentVersion = engine_->getStateVersion();
+            if (currentVersion >= targetVersion) {
+                stateUpdated = true;
+                ofLogNotice("CodeShell") << "State updated after script execution (version: " 
+                                        << stateVersionBefore << " → " << currentVersion << ")";
+                break;
+            }
+            
+            // Sleep for poll interval (10ms)
+            std::this_thread::sleep_for(std::chrono::milliseconds(pollIntervalMs));
+            checks++;
+        }
+        
+        if (!stateUpdated) {
+            uint64_t finalVersion = engine_->getStateVersion();
+            ofLogWarning("CodeShell") << "State update timeout after script execution (version: " 
+                                     << stateVersionBefore << " → " << finalVersion 
+                                     << ", expected: " << targetVersion 
+                                     << ") - State may not have updated yet";
+        }
+    }
+    
+    // CRITICAL FIX: Don't verify state changes by copying EngineState - causes memory corruption
+    // Version increment is sufficient to indicate state changed
+    // Copying EngineState can access module data being modified, causing crashes
+    if (result.success && stateUpdated) {
+        ofLogNotice("CodeShell") << "State updated after script execution (version: " 
+                                << stateVersionBefore << " → " << engine_->getStateVersion() << ")";
+    }
+    
+    // CRITICAL FIX (Phase 7.9.2 Plan 2 Task 2): Trigger script regeneration in VIEW mode
+    // After successful execution and state update verification, if in VIEW mode:
+    // ScriptManager will automatically regenerate script via observer callback (state changed)
+    // We don't need to manually trigger - the observer fires when state changes
+    // But we ensure we're in VIEW mode to allow script updates
+    if (result.success && stateUpdated && editorMode_ == EditorMode::VIEW) {
+        // Script regeneration happens automatically via ScriptManager observer callback
+        // The observer fires when state changes, which we've already confirmed
+        // ScriptManager::updateScriptFromState() will be called automatically
+        // and will call our updateCallback_ which updates the editor (if in VIEW mode)
+        ofLogVerbose("CodeShell") << "Script regeneration will occur via observer callback (state changed, VIEW mode)";
+    }
+    
+    // Flag is automatically cleared by ExecutionGuard RAII
+    
+    // After successful execution, switch to VIEW mode to allow script updates
+    // This enables bidirectional sync: user edits apply, then script updates show current state
+    if (result.success) {
+        editorMode_ = EditorMode::VIEW;
+        userEditBuffer_.clear();  // User edits have been applied
+        if (engine_) {
+            engine_->setScriptAutoUpdate(true);  // Re-enable auto-update for VIEW mode
+        }
+        ofLogNotice("CodeShell") << "Switched to VIEW mode - script executed successfully";
+        
+        // CRITICAL FIX: Don't access pendingScriptUpdate_ here - it might be modified by callback
+        // Instead, let update() handle script application when safe
+        // The callback will have stored it in pendingScriptUpdate_ for later
+    } else {
+        // CRITICAL FIX (Phase 7.9.2 Plan 2 Task 2): Error handling for failed execution
+        // If script execution fails, don't switch to VIEW mode (stay in EDIT mode)
+        // Don't trigger script regeneration on failure
+        ofLogError("CodeShell") << "Script execution failed - staying in EDIT mode";
+        // editorMode_ remains unchanged (stays in EDIT mode)
+        // Don't clear userEditBuffer_ (user edits are preserved)
+    }
+    
+    // Display result in REPL
+    if (replShell_) {
+        if (result.success) {
+            replShell_->appendOutput(result.message);
+        } else {
+            replShell_->appendError(result.error);
+            
+            // Mark error in editor
+            int errorLine = parseErrorLine(result.error);
+            if (errorLine > 0) {
+                markErrorInEditor(errorLine - 1, result.error);  // Convert to 0-based
             }
         }
-        // #endregion
-        
-        // Sync contract completed - script changes are now reflected in engine state
-        // State version has been updated, commands have been processed
-        
-        // Restore auto-update setting
-        if (engine_) {
-            engine_->setScriptAutoUpdate(wasAutoUpdate);
-        }
-        
-        // Handle result
-        if (success) {
-            clearErrors();
-            // Script executed successfully and state is synchronized
-        } else {
-            // Script execution or sync failed
-            // Error handling is done in sync contract callback
-            ofLogWarning("CodeShell") << "Script → Engine sync failed";
-        }
-        
-        // Re-enable auto-update only if it was enabled before AND execution succeeded
-        // But defer it to prevent immediate script overwrite
-        // The flag will remain false, protecting user edits
-        // User can manually sync later if needed
-    });
+    }
 }
 
 void CodeShell::markErrorInEditor(int line, const std::string& message) {
@@ -1037,7 +1019,7 @@ int CodeShell::parseErrorLine(const std::string& errorMessage) {
 void CodeShell::executeLine(int lineNumber) {
     if (!codeEditor_) return;
     
-    auto lines = codeEditor_->GetTextLines();
+    auto lines = getTextLinesCopy();
     if (lineNumber >= 0 && lineNumber < (int)lines.size()) {
         std::string line = lines[lineNumber];
         if (!line.empty()) {
@@ -1080,15 +1062,24 @@ bool CodeShell::isBPMChange(const std::string& line) {
 }
 
 void CodeShell::checkAndExecuteSimpleChanges() {
-    if (!codeEditor_) return;
+    if (!codeEditor_ || !editorInitialized_) return;
     
     // Get current script text
-    std::string currentText = codeEditor_->GetText();
+    std::string currentText;
+    try {
+        currentText = codeEditor_->GetText();
+    } catch (const std::exception& e) {
+        ofLogError("CodeShell") << "Exception getting editor text for simple changes: " << e.what();
+        return;
+    } catch (...) {
+        ofLogError("CodeShell") << "Unknown exception getting editor text for simple changes";
+        return;
+    }
     
     // If we have a previous executed script, detect all changed lines
     if (!lastExecutedScript_.empty() && !currentText.empty()) {
         std::vector<int> changedLines = detectChangedLines(lastExecutedScript_, currentText);
-        auto lines = codeEditor_->GetTextLines();
+        auto lines = getTextLinesCopy();
         
         // Check each changed line for parameter changes and execute immediately
         for (int lineNum : changedLines) {
@@ -1105,7 +1096,7 @@ void CodeShell::checkAndExecuteSimpleChanges() {
     } else {
         // Fallback: If no previous script, check cursor line (original behavior)
         auto cursorPos = codeEditor_->GetCursorPosition();
-        auto lines = codeEditor_->GetTextLines();
+        auto lines = getTextLinesCopy();
         
         if (cursorPos.mLine >= 0 && cursorPos.mLine < (int)lines.size()) {
             std::string currentLine = lines[cursorPos.mLine];
@@ -1288,18 +1279,6 @@ bool CodeShell::isUserInput(int key) const {
            key == OF_KEY_BACKSPACE || key == OF_KEY_DEL ||
            key == OF_KEY_LEFT || key == OF_KEY_RIGHT || 
            key == OF_KEY_UP || key == OF_KEY_DOWN;
-}
-
-void CodeShell::onStateChanged(const EngineState& state) {
-    // Cache state snapshot for thread-safe access in update() or draw()
-    cachedState_ = state;
-    
-    // Log state changes for debugging
-    ofLogNotice("CodeShell") << "State changed (BPM: " << state.transport.bpm 
-                             << ", Playing: " << (state.transport.isPlaying ? "true" : "false") << ")";
-    
-    // Note: UI updates should be deferred to draw() or update() methods
-    // This callback just caches the state snapshot
 }
 
 } // namespace shell
