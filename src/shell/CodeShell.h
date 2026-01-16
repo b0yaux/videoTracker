@@ -86,6 +86,7 @@ private:
     // Deferred script update (to prevent crashes during script execution or ImGui rendering)
     std::string pendingScriptUpdate_;
     bool hasPendingScriptUpdate_ = false;
+    uint64_t lastAppliedVersion_ = 0;  // Track last applied state version for update safety
     
     // Helper to refresh script from state (called only on activation)
     void refreshScriptFromState();

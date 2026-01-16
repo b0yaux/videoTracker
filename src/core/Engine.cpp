@@ -140,7 +140,7 @@ void Engine::setup(const EngineConfig& config) {
             *cachedState_ = initialState;
         }
         
-        // CRITICAL FIX (Phase 7.9-9.2-01): Update immutable snapshot with initial state
+        // Update immutable snapshot with initial state
         // This ensures getState() returns populated snapshot, not empty one
         initialState.version = stateVersion_.load();
         auto newSnapshot = std::make_shared<const EngineState>(std::move(initialState));
@@ -189,14 +189,14 @@ void Engine::setupCoreSystems() {
     connectionManager_.setPatternRuntime(&patternRuntime_);  // Enable PatternRuntime access for module initialization
     
     // Initialize SessionManager with dependencies (use move assignment since std::thread is not copyable)
-    sessionManager_ = std::move(SessionManager(
+    sessionManager_ = SessionManager(
         &projectManager_,
         &clock_,
         &moduleRegistry_,
         &moduleFactory_,
         &parameterRouter_,
         &connectionManager_
-    ));
+    );
     sessionManager_.setConnectionManager(&connectionManager_);
     sessionManager_.setPatternRuntime(&patternRuntime_);  // Phase 2: Enable pattern migration
     
@@ -261,7 +261,7 @@ void Engine::setupCommandExecutor() {
             config_.masterAudioOutName,
             config_.masterVideoOutName
         );
-        // CRITICAL FIX: Use deferred notification pattern to prevent recursive notifications
+        // Use deferred notification pattern to prevent recursive notifications
         // These callbacks can be triggered during state notifications (e.g., when scripts add/remove modules)
         enqueueStateNotification();
     });
@@ -279,7 +279,7 @@ void Engine::setupCommandExecutor() {
             config_.masterAudioOutName,
             config_.masterVideoOutName
         );
-        // CRITICAL FIX: Use deferred notification pattern to prevent recursive notifications
+        // Use deferred notification pattern to prevent recursive notifications
         enqueueStateNotification();
     });
     
@@ -622,7 +622,7 @@ Engine::Result Engine::executeCommand(const std::string& command) {
         // Restore old callback
         commandExecutor_.setOutputCallback(oldCallback);
         
-        // CRITICAL FIX (Phase 7.9.7): Don't call updateStateSnapshot() directly
+        // Don't call updateStateSnapshot() directly
         // executeCommand() can be called from any thread (main thread or script execution thread)
         // updateStateSnapshot() must only be called from main thread (has ASSERT_MAIN_THREAD())
         // enqueueStateNotification() will call updateStateSnapshot() on main thread via notification queue
@@ -658,7 +658,7 @@ Engine::Result Engine::eval(const std::string& script) {
         return Result(false, "Lua not initialized", "Failed to initialize Lua state");
     }
     
-    // CRITICAL FIX: Set script execution flag BEFORE any script execution begins
+    // Set script execution flag BEFORE any script execution begins
     // This must be set as early as possible to prevent any code path from calling
     // getState() or buildStateSnapshot() during script execution
     // This prevents crashes when script execution triggers state changes or callbacks
@@ -767,7 +767,7 @@ void Engine::syncScriptToEngine(const std::string& script, std::function<void(bo
     // Commands are processed immediately by audio thread
     // Now wait for state version to be updated
     
-    // CRITICAL FIX (Phase 7.9 Plan 6 Task 2): Wait for state version to reach target version
+    // Wait for state version to reach target version
     // This ensures state snapshot is updated with script changes BEFORE callback fires
     // State version increments in updateStateSnapshot() which is called after commands are processed
     // Phase 7.9 Plan 8.3: Increased timeout to 2 seconds to handle complex scripts (up to ~200 commands)
@@ -836,7 +836,7 @@ Engine::Result Engine::evalFile(const std::string& path) {
 }
 
 EngineState Engine::getState() const {
-    // CRITICAL FIX (Phase 7.9-9.2): Use immutable snapshot instead of building during unsafe periods
+    // Use immutable snapshot instead of building during unsafe periods
     // This prevents memory corruption from building snapshots during script execution
     // MEMORY SAFETY: Returns copy (not reference) to ensure deep copy semantics
     auto snapshot = getImmutableStateSnapshot();
@@ -919,6 +919,11 @@ void Engine::updateImmutableStateSnapshot() {
 
 void Engine::setScriptUpdateCallback(std::function<void(const std::string&)> callback) {
     scriptManager_.setScriptUpdateCallback(callback);
+}
+
+void Engine::clearScriptUpdateCallback() {
+    scriptManager_.clearScriptUpdateCallback();
+    ofLogVerbose("Engine") << "Script update callback cleared via Shell-safe API";
 }
 
 void Engine::setScriptAutoUpdate(bool enabled) {
@@ -1033,7 +1038,7 @@ void Engine::notifyStateChange() {
         return;
     }
     
-    // CRITICAL FIX: Defer notifications during rendering
+    // Defer notifications during rendering
     // This prevents state observers from firing during ImGui rendering, which causes crashes
     // State updates during rendering can corrupt ImGui state and cause segmentation faults
     if (isRendering_.load()) {
@@ -1048,13 +1053,13 @@ void Engine::notifyStateChange() {
         return;
     }
     
-    // CRITICAL FIX: Don't skip notifications during command processing
+    // Don't skip notifications during command processing
     // getState() now handles unsafe periods by returning cached state
     // This ensures observers always receive state updates, even during command processing
     // Observers will see the last known good state, which is acceptable
     // Notification queue ensures notifications happen on main thread after commands complete
     
-    // CRITICAL FIX (Phase 7.9-9.2): Update immutable snapshot instead of building during unsafe periods
+    // Update immutable snapshot instead of building during unsafe periods
     // This prevents memory corruption from building snapshots during script execution
     if (!isInUnsafeState()) {
         // Safe period - update immutable snapshot
@@ -1073,7 +1078,7 @@ void Engine::notifyStateChange() {
     
     
     
-    // CRITICAL FIX: Collect broken observers during iteration, remove after
+    // Collect broken observers during iteration, remove after
     // This prevents iterator invalidation and ensures all observers are called
     // Also handles edge cases:
     // - Observer exceptions: caught, logged, observer removed after iteration
@@ -1147,7 +1152,7 @@ void Engine::notifyObserversWithState() {
         return;
     }
     
-    // CRITICAL FIX (Phase 7.9 Plan 6 Task 2): Ensure state version matches engine version
+    // Ensure state version matches engine version
     // State version only increments AFTER commands are processed and snapshot is updated
     // If state version is stale, rebuild snapshot to ensure observers see fresh state
     uint64_t currentEngineVersion = stateVersion_.load();
@@ -1168,7 +1173,7 @@ void Engine::notifyObserversWithState() {
         std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
         if (cachedState_) {
             state = *cachedState_;  // Copy of cached state (deep copies preserved)
-            // CRITICAL FIX: Verify cached state version matches engine version
+            // Verify cached state version matches engine version
             // If stale, rebuild snapshot to ensure observers see fresh state
             if (state.version < currentEngineVersion) {
                 // Cached state is stale - rebuild snapshot
@@ -1274,7 +1279,7 @@ void Engine::enqueueStateNotification() {
     queueMonitorStats_.notificationQueueTotalEnqueued++;
     
     notificationQueue_.enqueue([this]() {
-        // CRITICAL FIX (Phase 7.9 Plan 6 Task 2): Update snapshot before notifying
+        // Update snapshot before notifying
         // This ensures state snapshot reflects processed commands before observers are notified
         // State version increments in updateStateSnapshot(), ensuring observers see fresh state
         updateStateSnapshot();
@@ -1362,8 +1367,8 @@ void Engine::notifyParameterChanged() {
         return;
     }
     
-    // CRITICAL FIX: Use deferred notification pattern to prevent recursive notifications
-    // notifyParameterChanged() can be called during state notifications (e.g., when observers trigger parameter changes)
+    // Use deferred notification pattern to prevent recursive notifications
+    // notifyParameterChanged() can be called during state notifications
     // Using deferred pattern ensures notifications happen on main thread and prevents infinite recursion
     enqueueStateNotification();
 }
@@ -1385,7 +1390,7 @@ void Engine::onBPMChanged(float& newBpm) {
 EngineState Engine::buildStateSnapshot() const {
     ASSERT_MAIN_THREAD();
     
-    // CRITICAL FIX: Set thread-local flag to prevent recursive snapshot building
+    // Set thread-local flag to prevent recursive snapshot building
     // This prevents getCurrentScript() from calling getState() during snapshot building
     // Use RAII to ensure flag is always restored, even on exceptions or early returns
     struct SnapshotGuard {
@@ -1400,7 +1405,7 @@ EngineState Engine::buildStateSnapshot() const {
     };
     SnapshotGuard guard(isBuildingSnapshot_);
     
-    // CRITICAL FIX: Check unsafe state flags FIRST
+    // Check unsafe state flags FIRST
     // If script is executing, return cached state immediately
     // This prevents state snapshot building during script execution
     // Note: Serialization no longer uses buildStateSnapshot() (uses getStateSnapshot() instead - lock-free)
@@ -1411,7 +1416,7 @@ EngineState Engine::buildStateSnapshot() const {
         // Note: Serialization no longer uses cachedState_ (uses getStateSnapshot() instead - lock-free)
         std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
         if (cachedState_) {
-            // CRITICAL FIX: Update version of cached state before returning
+            // Update version of cached state before returning
             // Cached state may have been built earlier with version 0, but we need current version
             // This ensures observers receive state with correct version for consistency tracking
             EngineState result = *cachedState_;
@@ -1432,8 +1437,8 @@ EngineState Engine::buildStateSnapshot() const {
         return EngineState();
     }
     
-    // CRITICAL FIX: Check ALL unsafe conditions using isInUnsafeState()
-    // Still needed: Yes - Must detect unsafe periods before building snapshots
+    // Check ALL unsafe conditions using isInUnsafeState()
+    // Must detect unsafe periods before building snapshots
     // Can be simplified: No - Multiple flags needed to detect all unsafe conditions
     // Script execution CAN directly modify module state (via Lua bindings), not just queue commands
     // So we must check unsafe state flags (script executing, commands processing) as well as parametersBeingModified_
@@ -1449,11 +1454,11 @@ EngineState Engine::buildStateSnapshot() const {
     int paramsModifying = parametersBeingModified_.load(std::memory_order_acquire);
     
     if (isExecuting || commandsProcessing || paramsModifying > 0) {
-        // CRITICAL FIX: Never return empty state - return cached state instead
+        // Never return empty state - return cached state instead
         // This ensures observers always receive valid state, even during unsafe periods
         std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
         if (cachedState_) {
-            // CRITICAL FIX: Update version of cached state before returning
+            // Update version of cached state before returning
             // Cached state may have been built earlier with version 0, but we need current version
             // This ensures observers receive state with correct version for consistency tracking
             EngineState result = *cachedState_;
@@ -1464,7 +1469,7 @@ EngineState Engine::buildStateSnapshot() const {
                                    << ", parametersModifying: " << paramsModifying << ")";
             return result;
         }
-        // CRITICAL FIX: Cached state should always be initialized during setup
+        // Cached state should always be initialized during setup
         // If it's not available, initialize it now (shouldn't happen, but safety fallback)
         ofLogError("Engine") << "buildStateSnapshot() called during unsafe period but cached state not initialized - initializing now";
         std::unique_lock<std::shared_mutex> cacheLock(cachedStateMutex_);
@@ -1474,7 +1479,7 @@ EngineState Engine::buildStateSnapshot() const {
         return *cachedState_;
     }
     
-    // CRITICAL FIX: Prevent concurrent snapshot building
+    // Prevent concurrent snapshot building
     // Use mutex for exclusive access during snapshot building
     // Note: Serialization no longer uses buildStateSnapshot() (uses getStateSnapshot() instead - lock-free)
     // This prevents crashes when multiple threads try to build snapshots simultaneously
@@ -1492,7 +1497,7 @@ EngineState Engine::buildStateSnapshot() const {
     }
     
     
-    // CRITICAL FIX: Double-check unsafe state RIGHT BEFORE calling buildModuleStates()
+    // Double-check unsafe state RIGHT BEFORE calling buildModuleStates()
     // State can change from safe to unsafe between the initial check and this point
     // (e.g., script execution can start on main thread while we're building snapshot)
     // This prevents buildModuleStates() from being called during script execution
@@ -1508,7 +1513,7 @@ EngineState Engine::buildStateSnapshot() const {
     }
     
     try {
-        // CRITICAL FIX: Check if buildModuleStates() completed successfully
+        // Check if buildModuleStates() completed successfully
         // If it returns false, it aborted due to unsafe period and left partial state
         // In this case, return cached state instead of partial state to prevent crashes
         bool buildSuccess = buildModuleStates(state);
@@ -1545,7 +1550,7 @@ EngineState Engine::buildStateSnapshot() const {
     }
     
     // Build script state (from ScriptManager)
-    // CRITICAL FIX: During snapshot building, only use cached script if available
+    // During snapshot building, only use cached script if available
     // Don't trigger script generation (which would call getState() and cause deadlock)
     // If script is empty, that's okay - it will be populated after snapshot completes
     if (scriptManager_.hasCachedScript()) {
@@ -1628,7 +1633,7 @@ void Engine::updateStateSnapshot() {
     transport.bpm = clock_.getTargetBPM();  // Use getTargetBPM() like buildTransportState()
     transport.currentBeat = 0;  // TODO: Get from Clock if available
     
-    // CRITICAL FIX (Phase 7.9.7.1): Check if commands are processing before updating snapshots
+    // Check if commands are processing before updating snapshots
     // Commands hold exclusive locks on moduleMutex_, so updateSnapshot() would block
     // Skip snapshot update if commands are processing (will be updated after commands complete)
     bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
@@ -1658,7 +1663,7 @@ void Engine::updateStateSnapshot() {
             // Hold shared_ptr reference to prevent destruction during copy
             auto moduleSnapshot = module->getSnapshot();  // Fast read with mutex (C++17 compatible)
             if (moduleSnapshot) {
-                // CRITICAL FIX (Phase 7.9 Plan 6 Task 5): Make a safe copy by serializing and deserializing
+                // Make a safe copy by serializing and deserializing
                 // This prevents memory corruption if the original JSON is being destroyed
                 // Add memory barrier to ensure snapshot is fully constructed before copying
                 std::atomic_thread_fence(std::memory_order_acquire);
@@ -1724,7 +1729,7 @@ void Engine::updateStateSnapshot() {
     // Version (for conflict detection)
     json["version"] = version;
     
-    // CRITICAL FIX (Phase 7.9 Plan 6 Task 5): Ensure snapshot updates are atomic
+    // Ensure snapshot updates are atomic
     // Create immutable JSON snapshot and update pointer with mutex (C++17 compatible)
     // Add memory barrier to ensure snapshot update is visible to all threads
     {
@@ -1737,7 +1742,7 @@ void Engine::updateStateSnapshot() {
 
 void Engine::buildTransportState(EngineState& state) const {
     state.transport.isPlaying = clock_.isPlaying();
-    // CRITICAL FIX: Use getTargetBPM() instead of getBPM() for state snapshots
+    // Use getTargetBPM() instead of getBPM() for state snapshots
     // getBPM() returns smoothed currentBpm (for audio/display), but for script generation
     // we want the target BPM (the value that was set, not the smoothed value)
     float bpm = clock_.getTargetBPM();
@@ -1765,7 +1770,7 @@ bool Engine::buildModuleStates(EngineState& state) const {
     
     // CRITICAL: Check unsafe periods at the point of module access
     // Even if buildStateSnapshot() checked, state can change between check and module access
-    // CRITICAL FIX: Use memory barrier to ensure we see the latest unsafe state flags
+    // Use memory barrier to ensure we see the latest unsafe state flags
     // This prevents race conditions where script execution starts but flag isn't visible yet
     std::atomic_thread_fence(std::memory_order_acquire);
     if (isInUnsafeState()) {
@@ -1785,7 +1790,7 @@ bool Engine::buildModuleStates(EngineState& state) const {
         modulesProcessed++;
         // CRITICAL: Check for unsafe periods INSIDE the loop
         // State can change from safe to unsafe while iterating over modules
-        // CRITICAL FIX: Use memory barrier to ensure we see the latest value
+        // Use memory barrier to ensure we see the latest value
         std::atomic_thread_fence(std::memory_order_acquire);
         bool isExecuting = hasUnsafeState(UnsafeState::SCRIPT_EXECUTING);
         bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
@@ -1991,7 +1996,7 @@ bool Engine::buildModuleStates(EngineState& state) const {
             }
         }
         
-        // CRITICAL FIX (Phase 7.9 Plan 4): Deep copy module snapshot JSON to prevent use-after-free
+        // Deep copy module snapshot JSON to prevent use-after-free
         // If module is deleted during snapshot iteration, shallow copy would become invalid
         // Deep copy via serialization/deserialization ensures snapshot is fully independent
         // This matches the pattern used in updateStateSnapshot() (Phase 7.2)
@@ -2068,7 +2073,7 @@ void Engine::audioOut(ofSoundBuffer& buffer) {
     // CRITICAL: Process unified command queue (all commands: parameters, structural changes, etc.)
     // This handles all state mutations in a single, unified queue
     // Parameter changes (SetParameterCommand) and structural changes all go through here
-    // CRITICAL FIX (Phase 7.9.6 Crash Fix): Process commands even during script execution
+    // Process commands even during script execution
     // Commands are safe to process - they're just state mutations in different threads
     // buildModuleStates() already has unsafe state checks to prevent crashes
     // Deferring command processing causes deadlock: script waits for commands that never get processed
@@ -2108,15 +2113,6 @@ void Engine::update(float deltaTime) {
         logQueueStatistics();
     }
     
-    
-    // Process pending script execution callbacks (from background thread)
-    PendingCallback callback;
-    while (pendingScriptCallbacks_.try_dequeue(callback)) {
-        if (callback.callback) {
-            callback.callback(callback.result);  // Execute on main thread
-        }
-    }
-    
     // Update session manager (handles auto-save)
     sessionManager_.update();
     
@@ -2130,7 +2126,7 @@ void Engine::update(float deltaTime) {
     // ScriptManager::update() handles the frame delay and safety checks
     // NOTE: Removed scriptManager_.update() - observer callback handles all updates immediately now
     
-    // CRITICAL FIX: Don't update modules while commands are processing
+    // Don't update modules while commands are processing
     // Commands modify module state, and updating modules concurrently causes race conditions
     // This prevents crashes when modules access state that's being modified by commands
     bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
@@ -2177,7 +2173,7 @@ void Engine::update(float deltaTime) {
 bool Engine::loadSession(const std::string& path) {
     bool result = sessionManager_.loadSession(path);
     if (result) {
-        // CRITICAL FIX: Use deferred notification pattern to prevent recursive notifications
+        // Use deferred notification pattern to prevent recursive notifications
         // Session loading can trigger state changes that might occur during notifications
         enqueueStateNotification();
     }
@@ -2272,8 +2268,8 @@ bool Engine::enqueueCommand(std::unique_ptr<Command> cmd) {
 int Engine::processCommands() {
     ASSERT_AUDIO_THREAD();
     
-    // CRITICAL FIX: Set flag to prevent state snapshots during command execution
-    // This prevents crashes when commands trigger state changes (e.g., clock:start())
+    // Set flag to prevent state snapshots during command execution
+    // This prevents crashes when commands trigger state changes
     setUnsafeState(UnsafeState::COMMANDS_PROCESSING, true);
     
     
@@ -2318,12 +2314,12 @@ int Engine::processCommands() {
     // No cooldown needed - state updates are deferred to main thread event loop
     
     
-    // CRITICAL FIX: Don't call notifyStateChange() or updateStateSnapshot() from audio thread
+    // Don't call notifyStateChange() or updateStateSnapshot() from audio thread
     // Enqueue notification instead - main thread will process queue in update()
     // This prevents thread safety issues with buildStateSnapshot() and module registry access
     // updateStateSnapshot() accesses moduleRegistry_ which is not safe from audio thread
     
-    // CRITICAL FIX (Phase 7.9 Plan 6 Task 2): Add memory barrier after command processing
+    // Add memory barrier after command processing
     // This ensures command execution is complete before notification is enqueued
     // Prevents race conditions where notification fires before commands are fully processed
     std::atomic_thread_fence(std::memory_order_release);
@@ -2344,8 +2340,8 @@ void Engine::executeCommandImmediate(std::unique_ptr<Command> cmd) {
     try {
         cmd->execute(*this);
         
-        // CRITICAL FIX (Phase 7.9.7): Don't call updateStateSnapshot() directly
-        // executeCommandImmediate() can be called from any thread (main thread via ClockGUI, or script execution thread via SWIG)
+        // Don't call updateStateSnapshot() directly
+        // executeCommandImmediate() can be called from any thread
         // updateStateSnapshot() must only be called from main thread (has ASSERT_MAIN_THREAD())
         // enqueueStateNotification() will call updateStateSnapshot() on main thread via notification queue
         // This prevents race conditions where both threads try to serialize modules simultaneously

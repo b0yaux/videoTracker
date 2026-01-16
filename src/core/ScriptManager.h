@@ -72,6 +72,7 @@ public:
     // Callback for shells to register (called when script updates)
     using ScriptUpdateCallback = std::function<void(const std::string& script)>;
     void setScriptUpdateCallback(ScriptUpdateCallback callback);
+    void clearScriptUpdateCallback();
     
     // Enable/disable auto-updates (useful when user is manually editing)
     void setAutoUpdate(bool enabled) { autoUpdateEnabled_ = enabled; }

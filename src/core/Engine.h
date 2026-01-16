@@ -230,7 +230,6 @@ public:
      * @return Shared pointer to immutable JSON snapshot, or nullptr if snapshot not yet created
      */
     std::shared_ptr<const ofJson> getStateSnapshot() const {
-        // CRITICAL FIX (Phase 7.9 Plan 6 Task 5): Add memory barrier for snapshot reads
         // Memory barrier ensures we see the latest snapshot update
         std::atomic_thread_fence(std::memory_order_acquire);
         std::lock_guard<std::mutex> lock(snapshotJsonMutex_);
@@ -283,6 +282,14 @@ public:
      * @param callback Function called when script updates
      */
     void setScriptUpdateCallback(std::function<void(const std::string&)> callback);
+    
+    /**
+     * Clear script update callback (Shell-safe API)
+     * Wraps ScriptManager::clearScriptUpdateCallback()
+     * IMPORTANT: Call this in Shell::exit() to prevent use-after-free crashes
+     * @return Current auto-update enabled status
+     */
+    void clearScriptUpdateCallback();
     
     /**
      * Set script auto-update enabled/disabled (Shell-safe API)
@@ -575,13 +582,6 @@ private:
     // Helper methods for unsafe state management
     void setUnsafeState(UnsafeState state, bool active);
     bool hasUnsafeState(UnsafeState state) const;
-    
-    // Render guard (prevents state updates during rendering)
-    // Purpose: Flag indicating rendering is in progress (ImGui draw() method)
-    // When used: notifyStateChange() checks this to defer notifications during rendering
-    // Still needed: Yes - Prevents crashes from state updates during ImGui rendering
-    // Can be simplified: No - Critical for preventing crashes during rendering
-    std::atomic<bool> isRendering_{false};
     
     // Render guard (prevents state updates during rendering)
     // Purpose: Flag indicating rendering is in progress (ImGui draw() method)

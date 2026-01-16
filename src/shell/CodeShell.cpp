@@ -113,16 +113,17 @@ void CodeShell::onStateChanged(const EngineState& state, uint64_t stateVersion) 
     // State version is current or newer - process update
     ofLogNotice("CodeShell") << "State update received (version: " << stateVersion << ")";
     
-    // In VIEW mode, script will be updated via ScriptManager callback (deferred update mechanism)
-    // In EDIT mode, store pending script update for later
+    // NOTE: Script updates are handled exclusively via the ScriptManager callback mechanism
+    // (setScriptUpdateCallback in setup()). The callback provides fresh script data directly
+    // from ScriptManager, avoiding stale state issues from state.script.currentScript.
+    // 
+    // onStateChanged() is kept for non-script state changes (module additions/removals,
+    // connection changes, etc.) but intentionally does NOT handle script updates.
+    
+    // Log that we're receiving state changes but script will sync via callback
     if (editorMode_ == EditorMode::EDIT) {
-        // Store pending script for later (user is editing, don't overwrite)
-        pendingScriptUpdate_ = state.script.currentScript;
-        hasPendingScriptUpdate_ = true;
-        ofLogVerbose("CodeShell") << "State update stored in pendingScriptUpdate_ - user is editing";
+        ofLogVerbose("CodeShell") << "State update received in EDIT mode - script will sync via callback when returning to VIEW mode";
     } else {
-        // VIEW mode: Script will be updated via ScriptManager callback
-        // The callback mechanism handles script updates in VIEW mode
         ofLogVerbose("CodeShell") << "State update received in VIEW mode - script will update via callback";
     }
 }
@@ -135,7 +136,7 @@ void CodeShell::update(float deltaTime) {
         replShell_->update(deltaTime);
     }
     
-    // CRITICAL FIX: Ensure TextEditor is initialized (but never in draw()!)
+    // Ensure TextEditor is initialized (but never in draw()!)
     // If editor is empty, initialize it here (safe to do in update())
     if (codeEditor_ && !editorInitialized_ && codeEditor_->GetTotalLines() == 0) {
         std::string defaultScript = "-- videoTracker Lua Script\n";
@@ -185,25 +186,24 @@ void CodeShell::update(float deltaTime) {
     // We need to be very careful - only apply when absolutely safe
     // NEVER call SetText() during draw() - it causes crashes!
     if (hasPendingScriptUpdate_ && codeEditor_ && editorMode_ == EditorMode::VIEW) {
-        // Multiple safety checks - only apply when ALL conditions are safe
+        // Use state version comparison instead of unsafe state flags
+        // State version increments AFTER commands/scripts complete, providing reliable safety signal
         bool isSafe = true;
+        uint64_t currentVersion = 0;
         
-        // Trust Engine's unsafe state flags instead of local flag
-        if (engine_ && isSafe) {
-            // Check if script is executing
-            if (engine_->isExecutingScript()) {
-                isSafe = false;
-                ofLogVerbose("CodeShell") << "Deferred update blocked - script executing";
-            }
+        if (engine_) {
+            currentVersion = engine_->getStateVersion();
             
-            // Check if commands are processing
-            if (isSafe && engine_->commandsBeingProcessed()) {
+            // Check if state has been updated since last apply
+            if (currentVersion <= lastAppliedVersion_) {
+                // State hasn't changed yet - wait for update to complete
                 isSafe = false;
-                ofLogVerbose("CodeShell") << "Deferred update blocked - commands processing";
+                ofLogVerbose("CodeShell") << "Deferred update blocked - waiting for state update (version: " 
+                                         << currentVersion << ", last applied: " << lastAppliedVersion_ << ")";
             }
         }
         
-        // Only apply if all safety checks pass
+        // Only apply if state has been updated (version increased)
         if (isSafe) {
             try {
                 // Update lastEditorText_ BEFORE SetText to prevent mode detection from triggering EDIT mode
@@ -215,7 +215,8 @@ void CodeShell::update(float deltaTime) {
                 
                 editorInitialized_ = true;
                 hasPendingScriptUpdate_ = false;
-                ofLogVerbose("CodeShell") << "Applied deferred script update (" << pendingScriptUpdate_.length() << " chars)";
+                lastAppliedVersion_ = currentVersion;  // Track applied version
+                ofLogVerbose("CodeShell") << "Applied deferred script update (version: " << currentVersion << ")";
             } catch (const std::exception& e) {
                 ofLogError("CodeShell") << "Exception applying deferred script update: " << e.what();
                 hasPendingScriptUpdate_ = false;  // Clear to prevent retry loop
@@ -224,15 +225,11 @@ void CodeShell::update(float deltaTime) {
                 hasPendingScriptUpdate_ = false;  // Clear to prevent retry loop
             }
         } else {
-            // Still unsafe - keep it pending for next frame
-            // But limit retries to prevent infinite pending state
-            static int pendingFrames = 0;
-            pendingFrames++;
-            if (pendingFrames > 60) {  // After 60 frames (~1 second at 60fps), give up
-                ofLogWarning("CodeShell") << "Deferred script update pending too long - clearing";
-                hasPendingScriptUpdate_ = false;
-                pendingFrames = 0;
-            }
+            // Still waiting for state update - keep it pending
+            // Updates persist until state version increases (no arbitrary timeout)
+            // This prevents updates from being lost during long-running script execution
+            ofLogVerbose("CodeShell") << "Deferred script update pending - waiting for state version " 
+                                     << (lastAppliedVersion_ + 1);
         }
     }
     
@@ -400,7 +397,7 @@ void CodeShell::draw() {
         
         // Always try to render if codeEditor_ exists
         if (codeEditor_) {
-            // CRITICAL FIX: Never call SetText() during draw() - it causes crashes!
+            // Never call SetText() during draw() - it causes crashes!
             // TextEditor must not be modified while it's being rendered
             // If text is empty, it will be initialized in update() or setup()
             int totalLines = codeEditor_->GetTotalLines();
@@ -500,7 +497,20 @@ void CodeShell::draw() {
 }
 
 void CodeShell::exit() {
-    // Cleanup if needed
+    // CRITICAL: Unregister script update callback to prevent use-after-free crashes
+    // The callback captures 'this' (CodeShell pointer). If we don't clear it,
+    // ScriptManager may call the callback after CodeShell is destroyed, causing
+    // malloc corruption crashes.
+    if (engine_) {
+        engine_->clearScriptUpdateCallback();
+        ofLogVerbose("CodeShell") << "Script update callback cleared - preventing use-after-free";
+    }
+    
+    // Cleanup embedded REPL shell
+    if (replShell_) {
+        replShell_->exit();
+        replShell_.reset();
+    }
 }
 
 std::vector<std::string> CodeShell::getTextLinesCopy() const {
@@ -531,7 +541,7 @@ void CodeShell::refreshScriptFromState() {
 void CodeShell::setActive(bool active) {
     Shell::setActive(active);
     
-    // CRITICAL FIX: Don't call refreshScriptFromState() here
+    // Don't call refreshScriptFromState() here
     // The callback mechanism (setScriptUpdateCallback) already handles script updates
     // refreshScriptFromState() reads from state.script.currentScript which may be stale
     // and overwrites the correct script that was provided by the callback
@@ -873,7 +883,7 @@ void CodeShell::executeBlock(int startLine, int endLine) {
     // Clear previous errors
     clearErrors();
     
-    // CRITICAL FIX: Prevent feedback loop during script execution
+    // Prevent feedback loop during script execution
     // Disable auto-update to prevent ScriptManager from overwriting editor
     // After successful execution, switch to VIEW mode to allow script updates
     bool wasAutoUpdate = false;
@@ -882,7 +892,7 @@ void CodeShell::executeBlock(int startLine, int endLine) {
         engine_->setScriptAutoUpdate(false);  // Prevent script overwrite - use safe API
     }
     
-    // CRITICAL FIX: Capture state version before execution (don't copy full state - causes memory corruption)
+    // Capture state version before execution (don't copy full state - causes memory corruption)
     // Only capture version number - don't copy EngineState as it can access module data being modified
     uint64_t stateVersionBefore = engine_->getStateVersion();
     uint64_t targetVersion = stateVersionBefore + 1;  // Expect version to increment after execution
@@ -892,7 +902,7 @@ void CodeShell::executeBlock(int startLine, int endLine) {
     // Execute via Engine
     Engine::Result result = engine_->eval(script);
     
-    // CRITICAL FIX (Phase 7.9.2 Plan 2 Task 1): Wait for state update after execution
+    // Wait for state update after execution
     // Script execution may enqueue commands that need to be processed before state updates
     // Wait for state version to increment (with timeout to prevent infinite waiting)
     bool stateUpdated = false;
@@ -927,7 +937,7 @@ void CodeShell::executeBlock(int startLine, int endLine) {
         }
     }
     
-    // CRITICAL FIX: Don't verify state changes by copying EngineState - causes memory corruption
+    // Don't verify state changes by copying EngineState - causes memory corruption
     // Version increment is sufficient to indicate state changed
     // Copying EngineState can access module data being modified, causing crashes
     if (result.success && stateUpdated) {
@@ -935,7 +945,7 @@ void CodeShell::executeBlock(int startLine, int endLine) {
                                 << stateVersionBefore << " → " << engine_->getStateVersion() << ")";
     }
     
-    // CRITICAL FIX (Phase 7.9.2 Plan 2 Task 2): Trigger script regeneration in VIEW mode
+    // Trigger script regeneration in VIEW mode
     // After successful execution and state update verification, if in VIEW mode:
     // ScriptManager will automatically regenerate script via observer callback (state changed)
     // We don't need to manually trigger - the observer fires when state changes
@@ -960,11 +970,11 @@ void CodeShell::executeBlock(int startLine, int endLine) {
         }
         ofLogNotice("CodeShell") << "Switched to VIEW mode - script executed successfully";
         
-        // CRITICAL FIX: Don't access pendingScriptUpdate_ here - it might be modified by callback
+        // Don't access pendingScriptUpdate_ here - it might be modified by callback
         // Instead, let update() handle script application when safe
         // The callback will have stored it in pendingScriptUpdate_ for later
     } else {
-        // CRITICAL FIX (Phase 7.9.2 Plan 2 Task 2): Error handling for failed execution
+        // Error handling for failed execution
         // If script execution fails, don't switch to VIEW mode (stay in EDIT mode)
         // Don't trigger script regeneration on failure
         ofLogError("CodeShell") << "Script execution failed - staying in EDIT mode";

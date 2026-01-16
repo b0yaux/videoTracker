@@ -490,9 +490,8 @@ void ScriptManager::updateScriptFromState(const EngineState& state) {
             ofLogError("ScriptManager") << "Exception in updateCallback: " << e.what();
         } catch (...) {
             ofLogError("ScriptManager") << "Unknown exception in updateCallback";
-        }
     }
-    }
+}
 }
 
 bool ScriptManager::hasStateChanged(
@@ -523,6 +522,11 @@ void ScriptManager::setScriptUpdateCallback(ScriptUpdateCallback callback) {
             ofLogError("ScriptManager") << "Unknown exception in callback registration";
         }
     }
+}
+
+void ScriptManager::clearScriptUpdateCallback() {
+    updateCallback_ = nullptr;
+    ofLogVerbose("ScriptManager") << "Script update callback cleared";
 }
 
 std::string ScriptManager::getCurrentScript() const {
