@@ -36,6 +36,12 @@ class GUIManager;
 class ViewManager;
 
 namespace vt {
+namespace shell {
+    class Shell;  // Forward declaration for shell registry
+}
+}
+
+namespace vt {
 
 // ═══════════════════════════════════════════════════════════
 // THREAD SAFETY ASSERTIONS (Phase 7.9 Plan 5)
@@ -146,29 +152,12 @@ public:
      * Use this for:
      * - Internal engine operations that need immediate results
      * - Scripts that must complete before continuing
-     * - Fallback when async execution unavailable
      * 
-     * For UI-triggered script execution, use evalAsync() instead (non-blocking).
+     * @param script Lua script to execute
+     * @return Result indicating success/failure
      */
     Result eval(const std::string& script);
     Result evalFile(const std::string& path);
-    
-    /**
-     * Execute Lua script asynchronously (non-blocking, returns immediately).
-     * 
-     * Use this for:
-     * - User-triggered script execution (CMD+R, auto-evaluation)
-     * - Long-running scripts that shouldn't block UI
-     * - Scripts that can complete in background
-     * 
-     * Result delivered via callback on main thread.
-     * 
-     * @param script Script to execute
-     * @param callback Callback function (executed on main thread)
-     * @param timeoutMs Timeout in milliseconds (0 = no timeout)
-     * @return Execution ID (0 if queue failed, use for cancellation)
-     */
-    uint64_t evalAsync(const std::string& script, std::function<void(Result)> callback, int timeoutMs = 0);
     
     /**
      * Execute script with sync contract (Script → Engine synchronization).
@@ -212,6 +201,18 @@ public:
     // Get complete engine state (immutable snapshot)
     EngineState getState() const;
     
+    // Lock-free read (atomic pointer load via mutex for C++17 compatibility)
+    // Returns immutable state snapshot that is never modified after creation
+    // MEMORY SAFETY: Returns shared_ptr to const EngineState (immutable)
+    // Thread-safe: Can be called from any thread (lock-free read via mutex)
+    std::shared_ptr<const EngineState> getImmutableStateSnapshot() const;
+    
+    // Update snapshot from runtime state (only during safe periods)
+    // CRITICAL: Only called during safe periods (not during script execution or command processing)
+    // Creates new immutable snapshot from current state and atomically swaps pointer
+    // Thread-safe: Must be called from main thread during safe periods
+    void updateImmutableStateSnapshot();
+    
     // Get specific module state
     EngineState::ModuleState getModuleState(const std::string& name) const;
     
@@ -245,7 +246,8 @@ public:
      * @return Current state version number
      */
     uint64_t getStateVersion() const {
-        return stateVersion_.load();
+        // Use acquire semantics to ensure we see latest state version
+        return stateVersion_.load(std::memory_order_acquire);
     }
     
     /**
@@ -255,9 +257,10 @@ public:
      * Returns when stateVersion_ >= targetVersion or timeout occurs.
      * 
      * @param targetVersion Target version number to wait for
-     * @param timeoutMs Timeout in milliseconds (default 1000ms)
+     * @param timeoutMs Timeout in milliseconds (default 2000ms, increased in Phase 7.9 Plan 8.3 for complex scripts)
+     * @return true if version reached, false if timeout occurred
      */
-    void waitForStateVersion(uint64_t targetVersion, uint64_t timeoutMs = 1000);
+    bool waitForStateVersion(uint64_t targetVersion, uint64_t timeoutMs = 2000);
     
     /**
      * Sync engine state to editor shells with completion guarantee (Engine → Editor Shell synchronization).
@@ -336,6 +339,34 @@ public:
     using StateObserver = std::function<void(const EngineState&)>;
     size_t subscribe(StateObserver callback);
     void unsubscribe(size_t id);
+    
+    // ═══════════════════════════════════════════════════════════
+    // MULTI-SHELL COORDINATION (Phase 7.9.2 Plan 3)
+    // ═══════════════════════════════════════════════════════════
+    
+    /**
+     * Register a shell for coordinated state updates.
+     * Shells are notified in registration order (FIFO) to ensure consistent state.
+     * 
+     * @param shell Shell to register (must not be null)
+     */
+    void registerShell(vt::shell::Shell* shell);
+    
+    /**
+     * Unregister a shell from coordinated state updates.
+     * 
+     * @param shell Shell to unregister
+     */
+    void unregisterShell(vt::shell::Shell* shell);
+    
+    /**
+     * Notify all registered shells of state update.
+     * Ensures all shells receive state updates in registration order (FIFO).
+     * 
+     * @param state Current engine state
+     * @param stateVersion State version number
+     */
+    void notifyAllShells(const EngineState& state, uint64_t stateVersion);
     
     // ═══════════════════════════════════════════════════════════
     // AUDIO/VIDEO CALLBACKS (for integration with host app)
@@ -467,12 +498,18 @@ public:
     bool commandsBeingProcessed() const { return hasUnsafeState(UnsafeState::COMMANDS_PROCESSING); }
     bool hasPendingCommands() const { return commandQueue_.size_approx() > 0; }
     bool isInUnsafeState() const { 
-        return unsafeStateFlags_.load() != 0 || parametersBeingModified_.load() > 0; 
+        // Use acquire semantics to ensure we see latest unsafe state flags
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return unsafeStateFlags_.load(std::memory_order_acquire) != 0 || 
+               parametersBeingModified_.load(std::memory_order_acquire) > 0; 
     }
     
     // Render guard (prevents state updates during rendering)
-    bool isRendering() const { return isRendering_.load(); }
-    void setRendering(bool rendering) { isRendering_.store(rendering); }
+    bool isRendering() const { return isRendering_.load(std::memory_order_acquire); }
+    void setRendering(bool rendering) { 
+        isRendering_.store(rendering, std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
     
     // Public method for ParameterRouter to notify state changes
     void notifyParameterChanged();  // Debounced parameter change notification for script sync
@@ -506,9 +543,6 @@ private:
     // Lua scripting
     std::unique_ptr<ofxLua> lua_;
     
-    // Background thread Lua state (for async execution)
-    std::unique_ptr<ofxLua> asyncLua_;
-    
     // Configuration
     EngineConfig config_;
     bool isSetup_ = false;
@@ -530,6 +564,11 @@ private:
     // Can be simplified: No - Atomic counter is optimal
     std::atomic<size_t> nextObserverId_{0};
     
+    // Multi-shell coordination (Phase 7.9.2 Plan 3)
+    // Shells registered for coordinated state updates (FIFO order)
+    // Protected by stateMutex_ (same mutex as observers_)
+    std::vector<vt::shell::Shell*> registeredShells_;
+    
     // Unsafe state flags (implementation detail - enum is public for inline method access)
     std::atomic<uint8_t> unsafeStateFlags_{0};
     
@@ -544,48 +583,12 @@ private:
     // Can be simplified: No - Critical for preventing crashes during rendering
     std::atomic<bool> isRendering_{false};
     
-    // CRITICAL: Mutex to completely block state snapshot building during script execution
-    // Purpose: Prevents buildStateSnapshot() from running during script execution
-    // When used: buildStateSnapshot() tries to acquire this (non-blocking) before building
-    // Still needed: Yes - buildStateSnapshot() is still used by getState() for state observation
-    // Can be simplified: Potentially - If Shells migrate to snapshots, buildStateSnapshot() may become unused
-    // Note: Serialization no longer uses this (uses getStateSnapshot() instead - lock-free)
-    // TODO: Remove after consolidating with unsafeStateFlags_ (Task 2)
-    mutable std::mutex scriptExecutionMutex_;
-    
-    // Background thread for async script execution
-    std::thread scriptExecutionThread_;
-    std::atomic<bool> scriptExecutionThreadRunning_{false};
-    std::atomic<uint64_t> nextScriptExecutionId_{1};
-    
-    // Script execution request for async execution
-    struct ScriptExecutionRequest {
-        std::string script;
-        std::function<void(Result)> callback;
-        uint64_t id;
-        std::chrono::steady_clock::time_point timestamp;
-        int timeoutMs = 0;  // 0 = no timeout
-        
-        ScriptExecutionRequest() : id(0), timeoutMs(0) {}
-    };
-    moodycamel::BlockingConcurrentQueue<ScriptExecutionRequest> scriptExecutionQueue_;
-    
-    // Pending callbacks to execute on main thread
-    struct PendingCallback {
-        uint64_t id;
-        Result result;
-        std::function<void(Result)> callback;
-    };
-    moodycamel::BlockingConcurrentQueue<PendingCallback> pendingScriptCallbacks_;
-    
-    // Background thread function for script execution
-    void scriptExecutionThreadFunction();
-    
-    // Execute script in background Lua state
-    Result executeScriptInBackground(const std::string& script, int timeoutMs = 0);
-    
-    // Post script execution result to main thread
-    void postScriptResultToMainThread(uint64_t id, Result result, std::function<void(Result)> callback);
+    // Render guard (prevents state updates during rendering)
+    // Purpose: Flag indicating rendering is in progress (ImGui draw() method)
+    // When used: notifyStateChange() checks this to defer notifications during rendering
+    // Still needed: Yes - Prevents crashes from state updates during ImGui rendering
+    // Can be simplified: No - Critical for preventing crashes during rendering
+    std::atomic<bool> isRendering_{false};
     
     // CRITICAL: Cooldown period after command processing to prevent crashes
     // Purpose: Prevents video drawing immediately after commands complete
@@ -625,6 +628,41 @@ private:
         uint64_t queueOverflows = 0;
     };
     CommandStats commandStats_;
+    
+    // Queue monitoring statistics (Phase 7.9 Plan 8.2)
+    struct QueueMonitorStats {
+        // Notification queue
+        size_t notificationQueueCurrent = 0;
+        size_t notificationQueueMax = 0;
+        size_t notificationQueueTotalProcessed = 0;
+        size_t notificationQueueTotalEnqueued = 0;
+        uint64_t notificationQueueLastLogTime = 0;
+        
+        // Command queue
+        size_t commandQueueCurrent = 0;
+        size_t commandQueueMax = 0;
+        size_t commandQueueTotalProcessed = 0;
+        size_t commandQueueTotalEnqueued = 0;
+        uint64_t commandQueueLastLogTime = 0;
+        
+        // State version
+        uint64_t stateVersionIncrements = 0;
+        uint64_t stateVersionLastValue = 0;
+        uint64_t stateVersionLastLogTime = 0;
+        uint64_t stateVersionMaxGap = 0;
+        uint64_t stateVersionSyncTimeouts = 0;
+    };
+    QueueMonitorStats queueMonitorStats_;
+    
+    // Monitoring thresholds (Phase 7.9 Plan 8.2)
+    static constexpr size_t NOTIFICATION_QUEUE_WARNING_THRESHOLD = 100;
+    static constexpr size_t NOTIFICATION_QUEUE_ERROR_THRESHOLD = 500;
+    static constexpr size_t COMMAND_QUEUE_WARNING_THRESHOLD = 500;
+    static constexpr size_t COMMAND_QUEUE_ERROR_THRESHOLD = 900;
+    static constexpr uint64_t STATE_VERSION_RATE_WARNING_THRESHOLD = 100;  // increments/sec
+    static constexpr uint64_t STATE_VERSION_RATE_ERROR_THRESHOLD = 1000;    // increments/sec
+    static constexpr uint64_t STATE_VERSION_GAP_WARNING_THRESHOLD = 10;
+    static constexpr uint64_t MONITORING_LOG_INTERVAL_MS = 5000;  // Log stats every 5 seconds
     
     // State snapshot throttling (prevents excessive expensive snapshot building)
     // Purpose: Limits buildStateSnapshot() frequency to prevent performance issues
@@ -686,6 +724,17 @@ private:
     // Can be simplified: No - Version tracking is necessary
     std::atomic<uint64_t> stateVersion_{0};
     
+    // Immutable state snapshot (Phase 7.9-9.2)
+    // Purpose: Lock-free immutable state snapshots to prevent memory corruption during script execution
+    // When used: getState() and notifyStateChange() use immutable snapshots instead of building during unsafe periods
+    // Still needed: Yes - Core of immutable state pattern to prevent race conditions
+    // Can be simplified: No - This is the new immutable state pattern
+    // Note: Stored as mutex-protected shared_ptr (C++17 compatible - std::atomic<shared_ptr> requires C++20)
+    //       Mutex is only used for pointer updates, reads are fast (single mutex lock)
+    //       Consistent with Phase 7.2's snapshotJson_ pattern
+    mutable std::mutex immutableStateSnapshotMutex_;
+    mutable std::shared_ptr<const EngineState> immutableStateSnapshot_;
+    
     // Helper to get current timestamp
     uint64_t getCurrentTimestamp() const;
     
@@ -707,6 +756,12 @@ private:
     // Replaces stateNeedsNotification_ flag pattern - queue is single source of truth
     void enqueueStateNotification();
     EngineState buildStateSnapshot() const;
+    
+    // Queue monitoring (Phase 7.9 Plan 8.2)
+    void updateNotificationQueueMonitoring();
+    void updateCommandQueueMonitoring();
+    void updateStateVersionMonitoring();
+    void logQueueStatistics();
     
     // Setup helpers
     void setupCoreSystems();
