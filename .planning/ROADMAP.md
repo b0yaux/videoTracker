@@ -624,16 +624,16 @@ See `.planning/phases/7.9.3-fix-persistent-scripting-crashes/RESEARCH.md` for co
 
 **Goal:** Implement the simplified ScriptManager architecture designed in Phase 7.10.
 
-**Status:** 🚧 **Plan 1 Complete**
+**Status:** 🚧 **Plan 3 Complete**
 **Depends on:** Phase 7.10 (all deliverables complete)
 **Estimated Effort:** 8-12 hours
 
 **Plans Completed:**
 - ✅ 7.10.1-01: ScriptManager header and implementation simplified
+- ✅ 7.10.1-02: CodeShell synchronization
+- ✅ 7.10.1-03: Async script execution
 
 **Plans Remaining:**
-- 7.10.1-02: CodeShell synchronization
-- 7.10.1-03: Async script execution
 - 7.10.1-04: Engine mutexes
 
 **Key Changes (based on Phase 7.10 recommendations):**
@@ -731,15 +731,15 @@ See `.planning/phases/7.9.3-fix-persistent-scripting-crashes/RESEARCH.md` for co
 - Implementation plan ready
 - Phase 7.10.1 implementation in progress
 
-**Phase 7.10.1 Status**: 🚧 **Plan 1 Complete** (3/4 plans remaining)
+**Phase 7.10.1 Status**: 🚧 **Plan 3 Complete** (1/4 plans remaining)
 - ✅ Plan 1: ScriptManager simplified
-- ⏳ Plan 2: CodeShell synchronization
-- ⏳ Plan 3: Async script execution
+- ✅ Plan 2: CodeShell synchronization
+- ✅ Plan 3: Async script execution
 - ⏳ Plan 4: Engine mutexes
 
 **Total Estimated Effort (Phase 7)**: 10-15 days
 
-**Critical Path**: Phase 7.1 → Phase 7.2 → Phase 7.3 → Phase 7.4 → Phase 7.5 → Phase 7.6 → Phase 7.7 → Phase 7.8 ✅ Complete → Phase 7.9 ✅ Complete → Phase 7.10 ✅ Complete → Phase 7.10.1 🚧 Plan 1/4 Complete
+**Critical Path**: Phase 7.1 → Phase 7.2 → Phase 7.3 → Phase 7.4 → Phase 7.5 → Phase 7.6 → Phase 7.7 → Phase 7.8 ✅ Complete → Phase 7.9 ✅ Complete → Phase 7.10 ✅ Complete → Phase 7.10.1 🚧 Plan 3/4 Complete
 
 **Blockers**: None (can start immediately)
 
