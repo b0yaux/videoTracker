@@ -250,15 +250,23 @@ public:
     }
     
     /**
-     * Wait for state to reach target version (optional, for future sync contracts).
-     * This method waits for state to reach target version (for future bidirectional sync contracts).
-     * Uses std::this_thread::yield() in wait loop (non-blocking).
-     * Returns when stateVersion_ >= targetVersion or timeout occurs.
+     * @deprecated DEPRECATED in Phase 1 - Do not use.
+     * 
+     * This function is inherently broken when called from the main thread because:
+     *   1. It blocks the main thread waiting for state version to increment
+     *   2. State version only increments in updateStateSnapshot()
+     *   3. updateStateSnapshot() is called from processNotificationQueue()
+     *   4. processNotificationQueue() runs in update() on the main thread
+     *   5. Main thread is blocked → deadlock
+     * 
+     * Kept for backward compatibility but logs a warning if called.
+     * Use the asynchronous observer pattern instead.
      * 
      * @param targetVersion Target version number to wait for
-     * @param timeoutMs Timeout in milliseconds (default 2000ms, increased in Phase 7.9 Plan 8.3 for complex scripts)
-     * @return true if version reached, false if timeout occurred
+     * @param timeoutMs Timeout in milliseconds (ignored - returns immediately)
+     * @return Always returns false
      */
+    [[deprecated("Use asynchronous observer pattern instead - this function causes deadlocks")]]
     bool waitForStateVersion(uint64_t targetVersion, uint64_t timeoutMs = 2000);
     
     /**
@@ -510,9 +518,10 @@ public:
     bool hasPendingCommands() const { return commandQueue_.size_approx() > 0; }
     bool isInUnsafeState() const { 
         // Use acquire semantics to ensure we see latest unsafe state flags
+        // Phase 2 Simplification: Removed parametersBeingModified_ check
+        // All state modifications now go through command queue, so SCRIPT_EXECUTING and COMMANDS_PROCESSING flags are sufficient
         std::atomic_thread_fence(std::memory_order_acquire);
-        return unsafeStateFlags_.load(std::memory_order_acquire) != 0 || 
-               parametersBeingModified_.load(std::memory_order_acquire) > 0; 
+        return unsafeStateFlags_.load(std::memory_order_acquire) != 0; 
     }
     
     // Render guard (prevents state updates during rendering)
@@ -594,17 +603,6 @@ private:
     // Can be simplified: No - Critical for preventing crashes during rendering
     std::atomic<bool> isRendering_{false};
     
-    // CRITICAL: Cooldown period after command processing to prevent crashes
-    // Purpose: Prevents video drawing immediately after commands complete
-    // When used: Video rendering checks this before accessing module state
-    
-    // Parameter modification guard (prevents state snapshots during parameter modification)
-    // Purpose: Counter for nested parameter modifications (allows nested calls)
-    // When used: buildStateSnapshot() checks this to return cached state during parameter changes
-    // Still needed: Yes - getState() uses this to detect unsafe periods
-    // Can be simplified: No - Counter pattern needed for nested modifications
-    std::atomic<int> parametersBeingModified_{0};  // Counter for nested parameter modifications
-    
     // Unified command queue (lock-free, processed in audio thread)
     // Producer: GUI thread (enqueueCommand)
     // Consumer: Audio thread (processCommands)
@@ -676,24 +674,10 @@ private:
     std::atomic<uint64_t> lastStateSnapshotTime_{0};
     static constexpr uint64_t STATE_SNAPSHOT_THROTTLE_MS = 100;  // Max once per 100ms
     
-    // Cached state snapshot (for use during script execution)
-    // Purpose: Stores last valid state snapshot for use during unsafe periods
-    // When used: getState() returns cachedState_ when buildStateSnapshot() can't run
-    // Still needed: Yes - getState() needs fallback during unsafe periods
-    // Can be simplified: Potentially - If Shells migrate to snapshots, getState() may become unused
-    // Note: Serialization no longer uses this (uses getStateSnapshot() instead - lock-free)
-    mutable std::unique_ptr<EngineState> cachedState_;
-    // Purpose: Protects cachedState_ access during updates
-    // When used: buildStateSnapshot() updates cachedState_ with exclusive lock
-    // Still needed: Yes - Protects cachedState_ updates
-    // Can be simplified: Potentially - If cachedState_ becomes unused, this can be removed
-    mutable std::shared_mutex cachedStateMutex_;
-    
     // Guard to prevent concurrent snapshot building
     // Purpose: Prevents multiple threads from building snapshots simultaneously
     // When used: buildStateSnapshot() acquires snapshotMutex_ for exclusive access
-    // Still needed: Yes - buildStateSnapshot() is still used by getState() for state observation
-    // Can be simplified: Potentially - If Shells migrate to snapshots, buildStateSnapshot() may become unused
+    // Still needed: Yes - buildStateSnapshot() is still used for building immutable snapshots
     // Note: Serialization no longer uses this (uses getStateSnapshot() instead - lock-free)
     mutable std::mutex snapshotMutex_;
     

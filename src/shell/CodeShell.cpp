@@ -66,17 +66,24 @@ void CodeShell::setup() {
             if (editorMode_ == EditorMode::EDIT) {
                 // EDIT mode: Store synced script for later, don't update editor
                 // The script will be applied when user switches back to VIEW mode
-                pendingScriptUpdate_ = script;
-                pendingScriptVersion_ = scriptVersion;
-                hasPendingScriptUpdate_ = true;
+                {
+                    std::lock_guard<std::mutex> lock(pendingUpdateMutex_);
+                    pendingScriptUpdate_ = script;
+                    pendingScriptVersion_ = scriptVersion;
+                }
+                hasPendingScriptUpdate_.store(true);
                 return;  // Don't update editor when user is editing
             }
             // VIEW mode: Continue to defer update (will be applied in update() when safe)
-            
+
             // Defer the update - will be applied in update() when safe
-            pendingScriptUpdate_ = script;
-            pendingScriptVersion_ = scriptVersion;
-            hasPendingScriptUpdate_ = true;
+            // Use mutex-protected storage for thread-safe access from any thread
+            {
+                std::lock_guard<std::mutex> lock(pendingUpdateMutex_);
+                pendingScriptUpdate_ = script;
+                pendingScriptVersion_ = scriptVersion;
+            }
+            hasPendingScriptUpdate_.store(true);
         });
         
         ofLogNotice("CodeShell") << "Callback registered - script will be populated via callback";
@@ -193,15 +200,15 @@ void CodeShell::update(float deltaTime) {
     // This prevents crashes from calling SetText() during script execution or ImGui rendering
     // We need to be very careful - only apply when absolutely safe
     // NEVER call SetText() during draw() - it causes crashes!
-    if (hasPendingScriptUpdate_ && codeEditor_ && editorMode_ == EditorMode::VIEW) {
+    if (hasPendingScriptUpdate_.load() && codeEditor_ && editorMode_ == EditorMode::VIEW) {
         // Use state version comparison instead of unsafe state flags
         // State version increments AFTER commands/scripts complete, providing reliable safety signal
         bool isSafe = true;
         uint64_t currentVersion = 0;
-        
+
         if (engine_) {
             currentVersion = engine_->getStateVersion();
-            
+
             // Check if state has been updated since last apply
             if (currentVersion <= lastAppliedVersion_) {
                 // State hasn't changed yet - wait for update to complete
@@ -213,34 +220,43 @@ void CodeShell::update(float deltaTime) {
                 }
             }
         }
-        
+
         // Only apply if state has been updated (version increased)
         if (isSafe) {
             try {
+                // ATOMIC load for flag, mutex-protected for string/version
+                std::string pendingUpdate;
+                uint64_t pendingVersion = 0;
+                {
+                    std::lock_guard<std::mutex> lock(pendingUpdateMutex_);
+                    pendingUpdate = pendingScriptUpdate_;
+                    pendingVersion = pendingScriptVersion_;
+                }
+
                 // Update lastEditorText_ BEFORE SetText to prevent mode detection from triggering EDIT mode
                 // This ensures that when SetText() is called, GetText() will match lastEditorText_
                 // and mode detection won't think the user edited
-                lastEditorText_ = pendingScriptUpdate_;
-                
-                codeEditor_->SetText(pendingScriptUpdate_);
-                
+                lastEditorText_ = pendingUpdate;
+
+                codeEditor_->SetText(pendingUpdate);
+
                 editorInitialized_ = true;
-                hasPendingScriptUpdate_ = false;
-                lastAppliedVersion_ = pendingScriptVersion_;
+                hasPendingScriptUpdate_.store(false);
+                lastAppliedVersion_ = pendingVersion;
                 ofLogVerbose("CodeShell") << "Applied deferred script update (state version: " << currentVersion
-                                          << ", script version: " << pendingScriptVersion_ << ")";
+                                          << ", script version: " << pendingVersion << ")";
             } catch (const std::exception& e) {
                 ofLogError("CodeShell") << "Exception applying deferred script update: " << e.what();
-                hasPendingScriptUpdate_ = false;  // Clear to prevent retry loop
+                hasPendingScriptUpdate_.store(false);  // Clear to prevent retry loop
             } catch (...) {
                 ofLogError("CodeShell") << "Unknown exception applying deferred script update";
-                hasPendingScriptUpdate_ = false;  // Clear to prevent retry loop
+                hasPendingScriptUpdate_.store(false);  // Clear to prevent retry loop
             }
         } else {
             // Still waiting for state update - keep it pending
             // Updates persist until state version increases (no arbitrary timeout)
             // This prevents updates from being lost during long-running script execution
-            ofLogVerbose("CodeShell") << "Deferred script update pending - waiting for state version " 
+            ofLogVerbose("CodeShell") << "Deferred script update pending - waiting for state version "
                                      << (lastAppliedVersion_ + 1);
         }
     }
@@ -252,7 +268,9 @@ void CodeShell::update(float deltaTime) {
         engine_->setScriptAutoUpdate(false);
     } else if (codeEditor_ && editorMode_ == EditorMode::VIEW && engine_) {
         // VIEW mode: Enable auto-update to allow script updates
-        bool enableAutoUpdate = !hasPendingScriptUpdate_;
+        // Use ATOMIC load for thread-safe access
+        bool hasPending = hasPendingScriptUpdate_.load();
+        bool enableAutoUpdate = !hasPending;
         engine_->setScriptAutoUpdate(enableAutoUpdate);
         if (!enableAutoUpdate) {
             ofLogWarning("CodeShell") << "VIEW mode but script auto-update held until pending script applies";

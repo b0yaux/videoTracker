@@ -87,9 +87,11 @@ private:
     bool wasActive_ = false;  // Track previous active state to detect activation
     
     // Deferred script update (to prevent crashes during script execution or ImGui rendering)
+    // Thread-safe: protected by mutex for cross-thread access (callback writes, update() reads)
     std::string pendingScriptUpdate_;
     uint64_t pendingScriptVersion_ = 0;
-    bool hasPendingScriptUpdate_ = false;
+    std::atomic<bool> hasPendingScriptUpdate_{false};
+    std::mutex pendingUpdateMutex_;  // Protects pendingScriptUpdate_ and pendingScriptVersion_
     uint64_t lastAppliedVersion_ = 0;  // Track last applied state version for update safety
     uint64_t lastDeferredVersionWarning_ = 0;
     

@@ -487,26 +487,29 @@ void ScriptManager::updateScriptFromState(const EngineState& state) {
     lastState_ = state;
     
     // Notify callback (CodeShell will register this)
-    // Invoke callback in a thread-safe manner
-    if (true) {
-        std::function<void(const std::string&, uint64_t)> cbCopy;
-        {
-            std::lock_guard<std::mutex> lock(callbackMutex_);
-            cbCopy = updateCallback_;
-        }
-        if (cbCopy) {
-            try {
-                ofLogNotice("ScriptManager") << "Invoking script update callback (thread=" << std::this_thread::get_id() << ", version=" << stateVersion << ")";
-                cbCopy(currentScript_, stateVersion);
-                ofLogNotice("ScriptManager") << "Script update callback finished (thread=" << std::this_thread::get_id() << ")";
-            } catch (const std::exception& e) {
-                ofLogError("ScriptManager") << "Exception in updateCallback: " << e.what();
-            } catch (...) {
-                ofLogError("ScriptManager") << "Unknown exception in updateCallback";
-            }
-        } else {
-            ofLogNotice("ScriptManager") << "Script update callback skipped (none registered, thread=" << std::this_thread::get_id() << ")";
-        }
+    // Invoke callback in a thread-safe manner with additional guards
+    ScriptUpdateCallback cbCopy;
+    {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        cbCopy = updateCallback_;
+    }
+    
+    // GUARD: Check if callback is valid before invoking
+    if (!cbCopy) {
+        ofLogVerbose("ScriptManager") << "Script update callback skipped (none registered, thread=" << std::this_thread::get_id() << ")";
+        return;
+    }
+    
+    // GUARD: Additional validation - ensure callback is callable
+    // This prevents potential issues with stale callbacks during destruction
+    try {
+        ofLogNotice("ScriptManager") << "Invoking script update callback (thread=" << std::this_thread::get_id() << ", version=" << stateVersion << ")";
+        cbCopy(currentScript_, stateVersion);
+        ofLogNotice("ScriptManager") << "Script update callback finished successfully (thread=" << std::this_thread::get_id() << ")";
+    } catch (const std::exception& e) {
+        ofLogError("ScriptManager") << "Exception in updateCallback: " << e.what();
+    } catch (...) {
+        ofLogError("ScriptManager") << "Unknown exception in updateCallback";
     }
 }
 
