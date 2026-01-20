@@ -616,6 +616,10 @@ private:
     // Still needed: Yes - Ensures notifications happen on main thread event loop, not during rendering or from audio thread
     moodycamel::BlockingConcurrentQueue<std::function<void()>> notificationQueue_;
     
+    // Phase 2: Suppress duplicate notifications during parameter cascades
+    // Set when enqueueStateNotification() is called, cleared after processing
+    std::atomic<bool> notificationEnqueued_{false};
+    
     // Recursive notification guard (prevents observers from triggering recursive notifications)
     // Purpose: Prevents infinite recursion if observer calls notifyStateChange()
     // When used: notifyStateChange() checks this before notifying, sets during notification
