@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <atomic>
+#include <mutex>
 
 namespace vt {
 
@@ -70,7 +71,7 @@ public:
     void clearUpdateFlag() { scriptNeedsUpdate_ = false; }
     
     // Callback for shells to register (called when script updates)
-    using ScriptUpdateCallback = std::function<void(const std::string& script)>;
+    using ScriptUpdateCallback = std::function<void(const std::string& script, uint64_t scriptVersion)>;
     void setScriptUpdateCallback(ScriptUpdateCallback callback);
     void clearScriptUpdateCallback();
     
@@ -89,6 +90,14 @@ private:
     bool scriptNeedsUpdate_ = false;
     bool autoUpdateEnabled_ = true;
     ScriptUpdateCallback updateCallback_;
+    std::mutex callbackMutex_;
+    
+    // Debug/diagnostic tracking (Phase 7.9.2 Script Sync instrumentation)
+    uint64_t scriptVersion_ = 0;
+    std::atomic<uint64_t> lastSuppressedVersion_{0};
+    std::atomic<uint64_t> lastDeferredVersion_{0};
+    std::atomic<uint64_t> lastSkippedStateVersion_{0};
+    std::atomic<uint64_t> lastGenerationDurationMs_{0};
     
     // Simple atomic state machine for update coordination
     // Eliminates 3 layers of deferred updates with single atomic guard

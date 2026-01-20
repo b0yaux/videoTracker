@@ -917,7 +917,7 @@ void Engine::updateImmutableStateSnapshot() {
 // SHELL-SAFE API (for ScriptManager operations)
 // ═══════════════════════════════════════════════════════════
 
-void Engine::setScriptUpdateCallback(std::function<void(const std::string&)> callback) {
+void vt::Engine::setScriptUpdateCallback(std::function<void(const std::string&, uint64_t)> callback) {
     scriptManager_.setScriptUpdateCallback(callback);
 }
 
@@ -1293,37 +1293,23 @@ void Engine::enqueueStateNotification() {
 }
 
 void Engine::processNotificationQueue() {
-    
-    // Process queued notifications from notificationQueue_
-    // Called from update() (main thread event loop) to ensure notifications happen on event loop, not during rendering
-    // Use non-blocking dequeue with per-frame limit to avoid blocking the event loop
-    // Limit prevents processing too many notifications in one frame, which could delay window rendering
-    
-    // Progressive limit: start conservative, increase over time
-    size_t frameCount = updateFrameCount_.load();
-    size_t MAX_NOTIFICATIONS_PER_FRAME;
-    if (frameCount < 20) {
-        MAX_NOTIFICATIONS_PER_FRAME = 1;  // Very conservative for first 20 frames
-    } else if (frameCount < 50) {
-        MAX_NOTIFICATIONS_PER_FRAME = 3;  // Moderate for next 30 frames
-    } else {
-        MAX_NOTIFICATIONS_PER_FRAME = 10; // Normal limit after 50 frames
-    }
-    
-    // Update monitoring: track queue depth before processing (Phase 7.9 Plan 8.2)
+    // Process ALL queued notifications from notificationQueue_
+    // Called from update() (main thread event loop)
+    // Redesign: Remove rate-limiting to prevent state update timeouts
+    // Process all notifications in a single frame to ensure consistency
+
+    // Update monitoring: track queue depth before processing
     size_t queueDepthBefore = notificationQueue_.size_approx();
     queueMonitorStats_.notificationQueueCurrent = queueDepthBefore;
     if (queueDepthBefore > queueMonitorStats_.notificationQueueMax) {
         queueMonitorStats_.notificationQueueMax = queueDepthBefore;
     }
-    
+
     std::function<void()> callback;
-    size_t processed = 0;
-    while (processed < MAX_NOTIFICATIONS_PER_FRAME && notificationQueue_.try_dequeue(callback)) {
+    while (notificationQueue_.try_dequeue(callback)) {
         if (callback) {
             try {
-                callback();  // Execute callback (calls notifyObserversWithState() or syncEngineToEditor callback)
-                processed++;
+                callback();
                 queueMonitorStats_.notificationQueueTotalProcessed++;
             } catch (const std::exception& e) {
                 ofLogError("Engine") << "Error processing notification callback: " << e.what();
@@ -1332,32 +1318,13 @@ void Engine::processNotificationQueue() {
             }
         }
     }
-    
-    // Update monitoring: track queue depth after processing (Phase 7.9 Plan 8.2)
+
+    // Update monitoring: track queue depth after processing
     size_t queueDepthAfter = notificationQueue_.size_approx();
     queueMonitorStats_.notificationQueueCurrent = queueDepthAfter;
-    
-    // Check thresholds and log warnings (Phase 7.9 Plan 8.2)
-    if (queueDepthAfter >= NOTIFICATION_QUEUE_ERROR_THRESHOLD) {
-        ofLogError("Engine") << "Notification queue depth CRITICAL: " << queueDepthAfter 
-                             << " (threshold: " << NOTIFICATION_QUEUE_ERROR_THRESHOLD 
-                             << ", processed: " << processed << " this frame)";
-    } else if (queueDepthAfter >= NOTIFICATION_QUEUE_WARNING_THRESHOLD) {
-        ofLogWarning("Engine") << "Notification queue depth high: " << queueDepthAfter 
-                               << " (threshold: " << NOTIFICATION_QUEUE_WARNING_THRESHOLD 
-                               << ", processed: " << processed << " this frame)";
-    }
-    
-    // Log if we hit the limit (indicates many notifications queued)
-    if (processed >= MAX_NOTIFICATIONS_PER_FRAME) {
-        if (queueDepthAfter > 0) {
-            ofLogVerbose("Engine") << "Notification queue processing limit reached (" << processed 
-                                   << " processed, ~" << queueDepthAfter << " remaining)";
-        }
-    }
 }
 
-void Engine::notifyParameterChanged() {
+void vt::Engine::notifyParameterChanged() {
     // SIMPLIFIED: If parameters are being modified, defer state notification
     // This prevents crashes when GUI changes parameters and triggers callbacks
     // Use acquire semantics to ensure we see latest parameter modification count
@@ -1373,8 +1340,8 @@ void Engine::notifyParameterChanged() {
     enqueueStateNotification();
 }
 
-void Engine::onBPMChanged(float& newBpm) {
-    
+void vt::Engine::onBPMChanged(float& newBpm) {
+
     // Defer state update if script is executing (prevents recursive updates)
     // The state will be updated after script execution completes
     if (hasUnsafeState(UnsafeState::SCRIPT_EXECUTING)) {
@@ -1382,12 +1349,12 @@ void Engine::onBPMChanged(float& newBpm) {
         // Don't notify during script execution - it will be notified after execution completes
         return;
     }
-    
+
     ofLogVerbose("Engine") << "[BPM_CHANGE] BPM changed to " << newBpm << ", notifying state change";
     notifyParameterChanged();
 }
 
-EngineState Engine::buildStateSnapshot() const {
+vt::EngineState vt::Engine::buildStateSnapshot() const {
     ASSERT_MAIN_THREAD();
     
     // Set thread-local flag to prevent recursive snapshot building
@@ -1578,14 +1545,14 @@ EngineState Engine::buildStateSnapshot() const {
     return state;
 }
 
-bool Engine::waitForStateVersion(uint64_t targetVersion, uint64_t timeoutMs) {
+bool vt::Engine::waitForStateVersion(uint64_t targetVersion, uint64_t timeoutMs) {
     // Wait for state to reach target version (for future sync contracts)
     // Uses std::this_thread::yield() in wait loop (non-blocking)
     // Returns when stateVersion_ >= targetVersion or timeout occurs
     // Returns true if version reached, false if timeout
     uint64_t startTime = getCurrentTimestamp();
     uint64_t timeoutTime = startTime + timeoutMs;
-    
+
     // Use acquire semantics to ensure we see latest state version
     while (stateVersion_.load(std::memory_order_acquire) < targetVersion) {
         uint64_t now = getCurrentTimestamp();
@@ -1593,7 +1560,7 @@ bool Engine::waitForStateVersion(uint64_t targetVersion, uint64_t timeoutMs) {
             // Timeout reached
             queueMonitorStats_.stateVersionSyncTimeouts++;  // Phase 7.9 Plan 8.2
             uint64_t currentVersion = stateVersion_.load(std::memory_order_acquire);
-            ofLogWarning("Engine") << "waitForStateVersion() timed out waiting for version " << targetVersion 
+            ofLogWarning("Engine") << "waitForStateVersion() timed out waiting for version " << targetVersion
                                    << " (current: " << currentVersion << ", timeout: " << timeoutMs << "ms)"
                                    << " - State synchronization incomplete, commands may still be processing";
             return false;  // Timeout occurred
@@ -1604,7 +1571,7 @@ bool Engine::waitForStateVersion(uint64_t targetVersion, uint64_t timeoutMs) {
     return true;  // Version reached successfully
 }
 
-void Engine::updateStateSnapshot() {
+void vt::Engine::updateStateSnapshot() {
     ASSERT_MAIN_THREAD();
     // Increment version number (atomic)
     // Use acquire-release semantics for state version updates
@@ -1740,7 +1707,7 @@ void Engine::updateStateSnapshot() {
     }
 }
 
-void Engine::buildTransportState(EngineState& state) const {
+void vt::Engine::buildTransportState(vt::EngineState& state) const {
     state.transport.isPlaying = clock_.isPlaying();
     // Use getTargetBPM() instead of getBPM() for state snapshots
     // getBPM() returns smoothed currentBpm (for audio/display), but for script generation
@@ -1748,10 +1715,10 @@ void Engine::buildTransportState(EngineState& state) const {
     float bpm = clock_.getTargetBPM();
     state.transport.bpm = bpm;
     state.transport.currentBeat = 0;  // TODO: Get from Clock if available
-    
+
 }
 
-bool Engine::buildModuleStates(EngineState& state) const {
+bool vt::Engine::buildModuleStates(vt::EngineState& state) const {
     // CRITICAL: This function should NEVER be called during script execution
     // If it is, it means our guards failed - log extensively and abort immediately
     std::atomic_thread_fence(std::memory_order_acquire);
@@ -2041,7 +2008,7 @@ bool Engine::buildModuleStates(EngineState& state) const {
     return !aborted;
 }
 
-void Engine::buildConnectionStates(EngineState& state) const {
+void vt::Engine::buildConnectionStates(vt::EngineState& state) const {
     // MEMORY SAFETY (Phase 7.9 Plan 4): Connection snapshots are already deep copies
     // ConnectionInfo contains only value types (strings, bool) - all copied by value
     // No shared references - snapshot is fully independent even if connection is deleted
@@ -2061,7 +2028,7 @@ void Engine::buildConnectionStates(EngineState& state) const {
     }
 }
 
-void Engine::audioOut(ofSoundBuffer& buffer) {
+void vt::Engine::audioOut(ofSoundBuffer& buffer) {
     // Track audio thread ID on first call (Phase 7.9 Plan 5)
     static std::once_flag audioThreadIdSet;
     std::call_once(audioThreadIdSet, [this]() {
@@ -2091,25 +2058,19 @@ void Engine::audioOut(ofSoundBuffer& buffer) {
     }
 }
 
-void Engine::update(float deltaTime) {
+void vt::Engine::update(float deltaTime) {
     ASSERT_MAIN_THREAD();
     
     // Increment frame counter
     size_t frameCount = updateFrameCount_.fetch_add(1) + 1;
-    
-    
-    // CRITICAL: Skip notification processing for first 10 frames to allow window to appear
-    // During initialization, many notifications may be queued, and processing them
-    // before the window is visible can delay window appearance
-    // Window needs several frames to become visible and stable
-    if (frameCount > 10) {
-        // Process notification queue (after window has appeared)
-        // This ensures deferred notifications are delivered on main thread event loop
-        // Notifications are delivered before any other update logic
-        // Process with limit to prevent blocking the event loop
-        processNotificationQueue();
-        
-        // Periodic queue statistics logging (Phase 7.9 Plan 8.2)
+
+    // CRITICAL: Process notification queue every frame
+    // Redesign: Removed first 10 frames skip - process immediately
+    // This ensures state updates happen without delay
+    processNotificationQueue();
+
+    // Periodic queue statistics logging (after first frame)
+    if (frameCount > 1) {
         logQueueStatistics();
     }
     
@@ -2170,7 +2131,7 @@ void Engine::update(float deltaTime) {
     }
 }
 
-bool Engine::loadSession(const std::string& path) {
+bool vt::Engine::loadSession(const std::string& path) {
     bool result = sessionManager_.loadSession(path);
     if (result) {
         // Use deferred notification pattern to prevent recursive notifications
@@ -2180,15 +2141,15 @@ bool Engine::loadSession(const std::string& path) {
     return result;
 }
 
-bool Engine::saveSession(const std::string& path) {
+bool vt::Engine::saveSession(const std::string& path) {
     return sessionManager_.saveSession(path);
 }
 
-std::string Engine::serializeState() const {
+std::string vt::Engine::serializeState() const {
     return getState().toJson();
 }
 
-bool Engine::deserializeState(const std::string& data) {
+bool vt::Engine::deserializeState(const std::string& data) {
     try {
         EngineState state = EngineState::fromJson(data);
         // TODO: Apply state to engine (Phase 2)
@@ -2198,13 +2159,13 @@ bool Engine::deserializeState(const std::string& data) {
     }
 }
 
-uint64_t Engine::getCurrentTimestamp() const {
+uint64_t vt::Engine::getCurrentTimestamp() const {
     auto now = std::chrono::steady_clock::now();
     auto duration = now.time_since_epoch();
     return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
 }
 
-bool Engine::enqueueCommand(std::unique_ptr<Command> cmd) {
+bool vt::Engine::enqueueCommand(std::unique_ptr<Command> cmd) {
     if (!cmd) {
         ofLogWarning("Engine") << "Attempted to enqueue null command";
         return false;
@@ -2267,67 +2228,44 @@ bool Engine::enqueueCommand(std::unique_ptr<Command> cmd) {
 
 int Engine::processCommands() {
     ASSERT_AUDIO_THREAD();
-    
-    // Set flag to prevent state snapshots during command execution
-    // This prevents crashes when commands trigger state changes
-    setUnsafeState(UnsafeState::COMMANDS_PROCESSING, true);
-    
-    
+
+    // Redesign: Removed COMMANDS_PROCESSING flag - not necessary
+    // Commands are queued and processed atomically, no need for flag
+    // Reduces flag spam and simplifies design
+
     int processed = 0;
     std::unique_ptr<Command> cmd;
-    
-    // Update monitoring: track command queue depth before processing (Phase 7.9 Plan 8.2)
+
+    // Update monitoring: track command queue depth before processing
     size_t queueDepthBefore = commandQueue_.size_approx();
     queueMonitorStats_.commandQueueCurrent = queueDepthBefore;
-    
+
     // Process all queued commands (lock-free, called from audio thread)
     while (commandQueue_.try_dequeue(cmd)) {
         try {
-            uint64_t versionBefore = stateVersion_.load();
-            EngineState stateBefore = getState();
-            
             cmd->execute(*this);
             commandStats_.commandsProcessed++;
-            queueMonitorStats_.commandQueueTotalProcessed++;  // Phase 7.9 Plan 8.2
+            queueMonitorStats_.commandQueueTotalProcessed++;
             processed++;
-            
-            uint64_t versionAfter = stateVersion_.load();
-            EngineState stateAfter = getState();
-            
-            // NOTE: Removed onCommandExecuted() callback - state observer handles all sync now
-            
         } catch (const std::exception& e) {
             ofLogError("Engine") << "Command execution failed: " << e.what()
                                 << " (" << cmd->describe() << ")";
             // Don't notify ScriptManager on error - state didn't change
         }
     }
-    
-    // Update monitoring: track command queue depth after processing (Phase 7.9 Plan 8.2)
+
+    // Update monitoring: track command queue depth after processing
     size_t queueDepthAfter = commandQueue_.size_approx();
     queueMonitorStats_.commandQueueCurrent = queueDepthAfter;
-    
-    // Clear flag after all commands are processed
-    setUnsafeState(UnsafeState::COMMANDS_PROCESSING, false);
-    
-    // Video drawing now relies on event-driven state updates via notification queue
-    // No cooldown needed - state updates are deferred to main thread event loop
-    
-    
-    // Don't call notifyStateChange() or updateStateSnapshot() from audio thread
-    // Enqueue notification instead - main thread will process queue in update()
-    // This prevents thread safety issues with buildStateSnapshot() and module registry access
-    // updateStateSnapshot() accesses moduleRegistry_ which is not safe from audio thread
-    
+
     // Add memory barrier after command processing
     // This ensures command execution is complete before notification is enqueued
-    // Prevents race conditions where notification fires before commands are fully processed
     std::atomic_thread_fence(std::memory_order_release);
-    
+
     if (processed > 0) {
         enqueueStateNotification();
     }
-    
+
     return processed;
 }
 

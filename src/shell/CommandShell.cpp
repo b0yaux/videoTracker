@@ -94,12 +94,22 @@ void CommandShell::exit() {
     Shell::exit();
 }
 
-void CommandShell::onStateChanged(const EngineState& state) {
+void CommandShell::onStateChanged(const EngineState& state, uint64_t stateVersion) {
+    // Check if state version is newer than last seen (prevent stale state processing)
+    if (stateVersion < lastStateVersion_) {
+        ofLogVerbose("CommandShell") << "Ignoring stale state update (version: " << stateVersion 
+                                      << ", last: " << lastStateVersion_ << ")";
+        return;
+    }
+    
+    // Call base class implementation to update lastStateVersion_
+    Shell::onStateChanged(state, stateVersion);
+    
     // Cache state snapshot for thread-safe access in draw() method
     cachedState_ = state;
     
     // Log state changes for debugging
-    ofLogNotice("CommandShell") << "State changed";
+    ofLogNotice("CommandShell") << "State changed (version: " << stateVersion << ")";
     
     // Note: UI updates should be deferred to draw() method
     // This callback just caches the state snapshot

@@ -149,9 +149,32 @@ ofJson SessionManager::serializeCore() const {
                 json["modules"]["instances"] = registry->toJson();  // Lock-free (uses snapshots)
             }
             
-            // Connections: Extract from engine snapshot (already array format)
-            if (engineSnapshot->contains("connections")) {
-                json["modules"]["connections"] = (*engineSnapshot)["connections"];
+            // Connections: Use ConnectionManager::toJson() directly (not engine snapshot format)
+            // CRITICAL FIX: Engine snapshot uses ConnectionInfo array format (for observation),
+            // but ConnectionManager expects its native format (object with separate arrays per type).
+            // Using ConnectionManager::toJson() ensures format matches what fromJson() expects.
+            if (connectionManager_) {
+                json["modules"]["connections"] = connectionManager_->toJson();
+                // Log connection counts for verification
+                auto connectionsJson = connectionManager_->toJson();
+                int audioCount = 0, videoCount = 0, paramCount = 0, eventCount = 0;
+                if (connectionsJson.contains("audioConnections") && connectionsJson["audioConnections"].is_array()) {
+                    audioCount = connectionsJson["audioConnections"].size();
+                }
+                if (connectionsJson.contains("videoConnections") && connectionsJson["videoConnections"].is_array()) {
+                    videoCount = connectionsJson["videoConnections"].size();
+                }
+                if (connectionsJson.contains("parameterConnections") && connectionsJson["parameterConnections"].is_array()) {
+                    paramCount = connectionsJson["parameterConnections"].size();
+                }
+                if (connectionsJson.contains("eventSubscriptions") && connectionsJson["eventSubscriptions"].is_array()) {
+                    eventCount = connectionsJson["eventSubscriptions"].size();
+                }
+                ofLogVerbose("SessionManager") << "Saving connections: " << audioCount << " audio, " 
+                                                << videoCount << " video, " << paramCount << " parameter, " 
+                                                << eventCount << " event";
+            } else {
+                ofLogWarning("SessionManager") << "ConnectionManager not available, connections not saved";
             }
             
             if (engineSnapshot->contains("script")) {
@@ -275,12 +298,68 @@ bool SessionManager::loadCore(const ofJson& json) {
         
         // Load unified connections (after modules are loaded)
         if (connectionManager_ && modulesJson.contains("connections")) {
+            ofLogNotice("SessionManager") << "Starting connection restoration (Phase 1: Connection establishment)...";
+            
+            // Count expected connections from JSON for verification
+            int expectedAudio = 0, expectedVideo = 0, expectedParam = 0, expectedEvent = 0;
+            auto connectionsJson = modulesJson["connections"];
+            if (connectionsJson.is_object()) {
+                if (connectionsJson.contains("audioConnections") && connectionsJson["audioConnections"].is_array()) {
+                    expectedAudio = connectionsJson["audioConnections"].size();
+                }
+                if (connectionsJson.contains("videoConnections") && connectionsJson["videoConnections"].is_array()) {
+                    expectedVideo = connectionsJson["videoConnections"].size();
+                }
+                if (connectionsJson.contains("parameterConnections") && connectionsJson["parameterConnections"].is_array()) {
+                    expectedParam = connectionsJson["parameterConnections"].size();
+                }
+                if (connectionsJson.contains("eventSubscriptions") && connectionsJson["eventSubscriptions"].is_array()) {
+                    expectedEvent = connectionsJson["eventSubscriptions"].size();
+                }
+                ofLogNotice("SessionManager") << "Expected connections: " << expectedAudio << " audio, " 
+                                              << expectedVideo << " video, " << expectedParam << " parameter, " 
+                                              << expectedEvent << " event";
+            } else {
+                ofLogWarning("SessionManager") << "Connections JSON is not an object (expected ConnectionManager format)";
+            }
+            
             try {
                 // ConnectionManager::fromJson() will restore connections immediately
                 // This establishes the physical connections but sets default volumes/opacities
                 if (!connectionManager_->fromJson(modulesJson["connections"])) {
                     ofLogError("SessionManager") << "Failed to load module connections";
                     return false;
+                }
+                
+                // Verify restoration success by counting actual connections
+                int actualAudio = connectionManager_->getConnectionsByType(ConnectionManager::ConnectionType::AUDIO).size();
+                int actualVideo = connectionManager_->getConnectionsByType(ConnectionManager::ConnectionType::VIDEO).size();
+                int actualParam = connectionManager_->getConnectionsByType(ConnectionManager::ConnectionType::PARAMETER).size();
+                int actualEvent = connectionManager_->getConnectionsByType(ConnectionManager::ConnectionType::EVENT).size();
+                
+                // Log restoration results
+                ofLogNotice("SessionManager") << "Connection restoration complete (Phase 1): " 
+                                              << actualAudio << "/" << expectedAudio << " audio, "
+                                              << actualVideo << "/" << expectedVideo << " video, "
+                                              << actualParam << "/" << expectedParam << " parameter, "
+                                              << actualEvent << "/" << expectedEvent << " event";
+                
+                // Warn if restoration incomplete
+                if (actualAudio != expectedAudio) {
+                    ofLogWarning("SessionManager") << "Audio connection restoration incomplete: " 
+                                                    << actualAudio << "/" << expectedAudio << " restored";
+                }
+                if (actualVideo != expectedVideo) {
+                    ofLogWarning("SessionManager") << "Video connection restoration incomplete: " 
+                                                    << actualVideo << "/" << expectedVideo << " restored";
+                }
+                if (actualParam != expectedParam) {
+                    ofLogWarning("SessionManager") << "Parameter connection restoration incomplete: " 
+                                                    << actualParam << "/" << expectedParam << " restored";
+                }
+                if (actualEvent != expectedEvent) {
+                    ofLogWarning("SessionManager") << "Event subscription restoration incomplete: " 
+                                                    << actualEvent << "/" << expectedEvent << " restored";
                 }
             } catch (const std::exception& e) {
                 ofLogError("SessionManager") << "Failed to load module connections: " << e.what();
@@ -291,11 +370,13 @@ bool SessionManager::loadCore(const ofJson& json) {
             // parameters (volumes, opacities, blend modes) from module JSON data
             // ConnectionManager only establishes the connections, but doesn't restore the parameters
             if (modulesJson.contains("instances")) {
-                ofLogNotice("SessionManager") << "Restoring connection parameters (volumes, opacities, blend modes)...";
+                ofLogNotice("SessionManager") << "Starting connection parameter restoration (Phase 2: Volumes, opacities, blend modes)...";
                 restoreMixerConnections(modulesJson["instances"]);
+                ofLogNotice("SessionManager") << "Connection parameter restoration complete (Phase 2)";
             }
         } else {
             // Fallback: Restore mixer connections from module data (backward compatibility)
+            ofLogNotice("SessionManager") << "Using fallback connection restoration (backward compatibility mode)...";
             restoreMixerConnections(modulesJson["instances"]);
         }
         
@@ -977,12 +1058,68 @@ bool SessionManager::deserializeAll(const ofJson& json) {
         
         // Load unified connections (after modules are loaded)
         if (connectionManager_ && modulesJson.contains("connections")) {
+            ofLogNotice("SessionManager") << "Starting connection restoration (Phase 1: Connection establishment)...";
+            
+            // Count expected connections from JSON for verification
+            int expectedAudio = 0, expectedVideo = 0, expectedParam = 0, expectedEvent = 0;
+            auto connectionsJson = modulesJson["connections"];
+            if (connectionsJson.is_object()) {
+                if (connectionsJson.contains("audioConnections") && connectionsJson["audioConnections"].is_array()) {
+                    expectedAudio = connectionsJson["audioConnections"].size();
+                }
+                if (connectionsJson.contains("videoConnections") && connectionsJson["videoConnections"].is_array()) {
+                    expectedVideo = connectionsJson["videoConnections"].size();
+                }
+                if (connectionsJson.contains("parameterConnections") && connectionsJson["parameterConnections"].is_array()) {
+                    expectedParam = connectionsJson["parameterConnections"].size();
+                }
+                if (connectionsJson.contains("eventSubscriptions") && connectionsJson["eventSubscriptions"].is_array()) {
+                    expectedEvent = connectionsJson["eventSubscriptions"].size();
+                }
+                ofLogNotice("SessionManager") << "Expected connections: " << expectedAudio << " audio, " 
+                                              << expectedVideo << " video, " << expectedParam << " parameter, " 
+                                              << expectedEvent << " event";
+            } else {
+                ofLogWarning("SessionManager") << "Connections JSON is not an object (expected ConnectionManager format)";
+            }
+            
             try {
                 // ConnectionManager::fromJson() will restore connections immediately
                 // This establishes the physical connections but sets default volumes/opacities
                 if (!connectionManager_->fromJson(modulesJson["connections"])) {
                     ofLogError("SessionManager") << "Failed to load module connections";
                     return false;
+                }
+                
+                // Verify restoration success by counting actual connections
+                int actualAudio = connectionManager_->getConnectionsByType(ConnectionManager::ConnectionType::AUDIO).size();
+                int actualVideo = connectionManager_->getConnectionsByType(ConnectionManager::ConnectionType::VIDEO).size();
+                int actualParam = connectionManager_->getConnectionsByType(ConnectionManager::ConnectionType::PARAMETER).size();
+                int actualEvent = connectionManager_->getConnectionsByType(ConnectionManager::ConnectionType::EVENT).size();
+                
+                // Log restoration results
+                ofLogNotice("SessionManager") << "Connection restoration complete (Phase 1): " 
+                                              << actualAudio << "/" << expectedAudio << " audio, "
+                                              << actualVideo << "/" << expectedVideo << " video, "
+                                              << actualParam << "/" << expectedParam << " parameter, "
+                                              << actualEvent << "/" << expectedEvent << " event";
+                
+                // Warn if restoration incomplete
+                if (actualAudio != expectedAudio) {
+                    ofLogWarning("SessionManager") << "Audio connection restoration incomplete: " 
+                                                    << actualAudio << "/" << expectedAudio << " restored";
+                }
+                if (actualVideo != expectedVideo) {
+                    ofLogWarning("SessionManager") << "Video connection restoration incomplete: " 
+                                                    << actualVideo << "/" << expectedVideo << " restored";
+                }
+                if (actualParam != expectedParam) {
+                    ofLogWarning("SessionManager") << "Parameter connection restoration incomplete: " 
+                                                    << actualParam << "/" << expectedParam << " restored";
+                }
+                if (actualEvent != expectedEvent) {
+                    ofLogWarning("SessionManager") << "Event subscription restoration incomplete: " 
+                                                    << actualEvent << "/" << expectedEvent << " restored";
                 }
             } catch (const std::exception& e) {
                 ofLogError("SessionManager") << "Failed to load module connections: " << e.what();
@@ -993,11 +1130,13 @@ bool SessionManager::deserializeAll(const ofJson& json) {
             // parameters (volumes, opacities, blend modes) from module JSON data
             // ConnectionManager only establishes the connections, but doesn't restore the parameters
             if (modulesJson.contains("instances")) {
-                ofLogNotice("SessionManager") << "Restoring connection parameters (volumes, opacities, blend modes)...";
+                ofLogNotice("SessionManager") << "Starting connection parameter restoration (Phase 2: Volumes, opacities, blend modes)...";
                 restoreMixerConnections(modulesJson["instances"]);
+                ofLogNotice("SessionManager") << "Connection parameter restoration complete (Phase 2)";
             }
         } else {
             // Fallback: Restore mixer connections from module data (backward compatibility)
+            ofLogNotice("SessionManager") << "Using fallback connection restoration (backward compatibility mode)...";
             restoreMixerConnections(modulesJson["instances"]);
         }
         

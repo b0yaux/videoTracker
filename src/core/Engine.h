@@ -281,7 +281,7 @@ public:
      * Wraps ScriptManager::setScriptUpdateCallback()
      * @param callback Function called when script updates
      */
-    void setScriptUpdateCallback(std::function<void(const std::string&)> callback);
+    void setScriptUpdateCallback(std::function<void(const std::string&, uint64_t)> callback);
     
     /**
      * Clear script update callback (Shell-safe API)
@@ -381,7 +381,11 @@ public:
     
     void audioOut(ofSoundBuffer& buffer);
     void update(float deltaTime);
-    
+
+    // Process all pending notifications immediately
+    // Redesign: Made public for shell transitions to ensure state consistency
+    void processNotificationQueue();
+
     // ═══════════════════════════════════════════════════════════
     // SESSION MANAGEMENT
     // ═══════════════════════════════════════════════════════════
@@ -749,7 +753,6 @@ private:
     
     // Internal methods
     void notifyStateChange();
-    void processNotificationQueue();  // Process queued notifications from main thread event loop
     void notifyObserversWithState();  // Helper to actually call observers with current state
     
     // Simplified notification: enqueue notification to be processed on main thread

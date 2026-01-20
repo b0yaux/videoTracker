@@ -326,7 +326,24 @@ bool VideoRouter::fromJson(const ofJson& json) {
         return false;
     }
     
+    // DEBUG: Log what we're restoring
+    int connectionsBefore = getConnectionCount();
+    int expectedCount = 0;
+    for (const auto& connJson : json) {
+        if (connJson.contains("type") && connJson["type"] == "video") {
+            expectedCount++;
+        }
+    }
+    ofLogNotice("VideoRouter") << "fromJson() called - JSON contains " << json.size() << " entries, " 
+                               << expectedCount << " video connections expected";
+    ofLogNotice("VideoRouter") << "Current connections before clear: " << connectionsBefore;
+    
     clear();
+    
+    int restoredCount = 0;
+    int failedCount = 0;
+    int missingRefCount = 0;
+    int invalidDataCount = 0;
     
     for (const auto& connJson : json) {
         if (connJson.contains("type") && connJson["type"] == "video") {
@@ -343,15 +360,45 @@ bool VideoRouter::fromJson(const ofJson& json) {
                 if (registry_) {
                     std::string fromModule = registry_->getName(fromUUID);
                     std::string toModule = registry_->getName(toUUID);
-                    if (!fromModule.empty() && !toModule.empty()) {
-                        connectPort(fromModule, fromPort, toModule, toPort);
+                    if (fromModule.empty() || toModule.empty()) {
+                        ofLogWarning("VideoRouter") << "Connection references missing module: "
+                                                    << "fromUUID=" << fromUUID << " toUUID=" << toUUID;
+                        missingRefCount++;
+                        continue;
                     }
+                    
+                    if (connectPort(fromModule, fromPort, toModule, toPort)) {
+                        restoredCount++;
+                        ofLogVerbose("VideoRouter") << "Restored connection: " << fromModule << "." << fromPort
+                                                    << " -> " << toModule << "." << toPort;
+                    } else {
+                        failedCount++;
+                        ofLogWarning("VideoRouter") << "Failed to restore connection: " << fromModule << "." << fromPort
+                                                    << " -> " << toModule << "." << toPort;
+                    }
+                } else {
+                    ofLogError("VideoRouter") << "Registry not available for connection restoration";
+                    failedCount++;
                 }
+            } else {
+                ofLogWarning("VideoRouter") << "Skipping video connection with missing required fields (fromUUID, fromPort, toUUID, toPort)";
+                invalidDataCount++;
             }
         }
     }
     
-    return true;
+    int connectionsAfter = getConnectionCount();
+    ofLogNotice("VideoRouter") << "fromJson() complete - restored " << restoredCount << " connections, "
+                                << "failed " << failedCount << ", "
+                                << "missing references " << missingRefCount << ", "
+                                << "invalid entries " << invalidDataCount << ", "
+                                << "total now: " << connectionsAfter;
+    
+    if (restoredCount != expectedCount) {
+        ofLogWarning("VideoRouter") << "Connection restoration incomplete: " << restoredCount << "/" << expectedCount << " restored";
+    }
+    
+    return (failedCount == 0 && missingRefCount == 0);
 }
 
 std::shared_ptr<Module> VideoRouter::getModule(const std::string& identifier) const {

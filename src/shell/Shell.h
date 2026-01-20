@@ -48,16 +48,34 @@ public:
     
     // Lifecycle
     virtual void setup() {
+        // Register shell with engine for coordinated state updates (Phase 7.9.2 Plan 3)
+        if (engine_) {
+            engine_->registerShell(this);
+        }
+        
         // Subscribe to state changes if engine is available
         if (engine_ && observerId_ == 0) {
+            // Wrap observer callback to extract state version and pass to onStateChanged()
             observerId_ = subscribe([this](const EngineState& state) {
-                this->onStateChanged(state);
+                // Extract state version from EngineState (state.version field)
+                uint64_t stateVersion = state.version;
+                // Get current state version from Engine (for initial state notification)
+                if (stateVersion == 0 && engine_) {
+                    stateVersion = engine_->getStateVersion();
+                }
+                // Notify shell with state and version
+                this->onStateChanged(state, stateVersion);
             });
         }
     }
     virtual void update(float deltaTime) {}  // Called every frame
     virtual void draw() {}  // Called every frame for rendering
     virtual void exit() {
+        // Unregister shell from engine coordination (Phase 7.9.2 Plan 3)
+        if (engine_) {
+            engine_->unregisterShell(this);
+        }
+        
         // Unsubscribe from state changes
         if (observerId_ > 0 && engine_) {
             unsubscribe(observerId_);
@@ -80,18 +98,34 @@ public:
     virtual std::string getName() const = 0;  // e.g., "CLI", "Command", "Patcher", "Editor"
     virtual std::string getDescription() const { return ""; }
     
+    /**
+     * Called when engine state changes (override in derived classes if needed).
+     * Receives immutable state snapshot (thread-safe) and state version.
+     * 
+     * Default implementation stores state version - shells override to handle state updates.
+     * 
+     * This method is public so Engine can call it to notify shells of state changes.
+     * 
+     * @param state Immutable state snapshot
+     * @param stateVersion State version number (monotonically increasing)
+     */
+    virtual void onStateChanged(const EngineState& state, uint64_t stateVersion) {
+        lastStateVersion_ = stateVersion;
+    }
+    
+    /**
+     * Get last seen state version (for debugging and verification).
+     * @return Last state version seen by this shell
+     */
+    uint64_t getLastStateVersion() const {
+        return lastStateVersion_;
+    }
+    
 protected:
     Engine* engine_;  // Reference to the central engine
     bool active_;       // Whether this shell is currently active
     size_t observerId_ = 0;  // Subscription ID for state change notifications
-    
-    /**
-     * Called when engine state changes (override in derived classes if needed).
-     * Receives immutable state snapshot (thread-safe).
-     * 
-     * Default implementation is empty - shells override to handle state updates.
-     */
-    virtual void onStateChanged(const EngineState& state) {}
+    uint64_t lastStateVersion_ = 0;  // Last seen state version (for stale state detection)
     
     // ═══════════════════════════════════════════════════════════
     // SHELL-SAFE API HELPERS (enforce abstraction pattern)

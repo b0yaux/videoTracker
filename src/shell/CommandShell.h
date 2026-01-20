@@ -147,7 +147,7 @@ private:
     void handleTab();
     
     // State change handler (override from Shell base class)
-    void onStateChanged(const EngineState& state) override;
+    void onStateChanged(const EngineState& state, uint64_t stateVersion) override;
     
     // Cached state for thread-safe access
     EngineState cachedState_;

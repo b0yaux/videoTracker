@@ -304,7 +304,24 @@ bool EventRouter::fromJson(const ofJson& json) {
         return false;
     }
     
+    // DEBUG: Log what we're restoring
+    int subscriptionsBefore = getSubscriptionCount();
+    int expectedCount = 0;
+    for (const auto& subJson : json) {
+        if (subJson.contains("type") && subJson["type"] == "event") {
+            expectedCount++;
+        }
+    }
+    ofLogNotice("EventRouter") << "fromJson() called - JSON contains " << json.size() << " entries, "
+                               << expectedCount << " event subscriptions expected";
+    ofLogNotice("EventRouter") << "Current subscriptions before clear: " << subscriptionsBefore;
+    
     clear();
+    
+    int restoredCount = 0;
+    int failedCount = 0;
+    int missingRefCount = 0;
+    int invalidDataCount = 0;
     
     for (const auto& subJson : json) {
         if (subJson.contains("type") && subJson["type"] == "event") {
@@ -321,15 +338,45 @@ bool EventRouter::fromJson(const ofJson& json) {
                 if (registry_) {
                     std::string source = registry_->getName(sourceUUID);
                     std::string target = registry_->getName(targetUUID);
-                    if (!source.empty() && !target.empty()) {
-                        subscribe(source, event, target, handler);
+                    if (source.empty() || target.empty()) {
+                        ofLogWarning("EventRouter") << "Subscription references missing module: "
+                                                    << "sourceUUID=" << sourceUUID << " targetUUID=" << targetUUID;
+                        missingRefCount++;
+                        continue;
                     }
+                    
+                    if (subscribe(source, event, target, handler)) {
+                        restoredCount++;
+                        ofLogVerbose("EventRouter") << "Restored subscription: " << source << "." << event
+                                                    << " -> " << target << "." << handler;
+                    } else {
+                        failedCount++;
+                        ofLogWarning("EventRouter") << "Failed to restore subscription: " << source << "." << event
+                                                    << " -> " << target << "." << handler;
+                    }
+                } else {
+                    ofLogError("EventRouter") << "Registry not available for subscription restoration";
+                    failedCount++;
                 }
+            } else {
+                ofLogWarning("EventRouter") << "Skipping event subscription with missing required fields (sourceUUID, eventName, targetUUID, handlerName)";
+                invalidDataCount++;
             }
         }
     }
     
-    return true;
+    int subscriptionsAfter = getSubscriptionCount();
+    ofLogNotice("EventRouter") << "fromJson() complete - restored " << restoredCount << " subscriptions, "
+                                << "failed " << failedCount << ", "
+                                << "missing references " << missingRefCount << ", "
+                                << "invalid entries " << invalidDataCount << ", "
+                                << "total now: " << subscriptionsAfter;
+    
+    if (restoredCount != expectedCount) {
+        ofLogWarning("EventRouter") << "Subscription restoration incomplete: " << restoredCount << "/" << expectedCount << " restored";
+    }
+    
+    return (failedCount == 0 && missingRefCount == 0);
 }
 
 std::shared_ptr<Module> EventRouter::getModule(const std::string& identifier) const {

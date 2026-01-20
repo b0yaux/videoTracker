@@ -420,11 +420,22 @@ bool ParameterRouter::fromJson(const ofJson& json) {
         return false;
     }
     
+    // DEBUG: Log what we're restoring
+    int connectionsBefore = static_cast<int>(connections.size());
+    int expectedCount = static_cast<int>(json.size());
+    ofLogNotice("ParameterRouter") << "fromJson() called - JSON contains " << expectedCount << " parameter connections expected";
+    ofLogNotice("ParameterRouter") << "Current connections before clear: " << connectionsBefore;
+    
     clear(); // Clear existing connections
+    
+    int restoredCount = 0;
+    int failedCount = 0;
+    int invalidDataCount = 0;
     
     for (const auto& connJson : json) {
         if (!connJson.is_object() || !connJson.contains("source") || !connJson.contains("target")) {
-            ofLogWarning("ParameterRouter") << "Skipping connection with missing required fields";
+            ofLogWarning("ParameterRouter") << "Skipping connection with missing required fields (source, target)";
+            invalidDataCount++;
             continue;
         }
         
@@ -432,12 +443,26 @@ bool ParameterRouter::fromJson(const ofJson& json) {
         std::string targetPath = connJson["target"];
         
         // Connect without condition (default: always true)
-        if (!connect(sourcePath, targetPath)) {
+        if (connect(sourcePath, targetPath)) {
+            restoredCount++;
+            ofLogVerbose("ParameterRouter") << "Restored connection: " << sourcePath << " -> " << targetPath;
+        } else {
+            failedCount++;
             ofLogWarning("ParameterRouter") << "Failed to restore connection: " << sourcePath << " -> " << targetPath;
         }
     }
     
-    return true;
+    int connectionsAfter = static_cast<int>(connections.size());
+    ofLogNotice("ParameterRouter") << "fromJson() complete - restored " << restoredCount << " connections, "
+                                    << "failed " << failedCount << ", "
+                                    << "invalid entries " << invalidDataCount << ", "
+                                    << "total now: " << connectionsAfter;
+    
+    if (restoredCount != expectedCount) {
+        ofLogWarning("ParameterRouter") << "Connection restoration incomplete: " << restoredCount << "/" << expectedCount << " restored";
+    }
+    
+    return (failedCount == 0);
 }
 
 //--------------------------------------------------------------

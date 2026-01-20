@@ -4,6 +4,9 @@
 #include "core/PatternRuntime.h"
 #include "data/Pattern.h"
 #include "ofLog.h"
+#include <thread> // for this_thread::get_id
+#include <chrono>
+#include <mutex>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -469,6 +472,7 @@ void ScriptManager::updateScriptFromState(const EngineState& state) {
     try {
         std::string generatedScript = generateScriptFromState(state);
         currentScript_ = generatedScript;
+        scriptVersion_ = stateVersion;
         ofLogVerbose("ScriptManager") << "Script regenerated (state version: " << stateVersion << ")";
         
     } catch (const std::exception& e) {
@@ -483,15 +487,27 @@ void ScriptManager::updateScriptFromState(const EngineState& state) {
     lastState_ = state;
     
     // Notify callback (CodeShell will register this)
-    if (updateCallback_) {
-        try {
-            updateCallback_(currentScript_);
-        } catch (const std::exception& e) {
-            ofLogError("ScriptManager") << "Exception in updateCallback: " << e.what();
-        } catch (...) {
-            ofLogError("ScriptManager") << "Unknown exception in updateCallback";
+    // Invoke callback in a thread-safe manner
+    if (true) {
+        std::function<void(const std::string&, uint64_t)> cbCopy;
+        {
+            std::lock_guard<std::mutex> lock(callbackMutex_);
+            cbCopy = updateCallback_;
+        }
+        if (cbCopy) {
+            try {
+                ofLogNotice("ScriptManager") << "Invoking script update callback (thread=" << std::this_thread::get_id() << ", version=" << stateVersion << ")";
+                cbCopy(currentScript_, stateVersion);
+                ofLogNotice("ScriptManager") << "Script update callback finished (thread=" << std::this_thread::get_id() << ")";
+            } catch (const std::exception& e) {
+                ofLogError("ScriptManager") << "Exception in updateCallback: " << e.what();
+            } catch (...) {
+                ofLogError("ScriptManager") << "Unknown exception in updateCallback";
+            }
+        } else {
+            ofLogNotice("ScriptManager") << "Script update callback skipped (none registered, thread=" << std::this_thread::get_id() << ")";
+        }
     }
-}
 }
 
 bool ScriptManager::hasStateChanged(
@@ -503,17 +519,29 @@ bool ScriptManager::hasStateChanged(
 }
 
 void ScriptManager::setScriptUpdateCallback(ScriptUpdateCallback callback) {
-    updateCallback_ = callback;
-    
+    {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        updateCallback_ = callback;
+    }
+    std::thread::id callerThread = std::this_thread::get_id();
+    ofLogNotice("ScriptManager") << "Script update callback set (thread=" << callerThread << ")";
+
     // Only use cached script - never call getState() which could cause issues
-    if (updateCallback_ && engine_) {
+        std::function<void(const std::string&, uint64_t)> cbCopy;
+        {
+            std::lock_guard<std::mutex> lock(callbackMutex_);
+            cbCopy = updateCallback_;
+        }
+
+
+    if (cbCopy && engine_) {
         try {
             if (!currentScript_.empty()) {
-                updateCallback_(currentScript_);
-                ofLogVerbose("ScriptManager") << "Immediately notified callback with cached script (" 
-                                             << currentScript_.length() << " chars)";
+                ofLogNotice("ScriptManager") << "Immediately notifying callback with cached script (thread=" << std::this_thread::get_id() << ", version=" << scriptVersion_ << ")";
+                cbCopy(currentScript_, scriptVersion_);
+                ofLogNotice("ScriptManager") << "Notified callback with cached script (" << currentScript_.length() << " chars)";
             } else {
-                // No cached script yet - request update via observer
+                ofLogNotice("ScriptManager") << "No cached script yet - requesting update via observer (thread=" << std::this_thread::get_id() << ")";
                 requestUpdate();
             }
         } catch (const std::exception& e) {
@@ -521,12 +549,19 @@ void ScriptManager::setScriptUpdateCallback(ScriptUpdateCallback callback) {
         } catch (...) {
             ofLogError("ScriptManager") << "Unknown exception in callback registration";
         }
+    } else {
+        ofLogNotice("ScriptManager") << "Callback not invoked immediately (cbCopy? "
+                                      << (cbCopy ? "yes" : "no") << ", engine? "
+                                      << (engine_ ? "yes" : "no") << ")";
     }
 }
 
 void ScriptManager::clearScriptUpdateCallback() {
-    updateCallback_ = nullptr;
-    ofLogVerbose("ScriptManager") << "Script update callback cleared";
+    {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        updateCallback_ = nullptr;
+    }
+    ofLogNotice("ScriptManager") << "Script update callback cleared (thread=" << std::this_thread::get_id() << ")";
 }
 
 std::string ScriptManager::getCurrentScript() const {

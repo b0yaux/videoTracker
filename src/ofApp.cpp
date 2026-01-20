@@ -50,7 +50,9 @@ void ofApp::setup() {
     // Window and app configuration
     ofSetFrameRate(0);
     ofSetVerticalSync(true);
-    ofSetLogLevel(OF_LOG_NOTICE);
+    ofSetLogLevel(OF_LOG_VERBOSE);
+    ofSetLogLevel("ScriptManager", OF_LOG_VERBOSE);
+    ofSetLogLevel("CodeShell", OF_LOG_VERBOSE);
     ofSetEscapeQuitsApp(false);
     
     // ============================================================
@@ -1494,16 +1496,21 @@ void ofApp::setupShells(const std::string& cliCommandOrFile) {
 
 void ofApp::switchShell(vt::shell::Shell* shell) {
     if (!shell) return;
-    
+
     // Deactivate current shell
     if (activeShell_) {
         activeShell_->setActive(false);
     }
-    
+
+    // Redesign: Process all pending notifications before switching shells
+    // This ensures state is consistent for new shell
+    // Prevents stale state or race conditions during transition
+    engine_.processNotificationQueue();
+
     // Activate new shell
     activeShell_ = shell;
     activeShell_->setActive(true);
-    
+
     ofLogNotice("ofApp") << "Switched to shell: " << shell->getName();
 }
 

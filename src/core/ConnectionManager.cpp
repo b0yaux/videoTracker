@@ -749,13 +749,27 @@ bool ConnectionManager::fromJson(const ofJson& json) {
     // Clear existing connections
     clear();
     
+    bool allSucceeded = true;
+    int totalExpected = 0;
+    int totalRestored = 0;
+    
     // Load audio connections via AudioRouter
     if (json.contains("audioConnections")) {
         if (!audioRouter_.fromJson(json["audioConnections"])) {
             ofLogWarning("ConnectionManager") << "Failed to restore audio connections";
+            allSucceeded = false;
         } else {
             int audioConnectionsAfter = audioRouter_.getConnectionCount();
             ofLogNotice("ConnectionManager") << "Audio connections after restore: " << audioConnectionsAfter;
+            totalRestored += audioConnectionsAfter;
+            // Count expected from JSON (only audio type entries)
+            if (json["audioConnections"].is_array()) {
+                for (const auto& conn : json["audioConnections"]) {
+                    if (conn.contains("type") && conn["type"] == "audio") {
+                        totalExpected++;
+                    }
+                }
+            }
         }
     } else {
         ofLogWarning("ConnectionManager") << "JSON does not contain 'audioConnections' key";
@@ -765,6 +779,19 @@ bool ConnectionManager::fromJson(const ofJson& json) {
     if (json.contains("videoConnections")) {
         if (!videoRouter_.fromJson(json["videoConnections"])) {
             ofLogWarning("ConnectionManager") << "Failed to restore video connections";
+            allSucceeded = false;
+        } else {
+            int videoConnectionsAfter = videoRouter_.getConnectionCount();
+            ofLogNotice("ConnectionManager") << "Video connections after restore: " << videoConnectionsAfter;
+            totalRestored += videoConnectionsAfter;
+            // Count expected from JSON (only video type entries)
+            if (json["videoConnections"].is_array()) {
+                for (const auto& conn : json["videoConnections"]) {
+                    if (conn.contains("type") && conn["type"] == "video") {
+                        totalExpected++;
+                    }
+                }
+            }
         }
     }
     
@@ -772,6 +799,14 @@ bool ConnectionManager::fromJson(const ofJson& json) {
     if (parameterRouter_ && json.contains("parameterConnections")) {
         if (!parameterRouter_->fromJson(json["parameterConnections"])) {
             ofLogWarning("ConnectionManager") << "Failed to restore parameter connections";
+            allSucceeded = false;
+        } else {
+            // ParameterRouter doesn't expose connection count directly, estimate from JSON
+            if (json["parameterConnections"].is_array()) {
+                int paramCount = static_cast<int>(json["parameterConnections"].size());
+                totalRestored += paramCount;
+                totalExpected += paramCount;
+            }
         }
     }
     
@@ -780,10 +815,33 @@ bool ConnectionManager::fromJson(const ofJson& json) {
     if (json.contains("eventSubscriptions")) {
         if (!eventRouter_.fromJson(json["eventSubscriptions"])) {
             ofLogWarning("ConnectionManager") << "Failed to restore event subscriptions";
+            allSucceeded = false;
+        } else {
+            int eventSubscriptionsAfter = eventRouter_.getSubscriptionCount();
+            ofLogNotice("ConnectionManager") << "Event subscriptions after restore: " << eventSubscriptionsAfter;
+            totalRestored += eventSubscriptionsAfter;
+            // Count expected from JSON (only event type entries)
+            if (json["eventSubscriptions"].is_array()) {
+                for (const auto& sub : json["eventSubscriptions"]) {
+                    if (sub.contains("type") && sub["type"] == "event") {
+                        totalExpected++;
+                    }
+                }
+            }
         }
     }
     
-    return true;
+    // Overall restoration summary
+    ofLogNotice("ConnectionManager") << "Connection restoration complete - "
+                                      << "restored " << totalRestored << " connections/subscriptions"
+                                      << (totalExpected > 0 ? " (expected: " + std::to_string(totalExpected) + ")" : "");
+    
+    if (totalExpected > 0 && totalRestored != totalExpected) {
+        ofLogWarning("ConnectionManager") << "Connection restoration incomplete: " 
+                                          << totalRestored << "/" << totalExpected << " restored";
+    }
+    
+    return allSucceeded;
 }
 
 // ========================================================================

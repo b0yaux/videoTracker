@@ -59,8 +59,8 @@ public:
     SessionManager(const SessionManager&) = delete;
     SessionManager& operator=(const SessionManager&) = delete;
     
-    // Move constructor and assignment (needed for move assignment in Engine)
-    SessionManager(SessionManager&&) noexcept = default;
+    // Move constructor is deleted because std::atomic<bool> cannot be moved
+    SessionManager(SessionManager&&) noexcept = delete;
     SessionManager& operator=(SessionManager&&) noexcept;
     
     /**

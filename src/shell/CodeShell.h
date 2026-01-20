@@ -2,8 +2,10 @@
 
 #include "Shell.h"
 #include "CommandShell.h"
+#include "core/EngineState.h"
 #include <atomic>
 #include <memory>
+#include <string>
 
 // Forward declaration - full definition in .cpp
 class TextEditor;
@@ -86,8 +88,10 @@ private:
     
     // Deferred script update (to prevent crashes during script execution or ImGui rendering)
     std::string pendingScriptUpdate_;
+    uint64_t pendingScriptVersion_ = 0;
     bool hasPendingScriptUpdate_ = false;
     uint64_t lastAppliedVersion_ = 0;  // Track last applied state version for update safety
+    uint64_t lastDeferredVersionWarning_ = 0;
     
     // Helper to refresh script from state (called only on activation)
     void refreshScriptFromState();
@@ -100,7 +104,9 @@ private:
     // Users can still execute manually with Ctrl+R (all) or Ctrl+Enter (selection/line)
     float lastEditTime_ = 0.0f;
     float autoEvalDebounce_ = 0.5f;  // 500ms debounce
-    bool autoEvalEnabled_ = true;  // Enabled by default - now safe with idempotency + incremental execution
+    bool autoEvalEnabled_ = false;  // Disabled by default - user must opt-in
+    bool autoEvalLoggedDisabled_ = false;
+    std::string autoEvalDisableReason_ = "Auto-evaluation disabled by default (press Ctrl+Shift+A to enable)";
     std::string lastEditorText_;  // Track text changes (what user typed, may not be executed yet)
     std::string lastExecutedScript_;  // Track executed script (for diffing with current text)
     
