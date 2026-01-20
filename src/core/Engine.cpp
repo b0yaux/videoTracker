@@ -93,15 +93,8 @@ void Engine::setup(const EngineConfig& config) {
     }
     
     config_ = config;
-    
-    // Initialize cached state early to ensure it's always available
-    // This prevents getState() from returning empty state during unsafe periods
-    {
-        std::unique_lock<std::shared_mutex> cacheLock(cachedStateMutex_);
-        if (!cachedState_) {
-            cachedState_ = std::make_unique<EngineState>();
-        }
-    }
+    // Phase 2 Simplification: Removed cachedState_ initialization
+    // All state now goes through immutableStateSnapshot_ via updateImmutableStateSnapshot()
     
     // Setup Clock first (foundation for timing)
     clock_.setup();
@@ -135,10 +128,6 @@ void Engine::setup(const EngineConfig& config) {
     
     try {
         EngineState initialState = buildStateSnapshot();
-        {
-            std::unique_lock<std::shared_mutex> cacheLock(cachedStateMutex_);
-            *cachedState_ = initialState;
-        }
         
         // Update immutable snapshot with initial state
         // This ensures getState() returns populated snapshot, not empty one
@@ -167,8 +156,7 @@ void Engine::setup(const EngineConfig& config) {
         }
     } catch (const std::exception& e) {
         ofLogError("Engine") << "Failed to build initial state snapshot: " << e.what();
-        ofLogError("Engine") << "Cached state will remain empty - script generation will fail!";
-        // Cached state already initialized with empty state, which is NOT acceptable
+        ofLogError("Engine") << "Immutable snapshot may be empty - script generation may fail!";
     }
     
     // Setup ScriptManager AFTER session is loaded AND initial snapshot is built
@@ -286,19 +274,10 @@ void Engine::setupCommandExecutor() {
     // Set parameter change notification callback for script sync
     // This will automatically update all existing modules' callbacks (including master outputs)
     moduleRegistry_.setParameterChangeNotificationCallback([this]() {
-        
-        // Increment counter to track parameter modification in progress
-        // Use release semantics to ensure all previous writes are visible
-        parametersBeingModified_.fetch_add(1, std::memory_order_release);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        
-        // Defer notification - will be processed after parameter modification completes
-        // This prevents building snapshots while parameters are being modified
+        // Phase 2 Simplification: Removed parametersBeingModified_ counter
+        // All state changes go through command queue, so we just defer the notification
+        // The notification will be processed on main thread via notification queue
         enqueueStateNotification();
-        
-        // Decrement counter
-        parametersBeingModified_.fetch_sub(1, std::memory_order_release);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
         
         ofLogVerbose("Engine") << "[PARAM_CHANGE] Parameter changed, deferring state notification";
     });
@@ -360,168 +339,7 @@ void Engine::setupLua() {
         // This is the simplest approach - one C function that executes commands
         lua_register(L, "exec", lua_execCommand);
         
-        // Register helper functions in Lua that use exec()
-        // These are simple, declarative functions for live-coding
-        std::string registerHelpers = R"(
--- Simple command execution helper
-local function execCommand(cmd)
-    local result = exec(cmd)
-    if result and result.success then
-        return true
-    else
-        local errorMsg = result and result.error or "Unknown error"
-        error("Command failed: " .. cmd .. " - " .. errorMsg)
-    end
-end
-
--- Create sampler module with optional config table
-function sampler(name, config)
-    if not name or name == "" then
-        error("sampler() requires a name")
-    end
-    execCommand("add MultiSampler " .. name)
-    
-    -- Apply configuration if provided
-    if config then
-        for k, v in pairs(config) do
-            execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
-        end
-    end
-    
-    return name
-end
-
--- Create sequencer module with optional config table
-function sequencer(name, config)
-    if not name or name == "" then
-        error("sequencer() requires a name")
-    end
-    execCommand("add TrackerSequencer " .. name)
-    
-    -- Apply configuration if provided
-    if config then
-        for k, v in pairs(config) do
-            execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
-        end
-    end
-    
-    return name
-end
-
--- Connect modules
-function connect(source, target, connType)
-    connType = connType or "audio"
-    local cmd = "route " .. source .. " " .. target
-    if connType == "event" then
-        cmd = cmd .. " event"
-    end
-    return execCommand(cmd)
-end
-
--- Set parameter
-function setParam(moduleName, paramName, value)
-    local cmd = "set " .. moduleName .. " " .. paramName .. " " .. tostring(value)
-    return execCommand(cmd)
-end
-
--- Get parameter (placeholder - will be improved)
-function getParam(moduleName, paramName)
-    -- TODO: Implement via command or SWIG
-    return 0
-end
-
--- Create pattern
-function pattern(name, steps)
-    steps = steps or 16
-    local cmd = "pattern create " .. name .. " " .. tostring(steps)
-    return execCommand(cmd)
-end
-
--- System module helpers (for cleaner syntax)
--- IDEMPOTENT: System modules already exist, we just configure them
--- These functions match the SWIG-wrapped functions in videoTracker.i
-function audioOut(name, config)
-    config = config or {}
-    -- System modules are created via ModuleFactory::ensureSystemModules()
-    -- We just need to configure parameters (idempotent for live-coding)
-    for k, v in pairs(config) do
-        execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
-    end
-    return name
-end
-
-function videoOut(name, config)
-    config = config or {}
-    -- System modules are created via ModuleFactory::ensureSystemModules()
-    -- We just need to configure parameters (idempotent for live-coding)
-    for k, v in pairs(config) do
-        execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
-    end
-    return name
-end
-
-function oscilloscope(name, config)
-    config = config or {}
-    -- System modules are created via ModuleFactory::ensureSystemModules()
-    -- We just need to configure parameters (idempotent for live-coding)
-    for k, v in pairs(config) do
-        execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
-    end
-    return name
-end
-
-function spectrogram(name, config)
-    config = config or {}
-    -- System modules are created via ModuleFactory::ensureSystemModules()
-    -- We just need to configure parameters (idempotent for live-coding)
-    for k, v in pairs(config) do
-        execCommand("set " .. name .. " " .. k .. " " .. tostring(v))
-    end
-    return name
-end
-
--- Engine wrapper for clock control
--- This provides a simple interface for clock operations
-local engine = {
-    getClock = function()
-        return {
-            setBPM = function(bpm)
-                return execCommand("bpm " .. tostring(bpm))
-            end,
-            getBPM = function()
-                -- TODO: Implement via command or SWIG
-                return 120
-            end,
-            start = function()
-                return execCommand("start")
-            end,
-            stop = function()
-                return execCommand("stop")
-            end,
-            pause = function()
-                return execCommand("stop")  -- pause uses stop for now
-            end,
-            play = function()
-                return execCommand("start")
-            end,
-            isPlaying = function()
-                -- TODO: Implement via command or SWIG
-                return false
-            end
-        }
-    end,
-    executeCommand = function(cmd)
-        local result = exec(cmd)
-        return result
-    end
-}
-
--- Make engine global
-_G.engine = engine
-)";
-        lua_->doString(registerHelpers);
-        
-        ofLogNotice("Engine") << "Lua initialized successfully - exec() and helper functions registered";
+        ofLogNotice("Engine") << "Lua initialized successfully - using SWIG bindings for helper functions";
     } else {
         ofLogWarning("Engine") << "Lua state not valid, cannot register functions";
     }
@@ -744,62 +562,40 @@ Engine::Result Engine::eval(const std::string& script) {
 }
 
 void Engine::syncScriptToEngine(const std::string& script, std::function<void(bool success)> callback) {
-    // Execute script with sync contract (Script → Engine synchronization)
-    // Guarantees script changes are reflected in engine state before callback fires
+    // Phase 1 Redesign: Non-blocking script execution
+    // 
+    // REMOVED: Blocking waitForStateVersion() - caused deadlock because:
+    //   1. Main thread blocked waiting for state version
+    //   2. Notification queue can only be processed on main thread (in update())
+    //   3. updateStateSnapshot() never called → state version never increments → timeout
+    //
+    // NEW DESIGN: Fire-and-forget with immediate callback
+    //   1. Execute script immediately (enqueues commands)
+    //   2. Call callback with script execution success/failure
+    //   3. State will update asynchronously when notifications are processed
+    //   4. Observers will be notified when state is ready
     
-    // Get current state version before execution
-    // Use acquire semantics to ensure we see latest state version
-    uint64_t currentVersion = stateVersion_.load(std::memory_order_acquire);
-    uint64_t targetVersion = currentVersion + 1;  // Expect version to increment after script execution
-    
-    // Execute script synchronously (simplified - no more async)
+    // Execute script synchronously (enqueues commands to audio thread)
     Result result = eval(script);
     
     if (!result.success) {
         // Script execution failed - call callback with failure
+        ofLogError("Engine") << "syncScriptToEngine: Script execution failed - " << result.error;
         if (callback) {
             callback(false);
         }
         return;
     }
     
-    // Script executed successfully - wait for command queue to be processed
-    // Commands are processed immediately by audio thread
-    // Now wait for state version to be updated
+    // Script executed successfully
+    // Commands are now queued and will be processed by audio thread
+    // State will update when notifications are processed in update() loop
+    ofLogVerbose("Engine") << "syncScriptToEngine: Script executed successfully (fire-and-forget)";
     
-    // Wait for state version to reach target version
-    // This ensures state snapshot is updated with script changes BEFORE callback fires
-    // State version increments in updateStateSnapshot() which is called after commands are processed
-    // Phase 7.9 Plan 8.3: Increased timeout to 2 seconds to handle complex scripts (up to ~200 commands)
-    bool versionReached = waitForStateVersion(targetVersion, 2000);  // 2 second timeout
-    
-    // Add memory barrier to ensure state snapshot is visible
-    std::atomic_thread_fence(std::memory_order_acquire);
-    
-    // Verify state version was updated
-    // Use acquire semantics to ensure we see latest state version
-    uint64_t finalVersion = stateVersion_.load(std::memory_order_acquire);
-    bool syncComplete = (finalVersion >= targetVersion);
-    
-    if (syncComplete) {
-        ofLogVerbose("Engine") << "Script → Engine sync complete (version: " << currentVersion << " → " << finalVersion << ")";
-    } else {
-        if (!versionReached) {
-            // Timeout occurred
-            ofLogWarning("Engine") << "Script → Engine sync timed out (version: " << currentVersion 
-                                   << " → " << finalVersion << ", expected: " << targetVersion 
-                                   << ") - Script executed successfully but state synchronization incomplete. "
-                                   << "Commands may still be processing. Consider increasing timeout or reducing script complexity.";
-        } else {
-            // Version not reached for other reasons
-            ofLogWarning("Engine") << "Script → Engine sync incomplete (version: " << currentVersion 
-                                   << " → " << finalVersion << ", expected: " << targetVersion << ")";
-        }
-    }
-    
-    // Call callback with sync status
+    // Call callback immediately with success
+    // State observers will be notified asynchronously when commands are processed
     if (callback) {
-        callback(syncComplete);
+        callback(true);
     }
 }
 
@@ -1138,8 +934,7 @@ void Engine::notifyObserversWithState() {
     // Includes all safety checks (recursive guard, throttling, etc.)
     
     // MEMORY SAFETY (Phase 7.9 Plan 4): Observers receive deep copies of state
-    // - getState() calls buildStateSnapshot() which creates deep copies of module snapshots
-    // - Cached state is also built via buildStateSnapshot() with deep copies
+    // - getState() returns copy of immutableStateSnapshot_
     // - EngineState is passed by value to observers (copy of struct)
     // - All JSON data (typeSpecificData) is deep copied, no shared references
     // - Safe even if modules/connections are deleted after observer receives state
@@ -1157,7 +952,7 @@ void Engine::notifyObserversWithState() {
     // If state version is stale, rebuild snapshot to ensure observers see fresh state
     uint64_t currentEngineVersion = stateVersion_.load();
     
-    // Get current state (with throttling and caching)
+    // Get current state (with throttling - use immutableStateSnapshot_ as cache)
     uint64_t now = getCurrentTimestamp();
     uint64_t lastTime = lastStateSnapshotTime_.load();
     bool shouldBuildSnapshot = (now - lastTime >= STATE_SNAPSHOT_THROTTLE_MS);
@@ -1165,32 +960,30 @@ void Engine::notifyObserversWithState() {
     EngineState state;
     if (shouldBuildSnapshot) {
         lastStateSnapshotTime_.store(now);
-        state = getState();  // Deep copy via buildStateSnapshot()
+        state = getState();  // Deep copy via immutableStateSnapshot_
         // Ensure state version matches engine version (should match after getState())
         state.version = currentEngineVersion;
     } else {
-        // Throttled - use cached state (also deep copied when cached)
-        std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
-        if (cachedState_) {
-            state = *cachedState_;  // Copy of cached state (deep copies preserved)
-            // Verify cached state version matches engine version
+        // Throttled - use immutableStateSnapshot_ (already available)
+        auto snapshot = getImmutableStateSnapshot();
+        if (snapshot) {
+            state = *snapshot;  // Copy of immutable snapshot (deep copies preserved)
+            // Verify state version matches engine version
             // If stale, rebuild snapshot to ensure observers see fresh state
             if (state.version < currentEngineVersion) {
-                // Cached state is stale - rebuild snapshot
-                lock.unlock();  // Release lock before calling getState()
-                ofLogVerbose("Engine") << "Cached state is stale (version: " << state.version 
+                ofLogVerbose("Engine") << "Immutable snapshot is stale (version: " << state.version 
                                        << ", engine: " << currentEngineVersion 
                                        << ") - rebuilding snapshot";
-                state = getState();  // Deep copy via buildStateSnapshot()
+                state = getState();  // Deep copy via immutableStateSnapshot_
                 state.version = currentEngineVersion;
             } else {
-                // Cached state is current - update version to match engine
+                // State is current - update version to match engine
                 state.version = currentEngineVersion;
             }
         } else {
-            // No cached state available - build snapshot anyway
-            ofLogWarning("Engine") << "notifyObserversWithState() throttled but no cached state available - building snapshot anyway";
-            state = getState();  // Deep copy via buildStateSnapshot()
+            // No snapshot available - build snapshot anyway
+            ofLogWarning("Engine") << "notifyObserversWithState() throttled but no snapshot available - building snapshot anyway";
+            state = getState();  // Deep copy via immutableStateSnapshot_
             state.version = currentEngineVersion;
         }
     }
@@ -1325,18 +1118,9 @@ void Engine::processNotificationQueue() {
 }
 
 void vt::Engine::notifyParameterChanged() {
-    // SIMPLIFIED: If parameters are being modified, defer state notification
-    // This prevents crashes when GUI changes parameters and triggers callbacks
-    // Use acquire semantics to ensure we see latest parameter modification count
-    if (parametersBeingModified_.load(std::memory_order_acquire) > 0) {
-        ofLogVerbose("Engine") << "notifyParameterChanged() deferred - parameter modification in progress";
-        enqueueStateNotification();
-        return;
-    }
-    
-    // Use deferred notification pattern to prevent recursive notifications
-    // notifyParameterChanged() can be called during state notifications
-    // Using deferred pattern ensures notifications happen on main thread and prevents infinite recursion
+    // Phase 2 Simplification: Removed parametersBeingModified_ check
+    // All state changes go through command queue, so we always defer the notification
+    // The notification will be processed on main thread via notification queue
     enqueueStateNotification();
 }
 
@@ -1372,78 +1156,33 @@ vt::EngineState vt::Engine::buildStateSnapshot() const {
     };
     SnapshotGuard guard(isBuildingSnapshot_);
     
+    // Phase 2 Simplification: Use immutableStateSnapshot_ as fallback instead of cachedState_
+    // The immutableStateSnapshot_ is maintained via the notification queue and is always up-to-date
+    // This eliminates the need for cachedState_ and cachedStateMutex_
+    
     // Check unsafe state flags FIRST
-    // If script is executing, return cached state immediately
-    // This prevents state snapshot building during script execution
-    // Note: Serialization no longer uses buildStateSnapshot() (uses getStateSnapshot() instead - lock-free)
-    if (hasUnsafeState(UnsafeState::SCRIPT_EXECUTING)) {
-        // Script is executing - return cached state immediately
-        // Still needed: Yes - getState() needs fallback during unsafe periods
-        // Can be simplified: Potentially - If Shells migrate to snapshots, getState() may become unused
-        // Note: Serialization no longer uses cachedState_ (uses getStateSnapshot() instead - lock-free)
-        std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
-        if (cachedState_) {
-            // Update version of cached state before returning
-            // Cached state may have been built earlier with version 0, but we need current version
-            // This ensures observers receive state with correct version for consistency tracking
-            EngineState result = *cachedState_;
-            result.version = stateVersion_.load();
-            
-            // CRITICAL: If cached state is empty (no modules), log a warning
-            // This indicates the initial snapshot was built before modules were loaded
-            if (cachedState_->modules.empty() && cachedState_->connections.empty()) {
-                ofLogWarning("Engine") << "buildStateSnapshot() BLOCKED by script execution - returning EMPTY cached state (modules: " 
-                                      << cachedState_->modules.size() << ", connections: " << cachedState_->connections.size() << ")";
-            } else {
-                ofLogVerbose("Engine") << "buildStateSnapshot() BLOCKED by script execution - returning cached state (modules: " 
-                                      << cachedState_->modules.size() << ", connections: " << cachedState_->connections.size() << ")";
-            }
-            return result;
-        }
-        ofLogError("Engine") << "buildStateSnapshot() blocked but no cached state available";
-        return EngineState();
-    }
-    
-    // Check ALL unsafe conditions using isInUnsafeState()
-    // Must detect unsafe periods before building snapshots
-    // Can be simplified: No - Multiple flags needed to detect all unsafe conditions
-    // Script execution CAN directly modify module state (via Lua bindings), not just queue commands
-    // So we must check unsafe state flags (script executing, commands processing) as well as parametersBeingModified_
-    // This prevents buildModuleStates() from aborting mid-iteration and leaving partial state
-    
-    // CRITICAL: Use memory barrier to ensure we see latest flag values
-    // Still needed: Yes - Ensures we see latest atomic flag values
-    // Can be simplified: No - Memory barrier is necessary for correctness
+    // If script is executing or commands are processing, return immutable snapshot immediately
+    // This prevents state snapshot building during unsafe periods
     std::atomic_thread_fence(std::memory_order_acquire);
     bool isExecuting = hasUnsafeState(UnsafeState::SCRIPT_EXECUTING);
     bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
-    // Use acquire semantics to ensure we see latest parameter modification count
-    int paramsModifying = parametersBeingModified_.load(std::memory_order_acquire);
     
-    if (isExecuting || commandsProcessing || paramsModifying > 0) {
-        // Never return empty state - return cached state instead
-        // This ensures observers always receive valid state, even during unsafe periods
-        std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
-        if (cachedState_) {
-            // Update version of cached state before returning
-            // Cached state may have been built earlier with version 0, but we need current version
-            // This ensures observers receive state with correct version for consistency tracking
-            EngineState result = *cachedState_;
+    if (isExecuting || commandsProcessing) {
+        // Return immutable snapshot (always available after setup)
+        auto snapshot = getImmutableStateSnapshot();
+        
+        if (snapshot) {
+            EngineState result = *snapshot;
             result.version = stateVersion_.load();
             
-            ofLogWarning("Engine") << "buildStateSnapshot() BLOCKED during unsafe period - returning cached state (isExecutingScript: " 
-                                   << isExecuting << ", commandsProcessing: " << commandsProcessing 
-                                   << ", parametersModifying: " << paramsModifying << ")";
+            ofLogVerbose("Engine") << "buildStateSnapshot() BLOCKED during unsafe period - returning immutable snapshot (isExecutingScript: " 
+                                   << isExecuting << ", commandsProcessing: " << commandsProcessing << ")";
             return result;
         }
-        // Cached state should always be initialized during setup
-        // If it's not available, initialize it now (shouldn't happen, but safety fallback)
-        ofLogError("Engine") << "buildStateSnapshot() called during unsafe period but cached state not initialized - initializing now";
-        std::unique_lock<std::shared_mutex> cacheLock(cachedStateMutex_);
-        if (!cachedState_) {
-            cachedState_ = std::make_unique<EngineState>();
-        }
-        return *cachedState_;
+        
+        // Safety fallback - should never happen
+        ofLogError("Engine") << "buildStateSnapshot() - immutable snapshot not available, returning empty state";
+        return EngineState();
     }
     
     // Prevent concurrent snapshot building
@@ -1469,31 +1208,33 @@ vt::EngineState vt::Engine::buildStateSnapshot() const {
     // (e.g., script execution can start on main thread while we're building snapshot)
     // This prevents buildModuleStates() from being called during script execution
     if (isInUnsafeState()) {
-        ofLogVerbose("Engine") << "buildStateSnapshot() - unsafe state detected before buildModuleStates() - returning cached state";
-        std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
-        if (cachedState_) {
-            return *cachedState_;
+        ofLogVerbose("Engine") << "buildStateSnapshot() - unsafe state detected before buildModuleStates() - returning immutable snapshot";
+        auto snapshot = getImmutableStateSnapshot();
+        if (snapshot) {
+            EngineState result = *snapshot;
+            result.version = stateVersion_.load();
+            return result;
         }
-        // If no cached state, return empty state (shouldn't happen)
-        ofLogError("Engine") << "buildStateSnapshot() - unsafe state but no cached state available";
+        // If no snapshot, return empty state (shouldn't happen)
+        ofLogError("Engine") << "buildStateSnapshot() - unsafe state but no snapshot available";
         return EngineState();
     }
     
     try {
         // Check if buildModuleStates() completed successfully
         // If it returns false, it aborted due to unsafe period and left partial state
-        // In this case, return cached state instead of partial state to prevent crashes
+        // In this case, return immutable snapshot instead of partial state to prevent crashes
         bool buildSuccess = buildModuleStates(state);
         if (!buildSuccess) {
-            // buildModuleStates() aborted - return cached state instead of partial state
-            std::shared_lock<std::shared_mutex> lock(cachedStateMutex_);
-            if (cachedState_) {
-                ofLogWarning("Engine") << "buildModuleStates() aborted due to unsafe period - returning cached state instead of partial state";
-                ofLogWarning("Engine") << "Cached state has " << cachedState_->modules.size() << " modules, " 
-                                      << cachedState_->connections.size() << " connections";
-                return *cachedState_;
+            // buildModuleStates() aborted - return immutable snapshot instead of partial state
+            auto snapshot = getImmutableStateSnapshot();
+            if (snapshot) {
+                ofLogWarning("Engine") << "buildModuleStates() aborted due to unsafe period - returning immutable snapshot instead of partial state";
+                EngineState result = *snapshot;
+                result.version = stateVersion_.load();
+                return result;
             } else {
-                ofLogError("Engine") << "buildModuleStates() aborted but no cached state available - returning partial state";
+                ofLogError("Engine") << "buildModuleStates() aborted but no snapshot available - returning partial state";
                 // Return partial state as fallback (better than empty state)
             }
         } else {
@@ -1531,44 +1272,32 @@ vt::EngineState vt::Engine::buildStateSnapshot() const {
     // Set state version for consistency tracking
     state.version = stateVersion_.load();
     
-    // Cache the result before releasing lock
-    {
-        std::unique_lock<std::shared_mutex> cacheLock(cachedStateMutex_);
-        if (!cachedState_) {
-            cachedState_ = std::make_unique<EngineState>();
-        }
-        *cachedState_ = state;
-    }
-    
     // Note: snapshotMutex_ is released automatically by lock_guard on function exit
     
     return state;
 }
 
 bool vt::Engine::waitForStateVersion(uint64_t targetVersion, uint64_t timeoutMs) {
-    // Wait for state to reach target version (for future sync contracts)
-    // Uses std::this_thread::yield() in wait loop (non-blocking)
-    // Returns when stateVersion_ >= targetVersion or timeout occurs
-    // Returns true if version reached, false if timeout
-    uint64_t startTime = getCurrentTimestamp();
-    uint64_t timeoutTime = startTime + timeoutMs;
-
-    // Use acquire semantics to ensure we see latest state version
-    while (stateVersion_.load(std::memory_order_acquire) < targetVersion) {
-        uint64_t now = getCurrentTimestamp();
-        if (now >= timeoutTime) {
-            // Timeout reached
-            queueMonitorStats_.stateVersionSyncTimeouts++;  // Phase 7.9 Plan 8.2
-            uint64_t currentVersion = stateVersion_.load(std::memory_order_acquire);
-            ofLogWarning("Engine") << "waitForStateVersion() timed out waiting for version " << targetVersion
-                                   << " (current: " << currentVersion << ", timeout: " << timeoutMs << "ms)"
-                                   << " - State synchronization incomplete, commands may still be processing";
-            return false;  // Timeout occurred
-        }
-        // Yield to other threads (non-blocking)
-        std::this_thread::yield();
+    // DEPRECATED: This function is inherently broken when called from main thread
+    // because it blocks the main thread while waiting for state version to increment,
+    // but state version only increments in updateStateSnapshot() which is called from
+    // processNotificationQueue() which runs on the main thread.
+    // This creates a deadlock.
+    //
+    // Phase 1 Fix: Always return immediately with a warning.
+    // Code that needs to wait for state should use the async observer pattern instead.
+    
+    ofLogWarning("Engine") << "waitForStateVersion() is DEPRECATED and causes deadlocks. "
+                           << "Use async observer pattern instead. Returning immediately.";
+    
+    // Check current version - if already at target, return true for backward compat
+    uint64_t currentVersion = stateVersion_.load(std::memory_order_acquire);
+    if (currentVersion >= targetVersion) {
+        return true;
     }
-    return true;  // Version reached successfully
+    
+    // Otherwise return false - we can't safely wait
+    return false;
 }
 
 void vt::Engine::updateStateSnapshot() {
@@ -1724,9 +1453,6 @@ bool vt::Engine::buildModuleStates(vt::EngineState& state) const {
     std::atomic_thread_fence(std::memory_order_acquire);
     bool isExecuting = hasUnsafeState(UnsafeState::SCRIPT_EXECUTING);
     bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
-    // Use acquire semantics to ensure we see latest parameter modification count
-    int paramsModifying = parametersBeingModified_.load(std::memory_order_acquire);
-    
     
     // CRITICAL: If we're here during script execution, something is very wrong
     if (isExecuting) {
@@ -1742,8 +1468,7 @@ bool vt::Engine::buildModuleStates(vt::EngineState& state) const {
     std::atomic_thread_fence(std::memory_order_acquire);
     if (isInUnsafeState()) {
         ofLogError("Engine") << "buildModuleStates() called during unsafe period - ABORTING to prevent crash (isExecutingScript: " 
-                             << hasUnsafeState(UnsafeState::SCRIPT_EXECUTING) << ", commandsProcessing: " << hasUnsafeState(UnsafeState::COMMANDS_PROCESSING) 
-                             << ", parametersModifying: " << parametersBeingModified_.load(std::memory_order_acquire) << ")";
+                             << hasUnsafeState(UnsafeState::SCRIPT_EXECUTING) << ", commandsProcessing: " << hasUnsafeState(UnsafeState::COMMANDS_PROCESSING) << ")";
         return false;  // Aborted - return false to indicate failure
     }
     // Flag to track if we aborted due to unsafe state
@@ -1761,8 +1486,7 @@ bool vt::Engine::buildModuleStates(vt::EngineState& state) const {
         std::atomic_thread_fence(std::memory_order_acquire);
         bool isExecuting = hasUnsafeState(UnsafeState::SCRIPT_EXECUTING);
         bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
-        // Use acquire semantics to ensure we see latest parameter modification count
-        int paramsModifying = parametersBeingModified_.load(std::memory_order_acquire);
+        // Phase 2 Simplification: Removed parametersBeingModified_ check
         if (isInUnsafeState()) {
             ofLogError("Engine") << "buildModuleStates() detected unsafe period while processing module " << name << " - ABORTING";
             aborted = true;
@@ -2229,9 +1953,14 @@ bool vt::Engine::enqueueCommand(std::unique_ptr<Command> cmd) {
 int Engine::processCommands() {
     ASSERT_AUDIO_THREAD();
 
-    // Redesign: Removed COMMANDS_PROCESSING flag - not necessary
-    // Commands are queued and processed atomically, no need for flag
-    // Reduces flag spam and simplifies design
+    // Phase 1 Fix: Restore COMMANDS_PROCESSING flag
+    // This flag protects state snapshots from being built while commands modify state
+    // Without this flag, isInUnsafeState() returns false during command processing,
+    // allowing race conditions where state is read while being modified
+    setUnsafeState(UnsafeState::COMMANDS_PROCESSING, true);
+    
+    // Memory barrier ensures flag is visible before command processing begins
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 
     int processed = 0;
     std::unique_ptr<Command> cmd;
@@ -2258,9 +1987,10 @@ int Engine::processCommands() {
     size_t queueDepthAfter = commandQueue_.size_approx();
     queueMonitorStats_.commandQueueCurrent = queueDepthAfter;
 
-    // Add memory barrier after command processing
-    // This ensures command execution is complete before notification is enqueued
+    // Clear COMMANDS_PROCESSING flag before notification
+    // Memory barrier ensures all command modifications are complete
     std::atomic_thread_fence(std::memory_order_release);
+    setUnsafeState(UnsafeState::COMMANDS_PROCESSING, false);
 
     if (processed > 0) {
         enqueueStateNotification();
