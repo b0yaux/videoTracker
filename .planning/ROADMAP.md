@@ -12,7 +12,7 @@
 
 **Goal**: Remove redundant string-based Lua helpers, use existing SWIG bindings directly.
 
-**Status**: 🔵 Planned (1 plan in 1 wave)
+**Status**: ✅ Complete (2026-01-20)
 
 **Context**: The codebase has SWIG bindings in `videoTracker.i` that are fully functional, but `Engine::setupLua()` re-implements everything with string commands that get parsed on every call.
 
@@ -45,7 +45,7 @@ setParam("kick", "volume", 0.9)
 **Estimated Effort**: 30 minutes
 
 **Plans:**
-- [x] 01-01-PLAN.md — Delete registerHelpers string, update log message
+- [x] 01-01-PLAN.md — Delete registerHelpers string, update log message ✓
 
 ---
 
@@ -238,11 +238,11 @@ Phase 7 was dramatically overcomplexified with 9+ subphases. The key simplificat
 ## Critical Path
 
 ```
-Phase 1 (DELETE string Lua) 
-    → Phase 2 (fix cascade) 
+Phase 1 (DELETE string Lua) → ✅ COMPLETE
+    → Phase 2 (fix cascade)
     → Phase 3 (complete lockfree)
     → Phase 4-5 (cleanup)
-    → THEN: Phases 8-13 can begin
+    → THEN: Phases 8-13 from old roadmap can resume
 ```
 
 **Blockers**: None - can start immediately
