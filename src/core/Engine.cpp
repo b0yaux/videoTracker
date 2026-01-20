@@ -1065,13 +1065,24 @@ void Engine::syncEngineToEditor(std::function<void(const EngineState&)> callback
 }
 
 void Engine::enqueueStateNotification() {
+    // Phase 2: Suppress duplicate notifications during parameter cascades
+    // Only one notification needed even if multiple parameters change in cascade
+    bool expected = false;
+    if (!notificationEnqueued_.compare_exchange_strong(expected, true)) {
+        // Already enqueued - skip to prevent notification storm
+        return;
+    }
+
     // Enqueue state notification to be processed on main thread
     // This replaces the stateNeedsNotification_ flag pattern - queue is single source of truth
-    
+
     // Update monitoring: track enqueued notifications (Phase 7.9 Plan 8.2)
     queueMonitorStats_.notificationQueueTotalEnqueued++;
-    
+
     notificationQueue_.enqueue([this]() {
+        // Phase 2: Clear flag AFTER processing, before next notification batch
+        notificationEnqueued_.store(false);
+
         // Update snapshot before notifying
         // This ensures state snapshot reflects processed commands before observers are notified
         // State version increments in updateStateSnapshot(), ensuring observers see fresh state
