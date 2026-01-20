@@ -51,19 +51,25 @@ setParam("kick", "volume", 0.9)
 
 ## Phase 2: Fix Notification Cascade (HIGH)
 
-**Goal**: Use existing `parametersBeingModified` counter to suppress duplicate notifications during parameter cascades.
+**Goal**: Use atomic flag to suppress duplicate notifications during parameter cascades.
 
-**Status**: 🔵 Not Started
+**Status**: 🟡 Planned
 
-**Context**: `ParameterRouter::processRoutingImmediate()` calls `setParameter()` on multiple modules, each triggering a notification. The `parametersBeingModified` counter exists but isn't used to suppress duplicates.
+**Context**: `ParameterRouter::processRoutingImmediate()` calls `setParameterValue()` on multiple modules, each triggering a notification callback. Without suppression, N notifications get enqueued when 1 is needed.
 
-**Fix** (`src/core/Engine.cpp`):
+**Fix** (`src/core/Engine.h` + `src/core/Engine.cpp`):
 ```cpp
+// Engine.h - add atomic flag
+std::atomic<bool> notificationEnqueued_{false};
+
+// Engine.cpp - suppress duplicates
 void Engine::enqueueStateNotification() {
-    if (parametersBeingModified.load() > 0) {
-        return;  // Skip during parameter cascade - batch in progress
+    bool expected = false;
+    if (!notificationEnqueued_.compare_exchange_strong(expected, true)) {
+        return;  // Already enqueued - skip to prevent notification storm
     }
     notificationQueue_.enqueue([this]() {
+        notificationEnqueued_.store(false);  // Clear after processing
         updateStateSnapshot();
         notifyObserversWithState();
     });
@@ -73,9 +79,13 @@ void Engine::enqueueStateNotification() {
 **Impact**: Eliminates notification storms during parameter routing cascades.
 
 **Files Modified**:
-- `src/core/Engine.cpp` - Check counter before enqueueing notification
+- `src/core/Engine.h` - Atomic flag declaration
+- `src/core/Engine.cpp` - Suppression logic
 
 **Estimated Effort**: 2 hours
+
+**Plans:**
+- [ ] 02-01-PLAN.md — Add notificationEnqueued_ flag and suppression logic
 
 ---
 
