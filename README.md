@@ -1,6 +1,44 @@
 # videoTracker
 
-openFrameworks / ImGui / C++ project - modular audiovisual sampling and synthesis.
+openFrameworks / ImGui / C++ project - modular audiovisual sampling and synthesis with live-coding support.
+
+## Overview
+
+videoTracker is a modular audiovisual sequencer that combines:
+- **Tracker-style sequencing** with step-based patterns
+- **Modular architecture** for flexible routing and processing
+- **Live-coding capabilities** via Lua scripting (in development)
+- **Multiple interaction modes** via Shell system (Command, Code, Editor)
+
+### Key Features
+
+- **Tracker-Style Sequencer**: Step-based pattern sequencing with multi-pattern support and pattern chaining
+- **Modular Architecture**: Plugin-style module system supporting sequencers, instruments, effects, and utilities
+- **Media Management**: Automatic media file scanning, pairing, and playback with drag-and-drop support
+- **Real-Time Mixing**: Separate audio and video mixers with routing capabilities
+- **Sample-Accurate Timing**: Audio-rate clock system for precise synchronization
+- **Session Management**: Complete project and session save/load with asset management
+- **Parameter Routing**: Flexible parameter modulation and automation system
+- **Connection Management**: Dynamic module connections for audio, video, parameters, and events
+- **Live-Coding Shells**: Multiple interaction modes (Command, Code, Editor) with state synchronization
+
+### Shell System
+
+videoTracker provides three interaction modes:
+
+- **CommandShell** (F1): Terminal-style REPL for quick commands and system management
+- **CodeShell** (F2): Live-coding environment with Lua editor and REPL output
+- **EditorShell** (F3): Traditional GUI with tiled windows and visual editing
+
+All shells stay synchronized via ScriptManager, which generates Lua scripts from Engine state.
+
+### Scripting & Live-Coding
+
+**Current State**: ScriptManager generates session reconstruction scripts (command-based)  
+**Goal**: Declarative live-coding syntax inspired by Tidal/Strudel/Hydra/SuperCollider  
+**Status**: Theorically : Foundation complete, high-level API and pattern DSL compiler pending. In practice : live-coding not working (scripting sync system malfunctions, malloc errors & crashes)
+
+
 
 ## Remaining issues / needed enhancements :
 
@@ -23,13 +61,12 @@ openFrameworks / ImGui / C++ project - modular audiovisual sampling and synthesi
 	- row 1 : simple pattern count (similar to current)
 - keep the existing +/-/D buttons for now aside the table on the right ON/OFF toggle on the left, and adapt all working features to this layout (like pattern mute when playing)
 
-### mediaPool (+GUI)
+### multiSampler (+GUI)
 
 **Parameter Grid :**
 
 - should clarify PLAY/STOP toggle button and Index cell : index cell set the active index, PLAY button is used to control manual playback & display current playback state for active index
 - 'loop Size' parameter cell is inconvenient because of custom mapping (impossible to edit properly like other cells, present issues when trying to edit buffer, should prevent this while preserving some kind of logarithmic precision)
-- rationalize the POLYPHONY mode to properly handle multiple players (up to 16 per instance)
 - add BLEND MODE MULTI-STATE button when in POLY mode
 
 ### assetLibrary
@@ -119,6 +156,22 @@ hello-imgui (App Framework)
 
 ### Core Design Philosophy
 
+videoTracker follows a **modular architecture** inspired by SunVox and BespokeSynth, with live-coding capabilities inspired by Tidal/Strudel/Hydra/SuperCollider:
+
+**Current State**:
+- ✅ Modular architecture with module-based routing
+- ✅ PatternRuntime for pattern management
+- ✅ ScriptManager for state synchronization
+- ✅ Multiple shells (Command, Code, Editor) with auto-sync
+- ⏳ Live-coding syntax (pattern DSL compiler pending)
+- ⏳ High-level Lua API (declarative functions pending)
+
+**Architecture Layers**:
+1. **Engine** (Headless Core): ModuleRegistry, PatternRuntime, ConnectionManager, ScriptManager
+2. **Shells** (UI Modes): CommandShell, CodeShell, EditorShell - all synchronized via ScriptManager
+3. **Modules** (Plugins): TrackerSequencer, MultiSampler, AudioMixer, VideoMixer, etc.
+4. **Pattern System**: PatternRuntime (first-class patterns) + PatternCompiler (future: DSL → Patterns)
+
 videoTracker follows a **modular architecture** inspired by SunVox and BespokeSynth, where:
 
 - **Modules** are self-contained units that can produce/consume audio, video, parameters, and events
@@ -134,7 +187,7 @@ The application is built around a unified `Module` base class that provides:
 #### Module Types
 
 - **SEQUENCER**: Generates trigger events (e.g., `TrackerSequencer`)
-- **INSTRUMENT**: Responds to triggers (e.g., `MediaPool`, `MIDIOutput`)
+- **INSTRUMENT**: Responds to triggers (e.g., `MultiSampler`, `MIDIOutput`)
 - **EFFECT**: Processes audio/video (future: video effects, audio effects)
 - **UTILITY**: Routing, mixing, utilities (e.g., `AudioMixer`, `VideoMixer`)
 
@@ -142,11 +195,11 @@ The application is built around a unified `Module` base class that provides:
 
 Modules declare capabilities rather than relying on type checks:
 
-- `ACCEPTS_FILE_DROP`: Can accept file drops (e.g., `MediaPool`)
+- `ACCEPTS_FILE_DROP`: Can accept file drops (e.g., `MultiSampler`)
 - `REQUIRES_INDEX_RANGE`: Needs index range callback (optional, defaults to 0-127)
-- `PROVIDES_INDEX_RANGE`: Provides index range (e.g., `MediaPool`)
+- `PROVIDES_INDEX_RANGE`: Provides index range (e.g., `MultiSampler`)
 - `EMITS_TRIGGER_EVENTS`: Emits trigger events (e.g., `TrackerSequencer`)
-- `ACCEPTS_TRIGGER_EVENTS`: Accepts trigger events (e.g., `MediaPool`)
+- `ACCEPTS_TRIGGER_EVENTS`: Accepts trigger events (e.g., `MultiSampler`)
 
 #### Module Interface
 
@@ -203,17 +256,58 @@ The main sequencer module that generates trigger events:
 
 **Trigger Events**: Emits `TriggerEvent` objects containing parameter maps that modules can respond to.
 
-#### MediaPool (`src/MediaPool.h`)
+#### MultiSampler (`src/modules/MediaPool.h`)
 
-Media library and playback module:
+AV sample playback instrument with polyphonic voice allocation (formerly MediaPool):
 
-- Automatic media file scanning and pairing
-- Drag-and-drop file support
-- Multiple playback modes (ONCE, LOOP, NEXT)
-- Position scanning modes (NONE, PER_STEP, PER_MEDIA, GLOBAL)
-- Polyphony modes (MONOPHONIC, POLYPHONIC)
-- Lock-free event queue for sequencer triggers
-- Audio/video output routing via internal mixers
+##### Parameters
+
+| Parameter | Type | Range | Default | Description |
+|-----------|------|-------|---------|-------------|
+| `index` | INT | 0 to N-1 | 0 | Sample index to trigger |
+| `position` | FLOAT | 0.0-1.0 | 0.0 | Start position within region (relative) |
+| `speed` | FLOAT | -10.0 to 10.0 | 1.0 | Playback speed (negative = reverse) |
+| `volume` | FLOAT | 0.0-2.0 | 1.0 | Output volume multiplier |
+| `loopSize` | FLOAT | 0.001-10.0s | 1.0 | Loop region size in seconds |
+| `regionStart` | FLOAT | 0.0-1.0 | 0.0 | Region start (absolute position) |
+| `regionEnd` | FLOAT | 0.0-1.0 | 1.0 | Region end (absolute position) |
+| `polyphonyMode` | INT | 0-1 | 0 | 0=Mono, 1=Poly |
+
+##### Play Styles
+
+| Style | Behavior |
+|-------|----------|
+| **ONCE** | Play once, stop at region end |
+| **LOOP** | Loop within loopSize region from startPosition |
+| **NEXT** | Loop with position memory (continues where left off) |
+
+##### Features
+
+- 16-voice polyphony pool with LRU voice stealing
+- 4 players per sample for true polyphonic playback of same sample
+- Audio + Video mixing via internal mixers
+- Complete preloading for zero-latency triggers
+- Region trimming (regionStart/regionEnd)
+- Variable-size loop regions (loopSize)
+- Bidirectional playback (negative speed)
+- File drag-and-drop support
+- Auto-pairing (audio+video by filename)
+- Sequencer trigger integration via `onTrigger`
+- Waveform display with zoom/pan (up to 10000x zoom)
+- Preview scrubbing in IDLE mode
+
+##### Ports
+
+| Port | Type | Description |
+|------|------|-------------|
+| `trigger_in` | EVENT_IN | Receives trigger events from sequencer |
+| `audio_out` | AUDIO_OUT | Mixed audio output |
+| `video_out` | VIDEO_OUT | Mixed video output |
+
+##### Capabilities
+
+- `ACCEPTS_FILE_DROP` - Drag files directly to add samples
+- `ACCEPTS_TRIGGER_EVENTS` - Receives sequencer triggers
 
 #### ModuleRegistry (`src/core/ModuleRegistry.h`)
 
@@ -275,7 +369,7 @@ Unified session and project management:
 src/
 ├── Module.h                    # Base module interface
 ├── TrackerSequencer.h/cpp      # Main sequencer module
-├── MediaPool.h/cpp             # Media library and playback
+├── MediaPool.h/cpp             # MultiSampler - AV sample instrument
 ├── Pattern.h/cpp               # Pattern data structure
 ├── Clock.h/cpp                 # Sample-accurate timing
 ├── MediaPlayer.h/cpp           # Individual media playback
@@ -295,7 +389,7 @@ src/
 │   ├── ViewManager.h/cpp       # View management
 │   ├── ModuleGUI.h/cpp          # Base module GUI
 │   ├── TrackerSequencerGUI.h/cpp
-│   ├── MediaPoolGUI.h/cpp
+│   ├── MediaPoolGUI.h/cpp      # MultiSamplerGUI
 │   └── ...
 └── input/                      # Input handling
     └── InputRouter.h/cpp       # Input routing
