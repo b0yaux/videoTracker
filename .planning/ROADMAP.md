@@ -53,7 +53,7 @@ setParam("kick", "volume", 0.9)
 
 **Goal**: Use atomic flag to suppress duplicate notifications during parameter cascades.
 
-**Status**: 🟡 Planned
+**Status**: ✅ Complete (2026-01-20)
 
 **Context**: `ParameterRouter::processRoutingImmediate()` calls `setParameterValue()` on multiple modules, each triggering a notification callback. Without suppression, N notifications get enqueued when 1 is needed.
 
@@ -85,7 +85,7 @@ void Engine::enqueueStateNotification() {
 **Estimated Effort**: 2 hours
 
 **Plans:**
-- [ ] 02-01-PLAN.md — Add notificationEnqueued_ flag and suppression logic
+- [x] 02-01-PLAN.md — Add notificationEnqueued_ flag and suppression logic ✓
 
 ---
 
@@ -249,7 +249,7 @@ Phase 7 was dramatically overcomplexified with 9+ subphases. The key simplificat
 
 ```
 Phase 1 (DELETE string Lua) → ✅ COMPLETE
-    → Phase 2 (fix cascade)
+    → Phase 2 (fix cascade) → ✅ COMPLETE
     → Phase 3 (complete lockfree)
     → Phase 4-5 (cleanup)
     → THEN: Phases 8-13 from old roadmap can resume
