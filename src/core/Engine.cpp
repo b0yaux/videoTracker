@@ -22,51 +22,6 @@ thread_local bool Engine::isBuildingSnapshot_ = false;
 std::thread::id Engine::mainThreadId_;
 std::thread::id Engine::audioThreadId_;
 
-// Helper methods for unsafe state management
-void Engine::setUnsafeState(UnsafeState state, bool active) {
-    uint8_t flag = static_cast<uint8_t>(state);
-    std::thread::id threadId = std::this_thread::get_id();
-    std::string stateName = (state == UnsafeState::SCRIPT_EXECUTING) ? "SCRIPT_EXECUTING" : "COMMANDS_PROCESSING";
-    
-    if (active) {
-        // Use release semantics when setting flags to ensure all previous writes are visible
-        unsafeStateFlags_.fetch_or(flag, std::memory_order_release);
-        // Memory barrier ensures flag is visible to all threads immediately
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        
-        // Log unsafe state flag set
-        ofLogVerbose("Engine") << "[UNSAFE_STATE] Set " << stateName << " flag (thread: " << threadId 
-                               << ", flags: 0x" << std::hex << unsafeStateFlags_.load(std::memory_order_acquire) << std::dec << ")";
-    } else {
-        // Use release semantics when clearing flags
-        unsafeStateFlags_.fetch_and(~flag, std::memory_order_release);
-        // Memory barrier ensures flag clear is visible to all threads immediately
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        
-        // Log unsafe state flag cleared
-        ofLogVerbose("Engine") << "[UNSAFE_STATE] Cleared " << stateName << " flag (thread: " << threadId 
-                               << ", flags: 0x" << std::hex << unsafeStateFlags_.load(std::memory_order_acquire) << std::dec << ")";
-    }
-}
-
-bool Engine::hasUnsafeState(UnsafeState state) const {
-    uint8_t flag = static_cast<uint8_t>(state);
-    // Use acquire semantics when reading flags to ensure we see the latest values
-    uint8_t currentFlags = unsafeStateFlags_.load(std::memory_order_acquire);
-    bool hasFlag = (currentFlags & flag) != 0;
-    
-    // Log unsafe state check (verbose only - can be very frequent)
-    // Only log when flag is set to reduce log noise
-    if (hasFlag) {
-        std::thread::id threadId = std::this_thread::get_id();
-        std::string stateName = (state == UnsafeState::SCRIPT_EXECUTING) ? "SCRIPT_EXECUTING" : "COMMANDS_PROCESSING";
-        ofLogVerbose("Engine") << "[UNSAFE_STATE] Check " << stateName << " flag: TRUE (thread: " << threadId 
-                               << ", flags: 0x" << std::hex << currentFlags << std::dec << ")";
-    }
-    
-    return hasFlag;
-}
-
 Engine::Engine() 
     : assetLibrary_(&projectManager_, &mediaConverter_, &moduleRegistry_)
     , scriptManager_(this) {
@@ -480,7 +435,7 @@ Engine::Result Engine::eval(const std::string& script) {
     // This must be set as early as possible to prevent any code path from calling
     // getState() or buildStateSnapshot() during script execution
     // This prevents crashes when script execution triggers state changes or callbacks
-    setUnsafeState(UnsafeState::SCRIPT_EXECUTING, true);
+    notifyingObservers_.store(true, std::memory_order_release);
     
     // CRITICAL: Ensure flag is visible to all threads immediately
     // Use memory barrier to ensure flag is set before any script execution
@@ -500,20 +455,20 @@ Engine::Result Engine::eval(const std::string& script) {
             success = lua_->doString(script);
         } catch (const std::bad_alloc& e) {
             // Memory allocation failure
-            setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
+            notifyingObservers_.store(false, std::memory_order_release);
             return Result(false, "Lua execution failed", "Memory allocation error: " + std::string(e.what()));
         } catch (const std::exception& e) {
             // Other C++ exceptions from SWIG wrappers
-            setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
+            notifyingObservers_.store(false, std::memory_order_release);
             return Result(false, "Lua execution failed", "C++ exception: " + std::string(e.what()));
         } catch (...) {
             // Unknown exceptions
-            setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
+            notifyingObservers_.store(false, std::memory_order_release);
             return Result(false, "Lua execution failed", "Unknown C++ exception during script execution");
         }
         
         // Clear script execution flag before returning
-        setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
+        notifyingObservers_.store(false, std::memory_order_release);
         
         // State notifications will happen automatically when commands are processed
         // No need to manually trigger them here
@@ -550,12 +505,12 @@ Engine::Result Engine::eval(const std::string& script) {
         }
     } catch (const std::exception& e) {
         // Clear flag on exception
-        setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
+        notifyingObservers_.store(false, std::memory_order_release);
         ofLogError("Engine") << "Script execution exception: " << e.what();
         return Result(false, "Script execution failed", "C++ exception: " + std::string(e.what()));
     } catch (...) {
         // Clear flag on unknown exception
-        setUnsafeState(UnsafeState::SCRIPT_EXECUTING, false);
+        notifyingObservers_.store(false, std::memory_order_release);
         ofLogError("Engine") << "Script execution unknown exception";
         return Result(false, "Script execution failed", "Unknown error occurred during script execution");
     }
@@ -1139,7 +1094,7 @@ void vt::Engine::onBPMChanged(float& newBpm) {
 
     // Defer state update if script is executing (prevents recursive updates)
     // The state will be updated after script execution completes
-    if (hasUnsafeState(UnsafeState::SCRIPT_EXECUTING)) {
+    if (notifyingObservers_.load(std::memory_order_acquire)) {
         ofLogVerbose("Engine") << "[BPM_CHANGE] BPM changed to " << newBpm << " during script execution - deferring state update";
         // Don't notify during script execution - it will be notified after execution completes
         return;
@@ -1171,14 +1126,13 @@ vt::EngineState vt::Engine::buildStateSnapshot() const {
     // The immutableStateSnapshot_ is maintained via the notification queue and is always up-to-date
     // This eliminates the need for cachedState_ and cachedStateMutex_
     
-    // Check unsafe state flags FIRST
+    // Check notification queue guard FIRST
     // If script is executing or commands are processing, return immutable snapshot immediately
     // This prevents state snapshot building during unsafe periods
     std::atomic_thread_fence(std::memory_order_acquire);
-    bool isExecuting = hasUnsafeState(UnsafeState::SCRIPT_EXECUTING);
-    bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
+    bool isUnsafe = notifyingObservers_.load(std::memory_order_acquire);
     
-    if (isExecuting || commandsProcessing) {
+    if (isUnsafe) {
         // Return immutable snapshot (always available after setup)
         auto snapshot = getImmutableStateSnapshot();
         
@@ -1186,8 +1140,8 @@ vt::EngineState vt::Engine::buildStateSnapshot() const {
             EngineState result = *snapshot;
             result.version = stateVersion_.load();
             
-            ofLogVerbose("Engine") << "buildStateSnapshot() BLOCKED during unsafe period - returning immutable snapshot (isExecutingScript: " 
-                                   << isExecuting << ", commandsProcessing: " << commandsProcessing << ")";
+            ofLogVerbose("Engine") << "buildStateSnapshot() BLOCKED during unsafe period - returning immutable snapshot (notifyingObservers: " 
+                                   << isUnsafe << ")";
             return result;
         }
         
@@ -1201,6 +1155,9 @@ vt::EngineState vt::Engine::buildStateSnapshot() const {
     // Note: Serialization no longer uses buildStateSnapshot() (uses getStateSnapshot() instead - lock-free)
     // This prevents crashes when multiple threads try to build snapshots simultaneously
     // (e.g., when ScriptManager observer fires while another snapshot is being built)
+    // Phase 3: snapshotMutex_ is kept to prevent expensive concurrent buildStateSnapshot() calls
+    // Unlike the previous pattern, we're using the notification queue guard for state detection,
+    // not atomic flags - mutex only prevents concurrent expensive operations
     std::lock_guard<std::mutex> mutexGuard(snapshotMutex_);
     
     EngineState state;
@@ -1343,7 +1300,7 @@ void vt::Engine::updateStateSnapshot() {
     // Check if commands are processing before updating snapshots
     // Commands hold exclusive locks on moduleMutex_, so updateSnapshot() would block
     // Skip snapshot update if commands are processing (will be updated after commands complete)
-    bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
+    bool commandsProcessing = notifyingObservers_.load(std::memory_order_acquire);
     
     if (!commandsProcessing) {
         // Safe to update snapshots - no exclusive locks held
@@ -1462,11 +1419,10 @@ bool vt::Engine::buildModuleStates(vt::EngineState& state) const {
     // CRITICAL: This function should NEVER be called during script execution
     // If it is, it means our guards failed - log extensively and abort immediately
     std::atomic_thread_fence(std::memory_order_acquire);
-    bool isExecuting = hasUnsafeState(UnsafeState::SCRIPT_EXECUTING);
-    bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
+    bool isUnsafe = notifyingObservers_.load(std::memory_order_acquire);
     
     // CRITICAL: If we're here during script execution, something is very wrong
-    if (isExecuting) {
+    if (isUnsafe) {
         ofLogError("Engine") << "CRITICAL: buildModuleStates() called during script execution! This should never happen! Aborting immediately.";
         // Log stack trace if possible
         return false;
@@ -1478,8 +1434,8 @@ bool vt::Engine::buildModuleStates(vt::EngineState& state) const {
     // This prevents race conditions where script execution starts but flag isn't visible yet
     std::atomic_thread_fence(std::memory_order_acquire);
     if (isInUnsafeState()) {
-        ofLogError("Engine") << "buildModuleStates() called during unsafe period - ABORTING to prevent crash (isExecutingScript: " 
-                             << hasUnsafeState(UnsafeState::SCRIPT_EXECUTING) << ", commandsProcessing: " << hasUnsafeState(UnsafeState::COMMANDS_PROCESSING) << ")";
+        ofLogError("Engine") << "buildModuleStates() called during unsafe period - ABORTING to prevent crash (notifyingObservers: " 
+                             << notifyingObservers_.load(std::memory_order_acquire) << ")";
         return false;  // Aborted - return false to indicate failure
     }
     // Flag to track if we aborted due to unsafe state
@@ -1495,8 +1451,7 @@ bool vt::Engine::buildModuleStates(vt::EngineState& state) const {
         // State can change from safe to unsafe while iterating over modules
         // Use memory barrier to ensure we see the latest value
         std::atomic_thread_fence(std::memory_order_acquire);
-        bool isExecuting = hasUnsafeState(UnsafeState::SCRIPT_EXECUTING);
-        bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
+        isUnsafe = notifyingObservers_.load(std::memory_order_acquire);
         // Phase 2 Simplification: Removed parametersBeingModified_ check
         if (isInUnsafeState()) {
             ofLogError("Engine") << "buildModuleStates() detected unsafe period while processing module " << name << " - ABORTING";
@@ -1825,7 +1780,7 @@ void vt::Engine::update(float deltaTime) {
     // Don't update modules while commands are processing
     // Commands modify module state, and updating modules concurrently causes race conditions
     // This prevents crashes when modules access state that's being modified by commands
-    bool commandsProcessing = hasUnsafeState(UnsafeState::COMMANDS_PROCESSING);
+    bool commandsProcessing = notifyingObservers_.load(std::memory_order_acquire);
     if (commandsProcessing) {
         // Commands are still processing - skip module updates this frame
         // They'll be updated next frame after commands complete
@@ -1968,7 +1923,7 @@ int Engine::processCommands() {
     // This flag protects state snapshots from being built while commands modify state
     // Without this flag, isInUnsafeState() returns false during command processing,
     // allowing race conditions where state is read while being modified
-    setUnsafeState(UnsafeState::COMMANDS_PROCESSING, true);
+    notifyingObservers_.store(true, std::memory_order_release);
     
     // Memory barrier ensures flag is visible before command processing begins
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2001,7 +1956,7 @@ int Engine::processCommands() {
     // Clear COMMANDS_PROCESSING flag before notification
     // Memory barrier ensures all command modifications are complete
     std::atomic_thread_fence(std::memory_order_release);
-    setUnsafeState(UnsafeState::COMMANDS_PROCESSING, false);
+    notifyingObservers_.store(false, std::memory_order_release);
 
     if (processed > 0) {
         enqueueStateNotification();

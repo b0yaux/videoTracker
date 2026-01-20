@@ -449,21 +449,6 @@ public:
     void setOnModuleRemoved(std::function<void(const std::string&)> callback) { onModuleRemoved_ = callback; }
     
     
-    // Unsafe state detection (consolidated from multiple flags)
-    // Purpose: Single source of truth for unsafe state detection
-    // Uses bitmask to track multiple unsafe conditions simultaneously
-    // Bit 0: Script executing
-    // Bit 1: Commands being processed
-    // Bit 2+: Reserved for future use
-    enum class UnsafeState : uint8_t {
-        NONE = 0,
-        SCRIPT_EXECUTING = 1 << 0,
-        COMMANDS_PROCESSING = 1 << 1
-    };
-    
-    // Check if script is currently executing (for components that need to defer operations)
-    bool isExecutingScript() const { return hasUnsafeState(UnsafeState::SCRIPT_EXECUTING); }
-    
     /**
      * Check if we're currently building a state snapshot (thread-local check)
      * Used to prevent recursive calls during snapshot building
@@ -514,14 +499,11 @@ public:
     static bool isAudioThread() {
         return std::this_thread::get_id() == audioThreadId_;
     }
-    bool commandsBeingProcessed() const { return hasUnsafeState(UnsafeState::COMMANDS_PROCESSING); }
     bool hasPendingCommands() const { return commandQueue_.size_approx() > 0; }
     bool isInUnsafeState() const { 
-        // Use acquire semantics to ensure we see latest unsafe state flags
-        // Phase 2 Simplification: Removed parametersBeingModified_ check
-        // All state modifications now go through command queue, so SCRIPT_EXECUTING and COMMANDS_PROCESSING flags are sufficient
-        std::atomic_thread_fence(std::memory_order_acquire);
-        return unsafeStateFlags_.load(std::memory_order_acquire) != 0; 
+        // Phase 3: Simplified - check notification queue guard instead of atomic flags
+        // The notification queue is the single source of truth for state updates
+        return notifyingObservers_.load(std::memory_order_acquire);
     }
     
     // Render guard (prevents state updates during rendering)
@@ -588,13 +570,6 @@ private:
     // Shells registered for coordinated state updates (FIFO order)
     // Protected by stateMutex_ (same mutex as observers_)
     std::vector<vt::shell::Shell*> registeredShells_;
-    
-    // Unsafe state flags (implementation detail - enum is public for inline method access)
-    std::atomic<uint8_t> unsafeStateFlags_{0};
-    
-    // Helper methods for unsafe state management
-    void setUnsafeState(UnsafeState state, bool active);
-    bool hasUnsafeState(UnsafeState state) const;
     
     // Render guard (prevents state updates during rendering)
     // Purpose: Flag indicating rendering is in progress (ImGui draw() method)
