@@ -142,6 +142,26 @@ void registerEngineGlobal(lua_State* L) {
     PatternRuntime* getPatternRuntime() {
         return &$self->getPatternRuntime();
     }
+    
+    /**
+     * Register Lua callback for state changes (Phase 6.3).
+     * Usage: local id = engine:onStateChange(function(state) ... end)
+     * @param callback Lua function that receives state table
+     * @return Callback ID for unregistration
+     */
+    size_t onStateChange(lua_State* L) {
+        return engineOnStateChange(L, $self);
+    }
+    
+    /**
+     * Unregister a previously registered callback (Phase 6.3).
+     * Usage: engine:removeStateChangeCallback(id)
+     * @param callbackId ID returned from onStateChange
+     * @return true if successful
+     */
+    bool removeStateChangeCallback(size_t callbackId) {
+        return engineRemoveStateChangeCallback(callbackId, $self);
+    }
 }
 
 // Extend ModuleRegistry to expose getModule
@@ -338,6 +358,99 @@ float getParam(const std::string& moduleName, const std::string& paramName) {
     } catch (...) {
         return 0.0f;
     }
+}
+
+// ═══════════════════════════════════════════════════════════
+// LUA CALLBACK API (Phase 6.3 - Reactive Sync for Live Coding)
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Register a Lua callback for state changes.
+ * Usage:
+ *   local callbackId = engine:onStateChange(function(state)
+ *       print("BPM: " .. state.clock.bpm)
+ *       if state.modules.kick then
+ *           print("Kick volume: " .. state.modules.kick.parameters.volume)
+ *       end
+ *   end)
+ * 
+ * @param callback Lua function that receives EngineState table
+ * @return Integer callback ID for use with removeStateChangeCallback
+ */
+size_t engineOnStateChange(lua_State* L, vt::Engine* engine) {
+    if (!lua_isfunction(L, 1)) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+    
+    // Stack: [function]
+    lua_pushvalue(L, 1);  // Push function reference
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);  // Store in registry, ref on stack
+    
+    // Create callback that will dereference and call the Lua function
+    auto callback = [ref, engine](lua_State* L, const vt::EngineState& state) {
+        // Get function from registry
+        lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+        
+        if (!lua_isfunction(L, -1)) {
+            lua_pop(L, 1);
+            return;
+        }
+        
+        // Push EngineState as table
+        lua_newtable(L);
+        
+        // Add clock info
+        lua_pushnumber(L, state.clock.bpm);
+        lua_setfield(L, -2, "bpm");
+        
+        // Add modules table
+        lua_newtable(L);
+        
+        // For each module, add its parameters
+        for (const auto& [name, moduleState] : state.modules) {
+            lua_pushstring(L, name.c_str());
+            lua_newtable(L);
+            
+            lua_pushnumber(L, moduleState.parameters.volume);
+            lua_setfield(L, -2, "volume");
+            
+            // Add more parameters as needed
+            lua_settable(L, -3);
+        }
+        lua_setfield(L, -2, "modules");
+        
+        // Call the function with state table as argument
+        // pcall: pop function + 1 arg, push 0 or error
+        if (lua_pcall(L, 1, 0, 0) != 0) {
+            ofLogError("Engine") << "Lua callback error: " << lua_tostring(L, -1);
+            lua_pop(L, 1);
+        }
+    };
+    
+    size_t callbackId = engine->registerStateChangeCallback(callback);
+    
+    if (callbackId == 0) {
+        // Registration failed, release the Lua reference
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        lua_pushinteger(L, 0);
+    } else {
+        lua_pushinteger(L, callbackId);
+    }
+    
+    return 1;
+}
+
+/**
+ * Remove a previously registered state change callback.
+ * Usage:
+ *   engine:removeStateChangeCallback(callbackId)
+ * 
+ * @param callbackId Integer ID returned from onStateChange
+ * @return true if removed, false if not found
+ */
+bool engineRemoveStateChangeCallback(size_t callbackId, vt::Engine* engine) {
+    return engine->unregisterStateChangeCallback(callbackId);
 }
 
 // System module helper functions (for live-coding syntax)
