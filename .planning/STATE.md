@@ -3,8 +3,9 @@
 ## Current Position
 
 **Primary Milestone**: Live-Scripting System Overhaul
-**Current Phase**: Phase 6.2 Complete - Ready for Phase 6.3
-**Status**: ✅ Phase 6.2 Complete
+**Current Phase**: Phase 6.3 In Progress - Reactive Callback API
+
+**Status**: 🚧 Phase 6.3-01 Complete
 
 **Next Steps:**
 1. ✅ Plan Phase 1: Delete String-Based Lua Functions
@@ -18,11 +19,12 @@
 9. ✅ **Phase 6 COMPLETE**: DESIGN.md and implementation sub-phases created
 10. ✅ **Phase 6.1 COMPLETE**: Register Engine Global (CRITICAL blocker fixed)
 11. ✅ **Phase 6.2 COMPLETE**: Standardize Command Routing (setBPM, createSampler, createSequencer)
-12. **Next**: Phase 6.3 - Add Reactive Callback API (MEDIUM)
+12. ✅ **Phase 6.3-01 COMPLETE**: Add Reactive Callback API
+13. **Next**: Phase 6.3 Plan 2 (if needed) or Phase 6.4
 
-**Next Phase:** Phase 6.3 - Add Reactive Callback API
+**Next Phase:** Phase 6.3 - Reactive Callback API (in progress)
 
-**Progress**: ████████████░ 94% (15/16 plans complete)
+**Progress**: ████████████░░ 94% (16/17 plans complete)
 
 ---
 
@@ -62,6 +64,52 @@
 - Dead infrastructure doesn't cause bugs, removing it introduces change risk
 
 **Impact**: No code changes. Undo interface preserved for potential future use.
+
+### 2026-01-21: Phase 6.3-01 COMPLETE - Add Reactive Callback API
+
+**Summary**: Added Lua callback API enabling scripts to receive state change notifications for live-coding workflow.
+
+**What was implemented**:
+
+**Task 1 - Lua callback registration in Engine.h:**
+- Added LuaStateChangeCallback typedef for Lua callback functions
+- Added registerStateChangeCallback() and unregisterStateChangeCallback() method declarations
+- Added luaCallbacks_ member variable for storing Lua callbacks
+- Added lua.h, lauxlib.h, lualib.h includes for Lua API types
+
+**Task 2 - Lua callback implementation in Engine.cpp:**
+- Implemented registerStateChangeCallback() with ID generation and storage
+- Implemented unregisterStateChangeCallback() with lookup and removal
+- Extended notifyObserversWithState() to invoke Lua callbacks after C++ observers
+- Lua callbacks receive lua_State* and EngineState for Lua table conversion
+
+**Task 3 - SWIG bindings in videoTracker.i:**
+- Added engineOnStateChange() helper for Lua callback registration with registry reference
+- Added engineRemoveStateChangeCallback() helper for unregistration
+- Extended vt::Engine with onStateChange() and removeStateChangeCallback() methods
+- Lua callbacks receive EngineState converted to table with clock.bpm and modules[]
+
+**Files modified:**
+- `src/core/Engine.h` - Added LuaStateChangeCallback typedef, method declarations, and luaCallbacks_ member
+- `src/core/Engine.cpp` - Implemented register/unregister methods and Lua callback invocation
+- `src/core/lua/videoTracker.i` - Added helper functions and %extend methods for SWIG
+
+**Build verification:** ✅ Successful (no errors)
+
+**API usage:**
+```lua
+local callbackId = engine:onStateChange(function(state)
+    print("BPM: " .. state.clock.bpm)
+    if state.modules.kick then
+        print("Kick volume: " .. state.modules.kick.parameters.volume)
+    end
+end)
+
+-- Later:
+engine:removeStateChangeCallback(callbackId)
+```
+
+**Impact**: Scripts can now stay synchronized with Engine state when changes come from external sources (UI, other shells, audio thread). Critical for live-coding workflows.
 
 ### 2026-01-21: Phase 6.1 COMPLETE - Register Engine Global (CRITICAL)
 
@@ -134,11 +182,11 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
     → Phase 6 (design) → ✅ COMPLETE
         → Phase 6.1 (engine global) → ✅ COMPLETE
         → Phase 6.2 (command routing) → ✅ COMPLETE
-        → Phase 6.3 (callbacks) → 🔵 NOT STARTED
+        → Phase 6.3 (callbacks) → 🚧 IN PROGRESS (06.3-01 complete)
     → THEN: Phases 8-13 from old roadmap can resume
 ```
 
-**Note**: Phase 6.2 complete. Ready to start Phase 6.3 (Add Reactive Callback API).
+**Note**: Phase 6.3-01 complete. Reactive callback API implemented with engine:onStateChange() and engine:removeStateChangeCallback().
 
 **Blockers**: None - ready for Phase 6.3
 
@@ -172,6 +220,8 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
 | **Engine global is CRITICAL blocker** | registerEngineGlobal() never called - must fix in Phase 6.1 | ✅ Confirmed (06-01) |
 | **AddModuleCommand needed** | Standardize module creation to match SetParameterCommand pattern | ✅ Confirmed (06-01) |
 | **Use executeCommandImmediate for setBPM fallback** | Ensures state notifications are sent even when queue is full | ✅ Confirmed (06.2-01) |
+| **Lua callbacks stored separately** | luaCallbacks_ separate from StateObserver for lua_State* handling | ✅ Confirmed (06.3-01) |
+| **Lua registry references** | Lua function stored via luaL_ref to prevent garbage collection | ✅ Confirmed (06.3-01) |
 
 ---
 
@@ -227,4 +277,4 @@ None currently.
 
 ---
 
-*Last updated: 2026-01-21 (Phase 6.2-01 complete - Standardize Command Routing)*
+*Last updated: 2026-01-21 (Phase 6.3-01 complete - Add Reactive Callback API)*
