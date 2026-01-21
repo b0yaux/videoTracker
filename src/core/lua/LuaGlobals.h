@@ -25,10 +25,6 @@ Engine* getGlobalEngine();
 // This function is declared in SWIG interface and implemented in Engine.cpp
 extern void registerEngineGlobal(void* luaState);
 
-// Register all helper functions as Lua globals (sampler, audioOut, etc.)
-// This is called from Engine::setupLua() to make live-coding functions available
-extern void registerHelperFunctions(void* luaState);
-
 } // namespace lua
 } // namespace vt
 
