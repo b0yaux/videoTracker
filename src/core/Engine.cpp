@@ -294,7 +294,11 @@ void Engine::setupLua() {
         // This is the simplest approach - one C function that executes commands
         lua_register(L, "exec", lua_execCommand);
         
-        ofLogNotice("Engine") << "Lua initialized successfully - using SWIG bindings for helper functions";
+        // CRITICAL: Register 'engine' global for ScriptManager-generated scripts
+        // This makes engine:* methods available in all Lua scripts
+        vt::lua::registerEngineGlobal(*lua_);
+        
+        ofLogNotice("Engine") << "Lua initialized with engine global";
     } else {
         ofLogWarning("Engine") << "Lua state not valid, cannot register functions";
     }
