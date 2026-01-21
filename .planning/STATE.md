@@ -3,8 +3,8 @@
 ## Current Position
 
 **Primary Milestone**: Live-Scripting System Overhaul
-**Current Phase**: Phase 6 Complete - Ready for Phase 6.1
-**Status**: ✅ Phase 6 Complete
+**Current Phase**: Phase 6.1 Complete - Ready for Phase 6.2
+**Status**: ✅ Phase 6.1 Complete
 
 **Next Steps:**
 1. ✅ Plan Phase 1: Delete String-Based Lua Functions
@@ -16,11 +16,12 @@
 7. ⏭️ **Phase 4 SKIPPED**: Analysis showed speculative complexity for unobserved edge case
 8. ⏭️ **Phase 5 SKIPPED**: Undo system is unused infrastructure
 9. ✅ **Phase 6 COMPLETE**: DESIGN.md and implementation sub-phases created
-10. **Next**: Phase 6.1 - Register Engine Global (CRITICAL blocker)
+10. ✅ **Phase 6.1 COMPLETE**: Register Engine Global (CRITICAL blocker fixed)
+11. **Next**: Phase 6.2 - Standardize Command Routing (HIGH priority)
 
-**Next Phase:** Phase 6.1 - Register Engine Global
+**Next Phase:** Phase 6.2 - Standardize Command Routing
 
-**Progress**: █████████░░░ 85% (13/13 plans complete in design, implementation sub-phases next)
+**Progress**: ██████████░░ 90% (14/14 plans complete)
 
 ---
 
@@ -38,6 +39,24 @@
 - Dead infrastructure doesn't cause bugs, removing it introduces change risk
 
 **Impact**: No code changes. Undo interface preserved for potential future use.
+
+### 2026-01-21: Phase 6.1 COMPLETE - Register Engine Global (CRITICAL)
+
+**Summary**: Fixed the critical blocker preventing ANY scripts from working.
+
+**What was fixed**:
+- Added `vt::lua::registerEngineGlobal(*lua_)` call in `Engine::setupLua()` (line 299)
+- Uses existing `registerEngineGlobal()` from LuaGlobals.cpp (no SWIG required)
+- Creates engine userdata with vt_Engine metatable
+- Scripts can now access `engine:*` methods without "nil value" errors
+
+**Technical correction**:
+- Original plan used SWIG internals (`SWIGTYPE_p_vt__Engine`)
+- Fixed to call existing `registerEngineGlobal()` from LuaGlobals.cpp
+- Uses `lua_newuserdata()` + metatable (cleaner approach)
+
+**Files modified**:
+- `src/core/Engine.cpp` - 2 lines added (comment + function call)
 
 ### 2026-01-21: Phase 4 SKIPPED - Analysis Shows Speculative Complexity
 
@@ -90,15 +109,15 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
     → ⏭️ Phase 4 (idempotent init) → SKIPPED
     → ⏭️ Phase 5 (undo methods) → SKIPPED
     → Phase 6 (design) → ✅ COMPLETE
-        → Phase 6.1 (engine global) → 🔵 NOT STARTED
+        → Phase 6.1 (engine global) → ✅ COMPLETE
         → Phase 6.2 (command routing) → 🔵 NOT STARTED
         → Phase 6.3 (callbacks) → 🔵 NOT STARTED
     → THEN: Phases 8-13 from old roadmap can resume
 ```
 
-**Note**: Phase 6 design complete. Implementation in sub-phases 6.1 (CRITICAL), 6.2 (HIGH), 6.3 (MEDIUM).
+**Note**: Phase 6.1 complete. Implementation continues with 6.2 (HIGH), 6.3 (MEDIUM).
 
-**Blockers**: None - ready for Phase 6.1
+**Blockers**: None - ready for Phase 6.2
 
 ---
 

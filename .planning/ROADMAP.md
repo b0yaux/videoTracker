@@ -262,13 +262,13 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
     → ⏭️ Phase 4 (idempotent init) → SKIPPED
     → ⏭️ Phase 5 (undo methods) → SKIPPED
     → Phase 6 (design) → ✅ COMPLETE
-        → Phase 6.1 (engine global) → 🔵 NOT STARTED
+        → Phase 6.1 (engine global) → ✅ COMPLETE
         → Phase 6.2 (command routing) → 🔵 NOT STARTED
         → Phase 6.3 (callbacks) → 🔵 NOT STARTED
     → THEN: Phases 8-13 from old roadmap can resume
 ```
 
-**Note**: Phases 4 and 5 were skipped as speculative complexity. Phase 6 is design-only, implementation in sub-phases 6.1-6.3.
+**Note**: Phase 6.1 complete. Implementation continues with 6.2 (HIGH), 6.3 (MEDIUM).
 
 ---
 
@@ -330,27 +330,27 @@ Plans:
 
 **Goal:** Fix the critical blocker preventing ANY scripts from working - register `engine` global in Lua state.
 
-**Status**: 🔵 Not Started
+**Status**: ✅ Complete (2026-01-21)
 
 **Depends on:** Phase 6
 
 **Context:**
-ScriptManager generates scripts that reference `engine:getClock()`, `engine:getModuleRegistry()`, etc., but `engine` global is NEVER created. The `registerEngineGlobal()` function exists in videoTracker.i but is never called from Engine::setupLua().
+ScriptManager generates scripts that reference `engine:getClock()`, `engine:getModuleRegistry()`, etc., but `engine` global is NEVER created. The `registerEngineGlobal()` function exists in LuaGlobals.cpp but is never called from Engine::setupLua().
 
-**Work:**
-- Add engine global registration to Engine::setupLua() after line 295
-- Use SWIG_NewPointerObj() to create userdata
-- Verify scripts can access engine:* methods
+**Work completed:**
+- Added `vt::lua::registerEngineGlobal(*lua_)` call in Engine::setupLua() (line 299)
+- Uses existing `registerEngineGlobal()` from LuaGlobals.cpp (lua_newuserdata + metatable)
+- Scripts can now access `engine:*` methods without "nil value" errors
 
 **Files:**
-- `src/core/Engine.cpp` - Add engine global registration
+- `src/core/Engine.cpp` - Added engine global registration call
 
 **Estimated Effort:** 30 minutes
 
 **Plans:** 1 plan
 
 Plans:
-- [ ] 06.1-01-PLAN.md — Add engine global registration to Engine::setupLua()
+- [x] 06.1-01-PLAN.md — Add engine global registration to Engine::setupLua() ✓
 
 ---
 
