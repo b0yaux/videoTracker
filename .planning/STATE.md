@@ -13,9 +13,9 @@
 4. ✅ Execute Phase 2: Add notification suppression (02-01)
 5. ✅ Plan Phase 3: Complete Lock-Free Migration
 6. ✅ Execute Phase 3: Remove unsafeStateFlags_ (03-01) - JUST COMPLETED
-7. **Next**: Continue Phase 3 cleanup (03-02+ if needed)
+7. **Next**: Proceed to Phase 4 or resume old roadmap phases 8-13
 
-**Progress**: ██████████░░░ 100% (10/10 plans complete)
+**Progress**: ████████████ 100% (11/11 plans complete)
 
 ---
 
@@ -78,6 +78,7 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
 | **Delete registerHelpers string** | ~160 lines removed, eliminate string parsing overhead | ✅ Confirmed (01-01) |
 | **Notification suppression** | Compare-exchange prevents duplicate notifications during cascades | ✅ Confirmed (02-01) |
 | **Remove unsafeStateFlags_** | Simplified state detection using notification queue guard | ✅ Confirmed (03-01) |
+| **Convenience methods** | isExecutingScript/commandsBeingProcessed delegate to isInUnsafeState() | ✅ Confirmed (03-02) |
 
 ---
 
@@ -97,21 +98,25 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
 - Flag set before enqueue, cleared after callback executes
 - Expected: Eliminates notification storms during parameter routing
 
-### Phase 3 Complete (03-01)
-- ✅ Removed unsafeStateFlags_ atomic from Engine.h
-- ✅ Removed UnsafeState enum from Engine.h
-- ✅ Removed isExecutingScript() and commandsBeingProcessed() methods
-- ✅ Simplified isInUnsafeState() to use notifyingObservers_ pattern
-- ✅ Removed setUnsafeState/hasUnsafeState implementations from Engine.cpp
-- ✅ Replaced all setUnsafeState calls with notifyingObservers_ store operations
-- ✅ Replaced all hasUnsafeState calls with notifyingObservers_ load operations
-- ✅ Updated buildStateSnapshot() comments to reflect Phase 3 simplification
-- **Result**: -70 lines of code, simplified state detection, eliminated timing windows
+### Phase 3 Complete (03-01 + 03-02)
+- ✅ Phase 3.01: Removed unsafeStateFlags_ atomic from Engine.h
+- ✅ Phase 3.01: Removed UnsafeState enum from Engine.h
+- ✅ Phase 3.01: Removed isExecutingScript() and commandsBeingProcessed() methods
+- ✅ Phase 3.01: Simplified isInUnsafeState() to use notifyingObservers_ pattern
+- ✅ Phase 3.01: Removed setUnsafeState/hasUnsafeState implementations from Engine.cpp
+- ✅ Phase 3.01: Replaced all setUnsafeState calls with notifyingObservers_ store operations
+- ✅ Phase 3.01: Replaced all hasUnsafeState calls with notifyingObservers_ load operations
+- ✅ Phase 3.01: Updated buildStateSnapshot() comments to reflect Phase 3 simplification
+- ✅ Phase 3.02: Added isExecutingScript() convenience method delegating to isInUnsafeState()
+- ✅ Phase 3.02: Added commandsBeingProcessed() convenience method delegating to isInUnsafeState()
+- ✅ Phase 3.02: Restored backward compatibility for 5 call sites across 4 files
+- **Result**: -60 lines of code, simplified state detection, maintained API compatibility
 
 ### Immediate Work (Phase 3)
 - ✅ Plan Phase 3: Complete Lock-Free Migration (03-01-PLAN.md created)
 - ✅ Execute Phase 3: Remove unsafeStateFlags_ (03-01-PLAN.md executed)
-- **Next**: Continue with remaining Phase 3 work or proceed to Phase 4
+- ✅ Execute Phase 3: Add convenience methods (03-02-PLAN.md executed)
+- **Next**: Proceed to Phase 4 or resume old roadmap phases 8-13
 
 ---
 
@@ -127,4 +132,4 @@ None currently.
 
 ---
 
-*Last updated: 2026-01-20 (Phase 3 complete - unsafeStateFlags_ removed)*
+*Last updated: 2026-01-21 (Phase 3 complete - all cleanup done)*
