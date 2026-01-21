@@ -17,17 +17,40 @@
 8. ⏭️ **Phase 5 SKIPPED**: Undo system is unused infrastructure
 9. ✅ **Phase 6 COMPLETE**: DESIGN.md and implementation sub-phases created
 10. ✅ **Phase 6.1 COMPLETE**: Register Engine Global (CRITICAL blocker fixed)
-11. **Next**: Phase 6.2 - Standardize Command Routing (HIGH priority)
+11. ✅ **Phase 6.2-01 COMPLETE**: Standardize Command Routing (setBPM, createSampler, createSequencer)
+12. **Next**: Phase 6.2-02 or Phase 6.3 - Callbacks for live-coding
 
-**Next Phase:** Phase 6.2 - Standardize Command Routing
+**Next Phase:** Phase 6.2 (continuing) or Phase 6.3
 
-**Progress**: ██████████░░ 90% (14/14 plans complete)
+**Progress**: ███████████░ 92% (15/16 plans complete)
 
 ---
 
 ## Recent Progress
 
-### 2026-01-21: Phase 5 SKIPPED - Undo System Is Unused Infrastructure
+### 2026-01-21: Phase 6.2-01 COMPLETE - Standardize Command Routing
+
+**Summary**: Standardized command routing so ALL Lua operations use the command queue for consistent behavior and thread safety.
+
+**What was fixed**:
+
+**Task 1 - Clock::setBPM fallback:**
+- Replaced direct `$self->setBPM(bpm)` call with `engine->executeCommandImmediate()` for queue-full fallback
+- Now matches pattern used by Clock::start() and Clock::stop()
+- Ensures state notifications are sent even when command queue is full
+- Direct call only remains for engine-not-available edge case
+
+**Task 2 - createSampler/createSequencer:**
+- Replaced string commands (`"add MultiSampler " + name`) with `AddModuleCommand` via `enqueueCommand()`
+- Primary path now uses command queue for consistent thread safety
+- String commands retained as fallback when queue is full
+- Same pattern applied to both createSampler and createSequencer
+
+**Files modified:**
+- `src/core/lua/videoTracker.i` - setBPM fallback fix
+- `src/core/lua/LuaHelpers.cpp` - createSampler/createSequencer refactor
+
+**Build verification:** ✅ Successful (no errors)
 
 **Decision**: Skip Phase 5 (Remove Incomplete Undo Methods) as the undo system is not implemented or used.
 
@@ -110,14 +133,14 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
     → ⏭️ Phase 5 (undo methods) → SKIPPED
     → Phase 6 (design) → ✅ COMPLETE
         → Phase 6.1 (engine global) → ✅ COMPLETE
-        → Phase 6.2 (command routing) → 🔵 NOT STARTED
+        → Phase 6.2 (command routing) → 🔵 IN PROGRESS (01-01 complete)
         → Phase 6.3 (callbacks) → 🔵 NOT STARTED
     → THEN: Phases 8-13 from old roadmap can resume
 ```
 
-**Note**: Phase 6.1 complete. Implementation continues with 6.2 (HIGH), 6.3 (MEDIUM).
+**Note**: Phase 6.2-01 complete. Continuing with remaining Phase 6.2 tasks or Phase 6.3.
 
-**Blockers**: None - ready for Phase 6.2
+**Blockers**: None - ready to continue Phase 6.2 or start Phase 6.3
 
 ---
 
@@ -148,6 +171,7 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
 | **Reactive callbacks for live coding** | engine:onStateChange(fn) enables scripts to sync with external changes | ✅ Confirmed (06-01) |
 | **Engine global is CRITICAL blocker** | registerEngineGlobal() never called - must fix in Phase 6.1 | ✅ Confirmed (06-01) |
 | **AddModuleCommand needed** | Standardize module creation to match SetParameterCommand pattern | ✅ Confirmed (06-01) |
+| **Use executeCommandImmediate for setBPM fallback** | Ensures state notifications are sent even when queue is full | ✅ Confirmed (06.2-01) |
 
 ---
 
@@ -203,4 +227,4 @@ None currently.
 
 ---
 
-*Last updated: 2026-01-21 (Phase 6 complete - ready for Phase 6.1)*
+*Last updated: 2026-01-21 (Phase 6.2-01 complete - Standardize Command Routing)*
