@@ -21,17 +21,52 @@
 12. ✅ **Phase 6.3 COMPLETE**: Add Reactive Callback API (engine:onStateChange)
 13. **Next**: Resume old roadmap Phases 8-13
 
-**Next Phase:** Phase 7 (Fix Command Queue Architecture - CRITICAL) - PLANNED
+**Next Phase:** Phase 7 (Fix Command Queue Architecture - CRITICAL) - **IN PROGRESS**
 
 **Progress**: ████████████░░ 100% (16/16 plans complete for Phases 1-6)
 
-**Phase 7 Status:** 🟡 Planned (5 sub-plans created, ready for execution)
+**Phase 7 Progress:** ██░░░░░░░░░░ 40% (2/5 plans complete)
 
 ---
 
 ## Recent Progress
 
-### 2026-01-21: Phase 6.2-01 COMPLETE - Standardize Command Routing
+### 2026-01-21: Phase 7.2-02 COMPLETE - Add PauseTransportCommand and ResetTransportCommand
+
+**Summary**: Added two new command classes to fix clock operations bypassing the command queue.
+
+**What was implemented**:
+
+- **PauseTransportCommand class:**
+  - Stores previous playing state for undo
+  - Calls `clock.pause()` when executed
+  - Restores playing state on undo (start if was playing, stop if was stopped)
+
+- **ResetTransportCommand class:**
+  - Stores previous playing state and position for undo
+  - Calls `clock.reset()` when executed
+  - Restores playing state on undo (position undo is limited per Clock API)
+
+**Files modified:**
+- `src/core/Command.h` - Added PauseTransportCommand and ResetTransportCommand class declarations
+- `src/core/Command.cpp` - Implemented execute() and undo() methods for both commands
+
+**Impact:** Fixes race conditions where `pause()` and `reset()` operations bypassed command queue (LuaGlobals.cpp:118, LuaGlobals.cpp:128, ClockGUI.cpp:211). All transport operations now consistently use command queue.
+
+### 2026-01-21: Phase 7.1-01 COMPLETE - Replace SPSC Queue with MPMC Queue
+
+**Summary**: Replaced `moodycamel::ReaderWriterQueue` (SPSC) with `moodycamel::ConcurrentQueue` (MPMC) in Engine.h.
+
+**What was fixed**:
+
+- **Critical UB eliminated:** Command queue had 6+ producers (ClockGUI, ModuleGUI, CommandShell, LuaGlobals, LuaHelpers, ParameterRouter) but was using Single-Producer Single-Consumer queue
+- **API-compatible swap:** Changed include and queue type, all API calls remain the same (`try_enqueue()`, `try_dequeue()`, `size_approx()`)
+- **Documentation updated:** Comment now reflects MPMC nature ("Producers: GUI thread, Lua scripts, parameter router (multiple)")
+
+**Files modified:**
+- `src/core/Engine.h` - Include, declaration, and comment updated
+
+**Impact:** Eliminates undefined behavior that could cause data corruption, lost commands, and crashes.
 
 **Summary**: Standardized command routing so ALL Lua operations use the command queue for consistent behavior and thread safety.
 
