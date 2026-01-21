@@ -25,11 +25,42 @@
 
 **Progress**: ████████████░░ 100% (16/16 plans complete for Phases 1-6)
 
-**Phase 7 Progress:** ████░░░░░░░░░ 60% (3/5 plans complete)
+**Phase 7 Progress:** ████████░░░░ 80% (4/5 plans complete)
 
 ---
 
 ## Recent Progress
+
+### 2026-01-21: Phase 7.4 COMPLETE - Add Script Execution Tracking
+
+**Summary**: Added ScriptExecutionTracker to prevent infinite retry loops when scripts fail in EDIT mode.
+
+**What was implemented**:
+
+- **ScriptExecutionTracker struct:**
+  - Hash-based tracking using std::hash for script identification
+  - Configurable retry limits (3 consecutive failures max)
+  - Cooldown mechanism (2000ms between retry attempts)
+  - Methods: shouldRetry(), recordSuccess(), recordFailure(), reset()
+
+- **hashScript() helper:**
+  - Simple, non-cryptographic hash for script content
+  - Enables change detection between executions
+
+- **Integration points:**
+  - checkAndExecuteSimpleChanges() - skips re-execution of failing scripts
+  - executeAll() - tracks success/failure, prevents retry loops
+  - update() - resets tracker when script content changes
+
+**Problem solved:**
+- **Before:** Scripts retried every frame when failing → CPU 100%, log spam, UI freeze
+- **After:** Hash-based tracking with cooldown → no infinite retries
+
+**Files modified:**
+- `src/shell/CodeShell.h` - Added ScriptExecutionTracker struct (+60 lines)
+- `src/shell/CodeShell.cpp` - Added tracking logic (+44 lines)
+
+**Commit:** 544b280
 
 ### 2026-01-21: Phase 7.2-02 COMPLETE - Add PauseTransportCommand and ResetTransportCommand
 
@@ -330,4 +361,4 @@ None currently.
 
 ---
 
-*Last updated: 2026-01-21 (Phase 7 planning complete - 5 sub-plans created)*
+*Last updated: 2026-01-21 (Phase 7.4 complete - 4/5 plans done)*
