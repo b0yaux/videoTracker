@@ -298,7 +298,11 @@ void Engine::setupLua() {
         // This makes engine:* methods available in all Lua scripts
         vt::lua::registerEngineGlobal(*lua_);
         
-        ofLogNotice("Engine") << "Lua initialized with engine global";
+        // CRITICAL: Register helper functions for live-coding syntax
+        // (sampler, sequencer, audioOut, oscilloscope, videoOut, spectrogram, connect, setParam, getParam, pattern)
+        vt::lua::registerHelperFunctions(*lua_);
+        
+        ofLogNotice("Engine") << "Lua initialized with engine global and helper functions";
     } else {
         ofLogWarning("Engine") << "Lua state not valid, cannot register functions";
     }

@@ -1,12 +1,17 @@
 #include "LuaGlobals.h"
+#include "LuaHelpers.h"
 #include "core/Engine.h"
 #include "utils/Clock.h"
 #include "core/ModuleRegistry.h"
 #include "core/ConnectionManager.h"
 #include "core/ParameterRouter.h"
 #include "core/PatternRuntime.h"
+#include "data/Pattern.h"
+#include "core/Command.h"
 #include <lua.hpp>
 #include <string>
+#include <map>
+#include <sstream>
 
 namespace vt {
 namespace lua {
@@ -212,6 +217,253 @@ void registerEngineGlobal(void* luaState) {
     
     // Set as global "engine"
     lua_setglobal(L, "engine");
+}
+
+// ═══════════════════════════════════════════════════════════
+// LUA HELPER FUNCTIONS (for live-coding syntax)
+// ═══════════════════════════════════════════════════════════
+
+// Helper to parse Lua table to std::map<std::string, std::string>
+static std::map<std::string, std::string> parseConfigTable(lua_State* L, int arg) {
+    std::map<std::string, std::string> config;
+    
+    if (lua_istable(L, arg)) {
+        lua_pushnil(L);
+        while (lua_next(L, arg) != 0) {
+            // Key at -2, value at -1
+            if (lua_isstring(L, -2)) {
+                std::string key = lua_tostring(L, -2);
+                std::string value;
+                
+                if (lua_isnumber(L, -1)) {
+                    value = std::to_string(lua_tonumber(L, -1));
+                } else if (lua_isboolean(L, -1)) {
+                    value = lua_toboolean(L, -1) ? "1" : "0";
+                } else if (lua_isstring(L, -1)) {
+                    value = lua_tostring(L, -1);
+                }
+                
+                if (!key.empty()) {
+                    config[key] = value;
+                }
+            }
+            lua_pop(L, 1);  // Pop value, keep key for next iteration
+        }
+    }
+    
+    return config;
+}
+
+// Lua C function: sampler(name, config) -> string
+static int lua_sampler(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    std::map<std::string, std::string> config = parseConfigTable(L, 2);
+    
+    Engine* engine = getGlobalEngine();
+    if (!engine) {
+        return luaL_error(L, "Engine not available");
+    }
+    
+    LuaHelpers helpers(engine);
+    std::string result = helpers.createSampler(name, config);
+    lua_pushstring(L, result.c_str());
+    return 1;
+}
+
+// Lua C function: sequencer(name, config) -> string
+static int lua_sequencer(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    std::map<std::string, std::string> config = parseConfigTable(L, 2);
+    
+    Engine* engine = getGlobalEngine();
+    if (!engine) {
+        return luaL_error(L, "Engine not available");
+    }
+    
+    LuaHelpers helpers(engine);
+    std::string result = helpers.createSequencer(name, config);
+    lua_pushstring(L, result.c_str());
+    return 1;
+}
+
+// Lua C function: audioOut(name, config) -> string
+static int lua_audioOut(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    std::map<std::string, std::string> config = parseConfigTable(L, 2);
+    
+    Engine* engine = getGlobalEngine();
+    if (!engine) {
+        return luaL_error(L, "Engine not available");
+    }
+    
+    LuaHelpers helpers(engine);
+    std::string result = helpers.createSystemModule("AudioOutput", name, config);
+    lua_pushstring(L, result.c_str());
+    return 1;
+}
+
+// Lua C function: videoOut(name, config) -> string
+static int lua_videoOut(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    std::map<std::string, std::string> config = parseConfigTable(L, 2);
+    
+    Engine* engine = getGlobalEngine();
+    if (!engine) {
+        return luaL_error(L, "Engine not available");
+    }
+    
+    LuaHelpers helpers(engine);
+    std::string result = helpers.createSystemModule("VideoOutput", name, config);
+    lua_pushstring(L, result.c_str());
+    return 1;
+}
+
+// Lua C function: oscilloscope(name, config) -> string
+static int lua_oscilloscope(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    std::map<std::string, std::string> config = parseConfigTable(L, 2);
+    
+    Engine* engine = getGlobalEngine();
+    if (!engine) {
+        return luaL_error(L, "Engine not available");
+    }
+    
+    LuaHelpers helpers(engine);
+    std::string result = helpers.createSystemModule("Oscilloscope", name, config);
+    lua_pushstring(L, result.c_str());
+    return 1;
+}
+
+// Lua C function: spectrogram(name, config) -> string
+static int lua_spectrogram(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    std::map<std::string, std::string> config = parseConfigTable(L, 2);
+    
+    Engine* engine = getGlobalEngine();
+    if (!engine) {
+        return luaL_error(L, "Engine not available");
+    }
+    
+    LuaHelpers helpers(engine);
+    std::string result = helpers.createSystemModule("Spectrogram", name, config);
+    lua_pushstring(L, result.c_str());
+    return 1;
+}
+
+// Lua C function: connect(source, target, type) -> bool
+static int lua_connect(lua_State* L) {
+    const char* source = luaL_checkstring(L, 1);
+    const char* target = luaL_checkstring(L, 2);
+    const char* type = luaL_optstring(L, 3, "audio");
+    
+    Engine* engine = getGlobalEngine();
+    if (!engine) {
+        return luaL_error(L, "Engine not available");
+    }
+    
+    LuaHelpers helpers(engine);
+    bool result = helpers.connect(source, target, type);
+    lua_pushboolean(L, result);
+    return 1;
+}
+
+// Lua C function: setParam(module, param, value) -> bool
+static int lua_setParam(lua_State* L) {
+    const char* module = luaL_checkstring(L, 1);
+    const char* param = luaL_checkstring(L, 2);
+    float value = static_cast<float>(luaL_checknumber(L, 3));
+    
+    Engine* engine = getGlobalEngine();
+    if (!engine) {
+        return luaL_error(L, "Engine not available");
+    }
+    
+    LuaHelpers helpers(engine);
+    std::ostringstream oss;
+    oss << value;
+    bool result = helpers.setParameter(module, param, oss.str());
+    lua_pushboolean(L, result);
+    return 1;
+}
+
+// Lua C function: getParam(module, param) -> float
+static int lua_getParam(lua_State* L) {
+    const char* module = luaL_checkstring(L, 1);
+    const char* param = luaL_checkstring(L, 2);
+    
+    Engine* engine = getGlobalEngine();
+    if (!engine) {
+        return luaL_error(L, "Engine not available");
+    }
+    
+    LuaHelpers helpers(engine);
+    std::string valueStr = helpers.getParameter(module, param);
+    
+    if (valueStr.empty()) {
+        lua_pushnumber(L, 0.0);
+    } else {
+        try {
+            lua_pushnumber(L, std::stof(valueStr));
+        } catch (...) {
+            lua_pushnumber(L, 0.0);
+        }
+    }
+    return 1;
+}
+
+// Lua C function: pattern(name, steps) -> string
+static int lua_pattern(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    int steps = static_cast<int>(luaL_optinteger(L, 2, 16));
+    
+    Engine* engine = getGlobalEngine();
+    if (!engine) {
+        return luaL_error(L, "Engine not available");
+    }
+    
+    // IDEMPOTENT: Check if pattern already exists
+    PatternRuntime& patternRuntime = engine->getPatternRuntime();
+    if (patternRuntime.patternExists(name)) {
+        // Pattern exists - update if step count changed
+        int currentStepCount = patternRuntime.getPatternStepCount(name);
+        if (currentStepCount != steps) {
+            Pattern updatedPattern(steps);
+            patternRuntime.updatePattern(name, updatedPattern);
+        }
+        lua_pushstring(L, name);
+        return 1;
+    }
+    
+    // Pattern doesn't exist - create it via command
+    std::string command = "pattern create " + std::string(name) + " " + std::to_string(steps);
+    auto result = engine->executeCommand(command);
+    
+    if (result.success) {
+        lua_pushstring(L, name);
+    } else {
+        lua_pushnil(L);
+    }
+    return 1;
+}
+
+// Register all helper functions as Lua globals
+void registerHelperFunctions(void* luaState) {
+    lua_State* L = static_cast<lua_State*>(luaState);
+    
+    if (!L) {
+        return;
+    }
+    
+    lua_register(L, "sampler", lua_sampler);
+    lua_register(L, "sequencer", lua_sequencer);
+    lua_register(L, "audioOut", lua_audioOut);
+    lua_register(L, "videoOut", lua_videoOut);
+    lua_register(L, "oscilloscope", lua_oscilloscope);
+    lua_register(L, "spectrogram", lua_spectrogram);
+    lua_register(L, "connect", lua_connect);
+    lua_register(L, "setParam", lua_setParam);
+    lua_register(L, "getParam", lua_getParam);
+    lua_register(L, "pattern", lua_pattern);
 }
 
 } // namespace lua
