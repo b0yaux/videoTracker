@@ -300,5 +300,52 @@ private:
     bool wasPlayingStored_;
 };
 
+/**
+ * PauseTransportCommand - Command to pause transport
+ *
+ * This command handles:
+ * - Pausing the clock transport (maintains position)
+ * - Storing previous playing state for undo
+ */
+class PauseTransportCommand : public Command {
+public:
+    PauseTransportCommand() : wasPlaying_(false), wasPlayingStored_(false) {}
+    
+    void execute(Engine& engine) override;
+    void undo(Engine& engine) override;
+    
+    std::string describe() const override {
+        return "pause transport";
+    }
+    
+private:
+    bool wasPlaying_;
+    bool wasPlayingStored_;
+};
+
+/**
+ * ResetTransportCommand - Command to reset transport
+ *
+ * This command handles:
+ * - Resetting the clock transport to position 0
+ * - Storing previous position and playing state for undo
+ */
+class ResetTransportCommand : public Command {
+public:
+    ResetTransportCommand() : wasPlaying_(false), previousPosition_(0.0), stateStored_(false) {}
+    
+    void execute(Engine& engine) override;
+    void undo(Engine& engine) override;
+    
+    std::string describe() const override {
+        return "reset transport";
+    }
+    
+private:
+    bool wasPlaying_;
+    double previousPosition_;
+    bool stateStored_;
+};
+
 } // namespace vt
 

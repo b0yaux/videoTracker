@@ -434,5 +434,108 @@ void StopTransportCommand::undo(Engine& engine) {
     }
 }
 
+void PauseTransportCommand::execute(Engine& engine) {
+    // Get Clock from engine
+    auto& clock = engine.getClock();
+    
+    // Store old playing state for undo (only once)
+    if (!wasPlayingStored_) {
+        try {
+            wasPlaying_ = clock.isPlaying();
+            wasPlayingStored_ = true;
+        } catch (const std::exception& e) {
+            ofLogWarning("PauseTransportCommand") << "Could not get old playing state: " << e.what();
+            wasPlaying_ = false;  // Default fallback
+            wasPlayingStored_ = true;
+        }
+    }
+    
+    // Pause transport
+    try {
+        clock.pause();
+    } catch (const std::exception& e) {
+        ofLogError("PauseTransportCommand") << "Failed to pause transport: " << e.what();
+        return;
+    }
+    
+    // NOTE: State synchronization is handled by Engine::processCommands()
+    // which calls notifyStateChange() after processing commands
+}
+
+void PauseTransportCommand::undo(Engine& engine) {
+    if (!wasPlayingStored_) {
+        ofLogWarning("PauseTransportCommand") << "Cannot undo: old playing state not stored";
+        return;
+    }
+    
+    // Get Clock from engine
+    auto& clock = engine.getClock();
+    
+    // Restore old playing state
+    try {
+        if (wasPlaying_) {
+            clock.start();
+        } else {
+            clock.stop();
+        }
+    } catch (const std::exception& e) {
+        ofLogError("PauseTransportCommand") << "Failed to undo transport: " << e.what();
+        return;
+    }
+}
+
+void ResetTransportCommand::execute(Engine& engine) {
+    // Get Clock from engine
+    auto& clock = engine.getClock();
+    
+    // Store old state for undo (only once)
+    if (!stateStored_) {
+        try {
+            wasPlaying_ = clock.isPlaying();
+            previousPosition_ = clock.getCurrentBeat();
+            stateStored_ = true;
+        } catch (const std::exception& e) {
+            ofLogWarning("ResetTransportCommand") << "Could not get old state: " << e.what();
+            wasPlaying_ = false;
+            previousPosition_ = 0.0;
+            stateStored_ = true;
+        }
+    }
+    
+    // Reset transport
+    try {
+        clock.reset();
+    } catch (const std::exception& e) {
+        ofLogError("ResetTransportCommand") << "Failed to reset transport: " << e.what();
+        return;
+    }
+    
+    // NOTE: State synchronization is handled by Engine::processCommands()
+    // which calls notifyStateChange() after processing commands
+}
+
+void ResetTransportCommand::undo(Engine& engine) {
+    if (!stateStored_) {
+        ofLogWarning("ResetTransportCommand") << "Cannot undo: old state not stored";
+        return;
+    }
+    
+    // Get Clock from engine
+    auto& clock = engine.getClock();
+    
+    // Restore old playing state
+    // Note: Full position undo requires setPosition() which may not exist
+    try {
+        if (wasPlaying_) {
+            clock.start();
+        }
+        // Position is not restored (clock.reset() is not easily reversible)
+        // This is a limitation noted in the plan
+    } catch (const std::exception& e) {
+        ofLogError("ResetTransportCommand") << "Failed to undo transport: " << e.what();
+        return;
+    }
+}
+
 } // namespace vt
 
