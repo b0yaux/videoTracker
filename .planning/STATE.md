@@ -25,7 +25,7 @@
 
 **Progress**: ████████████░░ 100% (16/16 plans complete for Phases 1-6)
 
-**Phase 7 Progress:** ██░░░░░░░░░░ 40% (2/5 plans complete)
+**Phase 7 Progress:** ████░░░░░░░░░ 60% (3/5 plans complete)
 
 ---
 
@@ -52,6 +52,22 @@
 - `src/core/Command.cpp` - Implemented execute() and undo() methods for both commands
 
 **Impact:** Fixes race conditions where `pause()` and `reset()` operations bypassed command queue (LuaGlobals.cpp:118, LuaGlobals.cpp:128, ClockGUI.cpp:211). All transport operations now consistently use command queue.
+
+### 2026-01-21: Phase 7.3-03 COMPLETE - Route Direct Calls Through Command Queue
+
+**Summary**: Replaced 3 direct clock method calls with command queue operations.
+
+**What was fixed**:
+
+- **LuaGlobals.cpp:lua_clock_pause()** - Replaced `clock->pause()` with `PauseTransportCommand` via `enqueueCommand()`
+- **LuaGlobals.cpp:lua_clock_reset()** - Replaced `clock->reset()` with `ResetTransportCommand` via `enqueueCommand()`
+- **ClockGUI.cpp Reset button** - Replaced `clock.reset()` with `ResetTransportCommand` via `enqueueCommand()` with fallback handling
+
+**Files modified:**
+- `src/core/lua/LuaGlobals.cpp` - Updated pause() and reset() functions to use command queue
+- `src/gui/ClockGUI.cpp` - Updated Reset button handler to use command queue
+
+**Impact:** All transport operations (start, stop, pause, reset, setBPM) now consistently route through the command queue for thread safety and state notification consistency.
 
 ### 2026-01-21: Phase 7.1-01 COMPLETE - Replace SPSC Queue with MPMC Queue
 
