@@ -358,24 +358,24 @@ Plans:
 
 **Goal:** Ensure all Lua operations route through command queue for consistent behavior.
 
-**Status**: 🔵 Not Started
+**Status**: 🟡 Planned
 
-**Depends on:** Phase 6.1
+**Depends on:** Phase 6.1 (complete)
+
+**Plans:** 1 plan
 
 **Work:**
 1. Fix setBPM fallback to use executeCommandImmediate() instead of direct call
-2. Add AddModuleCommand to Command.h
-3. Refactor createSampler/createSequencer to use AddModuleCommand instead of string commands
+2. Refactor createSampler/createSequencer to use AddModuleCommand (already exists in Command.h)
 
 **Files:**
 - `src/core/lua/videoTracker.i` - Fix Clock::setBPM fallback
-- `src/core/Command.h` - Add AddModuleCommand class
 - `src/core/lua/LuaHelpers.cpp` - Use AddModuleCommand
 
-**Estimated Effort:** 2 hours
+**Estimated Effort:** 1 hour
 
 Plans:
-- [ ] TBD (run /gsd-plan-phase 6.2 to break down)
+- [ ] 06.2-01-PLAN.md — Fix setBPM fallback, refactor createSampler/createSequencer to use AddModuleCommand
 
 ---
 
