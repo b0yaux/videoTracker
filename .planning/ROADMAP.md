@@ -143,7 +143,12 @@ EngineState Engine::buildStateSnapshot() const {
 
 **Goal**: Add guards to all module `initialize()` methods to prevent duplicate subscriptions.
 
-**Status**: 🔵 Not Started
+**Status**: 🟡 Planned
+
+**Plans:** 1 plan
+
+Plans:
+- [ ] 04-01-PLAN.md — Add isInitialized_ flag to Module base, make TrackerSequencer/MultiSampler idempotent, fix destructor
 
 **Context**: `initialize()` is called during setup and after session restore. Without idempotency checks, event subscriptions (e.g., `clock.subscribeToStep()`) duplicate.
 
