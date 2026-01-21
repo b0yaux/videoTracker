@@ -75,8 +75,9 @@ public:
     void setConfig(const ClockConfig& cfg);
     void setSampleRate(float rate);
     
-    // Accessors for GUI
+    // Accessors for GUI and state
     float getBeatPulse() const;
+    double getCurrentBeat() const;  // Returns current beat position from accumulator
     float getMinBPM() const;
     float getMaxBPM() const;
     float getSampleRate() const;

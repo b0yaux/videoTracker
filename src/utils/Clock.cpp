@@ -297,6 +297,11 @@ float Clock::getBeatPulse() const {
 }
 
 //--------------------------------------------------------------
+double Clock::getCurrentBeat() const {
+    return beatAccumulator;
+}
+
+//--------------------------------------------------------------
 float Clock::getMinBPM() const {
     return config.minBPM;
 }
