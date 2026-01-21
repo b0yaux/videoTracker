@@ -10,22 +10,29 @@
 
 This research investigates the Lua binding architecture connecting scripts to the Engine in the videoTracker project. The codebase has evolved through multiple phases of simplification (Phases 7.9-7.10, 1-3), eliminating deferred update layers and async script execution threads. The current architecture uses **SWIG-generated bindings** in `videoTracker.i` for C++ class exposure, **ofxLua** for Lua state management, and **lock-free command queues** for thread-safe state mutations.
 
-**Key Findings:**
+**Key Findings (Empirical Analysis):**
 
 1. **SWIG provides complete bindings** - All Engine subsystems (Clock, ModuleRegistry, ConnectionManager, PatternRuntime) are exposed via `videoTracker.i` with helper functions for declarative syntax (`sampler()`, `sequencer()`, `connect()`)
 
-2. **ScriptManager generates scripts from state** - It's a read-only observer that regenerates Lua when Engine state changes, NOT a direct script executor
+2. **Inconsistency in LuaHelpers** - `createSampler()` and `createSequencer()` use STRING commands (`executeCommand("add MultiSampler " + name)`) while `setParameter()` correctly uses `SetParameterCommand`. This bypasses command queue for module creation.
 
-3. **CodeShell executes scripts via Engine::eval()** - User input flows: CodeShell → Engine::eval() → ofxLua → SWIG bindings → Command execution → State notification → ScriptManager regeneration
+3. **Inconsistent fallbacks in Clock SWIG bindings** - `setBPM()` uses direct `$self->setBPM(bpm)` fallback while `start()`/`stop()` correctly use `executeCommandImmediate()`. Direct calls bypass Engine notifications.
 
-4. **Single atomic guard pattern replaces complex deferred updates** - ScriptManager uses `UpdateState` atomic state machine instead of multiple deferred layers
+4. **ScriptManager is read-only observer** - It regenerates scripts FROM Engine state, NOT a direct script executor. Current sync is ONE-WAY: Engine → ScriptManager → CodeShell. Scripts cannot receive reactive state updates.
 
-5. **Thread safety model is consistent** - Commands route through `moodycamel::BlockingConcurrentQueue`, state snapshots use atomic shared_ptr, notifications process on main thread
+5. **"Always synced" requires new infrastructure** - Fire-and-forget pattern doesn't support reactive scripts. Recommended solution: add `onStateChange(callback)` API to Engine, exposing existing observer pattern to Lua.
 
-**Primary Recommendation:** The current architecture is sound after Phases 1-3 simplifications. Focus implementation on:
-- Ensuring SWIG helper functions always route through command queue (some bypass via `executeCommand()`)
-- Documenting the sync contract clearly (fire-and-forget execution, state updates async)
-- Adding integration tests for the complete execution path
+**Primary Recommendations:**
+
+| Priority | Action | Files to Change |
+|----------|--------|-----------------|
+| **HIGH** | Fix setBPM fallback to use `executeCommandImmediate()` | `videoTracker.i` |
+| **HIGH** | Add `AddModuleCommand` to Command.h | `Command.h` |
+| **HIGH** | Refactor createSampler/sequencer to use AddModuleCommand | `LuaHelpers.cpp` |
+| **MEDIUM** | Add `onStateChange(callback)` API to Engine | `Engine.h`, `Engine.cpp` |
+| **MEDIUM** | Expose onStateChange to Lua via SWIG | `videoTracker.i` |
+
+**Sync Contract:** Current "fire-and-forget" remains for one-shot scripts. New "always synced" mode available via `engine:onStateChange(function(state) ... end)` callbacks.
 
 ---
 
@@ -671,53 +678,394 @@ Engine::Result Engine::eval(const std::string& script) {
 
 ## Open Questions
 
+## Open Questions
+
 ### Question 1: Should all Clock methods use executeCommandImmediate() fallback?
 
-**What we know:**
-- Current fallback in SWIG bindings calls `$self->setBPM(bpm)` directly when queue is full
-- This bypasses command queue and may cause thread safety issues
+**EMPIRICAL FINDING:** Clock methods have INCONSISTENT fallback patterns:
 
-**What's unclear:**
-- When does `enqueueCommand()` actually fail? Queue capacity is 1024 commands
-- Is the fallback path ever hit in practice?
+| Method | Fallback Pattern | Line | Issue |
+|--------|------------------|------|-------|
+| `setBPM()` | Direct call `$self->setBPM(bpm)` | videoTracker.i:190 | Bypasses Engine notifications |
+| `start()` | `executeCommandImmediate()` | videoTracker.i:213 | Correct pattern |
+| `stop()` | `executeCommandImmediate()` | videoTracker.i:240 | Correct pattern |
+| `play()` | Direct call `$self->start()` | videoTracker.i:224 | Inconsistent alias |
+
+**Analysis:**
+- Direct call in `setBPM()` bypasses Engine's notification system
+- `executeCommandImmediate()` routes through Engine, ensuring proper notifications
+- Queue capacity is 1024 commands; overflow is unlikely in normal operation
 
 **Recommendation:**
-- Add logging to track fallback usage frequency
-- If fallback is never hit, remove it to simplify code
-- If fallback is hit, investigate why queue is full
+- **REMOVE** direct call fallback from `setBPM()` - use `executeCommandImmediate()` only
+- **KEEP** `executeCommandImmediate()` fallback for all transport operations
+- **ADD** logging to track if fallbacks are ever hit (should be rare/never)
+- **RATIONALE:** `executeCommandImmediate()` ensures consistent notification behavior even when queue is full
 
 ### Question 2: Should LuaHelpers use SetParameterCommand or executeCommand()?
 
-**What we know:**
-- `LuaHelpers::setParameter()` uses `SetParameterCommand` via `enqueueCommand()`
-- Other helpers (createSampler, createSequencer, connect) use `executeCommand()` with string commands
-- String parsing overhead was the root cause of Phase 1
+**EMPIRICAL FINDING:** LuaHelpers.cpp has INCONSISTENT command patterns:
 
-**What's unclear:**
-- Why don't all helpers use command objects?
-- Is there a benefit to string commands for module creation?
+| Helper Method | Current Pattern | Lines | Should Use |
+|---------------|-----------------|-------|------------|
+| `setParameter()` | `SetParameterCommand` via `enqueueCommand()` | LuaHelpers.cpp:206-222 | Correct ✓ |
+| `createSampler()` | String `"add MultiSampler "` via `executeCommand()` | LuaHelpers.cpp:43-44 | AddModuleCommand |
+| `createSequencer()` | String `"add TrackerSequencer "` via `executeCommand()` | LuaHelpers.cpp:80-81 | AddModuleCommand |
+| `createSystemModule()` | String via `executeCommand()` | LuaHelpers.cpp:100+ | AddModuleCommand |
 
-**Recommendation:**
-- Standardize all helpers to use command objects for consistency
-- String commands should only be used for the high-level `exec()` function
-- Document the contract: helpers use commands, exec() parses strings
-
-### Question 3: What should the sync contract be for script execution?
-
-**What we know:**
-- Current implementation is "fire-and-forget" - eval() returns immediately, state updates async
-- `syncScriptToEngine()` was removed because it caused deadlocks
-- Callback fires when script execution completes, not when state is updated
-
-**What's unclear:**
-- Is fire-and-forget the right contract for all use cases?
-- Should there be a way to wait for state stabilization?
-- How should errors in command execution be reported to the script?
+**Analysis:**
+- `setParameter()` is CORRECT - uses command object with proper queuing
+- Module creation helpers BYPASS command queue via string parsing
+- String parsing overhead was the root cause of Phase 1 performance issues
+- Module creation IS a state mutation and should use command pattern
 
 **Recommendation:**
-- Document the current contract clearly: "Script executes, commands enqueued, state updates async"
-- Add integration test to verify the contract
-- Consider adding optional callback for state-ready if use cases emerge
+- **ADD** `AddModuleCommand` to Command.h for module creation
+- **REFACTOR** `createSampler()`, `createSequencer()`, `createSystemModule()` to use `AddModuleCommand`
+- **KEEP** `setParameter()` as-is (already correct)
+- **RATIONALE:** Consistent command pattern for all state mutations, eliminates string parsing overhead
+
+**Code Changes Required:**
+
+1. **Command.h** - Add AddModuleCommand:
+```cpp
+class AddModuleCommand : public Command {
+public:
+    AddModuleCommand(const std::string& moduleType, const std::string& name)
+        : moduleType_(moduleType), name_(name) {}
+    Result execute(Engine* engine) override;
+    std::string describe() const override { return "add " + moduleType_ + " " + name_; }
+private:
+    std::string moduleType_, name_;
+};
+```
+
+2. **LuaHelpers.cpp** - Refactor createSampler:
+```cpp
+std::string LuaHelpers::createSampler(const std::string& name, const std::map<std::string, std::string>& config) {
+    // ... existing idempotent check ...
+
+    // Use AddModuleCommand instead of string
+    auto cmd = std::make_unique<AddModuleCommand>("MultiSampler", name);
+    auto result = engine_->enqueueCommand(std::move(cmd));
+
+    if (!result) {
+        ofLogError("LuaHelpers") << "Failed to enqueue AddModuleCommand for: " << name;
+        return "";
+    }
+
+    // ... apply config via setParameter() ...
+}
+```
+
+### Question 3: What should the sync contract be for "always synced" scripts?
+
+**EMPIRICAL FINDING:** Current architecture is ONE-WAY with limitations:
+
+| Component | Direction | Mechanism |
+|-----------|-----------|-----------|
+| Engine → ScriptManager | State observation | Observer callback with atomic guard |
+| ScriptManager → CodeShell | Script push | `updateScriptFromState()` generates text |
+| Engine → Script (variables) | **NONE** | Scripts cannot receive reactive updates |
+| Script → Engine | Command queue | `enqueueCommand()` for mutations |
+
+**Current Flow:**
+```
+User types script → CodeShell → Engine::eval() → SWIG bindings → Command queue
+                                                            ↓
+Engine state changes → Observer callback → ScriptManager regenerates script
+                                                            ↓
+                                                    CodeShell receives new script
+```
+
+**The Problem:** Scripts run once (fire-and-forget), cannot receive reactive state updates.
+
+**Architectural Options for "Always Synced":**
+
+| Option | Approach | Pros | Cons | Empirical Support |
+|--------|----------|------|------|-------------------|
+| **A: Polling** | Script calls `engine:getState()` periodically | Simple, no new infrastructure | CPU overhead, latency | ✓ Works with existing `getState()` |
+| **B: Callbacks** | Script registers Lua callbacks for state changes | Reactive, low overhead | Complex lifecycle management | ✗ Requires new Engine observer API |
+| **C: Two-way binding** | Lua variables stay synced with Engine state | Most elegant | Significant implementation | ✗ No existing infrastructure |
+| **D: Event-driven (RECOMMENDED)** | Script uses `engine:onStateChange(fn)` | Matches existing observer pattern | Requires callback registration | ✓ Natural extension of ScriptManager |
+
+**EMPIRICAL ANALYSIS:**
+- ScriptManager ALREADY uses observer pattern - extend this to scripts
+- Engine has `subscribe()` method for observers - could expose to Lua
+- State version tracking exists - enables change detection
+- `getState()` returns immutable snapshot - safe for polling
+
+**Recommendation: Option D (Event-driven with onStateChange)**
+
+This extends the existing observer infrastructure rather than building new patterns:
+
+1. **Add Lua callback registration to Engine** (videoTracker.i):
+```cpp
+%extend Engine {
+    // Register Lua callback for state changes
+    void onStateChange(std::function<void(const EngineState&)> callback) {
+        // Store callback in a map, invoke on each state change
+    }
+
+    // Remove callback by ID
+    void removeStateChangeCallback(int callbackId) {
+        // Remove from map
+    }
+}
+```
+
+2. **Usage in Lua for "always synced" pattern:**
+```lua
+-- Option 1: Reactive variable binding
+engine:onStateChange(function(state)
+    currentBPM = state.clock.bpm
+    playheadPosition = state.patternRuntime.playhead
+end)
+
+-- Option 2: Watch specific module
+engine:onStateChange(function(state)
+    if state.modules.kick then
+        kickVol = state.modules.kick.parameters.volume
+    end
+end)
+
+-- Option 3: Manual sync trigger
+engine:onStateChange(function()
+    myScriptVars = engine:getState().clone()
+end)
+```
+
+3. **Implementation in ScriptManager:**
+```cpp
+// Existing infrastructure - extend to Lua callbacks
+void ScriptManager::notifyStateChange(const EngineState& state) {
+    // Existing: updateScriptFromState(state)
+
+    // NEW: Invoke Lua callbacks
+    for (auto& [id, callback] : luaCallbacks_) {
+        callback(state);
+    }
+}
+```
+
+**Alternative: Option A (Polling) for simpler use cases**
+
+If callback lifecycle is too complex, provide polling helper:
+```lua
+-- Simple polling - works with existing infrastructure
+function sync()
+    local state = engine:getState()
+    -- Update Lua variables from state
+end
+
+-- Call sync() periodically
+of.addTimer(sync, 0.1)  -- Every 100ms
+```
+
+**Final Recommendation:**
+- **PRIMARY:** Implement Option D (event-driven callbacks) as the "proper" solution
+- **ALSO SUPPORT:** Option A (polling) as escape hatch for simple cases
+- **DO NOT IMPLEMENT:** Option C (two-way binding) - requires significant new infrastructure
+- **CONTRACT DOCUMENTATION:** "Fire-and-forget for one-shot scripts, callbacks for reactive sync"
+
+---
+
+## Specific Code Recommendations
+
+Based on empirical analysis, here are the EXACT changes needed:
+
+### 1. videoTracker.i - Fix Clock Fallback Inconsistencies
+
+**File:** `src/core/lua/videoTracker.i`
+
+| Line | Current | Change To | Why |
+|------|---------|-----------|-----|
+| 189-190 | `$self->setBPM(bpm)` direct call | `engine->executeCommandImmediate()` | Consistent notification behavior |
+| 224 | `$self->start()` | Remove (alias handled by start()) | Duplicate, causes confusion |
+
+**Diff for setBPM():**
+```cpp
+// BEFORE (lines 183-196)
+void setBPM(float bpm) {
+    auto* engine = vt::lua::getGlobalEngine();
+    if (engine) {
+        auto cmd = std::make_unique<vt::SetBPMCommand>(bpm);
+        if (!engine->enqueueCommand(std::move(cmd))) {
+            ofLogWarning("Clock") << "Failed to enqueue SetBPMCommand, falling back to direct call";
+            $self->setBPM(bpm);  // <-- BAD: bypasses notifications
+        }
+    } else {
+        $self->setBPM(bpm);
+    }
+}
+
+// AFTER
+void setBPM(float bpm) {
+    auto* engine = vt::lua::getGlobalEngine();
+    if (engine) {
+        auto cmd = std::make_unique<vt::SetBPMCommand>(bpm);
+        if (!engine->enqueueCommand(std::move(cmd))) {
+            ofLogWarning("Clock") << "Command queue full, executing SetBPMCommand immediately";
+            auto fallbackCmd = std::make_unique<vt::SetBPMCommand>(bpm);
+            engine->executeCommandImmediate(std::move(fallbackCmd));
+        }
+    } else {
+        ofLogWarning("Clock") << "Engine not available, using direct setBPM call";
+        $self->setBPM(bpm);  // Only if engine truly unavailable
+    }
+}
+```
+
+### 2. Command.h - Add AddModuleCommand
+
+**File:** `src/core/Command.h`
+
+**Add after SetParameterCommand (around line 100):**
+```cpp
+class AddModuleCommand : public Command {
+public:
+    AddModuleCommand(const std::string& moduleType, const std::string& name)
+        : moduleType_(moduleType), name_(name) {}
+
+    Result execute(Engine* engine) override {
+        if (!engine) {
+            return Result::error("Engine is null");
+        }
+        auto& registry = engine->getModuleRegistry();
+        return registry.addModule(moduleType_, name_);
+    }
+
+    std::string describe() const override {
+        return "add " + moduleType_ + " " + name_;
+    }
+
+private:
+    std::string moduleType_;
+    std::string name_;
+};
+```
+
+### 3. LuaHelpers.cpp - Standardize on Command Objects
+
+**File:** `src/core/lua/LuaHelpers.cpp`
+
+| Function | Line | Current | Change To |
+|----------|------|---------|-----------|
+| `createSampler()` | 43-44 | `executeCommand("add MultiSampler " + name)` | `enqueueCommand(make_unique<AddModuleCommand>("MultiSampler", name))` |
+| `createSequencer()` | 80-81 | `executeCommand("add TrackerSequencer " + name)` | `enqueueCommand(make_unique<AddModuleCommand>("TrackerSequencer", name))` |
+| `createSystemModule()` | 100+ | String command | Add `AddModuleCommand` variant |
+
+**Diff for createSampler():**
+```cpp
+// BEFORE (lines 23-58)
+std::string LuaHelpers::createSampler(const std::string& name, const std::map<std::string, std::string>& config) {
+    // ... idempotent check ...
+
+    // Module doesn't exist - create it
+    std::string command = "add MultiSampler " + name;  // <-- STRING COMMAND
+    auto result = engine_->executeCommand(command);
+
+    // ... apply config ...
+}
+
+// AFTER
+std::string LuaHelpers::createSampler(const std::string& name, const std::map<std::string, std::string>& config) {
+    // ... idempotent check ...
+
+    // Module doesn't exist - create it
+    auto cmd = std::make_unique<AddModuleCommand>("MultiSampler", name);
+    bool enqueued = engine_->enqueueCommand(std::move(cmd));
+
+    if (!enqueued) {
+        ofLogError("LuaHelpers") << "Failed to enqueue AddModuleCommand for sampler: " << name;
+        return "";
+    }
+
+    // ... apply config via setParameter() (already correct) ...
+}
+```
+
+### 4. Engine.h/.cpp - Add onStateChange Callback API
+
+**File:** `src/core/Engine.h`
+
+**Add to Engine class (around existing subscription methods):**
+```cpp
+// Callback type for state change notifications
+using StateChangeCallback = std::function<void(const EngineState&)>;
+
+// Register Lua callback for state changes
+int registerStateChangeCallback(StateChangeCallback callback);
+
+// Remove callback by ID
+bool unregisterStateChangeCallback(int callbackId);
+```
+
+**File:** `src/core/Engine.cpp`
+
+**Add implementation (around line 400):**
+```cpp
+int Engine::registerStateChangeCallback(StateChangeCallback callback) {
+    std::lock_guard<std::mutex> lock(stateChangeMutex_);
+    int id = nextCallbackId_++;
+    stateChangeCallbacks_[id] = std::move(callback);
+    return id;
+}
+
+bool Engine::unregisterStateChangeCallback(int callbackId) {
+    std::lock_guard<std::mutex> lock(stateChangeMutex_);
+    return stateChangeCallbacks_.erase(callbackId) > 0;
+}
+```
+
+**Add to notifyObservers() (around line 340):**
+```cpp
+void Engine::notifyObservers(const EngineState& state) {
+    // Existing observer notifications...
+
+    // NEW: Invoke Lua state change callbacks
+    {
+        std::lock_guard<std::mutex> lock(stateChangeMutex_);
+        for (const auto& [id, callback] : stateChangeCallbacks_) {
+            try {
+                callback(state);
+            } catch (const std::exception& e) {
+                ofLogError("Engine") << "State change callback exception: " << e.what();
+            }
+        }
+    }
+}
+```
+
+### 5. videoTracker.i - Expose onStateChange to Lua
+
+**Add to %extend Engine section (around line 150):**
+```cpp
+// State change callbacks for "always synced" scripts
+int onStateChange(std::function<void(const EngineState&)> callback) {
+    return engine_->registerStateChangeCallback(callback);
+}
+
+bool removeStateChangeCallback(int callbackId) {
+    return engine_->unregisterStateChangeCallback(callbackId);
+}
+```
+
+### Summary of Changes
+
+| File | Changes | Priority |
+|------|---------|----------|
+| `videoTracker.i` | Fix setBPM fallback, expose onStateChange | HIGH |
+| `Command.h` | Add AddModuleCommand | HIGH |
+| `LuaHelpers.cpp` | Refactor createSampler/ Sequencer to use AddModuleCommand | HIGH |
+| `Engine.h` | Add callback registration methods | MEDIUM |
+| `Engine.cpp` | Implement callback infrastructure | MEDIUM |
+
+**Testing Strategy:**
+1. Verify Clock::setBPM routes through executeCommandImmediate when queue full
+2. Verify createSampler uses AddModuleCommand (check logs for "add MultiSampler")
+3. Verify onStateChange callback fires when Engine state changes
+4. Verify no regressions in existing fire-and-forget scripts
 
 ---
 
@@ -726,9 +1074,13 @@ Engine::Result Engine::eval(const std::string& script) {
 ### Primary (HIGH confidence - Source code analysis)
 
 - **videoTracker.i** (`src/core/lua/videoTracker.i`) - SWIG interface, 427 lines, complete bindings
+  - **Key lines:** 183-196 (Clock::setBPM fallback), 202-220 (Clock::start/stop), 281-288 (sampler helper)
 - **Engine.cpp** (`src/core/Engine.cpp`) - setupLua(), eval(), syncScriptToEngine(), 1000+ lines
 - **ScriptManager.cpp** (`src/core/ScriptManager.cpp`) - State observer, script generation, 621 lines
 - **CodeShell.cpp** (`src/shell/CodeShell.cpp`) - executeLuaScript(), 1200+ lines
+- **LuaHelpers.cpp** (`src/core/lua/LuaHelpers.cpp`) - Helper implementations, 290 lines
+  - **Key lines:** 43-44 (createSampler string command), 80-81 (createSequencer string command), 206-222 (setParameter command pattern)
+- **Command.h** (`src/core/Command.h`) - Command definitions, 305 lines
 
 ### Secondary (MEDIUM confidence - Prior phase research)
 
@@ -755,6 +1107,14 @@ Engine::Result Engine::eval(const std::string& script) {
 | Don't Hand-Roll | HIGH | Based on existing infrastructure and Phase 7.10.1 audit |
 | Common Pitfalls | HIGH | Documented from crash analysis and implementation experience |
 | Code Examples | HIGH | Directly from source files with verified context |
+| **Specific Recommendations** | **HIGH** | Based on empirical analysis of LuaHelpers.cpp:43-44, 80-81, videoTracker.i:183-196 |
+| **Always Synced Design** | **MEDIUM** | Extension of existing observer pattern, not yet implemented |
+
+**Confidence breakdown by empirical finding:**
+- Clock fallback inconsistency: HIGH (verified videoTracker.i:189-190)
+- LuaHelpers string commands: HIGH (verified LuaHelpers.cpp:43-44, 80-81)
+- ScriptManager one-way sync: HIGH (verified ScriptManager.cpp observer pattern)
+- onStateChange API design: MEDIUM (proposed extension, not yet validated)
 
 ### Research Date and Validity
 
@@ -771,7 +1131,7 @@ Engine::Result Engine::eval(const std::string& script) {
 | `src/core/ScriptManager.cpp` | 621 | State observation, script generation |
 | `src/shell/CodeShell.cpp` | 1200+ | Script execution from editor |
 | `src/core/Command.h` | 305 | Command definitions |
-| `src/core/lua/LuaHelpers.cpp` | 290 | Helper implementations |
+| `src/core/lua/LuaHelpers.cpp` | 290 | Helper implementations (KEY: lines 43-44, 80-81 for string command issue) |
 
 ---
 
