@@ -13,9 +13,17 @@
 #include <vector>
 #include <algorithm>
 #include <thread>
+#include <functional>
 
 namespace vt {
 namespace shell {
+
+// Simple hash for script content (Phase 7.4)
+static std::string hashScript(const std::string& script) {
+    // Use std::hash for simplicity - doesn't need to be cryptographic
+    std::hash<std::string> hasher;
+    return std::to_string(hasher(script));
+}
 
 CodeShell::CodeShell(Engine* engine)
     : Shell(engine)
@@ -300,6 +308,13 @@ void CodeShell::update(float deltaTime) {
         if (currentText != lastEditorText_) {
             lastEditTime_ = ofGetElapsedTimef();
             lastEditorText_ = currentText;
+            
+            // Phase 7.4: Reset failure tracking when script changes
+            // (Only reset if the hash is different - not just whitespace changes)
+            std::string newHash = hashScript(currentText);
+            if (newHash != hashScript(lastExecutedScript_)) {
+                executionTracker_.reset();
+            }
             
             // Check for simple parameter changes (execute immediately, no debounce)
             checkAndExecuteSimpleChanges();
@@ -821,8 +836,40 @@ void CodeShell::executeAll() {
     }
     
     if (!text.empty()) {
-        executeLuaScript(text);
-        lastExecutedScript_ = text;  // Update after execution
+        std::string scriptHash = hashScript(text);
+        uint64_t nowMs = static_cast<uint64_t>(ofGetElapsedTimeMillis());
+        
+        // Phase 7.4: Check if we should retry
+        if (!executionTracker_.shouldRetry(scriptHash, nowMs)) {
+            ofLogVerbose("CodeShell") << "Skipping execution - same failing script in cooldown";
+            return;
+        }
+        
+        // Store current auto-update state and disable during execution
+        bool wasAutoUpdate = false;
+        if (engine_) {
+            wasAutoUpdate = engine_->isScriptAutoUpdateEnabled();
+            engine_->setScriptAutoUpdate(false);
+        }
+        
+        // Execute via Engine
+        Engine::Result result = engine_->eval(text);
+        
+        // Re-enable auto-update
+        if (engine_) {
+            engine_->setScriptAutoUpdate(wasAutoUpdate);
+        }
+        
+        // Phase 7.4: Track result
+        if (result.success) {
+            executionTracker_.recordSuccess();
+            lastExecutedScript_ = text;  // Update after successful execution
+        } else {
+            executionTracker_.recordFailure(scriptHash, nowMs);
+            ofLogWarning("CodeShell") << "Script execution failed (failure #" 
+                                      << executionTracker_.consecutiveFailures << ")";
+            // Don't update lastExecutedScript_ on failure - keep old version for change detection
+        }
     }
 }
 
@@ -1061,6 +1108,14 @@ void CodeShell::checkAndExecuteSimpleChanges() {
         return;
     } catch (...) {
         ofLogError("CodeShell") << "Unknown exception getting editor text for simple changes";
+        return;
+    }
+    
+    // Phase 7.4: Check if we should retry this script
+    std::string scriptHash = hashScript(currentText);
+    uint64_t nowMs = static_cast<uint64_t>(ofGetElapsedTimeMillis());
+    if (!executionTracker_.shouldRetry(scriptHash, nowMs)) {
+        // Skip execution - same failing script, still in cooldown
         return;
     }
     

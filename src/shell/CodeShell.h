@@ -119,6 +119,53 @@ private:
     int maxIncrementalLines_ = 3;  // Max lines to execute incrementally (fallback to full execution if more)
     bool incrementalEvalEnabled_ = true;  // Enable incremental execution (use incremental for small changes)
     
+    // Script execution tracking to prevent infinite retry loops (Phase 7.4)
+    struct ScriptExecutionTracker {
+        std::string lastFailedScriptHash;
+        uint64_t lastFailureTimeMs{0};
+        int consecutiveFailures{0};
+        
+        static constexpr int MAX_CONSECUTIVE_FAILURES = 3;
+        static constexpr uint64_t FAILURE_COOLDOWN_MS = 2000;
+        
+        // Check if we should retry executing this script
+        bool shouldRetry(const std::string& scriptHash, uint64_t nowMs) const {
+            if (scriptHash != lastFailedScriptHash) {
+                return true;  // Different script, try it
+            }
+            if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                return false;  // Too many failures, wait for script change
+            }
+            if (nowMs - lastFailureTimeMs < FAILURE_COOLDOWN_MS) {
+                return false;  // Still in cooldown
+            }
+            return true;  // Retry allowed
+        }
+        
+        void recordSuccess() {
+            lastFailedScriptHash.clear();
+            consecutiveFailures = 0;
+            lastFailureTimeMs = 0;
+        }
+        
+        void recordFailure(const std::string& scriptHash, uint64_t nowMs) {
+            if (scriptHash == lastFailedScriptHash) {
+                consecutiveFailures++;
+            } else {
+                lastFailedScriptHash = scriptHash;
+                consecutiveFailures = 1;
+            }
+            lastFailureTimeMs = nowMs;
+        }
+        
+        void reset() {
+            lastFailedScriptHash.clear();
+            consecutiveFailures = 0;
+            lastFailureTimeMs = 0;
+        }
+    };
+    ScriptExecutionTracker executionTracker_;
+    
     // Execution
     void executeSelection();
     void executeAll();
