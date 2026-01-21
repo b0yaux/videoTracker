@@ -1,0 +1,12 @@
+{
+  "workflow": {
+    "mode": "yolo",
+    "depth": "comprehensive"
+  },
+  "gates": {
+    "confirmMajorDecisions": true,
+    "confirmPhasePlans": true,
+    "confirmExecution": true
+  }
+}
+

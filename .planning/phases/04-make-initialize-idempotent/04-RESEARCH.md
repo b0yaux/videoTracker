@@ -10,7 +10,12 @@ This research investigates how to make module `initialize()` methods idempotent 
 
 The codebase already has a partial solution in place: `TrackerSequencer` uses a `listenersRegistered_` flag to prevent duplicate Clock subscriptions. However, this pattern is not applied to PatternRuntime subscriptions, nor is it used consistently across other modules.
 
-**Primary recommendation:** Add `isInitialized_` flag to Module base class and use early-return pattern in all module `initialize()` methods.
+**Critical Finding:** PatternRuntime `triggerEvent` subscriptions happen in **4 different code paths**, not just `initialize()`. The other 3 paths (lines 835, 2579, 2652) only unsubscribe if `boundPatternName_` or `oldPattern` was non-empty, meaning they can add duplicate listeners when the initial subscription from `initialize()` was made when the pattern name was empty.
+
+**Primary recommendation:** 
+1. Add `isInitialized_` flag to Module base class for early-return in `initialize()`
+2. Add `patternTriggerListenerRegistered_` flag to TrackerSequencer to track triggerEvent subscription state
+3. Use the flag consistently in ALL 4 subscription paths for proper unsubscribe-before-subscribe
 
 ## Standard Stack
 
@@ -152,19 +157,40 @@ void TrackerSequencer::initialize(...) {
 
 ## Common Pitfalls
 
-### Pitfall 1: Not Guarding All Subscription Paths
+### Pitfall 1: Not Guarding All Subscription Paths (CRITICAL)
 
-**What goes wrong:** TrackerSequencer subscribes to PatternRuntime events in multiple places:
-- `initialize()` (line 184)
-- `bindToPattern()` (line 2579)
-- `onSequencerBindingChanged()` (line 2652)
-- Update sync logic (line 835)
+**What goes wrong:** TrackerSequencer subscribes to PatternRuntime `triggerEvent` in 4 places:
 
-**Why it happens:** Pattern changes trigger re-subscription without unsubscribing first.
+| Location | Line | Condition for Unsubscribe | Bug |
+|----------|------|---------------------------|-----|
+| `initialize()` | 184 | None (unconditional add) | Initial subscription - no issue |
+| `update()` sync | 835 | `if (!oldPattern.empty())` | Misses initial sub if pattern was empty |
+| `bindToPattern()` | 2579 | `if (!boundPatternName_.empty())` | Misses initial sub if pattern was empty |
+| `onSequencerBindingChanged()` | 2652 | `if (!oldPattern.empty())` | Misses initial sub if pattern was empty |
 
-**How to avoid:** Always unsubscribe before subscribing, or use a flag to track subscription state.
+**Problem Scenario:**
+1. `initialize()` called with empty `boundPatternName_` → subscribes to triggerEvent
+2. `bindToPattern("pattern1")` called → `!boundPatternName_.empty()` is FALSE (empty before this call)
+3. Code skips `ofRemoveListener` but adds new `ofAddListener`
+4. **Now we have 2 listeners!** Events fire twice.
 
-**Current mitigation:** Lines 829, 2565, 2647 have `ofRemoveListener` calls before new subscriptions, but the pattern is inconsistent.
+**Solution:** Add `patternTriggerListenerRegistered_` flag that tracks actual subscription state, not pattern name state:
+
+```cpp
+// TrackerSequencer.h - add new flag
+bool patternTriggerListenerRegistered_ = false;  // Track triggerEvent subscription
+
+// In all 4 subscription paths - use flag instead of pattern name check
+if (patternTriggerListenerRegistered_) {
+    ofRemoveListener(patternRuntime_->triggerEvent, this, &TrackerSequencer::onPatternRuntimeTrigger);
+    patternTriggerListenerRegistered_ = false;
+}
+// Subscribe to new pattern events
+ofAddListener(patternRuntime_->triggerEvent, this, &TrackerSequencer::onPatternRuntimeTrigger);
+patternTriggerListenerRegistered_ = true;
+```
+
+This ensures we ALWAYS unsubscribe if we're subscribed, regardless of pattern name state.
 
 ### Pitfall 2: Destructor Not Unsubscribing All Listeners
 
