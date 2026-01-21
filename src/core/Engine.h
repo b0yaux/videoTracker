@@ -18,6 +18,9 @@
 #include "modules/VideoOutput.h"
 #include "ofxSoundObjects.h"
 #include "ofxLua.h"
+#include "lua.h"
+#include "lauxlib.h"
+#include "lualib.h"
 #include "readerwriterqueue.h"
 #include "../../libs/concurrentqueue/blockingconcurrentqueue.h"  // From moodycamel (Phase 7.3)
 #include <memory>
@@ -356,6 +359,35 @@ public:
     void unsubscribe(size_t id);
     
     // ═══════════════════════════════════════════════════════════
+    // LUA CALLBACKS (Phase 6.3 - Reactive Sync for Live Coding)
+    // ═══════════════════════════════════════════════════════════
+    
+    /**
+     * Lua state change callback type.
+     * Receives EngineState snapshot when state changes.
+     */
+    using LuaStateChangeCallback = std::function<void(lua_State* L, const EngineState&)>;
+
+    /**
+     * Register a Lua callback for state changes.
+     * 
+     * Thread-safe: Can be called from any thread.
+     * Callback invoked on main thread via notification queue.
+     * 
+     * @param callback Lua callback function (stored as std::function)
+     * @return Unique callback ID for later unregistration, 0 on failure
+     */
+    size_t registerStateChangeCallback(LuaStateChangeCallback callback);
+    
+    /**
+     * Unregister a previously registered Lua callback.
+     * 
+     * @param callbackId ID returned from registerStateChangeCallback
+     * @return true if callback was found and removed, false otherwise
+     */
+    bool unregisterStateChangeCallback(size_t callbackId);
+    
+    // ═══════════════════════════════════════════════════════════
     // MULTI-SHELL COORDINATION (Phase 7.9.2 Plan 3)
     // ═══════════════════════════════════════════════════════════
     
@@ -570,6 +602,12 @@ private:
     // Can be simplified: No - shared_mutex allows concurrent reads, exclusive writes
     mutable std::shared_mutex stateMutex_;
     std::vector<std::pair<size_t, StateObserver>> observers_;
+    
+    // Lua callbacks for reactive sync (Phase 6.3)
+    // Stored separately from C++ StateObserver callbacks because they need lua_State*
+    // Protected by stateMutex_ (same mutex as observers_)
+    std::vector<std::pair<size_t, LuaStateChangeCallback>> luaCallbacks_;
+    
     // Purpose: Thread-safe observer ID generation
     // When used: subscribe() method to assign unique IDs
     // Still needed: Yes - Multiple threads may subscribe concurrently
