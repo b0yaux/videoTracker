@@ -19,6 +19,7 @@ Clock::Clock()
     , lastBeatTime(0.0f)
     , beatInterval(0.0f)
     , beatAccumulator(0.0)
+    , nextListenerId(1)
     , samplesPerBeat(0.0f) {
 }
 
@@ -102,20 +103,15 @@ void Clock::start() {
         }
         // #endregion
         
-        // Notify transport listeners
-        for (auto& listener : transportListeners) {
-            // #region agent log
-            {
-                std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-                if (logFile.is_open()) {
-                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                    logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,C\",\"location\":\"Clock.cpp:start\",\"message\":\"Clock::start() - calling transport listener\",\"data\":{},\"timestamp\":" << now << "}\n";
-                    logFile.flush();
-                    logFile.close();
-                }
+        // Notify transport listeners with try-catch protection
+        for (auto& [id, listener] : transportListeners) {
+            try {
+                listener(true);
+            } catch (const std::exception& e) {
+                ofLogError("Clock") << "Transport listener (id: " << id << ") threw exception: " << e.what();
+            } catch (...) {
+                ofLogError("Clock") << "Transport listener (id: " << id << ") threw unknown exception";
             }
-            // #endregion
-            listener(true);
         }
         
         // #region agent log
@@ -140,9 +136,15 @@ void Clock::stop() {
         beatAccumulator = 0.0; // Reset beat timing
         ofLogNotice("Clock") << "Audio-rate clock stopped";
         
-        // Notify transport listeners
-        for (auto& listener : transportListeners) {
-            listener(false);
+        // Notify transport listeners with try-catch protection
+        for (auto& [id, listener] : transportListeners) {
+            try {
+                listener(false);
+            } catch (const std::exception& e) {
+                ofLogError("Clock") << "Transport listener (id: " << id << ") threw exception: " << e.what();
+            } catch (...) {
+                ofLogError("Clock") << "Transport listener (id: " << id << ") threw unknown exception";
+            }
         }
     }
 }
@@ -153,9 +155,15 @@ void Clock::pause() {
         playing = false;
         ofLogNotice("Clock") << "Audio-rate clock paused";
         
-        // Notify transport listeners
-        for (auto& listener : transportListeners) {
-            listener(false);
+        // Notify transport listeners with try-catch protection
+        for (auto& [id, listener] : transportListeners) {
+            try {
+                listener(false);
+            } catch (const std::exception& e) {
+                ofLogError("Clock") << "Transport listener (id: " << id << ") threw exception: " << e.what();
+            } catch (...) {
+                ofLogError("Clock") << "Transport listener (id: " << id << ") threw unknown exception";
+            }
         }
     }
 }
@@ -184,9 +192,21 @@ void Clock::removeAudioListener() {
 }
 
 //--------------------------------------------------------------
-void Clock::addTransportListener(TransportCallback listener) {
-    transportListeners.push_back(listener);
-    ofLogNotice("Clock") << "Transport listener added (total: " << transportListeners.size() << ")";
+Clock::TransportListenerId Clock::addTransportListener(TransportCallback listener) {
+    TransportListenerId id = nextListenerId++;
+    transportListeners.push_back({id, std::move(listener)});
+    ofLogNotice("Clock") << "Transport listener added (total: " << transportListeners.size() << ", id: " << id << ")";
+    return id;
+}
+
+//--------------------------------------------------------------
+void Clock::removeTransportListener(TransportListenerId id) {
+    auto it = std::find_if(transportListeners.begin(), transportListeners.end(),
+        [id](const auto& pair) { return pair.first == id; });
+    if (it != transportListeners.end()) {
+        transportListeners.erase(it);
+        ofLogNotice("Clock") << "Transport listener removed (id: " << id << ", remaining: " << transportListeners.size() << ")";
+    }
 }
 
 //--------------------------------------------------------------

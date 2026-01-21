@@ -9,6 +9,11 @@
 #include "ofMain.h"
 #include "ofxSoundObjects.h"
 #include "ofJson.h"
+#include <functional>
+#include <vector>
+#include <utility>
+#include <cstdint>
+#include <algorithm>
 
 // Configuration structure for Clock
 struct ClockConfig {
@@ -55,7 +60,9 @@ public:
     
     // Transport listener system for play/stop events
     typedef std::function<void(bool isPlaying)> TransportCallback;
-    void addTransportListener(TransportCallback listener);
+    using TransportListenerId = uint64_t;
+    TransportListenerId addTransportListener(TransportCallback listener);
+    void removeTransportListener(TransportListenerId id);
     void removeTransportListener();
     
     // Time event system for sample-accurate beat timing
@@ -107,8 +114,11 @@ private:
     // Audio listeners
     std::vector<std::function<void(ofSoundBuffer&)>> audioListeners;
     
-    // Transport listeners for play/stop events
-    std::vector<TransportCallback> transportListeners;
+    // Transport listeners for play/stop events - stored with ID for safe removal
+    std::vector<std::pair<TransportListenerId, TransportCallback>> transportListeners;
+    
+    // Counter for assigning unique IDs to listeners
+    TransportListenerId nextListenerId;
     
     // Internal methods
     void onBPMChanged();
