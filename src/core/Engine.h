@@ -506,6 +506,16 @@ public:
         return notifyingObservers_.load(std::memory_order_acquire);
     }
     
+    // Convenience methods for backward compatibility (Phase 3.2 fix)
+    // These delegate to isInUnsafeState() which checks notifyingObservers_
+    bool isExecutingScript() const {
+        return isInUnsafeState();
+    }
+
+    bool commandsBeingProcessed() const {
+        return isInUnsafeState();
+    }
+    
     // Render guard (prevents state updates during rendering)
     bool isRendering() const { return isRendering_.load(std::memory_order_acquire); }
     void setRendering(bool rendering) { 
