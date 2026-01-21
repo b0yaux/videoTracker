@@ -39,13 +39,21 @@ std::string LuaHelpers::createSampler(const std::string& name, const std::map<st
         return name;  // Return existing module name
     }
     
-    // Module doesn't exist - create it
-    std::string command = "add MultiSampler " + name;
-    auto result = engine_->executeCommand(command);
+    // Module doesn't exist - create it using command queue
+    auto cmd = std::make_unique<vt::AddModuleCommand>("MultiSampler", name);
+    bool enqueued = engine_->enqueueCommand(std::move(cmd));
     
-    if (!result.success) {
-        ofLogError("LuaHelpers") << "Failed to create sampler: " << name << " - " << result.error;
-        return "";
+    if (!enqueued) {
+        ofLogWarning("LuaHelpers") << "Command queue full, falling back to executeCommand";
+        std::string command = "add MultiSampler " + name;
+        auto result = engine_->executeCommand(command);
+        if (!result.success) {
+            ofLogError("LuaHelpers") << "Failed to create sampler: " << name << " - " << result.error;
+            return "";
+        }
+    } else {
+        // Give command queue a moment to process (module creation is async)
+        ofLogNotice("LuaHelpers") << "Enqueued AddModuleCommand for sampler: " << name;
     }
     
     // Apply configuration
@@ -76,13 +84,21 @@ std::string LuaHelpers::createSequencer(const std::string& name, const std::map<
         return name;  // Return existing module name
     }
     
-    // Module doesn't exist - create it
-    std::string command = "add TrackerSequencer " + name;
-    auto result = engine_->executeCommand(command);
+    // Module doesn't exist - create it using command queue
+    auto cmd = std::make_unique<vt::AddModuleCommand>("TrackerSequencer", name);
+    bool enqueued = engine_->enqueueCommand(std::move(cmd));
     
-    if (!result.success) {
-        ofLogError("LuaHelpers") << "Failed to create sequencer: " << name << " - " << result.error;
-        return "";
+    if (!enqueued) {
+        ofLogWarning("LuaHelpers") << "Command queue full, falling back to executeCommand";
+        std::string command = "add TrackerSequencer " + name;
+        auto result = engine_->executeCommand(command);
+        if (!result.success) {
+            ofLogError("LuaHelpers") << "Failed to create sequencer: " << name << " - " << result.error;
+            return "";
+        }
+    } else {
+        // Give command queue a moment to process (module creation is async)
+        ofLogNotice("LuaHelpers") << "Enqueued AddModuleCommand for sequencer: " << name;
     }
     
     // Apply configuration
