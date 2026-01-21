@@ -21,7 +21,7 @@
 #include "lua.h"
 #include "lauxlib.h"
 #include "lualib.h"
-#include "readerwriterqueue.h"
+#include "concurrentqueue.h"
 #include "../../libs/concurrentqueue/blockingconcurrentqueue.h"  // From moodycamel (Phase 7.3)
 #include <memory>
 #include <shared_mutex>
@@ -627,11 +627,10 @@ private:
     // Can be simplified: No - Critical for preventing crashes during rendering
     std::atomic<bool> isRendering_{false};
     
-    // Unified command queue (lock-free, processed in audio thread)
-    // Producer: GUI thread (enqueueCommand)
+    // Unified command queue (lock-free MPMC, processed in audio thread)
+    // Producers: GUI thread, Lua scripts, parameter router (multiple)
     // Consumer: Audio thread (processCommands)
-    // Capacity: 1024 commands (should be more than enough)
-    moodycamel::ReaderWriterQueue<std::unique_ptr<Command>> commandQueue_{1024};
+    moodycamel::ConcurrentQueue<std::unique_ptr<Command>> commandQueue_{1024};
     
     // Event-driven notification queue (unified notification mechanism)
     // Purpose: Queue stores all state notification callbacks that are processed in update()
