@@ -344,6 +344,7 @@ private:
     static std::string formatParameterValue(const std::string& paramName, float value); // Format based on parameter type
     
     Clock* clock;
+    uint64_t transportListenerId = 0;  // Store ID for proper cleanup (Clock::TransportListenerId)
     bool listenersRegistered_ = false;  // Flag to prevent double listener registration
     
     // Pattern sequencer state (app-specific)

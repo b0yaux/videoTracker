@@ -28,6 +28,12 @@ TrackerSequencer::TrackerSequencer()
 }
 
 TrackerSequencer::~TrackerSequencer() {
+    // Remove transport listener to prevent dangling pointer crashes
+    if (transportListenerId != 0 && clock) {
+        clock->removeTransportListener(transportListenerId);
+        transportListenerId = 0;
+    }
+    
     // Unsubscribe from PatternRuntime events
     if (patternRuntime_) {
         ofRemoveListener(patternRuntime_->triggerEvent, this, &TrackerSequencer::onPatternRuntimeTrigger);
@@ -54,8 +60,8 @@ void TrackerSequencer::setup(Clock* clockRef) {
             this->processAudioBuffer(buffer);
         });
         
-        // Subscribe to Clock transport changes
-        clock->addTransportListener([this](bool isPlaying) {
+        // Subscribe to Clock transport changes - store ID for cleanup
+        transportListenerId = clock->addTransportListener([this](bool isPlaying) {
             this->onClockTransportChanged(isPlaying);
         });
         
@@ -90,8 +96,8 @@ void TrackerSequencer::initialize(Clock* clock, ModuleRegistry* registry, Connec
                     this->processAudioBuffer(buffer);
                 });
                 
-                // Subscribe to Clock transport changes
-                clock->addTransportListener([this](bool isPlaying) {
+                // Subscribe to Clock transport changes - store ID for cleanup
+                transportListenerId = clock->addTransportListener([this](bool isPlaying) {
                     this->onClockTransportChanged(isPlaying);
                 });
                 
