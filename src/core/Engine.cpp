@@ -458,6 +458,19 @@ Engine::Result Engine::eval(const std::string& script) {
         return Result(false, "Lua not initialized", "Failed to initialize Lua state");
     }
     
+    // CRITICAL: Check Lua state integrity before execution
+    // This helps detect memory corruption that could cause crashes
+    lua_State* L = *lua_;
+    if (!L) {
+        ofLogError("Engine") << "Lua state is null - resetting Lua";
+        lua_.reset();
+        setupLua();
+        if (!lua_ || !lua_->isValid()) {
+            return Result(false, "Lua state corrupted", "Failed to reset Lua state after corruption detected");
+        }
+        ofLogNotice("Engine") << "Lua state reset successfully";
+    }
+    
     // Set script execution flag BEFORE any script execution begins
     // This must be set as early as possible to prevent any code path from calling
     // getState() or buildStateSnapshot() during script execution
