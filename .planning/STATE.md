@@ -3,8 +3,8 @@
 ## Current Position
 
 **Primary Milestone**: Live-Scripting System Overhaul
-**Current Phase**: 3 (Complete Lock-Free Migration)
-**Status**: 🟢 In Progress
+**Current Phase**: Phase 6 - Research & Design Lua-Engine Integration
+**Status**: 🚧 In Progress
 
 **Next Steps:**
 1. ✅ Plan Phase 1: Delete String-Based Lua Functions
@@ -12,14 +12,45 @@
 3. ✅ Plan Phase 2: Fix Notification Cascade
 4. ✅ Execute Phase 2: Add notification suppression (02-01)
 5. ✅ Plan Phase 3: Complete Lock-Free Migration
-6. ✅ Execute Phase 3: Remove unsafeStateFlags_ (03-01) - JUST COMPLETED
-7. **Next**: Proceed to Phase 4 or resume old roadmap phases 8-13
+6. ✅ Execute Phase 3: Remove unsafeStateFlags_ (03-01) - COMPLETE
+7. ⏭️ **Phase 4 SKIPPED**: Analysis showed speculative complexity for unobserved edge case
+8. ⏭️ **Phase 5 SKIPPED**: Undo system is unused infrastructure
+9. ✅ **Phase 6.01 COMPLETE**: Create DESIGN.md and implementation sub-phases
+10. **Next**: Phase 6.1 - Register Engine Global (CRITICAL blocker)
 
-**Progress**: ████████████ 100% (11/11 plans complete)
+**Next Phase:** Phase 6.1 - Register Engine Global
+
+**Progress**: █████████░░░ 80% (12/12 plans complete in design, implementation sub-phases next)
 
 ---
 
 ## Recent Progress
+
+### 2026-01-21: Phase 5 SKIPPED - Undo System Is Unused Infrastructure
+
+**Decision**: Skip Phase 5 (Remove Incomplete Undo Methods) as the undo system is not implemented or used.
+
+**Analysis Findings**:
+- No code calls `undo()` - grep found zero call sites
+- No undo UI buttons, command queue, or keyboard shortcuts (cmd+Z)
+- 6/8 commands already have full undo implementations
+- 2 stubs (RemoveModuleCommand, DisconnectCommand) are safe (log warnings, don't crash)
+- Dead infrastructure doesn't cause bugs, removing it introduces change risk
+
+**Impact**: No code changes. Undo interface preserved for potential future use.
+
+### 2026-01-21: Phase 4 SKIPPED - Analysis Shows Speculative Complexity
+
+**Decision**: Skip Phase 4 (Make initialize() Idempotent) as it adds flags for an unobserved edge case.
+
+**Analysis Findings**:
+- PatternRuntime is persistent (app-lifetime singleton), not recreated during session restore
+- `isRestored` parameter on `initialize()` already exists for this purpose
+- No crashes observed from duplicate subscriptions
+- Current issues (script sync, malloc corruption) were fixed in Phases 1-3
+- Adding `isInitialized_` and `patternTriggerListenerRegistered_` flags would be overcomplexification
+
+**Impact**: No code changes. Analysis preserved in `.planning/phases/04-make-initialize-idempotent/`.
 
 ### 2026-01-20: New Roadmap Created - Live-Scripting System Overhaul
 
@@ -27,10 +58,10 @@
 - Phase 1: Delete String-Based Lua Functions (CRITICAL) - ~10x Lua performance improvement
 - Phase 2: Fix Notification Cascade (HIGH) - Eliminate notification storms during parameter routing
 - Phase 3: Complete Lock-Free Migration (MEDIUM) - Simplify threading model
-- Phase 4: Make initialize() Idempotent (LOW) - Prevent duplicate subscriptions
-- Phase 5: Remove Incomplete Undo Methods (LOW) - Code cleanup
+- Phase 4: ~~Make initialize() Idempotent (LOW)~~ - ⏭️ SKIPPED
+- Phase 5: ~~Remove Incomplete Undo Methods (LOW)~~ - ⏭️ SKIPPED
 
-**Key Insight**: The 7.x phases were dramatically overcomplexified. The new roadmap consolidates to 5 focused phases targeting the real root causes.
+**Key Insight**: The 7.x phases were dramatically overcomplexified. The new roadmap consolidates to focused phases targeting the real root causes. Phases 4 and 5 were later skipped as speculative complexity.
 
 ### 2026-01-16: Phase 7.10.1 COMPLETE - Simplified ScriptManager Architecture
 
@@ -55,12 +86,25 @@
 ```
 Phase 1 (DELETE string Lua) → ✅ COMPLETE
     → Phase 2 (fix cascade) → ✅ COMPLETE
-    → Phase 3 (complete lockfree) → ✅ EXECUTING (03-01 COMPLETE)
-    → Phase 4-5 (cleanup)
+    → Phase 3 (complete lockfree) → ✅ COMPLETE
+    → ⏭️ Phase 4 (idempotent init) → SKIPPED
+    → ⏭️ Phase 5 (undo methods) → SKIPPED
+    → Phase 6 (design) → 🚧 IN PROGRESS (06-01 complete)
+        → Phase 6.1 (engine global) → 🔵 NOT STARTED
+        → Phase 6.2 (command routing) → 🔵 NOT STARTED
+        → Phase 6.3 (callbacks) → 🔵 NOT STARTED
     → THEN: Phases 8-13 from old roadmap can resume
 ```
 
-**Blockers**: None - ready to continue with Phase 3 or proceed to Phase 4
+**Note**: Phase 6 design complete. Implementation in sub-phases 6.1 (CRITICAL), 6.2 (HIGH), 6.3 (MEDIUM).
+
+**Blockers**: None - ready for Phase 6.1
+
+---
+
+## Roadmap Evolution
+
+- Phase 6 revised: Research & Design Lua-Engine Integration Architecture (research-first approach, 2026-01-21)
 
 ---
 
@@ -79,6 +123,12 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
 | **Notification suppression** | Compare-exchange prevents duplicate notifications during cascades | ✅ Confirmed (02-01) |
 | **Remove unsafeStateFlags_** | Simplified state detection using notification queue guard | ✅ Confirmed (03-01) |
 | **Convenience methods** | isExecutingScript/commandsBeingProcessed delegate to isInUnsafeState() | ✅ Confirmed (03-02) |
+| **Skip Phase 4 idempotency** | PatternRuntime is persistent, no observed bugs, adding flags is overcomplexification | ⏭️ Confirmed (2026-01-21) |
+| **Skip Phase 5 undo methods** | Undo system is unused infrastructure, no user demand, dead code doesn't hurt | ⏭️ Confirmed (2026-01-21) |
+| **Fire-and-forget execution** | Scripts run once via Engine::eval(), state updates async | ✅ Confirmed (06-01) |
+| **Reactive callbacks for live coding** | engine:onStateChange(fn) enables scripts to sync with external changes | ✅ Confirmed (06-01) |
+| **Engine global is CRITICAL blocker** | registerEngineGlobal() never called - must fix in Phase 6.1 | ✅ Confirmed (06-01) |
+| **AddModuleCommand needed** | Standardize module creation to match SetParameterCommand pattern | ✅ Confirmed (06-01) |
 
 ---
 
@@ -112,11 +162,13 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
 - ✅ Phase 3.02: Restored backward compatibility for 5 call sites across 4 files
 - **Result**: -60 lines of code, simplified state detection, maintained API compatibility
 
-### Immediate Work (Phase 3)
+### Immediate Work (Phases 1-3 Complete, 4-5 Skipped)
 - ✅ Plan Phase 3: Complete Lock-Free Migration (03-01-PLAN.md created)
 - ✅ Execute Phase 3: Remove unsafeStateFlags_ (03-01-PLAN.md executed)
 - ✅ Execute Phase 3: Add convenience methods (03-02-PLAN.md executed)
-- **Next**: Proceed to Phase 4 or resume old roadmap phases 8-13
+- ⏭️ Phase 4: Skipped - no code changes, speculative complexity for unobserved edge case
+- ⏭️ Phase 5: Skipped - undo system is unused infrastructure
+- **Next**: Resume old roadmap phases 8-13 (PatternRuntime completion, Engine API simplification, etc.)
 
 ---
 
@@ -132,4 +184,4 @@ None currently.
 
 ---
 
-*Last updated: 2026-01-21 (Phase 3 complete - all cleanup done)*
+*Last updated: 2026-01-21 (Phase 6.01 complete - DESIGN.md and implementation sub-phases created)*
