@@ -111,21 +111,31 @@ static int lua_clock_stop(lua_State* L) {
 
 // Lua C function: Clock:pause()
 static int lua_clock_pause(lua_State* L) {
-    Clock* clock = lua_clock_checkAndGet(L);
-    if (!clock) {
-        return luaL_error(L, "Invalid clock - see logs for details");
+    if (!g_engine) {
+        return luaL_error(L, "Engine not available for clock operation");
     }
-    clock->pause();
+
+    ofLogNotice("LuaGlobals") << "lua_clock_pause: Enqueueing PauseTransportCommand";
+
+    auto cmd = std::make_unique<vt::PauseTransportCommand>();
+    if (!g_engine->enqueueCommand(std::move(cmd))) {
+        return luaL_error(L, "Failed to enqueue pause transport command");
+    }
     return 0;
 }
 
 // Lua C function: Clock:reset()
 static int lua_clock_reset(lua_State* L) {
-    Clock* clock = lua_clock_checkAndGet(L);
-    if (!clock) {
-        return luaL_error(L, "Invalid clock - see logs for details");
+    if (!g_engine) {
+        return luaL_error(L, "Engine not available for clock operation");
     }
-    clock->reset();
+
+    ofLogNotice("LuaGlobals") << "lua_clock_reset: Enqueueing ResetTransportCommand";
+
+    auto cmd = std::make_unique<vt::ResetTransportCommand>();
+    if (!g_engine->enqueueCommand(std::move(cmd))) {
+        return luaL_error(L, "Failed to enqueue reset transport command");
+    }
     return 0;
 }
 

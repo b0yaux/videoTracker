@@ -208,7 +208,18 @@ void ClockGUI::draw(Clock& clock) {
     
     ImGui::SameLine();
     if (ImGui::Button("Reset")) {
-        clock.reset();
+        // CRITICAL FIX: Route reset through command queue for thread safety and script sync
+        if (engine_) {
+            auto cmd = std::make_unique<vt::ResetTransportCommand>();
+            if (!engine_->enqueueCommand(std::move(cmd))) {
+                ofLogWarning("ClockGUI") << "Failed to enqueue ResetTransportCommand, falling back to direct call";
+                clock.reset();
+            }
+        } else {
+            // Fallback to direct call if engine not available (shouldn't happen in normal operation)
+            ofLogWarning("ClockGUI") << "Engine not available, using direct clock call";
+            clock.reset();
+        }
     }
 }
 
