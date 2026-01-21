@@ -1014,6 +1014,9 @@ void Engine::notifyObserversWithState() {
     lock.unlock();
     
     // Notify Lua callbacks (Phase 6.3)
+    // CRITICAL: Lua callbacks can trigger engine methods that enqueue commands
+    // These commands will be processed in the next update() cycle, not recursively
+    // This prevents stack overflow from nested notifications
     {
         std::shared_lock<std::shared_mutex> lock(stateMutex_);
         for (const auto& [id, callback] : luaCallbacks_) {
@@ -1021,6 +1024,7 @@ void Engine::notifyObserversWithState() {
                 if (callback && lua_) {
                     lua_State* L = *lua_;
                     // Callback will handle Lua stack operations
+                    // Engine methods called from Lua will enqueue commands for next cycle
                     callback(L, state);
                 }
             } catch (const std::exception& e) {
@@ -1029,7 +1033,7 @@ void Engine::notifyObserversWithState() {
         }
     }
     
-    // Remove broken observers
+    // Remove broken observers AFTER Lua callbacks to avoid iterator invalidation
     if (!brokenObservers.empty()) {
         std::unique_lock<std::shared_mutex> writeLock(stateMutex_);
         std::set<size_t> brokenIds(brokenObservers.begin(), brokenObservers.end());
