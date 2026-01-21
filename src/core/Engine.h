@@ -564,6 +564,7 @@ public:
 private:
     // Core components (already exist, just moved from ofApp)
     Clock clock_;
+    Clock::TransportListenerId transportListenerId_ = 0;  // For tracking transport state changes
     PatternRuntime patternRuntime_;  // Foundational system for pattern management
     ModuleRegistry moduleRegistry_;
     ModuleFactory moduleFactory_;
@@ -649,6 +650,13 @@ private:
     // Still needed: Yes - Prevents recursive notification crashes
     // Can be simplified: No - Guard pattern is necessary
     std::atomic<bool> notifyingObservers_{false};
+
+    // Transport state change tracker for script execution
+    // Purpose: Tracks transport start/stop events that occur during script execution
+    // When used: Transport listener sets this flag when clock:start/stop() is called from Lua
+    // Why needed: updateStateSnapshot() skips updates during script execution, so we need
+    // to defer the notification until after script completes
+    std::atomic<bool> transportStateChangedDuringScript_{false};
     
     // Command statistics (for debugging)
     struct CommandStats {

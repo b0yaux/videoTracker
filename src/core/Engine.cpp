@@ -180,6 +180,29 @@ void Engine::setupMasterOutputs() {
     
     // Subscribe to Clock BPM changes (proper event-based architecture)
     ofAddListener(clock_.bpmChangedEvent, this, &Engine::onBPMChanged);
+    
+    // Subscribe to Clock transport changes (start/stop/pause)
+    // This ensures state is updated when clock:start() is called from Lua
+    transportListenerId_ = clock_.addTransportListener([this](bool playing) {
+        if (playing) {
+            ofLogNotice("Engine") << "Transport started via Clock callback";
+        } else {
+            ofLogNotice("Engine") << "Transport stopped via Clock callback";
+        }
+        
+        // Track transport state changes during script execution
+        // This is needed because updateStateSnapshot() skips updates while script is executing
+        // The flag will be checked at the end of eval() to trigger a deferred notification
+        if (notifyingObservers_.load(std::memory_order_acquire)) {
+            ofLogVerbose("Engine") << "Transport changed during script execution - deferring notification";
+            transportStateChangedDuringScript_.store(true, std::memory_order_release);
+            return;  // Don't enqueue now - will be handled after script completes
+        }
+        
+        // Trigger state notification so observers know playing state changed
+        enqueueStateNotification();
+    });
+    ofLogNotice("Engine") << "Transport listener registered (id: " << transportListenerId_ << ")";
 }
 
 void Engine::setupCommandExecutor() {
@@ -474,6 +497,14 @@ Engine::Result Engine::eval(const std::string& script) {
         // Clear script execution flag before returning
         notifyingObservers_.store(false, std::memory_order_release);
         
+        // Check if transport state changed during script execution
+        // If so, trigger a deferred notification to update observers with the new playing state
+        bool transportChanged = transportStateChangedDuringScript_.exchange(false, std::memory_order_acq_rel);
+        if (transportChanged) {
+            ofLogVerbose("Engine") << "Deferred transport state change detected - triggering notification after script";
+            enqueueStateNotification();
+        }
+        
         // State notifications will happen automatically when commands are processed
         // No need to manually trigger them here
         if (success) {
@@ -510,11 +541,27 @@ Engine::Result Engine::eval(const std::string& script) {
     } catch (const std::exception& e) {
         // Clear flag on exception
         notifyingObservers_.store(false, std::memory_order_release);
+        
+        // Check if transport state changed during script execution (even on error)
+        bool transportChanged = transportStateChangedDuringScript_.exchange(false, std::memory_order_acq_rel);
+        if (transportChanged) {
+            ofLogVerbose("Engine") << "Deferred transport state change detected (exception path) - triggering notification";
+            enqueueStateNotification();
+        }
+        
         ofLogError("Engine") << "Script execution exception: " << e.what();
         return Result(false, "Script execution failed", "C++ exception: " + std::string(e.what()));
     } catch (...) {
         // Clear flag on unknown exception
         notifyingObservers_.store(false, std::memory_order_release);
+        
+        // Check if transport state changed during script execution (even on error)
+        bool transportChanged = transportStateChangedDuringScript_.exchange(false, std::memory_order_acq_rel);
+        if (transportChanged) {
+            ofLogVerbose("Engine") << "Deferred transport state change detected (unknown exception path) - triggering notification";
+            enqueueStateNotification();
+        }
+        
         ofLogError("Engine") << "Script execution unknown exception";
         return Result(false, "Script execution failed", "Unknown error occurred during script execution");
     }
@@ -1105,6 +1152,11 @@ void Engine::enqueueStateNotification() {
         // This ensures state snapshot reflects processed commands before observers are notified
         // State version increments in updateStateSnapshot(), ensuring observers see fresh state
         updateStateSnapshot();
+        
+        // ALSO update the immutable state snapshot (EngineState)
+        // This is needed because getState() returns immutableStateSnapshot_, not snapshotJson_
+        // Both snapshots need to be in sync for state to be consistent
+        updateImmutableStateSnapshot();
         
         // Add memory barrier to ensure snapshot update is visible to observers
         std::atomic_thread_fence(std::memory_order_release);

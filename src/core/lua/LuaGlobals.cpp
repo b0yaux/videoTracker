@@ -1,11 +1,13 @@
 #include "LuaGlobals.h"
 #include "core/Engine.h"
+#include "core/Command.h"
 #include "utils/Clock.h"
 #include "core/ModuleRegistry.h"
 #include "core/ConnectionManager.h"
 #include "core/ParameterRouter.h"
 #include "core/PatternRuntime.h"
 #include <lua.hpp>
+#include <memory>
 #include <string>
 
 namespace vt {
@@ -26,61 +28,92 @@ Engine* getGlobalEngine() {
 // CLOCK LUA BINDINGS
 // ═══════════════════════════════════════════════════════════
 
-// Lua C function: Clock:setBPM(float)
-static int lua_clock_setBPM(lua_State* L) {
-    void* userdata = lua_touserdata(L, 1);
+// Helper function to safely extract Clock pointer from userdata
+// Returns nullptr on failure, logs detailed error
+static Clock* lua_clock_checkAndGet(lua_State* L, int arg = 1) {
+    void* userdata = lua_touserdata(L, arg);
     if (!userdata) {
-        return luaL_error(L, "Invalid clock userdata");
+        ofLogError("LuaGlobals") << "lua_clock_checkAndGet: Argument " << arg << " is nil userdata";
+        return nullptr;
     }
+    
+    // Type check: verify this is a vt_Clock userdata
+    if (!lua_getmetatable(L, arg)) {
+        ofLogError("LuaGlobals") << "lua_clock_checkAndGet: Argument " << arg << " has no metatable";
+        return nullptr;
+    }
+    luaL_getmetatable(L, "vt_Clock");
+    bool isClock = lua_rawequal(L, -1, -2);
+    lua_pop(L, 2);  // Pop both metatables
+    
+    if (!isClock) {
+        ofLogError("LuaGlobals") << "lua_clock_checkAndGet: Argument " << arg << " is not a Clock (wrong metatable)";
+        return nullptr;
+    }
+    
     Clock* clock = *static_cast<Clock**>(userdata);
     if (!clock) {
-        return luaL_error(L, "Clock has been destroyed");
+        ofLogError("LuaGlobals") << "lua_clock_checkAndGet: Clock pointer is null (destroyed?)";
+        return nullptr;
     }
+    
+    return clock;
+}
+
+// Lua C function: Clock:setBPM(float)
+static int lua_clock_setBPM(lua_State* L) {
+    if (!g_engine) {
+        return luaL_error(L, "Engine not available for clock operation");
+    }
+
     if (lua_isnumber(L, 2)) {
         float bpm = static_cast<float>(lua_tonumber(L, 2));
-        clock->setBPM(bpm);
+        ofLogNotice("LuaGlobals") << "lua_clock_setBPM: Enqueueing SetBPMCommand with BPM " << bpm;
+
+        auto cmd = std::make_unique<vt::SetBPMCommand>(bpm);
+        if (!g_engine->enqueueCommand(std::move(cmd))) {
+            return luaL_error(L, "Failed to enqueue BPM command");
+        }
         return 0;
     }
-    return luaL_error(L, "Invalid arguments to setBPM");
+    return luaL_error(L, "Invalid arguments to setBPM - expected number");
 }
 
 // Lua C function: Clock:start()
 static int lua_clock_start(lua_State* L) {
-    void* userdata = lua_touserdata(L, 1);
-    if (!userdata) {
-        return luaL_error(L, "Invalid clock userdata");
+    if (!g_engine) {
+        return luaL_error(L, "Engine not available for clock operation");
     }
-    Clock* clock = *static_cast<Clock**>(userdata);
-    if (!clock) {
-        return luaL_error(L, "Clock has been destroyed");
+
+    ofLogNotice("LuaGlobals") << "lua_clock_start: Enqueueing StartTransportCommand";
+
+    auto cmd = std::make_unique<vt::StartTransportCommand>();
+    if (!g_engine->enqueueCommand(std::move(cmd))) {
+        return luaL_error(L, "Failed to enqueue start transport command");
     }
-    clock->start();
     return 0;
 }
 
 // Lua C function: Clock:stop()
 static int lua_clock_stop(lua_State* L) {
-    void* userdata = lua_touserdata(L, 1);
-    if (!userdata) {
-        return luaL_error(L, "Invalid clock userdata");
+    if (!g_engine) {
+        return luaL_error(L, "Engine not available for clock operation");
     }
-    Clock* clock = *static_cast<Clock**>(userdata);
-    if (!clock) {
-        return luaL_error(L, "Clock has been destroyed");
+
+    ofLogNotice("LuaGlobals") << "lua_clock_stop: Enqueueing StopTransportCommand";
+
+    auto cmd = std::make_unique<vt::StopTransportCommand>();
+    if (!g_engine->enqueueCommand(std::move(cmd))) {
+        return luaL_error(L, "Failed to enqueue stop transport command");
     }
-    clock->stop();
     return 0;
 }
 
 // Lua C function: Clock:pause()
 static int lua_clock_pause(lua_State* L) {
-    void* userdata = lua_touserdata(L, 1);
-    if (!userdata) {
-        return luaL_error(L, "Invalid clock userdata");
-    }
-    Clock* clock = *static_cast<Clock**>(userdata);
+    Clock* clock = lua_clock_checkAndGet(L);
     if (!clock) {
-        return luaL_error(L, "Clock has been destroyed");
+        return luaL_error(L, "Invalid clock - see logs for details");
     }
     clock->pause();
     return 0;
@@ -88,13 +121,9 @@ static int lua_clock_pause(lua_State* L) {
 
 // Lua C function: Clock:reset()
 static int lua_clock_reset(lua_State* L) {
-    void* userdata = lua_touserdata(L, 1);
-    if (!userdata) {
-        return luaL_error(L, "Invalid clock userdata");
-    }
-    Clock* clock = *static_cast<Clock**>(userdata);
+    Clock* clock = lua_clock_checkAndGet(L);
     if (!clock) {
-        return luaL_error(L, "Clock has been destroyed");
+        return luaL_error(L, "Invalid clock - see logs for details");
     }
     clock->reset();
     return 0;
@@ -102,29 +131,25 @@ static int lua_clock_reset(lua_State* L) {
 
 // Lua C function: Clock:isPlaying() -> boolean
 static int lua_clock_isPlaying(lua_State* L) {
-    void* userdata = lua_touserdata(L, 1);
-    if (!userdata) {
-        return luaL_error(L, "Invalid clock userdata");
-    }
-    Clock* clock = *static_cast<Clock**>(userdata);
+    Clock* clock = lua_clock_checkAndGet(L);
     if (!clock) {
-        return luaL_error(L, "Clock has been destroyed");
+        return luaL_error(L, "Invalid clock - see logs for details");
     }
-    lua_pushboolean(L, clock->isPlaying());
+    bool playing = clock->isPlaying();
+    ofLogNotice("LuaGlobals") << "lua_clock_isPlaying: Returning " << playing;
+    lua_pushboolean(L, playing);
     return 1;
 }
 
 // Lua C function: Clock:getBPM() -> float
 static int lua_clock_getBPM(lua_State* L) {
-    void* userdata = lua_touserdata(L, 1);
-    if (!userdata) {
-        return luaL_error(L, "Invalid clock userdata");
-    }
-    Clock* clock = *static_cast<Clock**>(userdata);
+    Clock* clock = lua_clock_checkAndGet(L);
     if (!clock) {
-        return luaL_error(L, "Clock has been destroyed");
+        return luaL_error(L, "Invalid clock - see logs for details");
     }
-    lua_pushnumber(L, clock->getBPM());
+    float bpm = clock->getBPM();
+    ofLogNotice("LuaGlobals") << "lua_clock_getBPM: Returning " << bpm;
+    lua_pushnumber(L, bpm);
     return 1;
 }
 
@@ -168,35 +193,80 @@ static void registerClockMetatable(lua_State* L) {
 
 // Lua C function to get clock from engine userdata
 static int lua_engine_getClock(lua_State* L) {
+    // SAFETY: Verify metatable type to prevent memory corruption
     void* userdata = lua_touserdata(L, 1);
     if (!userdata) {
-        return luaL_error(L, "Invalid engine userdata");
+        return luaL_error(L, "getClock: Invalid engine userdata (null)");
     }
+    
+    // Type check: verify this is actually a vt_Engine userdata
+    if (!lua_getmetatable(L, 1)) {
+        return luaL_error(L, "getClock: Engine userdata has no metatable");
+    }
+    luaL_getmetatable(L, "vt_Engine");
+    bool isEngine = lua_rawequal(L, -1, -2);
+    lua_pop(L, 2);  // Pop both metatables
+    
+    if (!isEngine) {
+        return luaL_error(L, "getClock: First argument is not an Engine (wrong metatable)");
+    }
+    
     Engine* engine = *static_cast<Engine**>(userdata);
     if (!engine) {
-        return luaL_error(L, "Engine has been destroyed");
+        return luaL_error(L, "getClock: Engine has been destroyed");
     }
-    // Create userdata for Clock pointer with proper metatable
+    
+    // Get clock reference and validate
     Clock* clock = &engine->getClock();
-        Clock** clockPtr = static_cast<Clock**>(lua_newuserdata(L, sizeof(Clock*)));
-        *clockPtr = clock;
+    if (!clock) {
+        return luaL_error(L, "getClock: Clock is null");
+    }
+    
+    // Additional validation: check BPM is in valid range (detect corruption)
+    float bpm = clock->getBPM();
+    if (bpm < 1.0f || bpm > 1000.0f) {
+        ofLogWarning("LuaGlobals") << "getClock: Suspicious BPM value " << bpm 
+                                    << " (clock ptr: " << clock << ", engine ptr: " << engine << ")";
+    }
+    
+    // Create userdata for Clock pointer with proper metatable
+    Clock** clockPtr = static_cast<Clock**>(lua_newuserdata(L, sizeof(Clock*)));
+    *clockPtr = clock;
 
-        // Set the metatable for this userdata
-        luaL_getmetatable(L, "vt_Clock");
-        lua_setmetatable(L, -2);
+    // Set the metatable for this userdata
+    luaL_getmetatable(L, "vt_Clock");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return luaL_error(L, "getClock: vt_Clock metatable not registered");
+    }
+    lua_setmetatable(L, -2);
 
-        return 1;
+    return 1;
 }
 
 // Lua C function to execute command via engine
 static int lua_engine_executeCommand(lua_State* L) {
+    // SAFETY: Verify metatable type to prevent memory corruption
     void* userdata = lua_touserdata(L, 1);
     if (!userdata) {
-        return luaL_error(L, "Invalid engine userdata");
+        return luaL_error(L, "executeCommand: Invalid engine userdata (null)");
     }
+    
+    // Type check: verify this is actually a vt_Engine userdata
+    if (!lua_getmetatable(L, 1)) {
+        return luaL_error(L, "executeCommand: Engine userdata has no metatable");
+    }
+    luaL_getmetatable(L, "vt_Engine");
+    bool isEngine = lua_rawequal(L, -1, -2);
+    lua_pop(L, 2);  // Pop both metatables
+    
+    if (!isEngine) {
+        return luaL_error(L, "executeCommand: First argument is not an Engine (wrong metatable)");
+    }
+    
     Engine* engine = *static_cast<Engine**>(userdata);
     if (!engine) {
-        return luaL_error(L, "Engine has been destroyed");
+        return luaL_error(L, "executeCommand: Engine has been destroyed");
     }
     if (lua_isstring(L, 2)) {
         const char* cmd = lua_tostring(L, 2);
@@ -220,6 +290,47 @@ static int lua_engine_executeCommand(lua_State* L) {
     return 1;
 }
 
+// ═══════════════════════════════════════════════════════════
+// LUA HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════
+
+// Helper function to batch parameter updates from a Lua table
+// Returns the number of parameters processed
+static int applyBatchedParameters(Engine* engine, const std::string& moduleName, lua_State* L, int tableIndex) {
+    if (!lua_istable(L, tableIndex)) {
+        return 0;
+    }
+    
+    std::vector<std::pair<std::string, float>> params;
+    
+    lua_pushnil(L);
+    while (lua_next(L, tableIndex) != 0) {
+        const char* key = lua_tostring(L, -2);
+        float value = static_cast<float>(lua_tonumber(L, -1));
+        if (key) {
+            params.push_back({std::string(key), value});
+        }
+        lua_pop(L, 1);
+    }
+    
+    if (params.empty()) {
+        return 0;
+    }
+    
+    // Build a single batched command: "set moduleName key1=value1 key2=value2 ..."
+    std::string cmd = "set " + moduleName;
+    for (const auto& [key, value] : params) {
+        cmd += " " + key + "=" + std::to_string(value);
+    }
+    
+    auto result = engine->executeCommand(cmd);
+    if (!result.success) {
+        ofLogWarning("LuaGlobals") << "Failed to batch set parameters for " << moduleName << ": " << result.error;
+    }
+    
+    return static_cast<int>(params.size());
+}
+
 // Lua C function: audioOut(name) or audioOut(name, configTable)
 // Creates or configures an audio output module
 static int lua_audioOut(lua_State* L) {
@@ -240,15 +351,11 @@ static int lua_audioOut(lua_State* L) {
         g_engine->executeCommand(cmd);
     }
     
-    // If config table is provided, apply parameters
+    // If config table is provided, apply parameters (batched)
     if (lua_istable(L, 2)) {
-        lua_pushnil(L);  // First key
-        while (lua_next(L, 2) != 0) {
-            const char* key = lua_tostring(L, -2);
-            float value = static_cast<float>(lua_tonumber(L, -1));
-            std::string cmd = "set " + moduleName + " " + key + " " + std::to_string(value);
-            g_engine->executeCommand(cmd);
-            lua_pop(L, 1);  // Remove value, keep key for next iteration
+        int count = applyBatchedParameters(g_engine, moduleName, L, 2);
+        if (count > 0) {
+            ofLogNotice("LuaGlobals") << "audioOut: Batched " << count << " parameters for " << moduleName;
         }
     }
     
@@ -277,15 +384,11 @@ static int lua_videoOut(lua_State* L) {
         g_engine->executeCommand(cmd);
     }
     
-    // If config table is provided, apply parameters
+    // If config table is provided, apply parameters (batched)
     if (lua_istable(L, 2)) {
-        lua_pushnil(L);  // First key
-        while (lua_next(L, 2) != 0) {
-            const char* key = lua_tostring(L, -2);
-            float value = static_cast<float>(lua_tonumber(L, -1));
-            std::string cmd = "set " + moduleName + " " + key + " " + std::to_string(value);
-            g_engine->executeCommand(cmd);
-            lua_pop(L, 1);  // Remove value, keep key for next iteration
+        int count = applyBatchedParameters(g_engine, moduleName, L, 2);
+        if (count > 0) {
+            ofLogNotice("LuaGlobals") << "videoOut: Batched " << count << " parameters for " << moduleName;
         }
     }
     
@@ -314,15 +417,11 @@ static int lua_oscilloscope(lua_State* L) {
         g_engine->executeCommand(cmd);
     }
     
-    // If config table is provided, apply parameters
+    // If config table is provided, apply parameters (batched)
     if (lua_istable(L, 2)) {
-        lua_pushnil(L);
-        while (lua_next(L, 2) != 0) {
-            const char* key = lua_tostring(L, -2);
-            float value = static_cast<float>(lua_tonumber(L, -1));
-            std::string cmd = "set " + moduleName + " " + key + " " + std::to_string(value);
-            g_engine->executeCommand(cmd);
-            lua_pop(L, 1);
+        int count = applyBatchedParameters(g_engine, moduleName, L, 2);
+        if (count > 0) {
+            ofLogNotice("LuaGlobals") << "oscilloscope: Batched " << count << " parameters for " << moduleName;
         }
     }
     
@@ -349,15 +448,11 @@ static int lua_spectrogram(lua_State* L) {
         g_engine->executeCommand(cmd);
     }
     
-    // If config table is provided, apply parameters
+    // If config table is provided, apply parameters (batched)
     if (lua_istable(L, 2)) {
-        lua_pushnil(L);
-        while (lua_next(L, 2) != 0) {
-            const char* key = lua_tostring(L, -2);
-            float value = static_cast<float>(lua_tonumber(L, -1));
-            std::string cmd = "set " + moduleName + " " + key + " " + std::to_string(value);
-            g_engine->executeCommand(cmd);
-            lua_pop(L, 1);
+        int count = applyBatchedParameters(g_engine, moduleName, L, 2);
+        if (count > 0) {
+            ofLogNotice("LuaGlobals") << "spectrogram: Batched " << count << " parameters for " << moduleName;
         }
     }
     
@@ -384,15 +479,11 @@ static int lua_sampler(lua_State* L) {
         g_engine->executeCommand(cmd);
     }
     
-    // If config table is provided, apply parameters
+    // If config table is provided, apply parameters (batched)
     if (lua_istable(L, 2)) {
-        lua_pushnil(L);
-        while (lua_next(L, 2) != 0) {
-            const char* key = lua_tostring(L, -2);
-            float value = static_cast<float>(lua_tonumber(L, -1));
-            std::string cmd = "set " + moduleName + " " + key + " " + std::to_string(value);
-            g_engine->executeCommand(cmd);
-            lua_pop(L, 1);
+        int count = applyBatchedParameters(g_engine, moduleName, L, 2);
+        if (count > 0) {
+            ofLogNotice("LuaGlobals") << "sampler: Batched " << count << " parameters for " << moduleName;
         }
     }
     
@@ -419,15 +510,11 @@ static int lua_sequencer(lua_State* L) {
         g_engine->executeCommand(cmd);
     }
     
-    // If config table is provided, apply parameters
+    // If config table is provided, apply parameters (batched)
     if (lua_istable(L, 2)) {
-        lua_pushnil(L);
-        while (lua_next(L, 2) != 0) {
-            const char* key = lua_tostring(L, -2);
-            float value = static_cast<float>(lua_tonumber(L, -1));
-            std::string cmd = "set " + moduleName + " " + key + " " + std::to_string(value);
-            g_engine->executeCommand(cmd);
-            lua_pop(L, 1);
+        int count = applyBatchedParameters(g_engine, moduleName, L, 2);
+        if (count > 0) {
+            ofLogNotice("LuaGlobals") << "sequencer: Batched " << count << " parameters for " << moduleName;
         }
     }
     
@@ -545,11 +632,15 @@ void registerEngineGlobal(void* luaState) {
     lua_State* L = static_cast<lua_State*>(luaState);
     
     if (!L || !g_engine) {
+        ofLogError("LuaGlobals") << "registerEngineGlobal: L or g_engine is null";
         return;
     }
     
+    ofLogNotice("LuaGlobals") << "registerEngineGlobal: Registering engine global (ptr: " << g_engine << ")";
+    
     // Register Clock metatable first (before creating clock userdata)
     registerClockMetatable(L);
+    ofLogNotice("LuaGlobals") << "registerEngineGlobal: Clock metatable registered";
     
     // Register helper functions as globals
     registerHelperFunctions(L);
@@ -557,9 +648,11 @@ void registerEngineGlobal(void* luaState) {
     // Create userdata for engine pointer
     void* userdata = lua_newuserdata(L, sizeof(Engine*));
     *reinterpret_cast<Engine**>(userdata) = g_engine;
+    ofLogNotice("LuaGlobals") << "registerEngineGlobal: Created engine userdata at " << userdata;
     
     // Create and set metatable for engine userdata
     luaL_newmetatable(L, "vt_Engine");
+    ofLogNotice("LuaGlobals") << "registerEngineGlobal: Created vt_Engine metatable";
     
     // Add __index method that returns functions
     lua_pushcfunction(L, lua_engine_getClock);
@@ -574,9 +667,11 @@ void registerEngineGlobal(void* luaState) {
     
     // Set metatable for userdata
     lua_setmetatable(L, -2);
+    ofLogNotice("LuaGlobals") << "registerEngineGlobal: Set metatable for engine userdata";
     
     // Set as global "engine"
     lua_setglobal(L, "engine");
+    ofLogNotice("LuaGlobals") << "registerEngineGlobal: Engine global registered successfully";
 }
 
 } // namespace lua

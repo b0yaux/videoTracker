@@ -996,7 +996,9 @@ void CommandExecutor::cmdGetParam(const std::string& args) {
 void CommandExecutor::cmdSetParam(const std::string& args) {
     if (args.empty()) {
         output("Usage: set <module> <parameter> <value>");
+        output("       set <module> <key1>=<value1> [<key2>=<value2> ...]");
         output("Example: set pool1 volume 0.8");
+        output("Example: set pool1 volume=0.8 pan=0.5");
         return;
     }
     
@@ -1006,14 +1008,11 @@ void CommandExecutor::cmdSetParam(const std::string& args) {
     }
     
     std::istringstream iss(args);
-    std::string moduleName, paramName, valueStr;
+    std::string moduleName;
     iss >> moduleName;
-    iss >> paramName;
-    iss >> valueStr;
     
-    if (moduleName.empty() || paramName.empty() || valueStr.empty()) {
-        output("Error: Module, parameter, and value required");
-        output("Usage: set <module> <parameter> <value>");
+    if (moduleName.empty()) {
+        output("Error: Module name required");
         return;
     }
     
@@ -1023,20 +1022,74 @@ void CommandExecutor::cmdSetParam(const std::string& args) {
         return;
     }
     
+    // Check remaining args for batched format (key=value pairs)
+    std::string remaining;
+    std::getline(iss, remaining);
+    remaining = trim(remaining);
+    
+    // If remaining contains '=', it's batched format: key1=value1 key2=value2 ...
+    if (!remaining.empty() && remaining.find('=') != std::string::npos) {
+        // Batched format: set module key1=value1 key2=value2 ...
+        std::istringstream batchIss(remaining);
+        std::string pair;
+        int count = 0;
+        
+        while (batchIss >> pair) {
+            size_t eqPos = pair.find('=');
+            if (eqPos == std::string::npos) {
+                output("Warning: Invalid key=value pair: '%s'", pair.c_str());
+                continue;
+            }
+            
+            std::string paramName = pair.substr(0, eqPos);
+            std::string valueStr = pair.substr(eqPos + 1);
+            
+            if (paramName.empty() || valueStr.empty()) {
+                output("Warning: Empty key or value in: '%s'", pair.c_str());
+                continue;
+            }
+            
+            try {
+                float value = std::stof(valueStr);
+                auto cmd = std::make_unique<vt::SetParameterCommand>(moduleName, paramName, value);
+                if (engine_ && engine_->enqueueCommand(std::move(cmd))) {
+                    count++;
+                } else {
+                    // Fallback: direct access
+                    module->setParameter(paramName, value);
+                    count++;
+                }
+            } catch (const std::exception& e) {
+                output("Error setting %s: %s", paramName.c_str(), e.what());
+            }
+        }
+        
+        if (count > 0) {
+            output("Set %d parameter(s) on %s", count, moduleName.c_str());
+        }
+        return;
+    }
+    
+    // Original format: set module param value
+    std::string paramName, valueStr;
+    iss >> paramName;
+    iss >> valueStr;
+    
+    if (paramName.empty() || valueStr.empty()) {
+        output("Error: Parameter and value required");
+        output("Usage: set <module> <parameter> <value>");
+        return;
+    }
+    
     try {
         float value = std::stof(valueStr);
-        
-        // CRITICAL FIX: Use command queue for thread safety
-        // Direct parameter access from CommandExecutor (main thread) is unsafe
-        // when audio thread is processing
         auto cmd = std::make_unique<vt::SetParameterCommand>(moduleName, paramName, value);
         if (engine_ && engine_->enqueueCommand(std::move(cmd))) {
             output("%s.%s = %.4f", moduleName.c_str(), paramName.c_str(), value);
         } else {
-            // Fallback: direct access (only if command queue unavailable)
-            // This should rarely happen, but provides backward compatibility
-        module->setParameter(paramName, value);
-        output("%s.%s = %.4f", moduleName.c_str(), paramName.c_str(), value);
+            // Fallback: direct access
+            module->setParameter(paramName, value);
+            output("%s.%s = %.4f", moduleName.c_str(), paramName.c_str(), value);
         }
     } catch (const std::exception& e) {
         output("Error: %s", e.what());

@@ -410,4 +410,90 @@ Plans:
 
 ---
 
-*Last updated: 2026-01-21 (Phase 6.3 complete - Reactive Callback API implemented, all sub-phases complete)*
+## Phase 7: Fix Command Queue Architecture (CRITICAL)
+
+**Goal:** Replace SPSC queue with MPMC, unify on command pattern, fix infinite re-execution loop, and simplify state guards.
+
+**Depends on:** Phase 6.3
+
+**Plans:** 5 plans (4 required + 1 optional)
+
+**Status**: 🟡 Planned (Ready for Execution)
+
+**Context:**
+Analysis identified 5 critical architectural issues with the command queue system:
+
+| Issue | Severity | Fix Effort | Impact |
+|-------|----------|------------|--------|
+| Wrong queue type (SPSC vs MPMC) | CRITICAL | Medium | Unpredictable failures |
+| Mixed sync/async patterns | HIGH | High | Race conditions |
+| Infinite re-execution loop | HIGH | Low | CPU waste, spam |
+| Flag overloading | MEDIUM | Medium | Deadlock potential |
+| Defensive code complexity | MEDIUM | High | Maintainability |
+
+### Phase 7.1: Replace SPSC Queue with MPMC Queue (CRITICAL)
+**Effort:** 30 minutes | **Risk:** LOW
+
+Replace `moodycamel::ReaderWriterQueue` with `moodycamel::ConcurrentQueue`:
+- Current queue is SPSC (Single Producer Single Consumer)
+- Codebase has 6+ producers - this is undefined behavior
+- ConcurrentQueue is MPMC and already in codebase
+- API is compatible - simple drop-in replacement
+
+**Files:** `src/core/Engine.h`
+
+### Phase 7.2: Add Missing Command Types (HIGH)
+**Effort:** 30 minutes | **Risk:** LOW
+
+Add `PauseTransportCommand` and `ResetTransportCommand`:
+- `pause()` and `reset()` currently bypass command queue
+- `start()` and `stop()` already have commands
+- Follows existing command pattern
+
+**Files:** `src/core/Command.h`, `src/core/Command.cpp`
+
+### Phase 7.3: Route Direct Calls Through Commands (HIGH)
+**Effort:** 30 minutes | **Risk:** LOW
+
+Replace direct clock calls with commands:
+- `LuaGlobals.cpp:118` - `clock->pause()` → `PauseTransportCommand`
+- `LuaGlobals.cpp:128` - `clock->reset()` → `ResetTransportCommand`
+- `ClockGUI.cpp:211` - `clock.reset()` → `ResetTransportCommand`
+
+**Files:** `src/core/lua/LuaGlobals.cpp`, `src/gui/ClockGUI.cpp`
+
+### Phase 7.4: Add Script Execution Tracking (HIGH)
+**Effort:** 1 hour | **Risk:** MEDIUM
+
+Prevent infinite retry of failing scripts:
+- Add `ScriptExecutionTracker` struct with hash-based tracking
+- Skip re-execution of same failing script
+- Configurable cooldown (default: 3 retries, 2s cooldown)
+
+**Files:** `src/shell/CodeShell.h`, `src/shell/CodeShell.cpp`
+
+### Phase 7.5: Simplify State Guards (OPTIONAL - DEFERRED)
+**Effort:** 3 hours | **Risk:** HIGHER
+
+Document and potentially consolidate synchronization flags:
+- Currently 6+ overlapping flags
+- Higher risk of introducing bugs
+- Benefits are maintainability, not functionality
+- **Recommendation:** Complete 7.1-7.4 first, evaluate later
+
+**Files:** `src/core/Engine.h`, `src/core/Engine.cpp`
+
+---
+
+**Plans:**
+- [ ] 07-01-PLAN.md — Replace SPSC Queue with MPMC Queue
+- [ ] 07-02-PLAN.md — Add Missing Command Types (Pause/Reset)
+- [ ] 07-03-PLAN.md — Route Direct Calls Through Commands
+- [ ] 07-04-PLAN.md — Add Script Execution Tracking
+- [ ] 07-05-PLAN.md — Simplify State Guards (OPTIONAL)
+
+**Estimated Total Effort:** 2.5 hours (required phases only)
+
+---
+
+*Last updated: 2026-01-21 (Phase 7 planning complete - 5 plans created)*

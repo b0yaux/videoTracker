@@ -21,9 +21,11 @@
 12. ✅ **Phase 6.3 COMPLETE**: Add Reactive Callback API (engine:onStateChange)
 13. **Next**: Resume old roadmap Phases 8-13
 
-**Next Phase:** Phase 8 (Complete PatternRuntime) or Phase 6.4 (if additional Lua features needed)
+**Next Phase:** Phase 7 (Fix Command Queue Architecture - CRITICAL) - PLANNED
 
-**Progress**: ████████████░░ 100% (16/16 plans complete)
+**Progress**: ████████████░░ 100% (16/16 plans complete for Phases 1-6)
+
+**Phase 7 Status:** 🟡 Planned (5 sub-plans created, ready for execution)
 
 ---
 
@@ -185,14 +187,15 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
     → THEN: Phases 8-13 from old roadmap can resume
 ```
 
-**Note**: Phase 6.3 complete. Reactive callback API implemented with engine:onStateChange() and engine:removeStateChangeCallback().
+**Note**: Phase 6.3 complete. Phase 7 planning complete with 5 sub-plans ready for execution.
 
-**Blockers**: None - ready for next phase
+**Blockers**: None - Phase 7 ready for execution
 
 ---
 
 ## Roadmap Evolution
 
+- Phase 7 added: Fix Command Queue Architecture (CRITICAL - SPSC→MPMC, unify command pattern, fix re-execution loop, simplify guards)
 - Phase 6 revised: Research & Design Lua-Engine Integration Architecture (research-first approach, 2026-01-21)
 
 ---
@@ -276,4 +279,4 @@ None currently.
 
 ---
 
-*Last updated: 2026-01-21 (Phase 6.3 complete - All sub-phases executed, Reactive Callback API verified)*
+*Last updated: 2026-01-21 (Phase 7 planning complete - 5 sub-plans created)*
