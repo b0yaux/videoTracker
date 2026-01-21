@@ -966,6 +966,22 @@ void Engine::notifyObserversWithState() {
     }
     lock.unlock();
     
+    // Notify Lua callbacks (Phase 6.3)
+    {
+        std::shared_lock<std::shared_mutex> lock(stateMutex_);
+        for (const auto& [id, callback] : luaCallbacks_) {
+            try {
+                if (callback && lua_) {
+                    lua_State* L = *lua_;
+                    // Callback will handle Lua stack operations
+                    callback(L, state);
+                }
+            } catch (const std::exception& e) {
+                ofLogError("Engine") << "Lua callback exception: " << e.what();
+            }
+        }
+    }
+    
     // Remove broken observers
     if (!brokenObservers.empty()) {
         std::unique_lock<std::shared_mutex> writeLock(stateMutex_);
@@ -989,6 +1005,49 @@ void Engine::notifyObserversWithState() {
     // This ensures all shells receive state updates in registration order (FIFO)
     // Shells check state version to prevent processing stale updates
     notifyAllShells(state, currentEngineVersion);
+}
+
+// ═══════════════════════════════════════════════════════════
+// LUA CALLBACK IMPLEMENTATION (Phase 6.3)
+// ═══════════════════════════════════════════════════════════
+
+size_t Engine::registerStateChangeCallback(LuaStateChangeCallback callback) {
+    if (!callback) {
+        ofLogWarning("Engine") << "registerStateChangeCallback: null callback ignored";
+        return 0;
+    }
+    
+    std::lock_guard<std::shared_mutex> lock(stateMutex_);
+    
+    // Generate unique ID (wrap-around is fine - we just need uniqueness for lifetime)
+    size_t id = ++nextObserverId_;
+    
+    luaCallbacks_.push_back({id, std::move(callback)});
+    
+    ofLogNotice("Engine") << "Registered Lua state change callback: " << id;
+    return id;
+}
+
+bool Engine::unregisterStateChangeCallback(size_t callbackId) {
+    if (callbackId == 0) {
+        return false;
+    }
+    
+    std::lock_guard<std::shared_mutex> lock(stateMutex_);
+    
+    auto it = std::find_if(luaCallbacks_.begin(), luaCallbacks_.end(),
+        [callbackId](const std::pair<size_t, LuaStateChangeCallback>& pair) {
+            return pair.first == callbackId;
+        });
+    
+    if (it != luaCallbacks_.end()) {
+        luaCallbacks_.erase(it);
+        ofLogNotice("Engine") << "Unregistered Lua state change callback: " << callbackId;
+        return true;
+    }
+    
+    ofLogWarning("Engine") << "unregisterStateChangeCallback: callback " << callbackId << " not found";
+    return false;
 }
 
 void Engine::syncEngineToEditor(std::function<void(const EngineState&)> callback) {
