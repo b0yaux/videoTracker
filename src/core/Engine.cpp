@@ -946,12 +946,16 @@ void Engine::notifyObserversWithState() {
     // - Safe even if modules/connections are deleted after observer receives state
     
     // CRITICAL: Prevent recursive notifications
+    // Use compare-exchange to atomically check and set the flag
     bool expected = false;
     if (!notifyingObservers_.compare_exchange_strong(expected, true)) {
         // Already notifying - recursive call detected, ignore it
         ofLogWarning("Engine") << "Recursive notifyObserversWithState() call detected and ignored";
         return;
     }
+    
+    // DEBUG: Log when notification starts
+    ofLogVerbose("Engine") << "notifyObserversWithState(): starting notification (notifyingObservers_ was " << expected << ")";
     
     // Ensure state version matches engine version
     // State version only increments AFTER commands are processed and snapshot is updated
@@ -1051,6 +1055,7 @@ void Engine::notifyObserversWithState() {
     
     // Release recursive notification guard
     notifyingObservers_.store(false);
+    ofLogVerbose("Engine") << "notifyObserversWithState(): completed, notifyingObservers_ cleared";
     
     // Notify all registered shells with current state and version (Phase 7.9.2 Plan 3)
     // This ensures all shells receive state updates in registration order (FIFO)
@@ -1171,18 +1176,22 @@ void Engine::enqueueStateNotification() {
 }
 
 void Engine::processNotificationQueue() {
-    // Process ALL queued notifications from notificationQueue_
-    // Called from update() (main thread event loop)
-    // Redesign: Remove rate-limiting to prevent state update timeouts
-    // Process all notifications in a single frame to ensure consistency
-
+    // CRITICAL: Process notification queue FIRST to prevent deadlock
+    // This must run before any checks that might return early
+    // Previously, this was called after notifyingObservers_ check, causing deadlock
+    
     // Update monitoring: track queue depth before processing
     size_t queueDepthBefore = notificationQueue_.size_approx();
     queueMonitorStats_.notificationQueueCurrent = queueDepthBefore;
     if (queueDepthBefore > queueMonitorStats_.notificationQueueMax) {
         queueMonitorStats_.notificationQueueMax = queueDepthBefore;
     }
-
+    
+    // DEBUG: Log when processing queue
+    if (queueDepthBefore > 0) {
+        ofLogVerbose("Engine") << "processNotificationQueue(): processing " << queueDepthBefore << " callbacks";
+    }
+    
     std::function<void()> callback;
     while (notificationQueue_.try_dequeue(callback)) {
         if (callback) {
@@ -1196,10 +1205,18 @@ void Engine::processNotificationQueue() {
             }
         }
     }
-
-    // Update monitoring: track queue depth after processing
+    
+    // DEBUG: Log when queue is empty
     size_t queueDepthAfter = notificationQueue_.size_approx();
     queueMonitorStats_.notificationQueueCurrent = queueDepthAfter;
+    
+    // CRITICAL: After processing, ensure notifyingObservers_ is false
+    // This prevents deadlock if callback forgot to clear the flag
+    bool stillNotifying = notifyingObservers_.load(std::memory_order_acquire);
+    if (stillNotifying) {
+        ofLogWarning("Engine") << "processNotificationQueue(): notifyingObservers_ still true after processing - forcing clear";
+        notifyingObservers_.store(false, std::memory_order_release);
+    }
 }
 
 void vt::Engine::notifyParameterChanged() {
