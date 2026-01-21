@@ -347,8 +347,10 @@ ScriptManager generates scripts that reference `engine:getClock()`, `engine:getM
 
 **Estimated Effort:** 30 minutes
 
+**Plans:** 1 plan
+
 Plans:
-- [ ] TBD (run /gsd-plan-phase 6.1 to break down)
+- [ ] 06.1-01-PLAN.md — Add engine global registration to Engine::setupLua()
 
 ---
 
