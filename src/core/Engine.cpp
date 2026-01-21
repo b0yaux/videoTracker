@@ -1869,9 +1869,9 @@ void vt::Engine::update(float deltaTime) {
     // Increment frame counter
     size_t frameCount = updateFrameCount_.fetch_add(1) + 1;
 
-    // CRITICAL: Process notification queue every frame
-    // Redesign: Removed first 10 frames skip - process immediately
-    // This ensures state updates happen without delay
+    // CRITICAL: Process notification queue FIRST, before any state checks
+    // This prevents deadlock where notifyingObservers_ is stuck at true
+    // and update() returns early without processing notifications
     processNotificationQueue();
 
     // Periodic queue statistics logging (after first frame)
