@@ -261,10 +261,14 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
     → Phase 3 (complete lockfree) → ✅ COMPLETE
     → ⏭️ Phase 4 (idempotent init) → SKIPPED
     → ⏭️ Phase 5 (undo methods) → SKIPPED
+    → Phase 6 (design) → 🚧 IN PROGRESS
+        → Phase 6.1 (engine global) → 🔵 NOT STARTED
+        → Phase 6.2 (command routing) → 🔵 NOT STARTED
+        → Phase 6.3 (callbacks) → 🔵 NOT STARTED
     → THEN: Phases 8-13 from old roadmap can resume
 ```
 
-**Note**: Phases 4 and 5 were skipped as speculative complexity. No observable bugs to fix - current issues (script sync, malloc corruption) resolved in Phases 1-3.
+**Note**: Phases 4 and 5 were skipped as speculative complexity. Phase 6 is design-only, implementation in sub-phases 6.1-6.3.
 
 ---
 
@@ -272,11 +276,11 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
 
 **Goal:** Research the current Lua binding architecture and design a proper long-term solution for connecting scripts to the Engine. This is a design-first phase—no implementation until the architecture is understood and documented.
 
-**Status**: 🔵 Not Started
+**Status**: 🚧 In Progress
 
 **Depends on:** Phase 3
 
-**Plans:** 1 plan
+**Plans:** 1 plan (executing)
 
 **Context:**
 Phases 1-3 fixed internal Engine problems:
@@ -318,8 +322,87 @@ But the Lua binding layer connecting scripts to the Engine remains unaddressed:
    - May spawn sub-phases (6.1, 6.2, etc.) if implementation is complex
 
 Plans:
-- [ ] 06-01-PLAN.md — Create DESIGN.md and implementation sub-phases (6.1, 6.2, 6.3)
+- [x] 06-01-PLAN.md — Create DESIGN.md and implementation sub-phases (6.1, 6.2, 6.3) ✓
 
 ---
 
-*Last updated: 2026-01-21 (Phase 6 planned - 1 plan creating DESIGN.md and sub-phases 6.1-6.3)*
+## Phase 6.1: Register Engine Global (CRITICAL)
+
+**Goal:** Fix the critical blocker preventing ANY scripts from working - register `engine` global in Lua state.
+
+**Status**: 🔵 Not Started
+
+**Depends on:** Phase 6
+
+**Context:**
+ScriptManager generates scripts that reference `engine:getClock()`, `engine:getModuleRegistry()`, etc., but `engine` global is NEVER created. The `registerEngineGlobal()` function exists in videoTracker.i but is never called from Engine::setupLua().
+
+**Work:**
+- Add engine global registration to Engine::setupLua() after line 295
+- Use SWIG_NewPointerObj() to create userdata
+- Verify scripts can access engine:* methods
+
+**Files:**
+- `src/core/Engine.cpp` - Add engine global registration
+
+**Estimated Effort:** 30 minutes
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 6.1 to break down)
+
+---
+
+## Phase 6.2: Standardize Command Routing (HIGH)
+
+**Goal:** Ensure all Lua operations route through command queue for consistent behavior.
+
+**Status**: 🔵 Not Started
+
+**Depends on:** Phase 6.1
+
+**Work:**
+1. Fix setBPM fallback to use executeCommandImmediate() instead of direct call
+2. Add AddModuleCommand to Command.h
+3. Refactor createSampler/createSequencer to use AddModuleCommand instead of string commands
+
+**Files:**
+- `src/core/lua/videoTracker.i` - Fix Clock::setBPM fallback
+- `src/core/Command.h` - Add AddModuleCommand class
+- `src/core/lua/LuaHelpers.cpp` - Use AddModuleCommand
+
+**Estimated Effort:** 2 hours
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 6.2 to break down)
+
+---
+
+## Phase 6.3: Add Reactive Callback API (MEDIUM)
+
+**Goal:** Enable scripts to receive state change notifications for live coding workflow.
+
+**Status**: 🔵 Not Started
+
+**Depends on:** Phase 6.2
+
+**Context:**
+Current architecture is one-way (Engine → ScriptManager → CodeShell). Scripts cannot receive reactive updates when state changes externally (UI, other shells). This breaks live coding workflow where scripts need to stay synced.
+
+**Work:**
+1. Add registerStateChangeCallback() and unregisterStateChangeCallback() to Engine
+2. Extend notifyObservers() to invoke Lua callbacks
+3. Expose engine:onStateChange(fn) via SWIG in videoTracker.i
+
+**Files:**
+- `src/core/Engine.h` - Add callback registration methods
+- `src/core/Engine.cpp` - Implement callback infrastructure
+- `src/core/lua/videoTracker.i` - Expose onStateChange to Lua
+
+**Estimated Effort:** 3 hours
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 6.3 to break down)
+
+---
+
+*Last updated: 2026-01-21 (Phase 6.01 complete - sub-phases 6.1, 6.2, 6.3 added)*
