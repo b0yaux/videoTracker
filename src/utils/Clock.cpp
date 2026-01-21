@@ -83,6 +83,13 @@ float Clock::getTargetBPM() const {
 //--------------------------------------------------------------
 void Clock::start() {
     if (!playing) {
+        // Guard against starting at BPM 0 (would cause division by zero)
+        if (currentBpm.load() <= 0.0f) {
+            ofLogWarning("Clock") << "Cannot start clock with BPM <= 0, using default BPM 120";
+            currentBpm.store(120.0f);
+            targetBpm.store(120.0f);
+        }
+        
         playing = true;
         // Reset accumulator
         beatAccumulator = 0.0;
@@ -90,18 +97,6 @@ void Clock::start() {
         // to get accurate sample rate from the actual audio stream
         // This ensures sample-accurate timing from the start
         ofLogNotice("Clock") << "Audio-rate clock started at BPM: " << currentBpm.load() << " (will detect SR from first buffer)";
-        
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,C\",\"location\":\"Clock.cpp:start\",\"message\":\"Clock::start() - before transport listeners\",\"data\":{\"listenerCount\":" << transportListeners.size() << "},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
         
         // Notify transport listeners with try-catch protection
         for (auto& [id, listener] : transportListeners) {
@@ -113,18 +108,6 @@ void Clock::start() {
                 ofLogError("Clock") << "Transport listener (id: " << id << ") threw unknown exception";
             }
         }
-        
-        // #region agent log
-        {
-            std::ofstream logFile("/Users/jaufre/works/of_v0.12.1_osx_release/.cursor/debug.log", std::ios::app);
-            if (logFile.is_open()) {
-                auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                logFile << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,C\",\"location\":\"Clock.cpp:start\",\"message\":\"Clock::start() - after transport listeners\",\"data\":{},\"timestamp\":" << now << "}\n";
-                logFile.flush();
-                logFile.close();
-            }
-        }
-        // #endregion
     }
 }
 
