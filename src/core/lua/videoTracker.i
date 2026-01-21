@@ -186,8 +186,10 @@ void registerEngineGlobal(lua_State* L) {
         if (engine) {
             auto cmd = std::make_unique<vt::SetBPMCommand>(bpm);
             if (!engine->enqueueCommand(std::move(cmd))) {
-                ofLogWarning("Clock") << "Failed to enqueue SetBPMCommand, falling back to direct call";
-                $self->setBPM(bpm);
+                // Fallback: execute immediately if queue is full (ensures state notifications)
+                ofLogWarning("Clock") << "Command queue full, executing SetBPMCommand immediately";
+                auto fallbackCmd = std::make_unique<vt::SetBPMCommand>(bpm);
+                engine->executeCommandImmediate(std::move(fallbackCmd));
             }
         } else {
             // Fallback to direct call if engine not available
