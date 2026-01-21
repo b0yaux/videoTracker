@@ -168,10 +168,16 @@ static void registerClockMetatable(lua_State* L) {
 
 // Lua C function to get clock from engine userdata
 static int lua_engine_getClock(lua_State* L) {
-    Engine* engine = reinterpret_cast<Engine*>(lua_touserdata(L, 1));
-    if (engine) {
-        // Create userdata for Clock pointer with proper metatable
-        Clock* clock = &engine->getClock();
+    void* userdata = lua_touserdata(L, 1);
+    if (!userdata) {
+        return luaL_error(L, "Invalid engine userdata");
+    }
+    Engine* engine = *static_cast<Engine**>(userdata);
+    if (!engine) {
+        return luaL_error(L, "Engine has been destroyed");
+    }
+    // Create userdata for Clock pointer with proper metatable
+    Clock* clock = &engine->getClock();
         Clock** clockPtr = static_cast<Clock**>(lua_newuserdata(L, sizeof(Clock*)));
         *clockPtr = clock;
 
@@ -180,14 +186,19 @@ static int lua_engine_getClock(lua_State* L) {
         lua_setmetatable(L, -2);
 
         return 1;
-    }
-    return 0;
 }
 
 // Lua C function to execute command via engine
 static int lua_engine_executeCommand(lua_State* L) {
-    Engine* engine = reinterpret_cast<Engine*>(lua_touserdata(L, 1));
-    if (engine && lua_isstring(L, 2)) {
+    void* userdata = lua_touserdata(L, 1);
+    if (!userdata) {
+        return luaL_error(L, "Invalid engine userdata");
+    }
+    Engine* engine = *static_cast<Engine**>(userdata);
+    if (!engine) {
+        return luaL_error(L, "Engine has been destroyed");
+    }
+    if (lua_isstring(L, 2)) {
         const char* cmd = lua_tostring(L, 2);
         auto result = engine->executeCommand(std::string(cmd));
         // Push result table
@@ -200,11 +211,11 @@ static int lua_engine_executeCommand(lua_State* L) {
         lua_setfield(L, -2, "error");
         return 1;
     }
-    // Return error
+    // Return error - command argument is not a string
     lua_newtable(L);
     lua_pushboolean(L, false);
     lua_setfield(L, -2, "success");
-    lua_pushstring(L, "Invalid command or engine not available");
+    lua_pushstring(L, "Command must be a string");
     lua_setfield(L, -2, "error");
     return 1;
 }
