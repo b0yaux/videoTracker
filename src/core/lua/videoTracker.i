@@ -242,8 +242,19 @@ void registerEngineGlobal(lua_State* L) {
     }
     
     void play() {
-        // Alias for start() - also routes through command queue
-        $self->start();
+        // Route through command queue like start() does
+        auto* engine = vt::lua::getGlobalEngine();
+        if (engine) {
+            auto cmd = std::make_unique<vt::StartTransportCommand>();
+            if (!engine->enqueueCommand(std::move(cmd))) {
+                ofLogWarning("Clock") << "Command queue full, executing StartTransportCommand immediately";
+                auto fallbackCmd = std::make_unique<vt::StartTransportCommand>();
+                engine->executeCommandImmediate(std::move(fallbackCmd));
+            }
+        } else {
+            ofLogWarning("Clock") << "Engine not available, using direct start() call";
+            $self->start();
+        }
     }
     
     void stop() {
@@ -267,8 +278,19 @@ void registerEngineGlobal(lua_State* L) {
     }
     
     void pause() {
-        // Pause is same as stop for now
-        $self->stop();
+        // Route through command queue like stop() does
+        auto* engine = vt::lua::getGlobalEngine();
+        if (engine) {
+            auto cmd = std::make_unique<vt::StopTransportCommand>();
+            if (!engine->enqueueCommand(std::move(cmd))) {
+                ofLogWarning("Clock") << "Command queue full, executing StopTransportCommand immediately";
+                auto fallbackCmd = std::make_unique<vt::StopTransportCommand>();
+                engine->executeCommandImmediate(std::move(fallbackCmd));
+            }
+        } else {
+            ofLogWarning("Clock") << "Engine not available, using direct stop() call";
+            $self->stop();
+        }
     }
     
     bool isPlaying() {
