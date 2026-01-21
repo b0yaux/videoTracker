@@ -263,12 +263,12 @@ Phase 1 (DELETE string Lua) → ✅ COMPLETE
     → ⏭️ Phase 5 (undo methods) → SKIPPED
     → Phase 6 (design) → ✅ COMPLETE
         → Phase 6.1 (engine global) → ✅ COMPLETE
-        → Phase 6.2 (command routing) → 🔵 NOT STARTED
+        → Phase 6.2 (command routing) → ✅ COMPLETE
         → Phase 6.3 (callbacks) → 🔵 NOT STARTED
     → THEN: Phases 8-13 from old roadmap can resume
 ```
 
-**Note**: Phase 6.1 complete. Implementation continues with 6.2 (HIGH), 6.3 (MEDIUM).
+**Note**: Phase 6.2 complete. Implementation continues with 6.3 (MEDIUM).
 
 ---
 
@@ -358,7 +358,7 @@ Plans:
 
 **Goal:** Ensure all Lua operations route through command queue for consistent behavior.
 
-**Status**: 🟡 Planned
+**Status**: ✅ Complete (2026-01-21)
 
 **Depends on:** Phase 6.1 (complete)
 
@@ -374,8 +374,10 @@ Plans:
 
 **Estimated Effort:** 1 hour
 
+**Verification:** ✅ Passed (3/3 must-haves verified)
+
 Plans:
-- [ ] 06.2-01-PLAN.md — Fix setBPM fallback, refactor createSampler/createSequencer to use AddModuleCommand
+- [x] 06.2-01-PLAN.md — Fix setBPM fallback, refactor createSampler/createSequencer to use AddModuleCommand ✓
 
 ---
 
@@ -383,12 +385,11 @@ Plans:
 
 **Goal:** Enable scripts to receive state change notifications for live coding workflow.
 
-**Status**: 🔵 Not Started
+**Status**: 🟡 Planned
 
 **Depends on:** Phase 6.2
 
-**Context:**
-Current architecture is one-way (Engine → ScriptManager → CodeShell). Scripts cannot receive reactive updates when state changes externally (UI, other shells). This breaks live coding workflow where scripts need to stay synced.
+**Plans:** 1 plan
 
 **Work:**
 1. Add registerStateChangeCallback() and unregisterStateChangeCallback() to Engine
@@ -403,7 +404,7 @@ Current architecture is one-way (Engine → ScriptManager → CodeShell). Script
 **Estimated Effort:** 3 hours
 
 Plans:
-- [ ] TBD (run /gsd-plan-phase 6.3 to break down)
+- [ ] 06.3-01-PLAN.md — Add registerStateChangeCallback/unregisterStateChangeCallback, extend notifyObserversWithState, expose onStateChange via SWIG
 
 ---
 
