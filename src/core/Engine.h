@@ -21,7 +21,7 @@
 #include "lua.h"
 #include "lauxlib.h"
 #include "lualib.h"
-#include "concurrentqueue.h"
+#include "../../libs/concurrentqueue/concurrentqueue.h"
 #include "../../libs/concurrentqueue/blockingconcurrentqueue.h"  // From moodycamel (Phase 7.3)
 #include <memory>
 #include <shared_mutex>

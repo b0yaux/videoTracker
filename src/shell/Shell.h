@@ -52,7 +52,7 @@ public:
         if (engine_) {
             engine_->registerShell(this);
         }
-        
+
         // Subscribe to state changes if engine is available
         if (engine_ && observerId_ == 0) {
             // Wrap observer callback to extract state version and pass to onStateChanged()
@@ -101,21 +101,18 @@ public:
     /**
      * Called when engine state changes (override in derived classes if needed).
      * Receives immutable state snapshot (thread-safe) and state version.
-     * 
+     *
      * Default implementation stores state version - shells override to handle state updates.
-     * 
-     * This method is public so Engine can call it to notify shells of state changes.
-     * 
+     *
      * @param state Immutable state snapshot
      * @param stateVersion State version number (monotonically increasing)
      */
     virtual void onStateChanged(const EngineState& state, uint64_t stateVersion) {
         lastStateVersion_ = stateVersion;
     }
-    
+
     /**
      * Get last seen state version (for debugging and verification).
-     * @return Last state version seen by this shell
      */
     uint64_t getLastStateVersion() const {
         return lastStateVersion_;

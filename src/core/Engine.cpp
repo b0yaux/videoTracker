@@ -476,11 +476,24 @@ Engine::Result Engine::eval(const std::string& script) {
     // getState() or buildStateSnapshot() during script execution
     // This prevents crashes when script execution triggers state changes or callbacks
     notifyingObservers_.store(true, std::memory_order_release);
-    
+
     // CRITICAL: Ensure flag is visible to all threads immediately
     // Use memory barrier to ensure flag is set before any script execution
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    
+
+    // RAII guard to ensure flag is always cleared, even on exceptions
+    struct NotifyingGuard {
+        std::atomic<bool>& flag_;
+        NotifyingGuard(std::atomic<bool>& flag) : flag_(flag) {}
+        ~NotifyingGuard() {
+            bool oldValue = flag_.load(std::memory_order_acquire);
+            if (oldValue) {
+                ofLogVerbose("Engine") << "NotifyingGuard: clearing notifyingObservers_";
+                flag_.store(false, std::memory_order_release);
+            }
+        }
+    } notifyingGuard(notifyingObservers_);
+
     try {
         // Set error callback to capture errors
         std::string luaError;
@@ -508,16 +521,21 @@ Engine::Result Engine::eval(const std::string& script) {
         }
         
         // Clear script execution flag before returning
-        notifyingObservers_.store(false, std::memory_order_release);
-        
+        // Note: RAII guard (notifyingGuard) will automatically clear the flag
+        // when this scope exits, even if exceptions are thrown
+
         // Check if transport state changed during script execution
         // If so, trigger a deferred notification to update observers with the new playing state
+        // BUT: Only trigger if no commands were enqueued (command processing will handle notification)
         bool transportChanged = transportStateChangedDuringScript_.exchange(false, std::memory_order_acq_rel);
-        if (transportChanged) {
-            ofLogVerbose("Engine") << "Deferred transport state change detected - triggering notification after script";
+        size_t commandsEnqueued = commandQueue_.size_approx();
+        if (transportChanged && commandsEnqueued == 0) {
+            ofLogVerbose("Engine") << "Deferred transport state change detected (no commands enqueued) - triggering notification after script";
             enqueueStateNotification();
+        } else if (transportChanged && commandsEnqueued > 0) {
+            ofLogVerbose("Engine") << "Deferred transport state change detected (" << commandsEnqueued << " commands enqueued) - letting command processing handle notification";
         }
-        
+
         // State notifications will happen automatically when commands are processed
         // No need to manually trigger them here
         if (success) {
@@ -969,7 +987,20 @@ void Engine::notifyObserversWithState() {
     
     // DEBUG: Log when notification starts
     ofLogVerbose("Engine") << "notifyObserversWithState(): starting notification (notifyingObservers_ was " << expected << ")";
-    
+
+    // RAII guard to ensure flag is always cleared, even on exceptions
+    struct NotifyingGuard {
+        std::atomic<bool>& flag_;
+        NotifyingGuard(std::atomic<bool>& flag) : flag_(flag) {}
+        ~NotifyingGuard() {
+            bool oldValue = flag_.load(std::memory_order_acquire);
+            if (oldValue) {
+                ofLogVerbose("Engine") << "NotifyingGuard (notifyObserversWithState): clearing notifyingObservers_";
+                flag_.store(false, std::memory_order_release);
+            }
+        }
+    } notifyingGuard(notifyingObservers_);
+
     // Ensure state version matches engine version
     // State version only increments AFTER commands are processed and snapshot is updated
     // If state version is stale, rebuild snapshot to ensure observers see fresh state
@@ -1070,10 +1101,9 @@ void Engine::notifyObserversWithState() {
     notifyingObservers_.store(false);
     ofLogVerbose("Engine") << "notifyObserversWithState(): completed, notifyingObservers_ cleared";
     
-    // Notify all registered shells with current state and version (Phase 7.9.2 Plan 3)
-    // This ensures all shells receive state updates in registration order (FIFO)
-    // Shells check state version to prevent processing stale updates
-    notifyAllShells(state, currentEngineVersion);
+    // NOTE: Removed notifyAllShells() call - shells already receive state updates
+    // via their observer subscription in Shell::setup(). This prevents duplicate
+    // notifications that were causing issues.
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1170,19 +1200,27 @@ void Engine::enqueueStateNotification() {
         // Phase 2: Clear flag AFTER processing, before next notification batch
         notificationEnqueued_.store(false);
 
+        // MEMORY SAFETY: Check if we're still in a valid state before building snapshot
+        // If modules are being deleted or system is shutting down, skip the notification
+        if (notifyingObservers_.load(std::memory_order_acquire)) {
+            ofLogWarning("Engine") << "enqueueStateNotification callback: notifyingObservers_ is still true - checking for deadlock";
+            // Try to clear it if it looks stuck
+            processNotificationQueue();
+        }
+
         // Update snapshot before notifying
         // This ensures state snapshot reflects processed commands before observers are notified
         // State version increments in updateStateSnapshot(), ensuring observers see fresh state
         updateStateSnapshot();
-        
+
         // ALSO update the immutable state snapshot (EngineState)
         // This is needed because getState() returns immutableStateSnapshot_, not snapshotJson_
         // Both snapshots need to be in sync for state to be consistent
         updateImmutableStateSnapshot();
-        
+
         // Add memory barrier to ensure snapshot update is visible to observers
         std::atomic_thread_fence(std::memory_order_release);
-        
+
         // Notify observers with current state (state version verified in notifyObserversWithState())
         notifyObserversWithState();
     });
@@ -2073,9 +2111,22 @@ int Engine::processCommands() {
     // Without this flag, isInUnsafeState() returns false during command processing,
     // allowing race conditions where state is read while being modified
     notifyingObservers_.store(true, std::memory_order_release);
-    
+
     // Memory barrier ensures flag is visible before command processing begins
     std::atomic_thread_fence(std::memory_order_seq_cst);
+
+    // RAII guard to ensure flag is always cleared, even on exceptions
+    struct NotifyingGuard {
+        std::atomic<bool>& flag_;
+        NotifyingGuard(std::atomic<bool>& flag) : flag_(flag) {}
+        ~NotifyingGuard() {
+            bool oldValue = flag_.load(std::memory_order_acquire);
+            if (oldValue) {
+                ofLogVerbose("Engine") << "NotifyingGuard (processCommands): clearing notifyingObservers_";
+                flag_.store(false, std::memory_order_release);
+            }
+        }
+    } notifyingGuard(notifyingObservers_);
 
     int processed = 0;
     std::unique_ptr<Command> cmd;
