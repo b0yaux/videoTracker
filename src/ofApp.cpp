@@ -356,7 +356,7 @@ void ofApp::update() {
     // Update all modules (MediaPool, TrackerSequencer, etc.)
     // This is critical for MediaPool to process its event queue
     float modulesStartTime = ofGetElapsedTimef();
-    moduleRegistry.forEachModule([this](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
+    moduleRegistry.forEachModule([](const std::string& uuid, const std::string& name, std::shared_ptr<Module> module) {
         if (module) {
             float moduleStartTime = ofGetElapsedTimef();
             try {
@@ -629,10 +629,10 @@ void ofApp::setupGUI() {
         [this]() { viewManager.setAssetLibraryVisible(!viewManager.isAssetLibraryVisible()); }, // onToggleAssetLibrary
         [this]() { showDemoWindow = !showDemoWindow; }, // onToggleDemoWindow
         [this]() { sessionManager.saveSession("session"); }, // onSaveSession
-        [this]() { /* TODO: Save session as */ }, // onSaveSessionAs
+        []() { /* TODO: Save session as */ }, // onSaveSessionAs
         [this]() { sessionManager.loadSession("session"); }, // onOpenSession
-        [this](const std::string& sessionPath) { /* TODO: Open recent session */ }, // onOpenRecentSession
-        [this]() { /* TODO: New session */ }, // onNewSession
+        [](const std::string& sessionPath) { /* TODO: Open recent session */ }, // onOpenRecentSession
+        []() { /* TODO: New session */ }, // onNewSession
         [this]() { return sessionManager.getCurrentSessionName(); }, // getCurrentSessionName
         [this]() { 
             // onOpenProject (TODO: implement file dialog)

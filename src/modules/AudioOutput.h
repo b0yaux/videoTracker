@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Module.h"
+#include "ofMain.h"
 #include "ofxSoundObjects.h"
 #include "ofSoundStream.h"
 #include <vector>
@@ -57,7 +58,7 @@ public:
     void setParameter(const std::string& paramName, float value, bool notify = true) override;
     float getParameter(const std::string& paramName) const override;
     ModuleMetadata getMetadata() const override;
-    
+
     // Routing interface - AudioOutput accepts audio input (it's a sink, not a source)
     // But internally it uses a mixer, so sources connect to the mixer
     // The mixer output can be monitored for visualization (oscilloscope, spectrogram, etc.)
@@ -78,12 +79,6 @@ public:
     
     // Audio processing
     void audioOut(ofSoundBuffer& buffer);
-    
-    /**
-     * Disconnect module at connection index
-     * @param connectionIndex Index of connection to remove
-     */
-    void disconnectModule(size_t connectionIndex);
     
     /**
      * Get number of connected modules
@@ -134,19 +129,23 @@ public:
      */
     float getConnectionVolume(size_t connectionIndex) const;
     
+    // Parameters access
+    ofParameterGroup& getParameterGroup() override { return params; }
+
     // Master volume control
     /**
      * Set master volume for all connections
      * @param volume Master volume (0.0 to 1.0)
      */
     void setMasterVolume(float volume);
+    void setAudioDevice(int deviceIndex);
     
     /**
      * Get master volume
      * @return Master volume value
      */
     float getMasterVolume() const;
-    
+
     // Audio device management
     /**
      * Setup audio stream with current device selection
@@ -159,12 +158,6 @@ public:
      * @return Vector of audio device info
      */
     std::vector<ofSoundDevice> getAudioDevices() const;
-    
-    /**
-     * Set selected audio device by index
-     * @param deviceIndex Index in device list
-     */
-    void setAudioDevice(int deviceIndex);
     
     /**
      * Get selected audio device index
@@ -223,7 +216,20 @@ public:
     void removeMonitoringConnection(std::shared_ptr<Module> monitorModule);
     
 private:
+    // Internal connection management
+    void disconnectModuleAtIndex(size_t connectionIndex);
+
+private:
+    // Parameters
+    ofParameter<float> masterVolumeParam;
+    ofParameter<int> audioDeviceParam;
+    
+    // Parameter listeners
+    void onMasterVolumeParamChanged(float& volume);
+    void onAudioDeviceParamChanged(int& deviceIndex);
+
     // Internal sound mixer (mixes all connected sources)
+
     ofxSoundMixer soundMixer_;
     
     // Underlying sound output (connects mixer to sound card)

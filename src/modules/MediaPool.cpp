@@ -13,8 +13,16 @@ MediaPool::MediaPool(const std::string& dataDir)
     : currentIndex(0), dataDirectory(dataDir), isSetup(false), currentMode(PlaybackMode::IDLE), 
       currentPlayStyle(PlayStyle::ONCE), clock(nullptr), activePlayer(nullptr), 
       lastTriggeredStep(-1), activeStepContext(),
-      polyphonyMode_(PolyphonyMode::MONOPHONIC) {  // Default to monophonic for backward compatibility
-    // setup() will be called later with clock reference
+      polyphonyMode_(PolyphonyMode::MONOPHONIC) {
+    
+    // Setup parameters
+    params.setName("MediaPool");
+    params.add(playStyleParam.set("Play Style", 0, 0, 2));
+    params.add(polyphonyModeParam.set("Polyphony Mode", 0, 0, 1));
+    
+    // Listen for changes
+    playStyleParam.addListener(this, &MediaPool::setPlayStyleFromParam);
+    polyphonyModeParam.addListener(this, &MediaPool::setPolyphonyModeFromParam);
 }
 
 MediaPool::~MediaPool() noexcept {
@@ -105,35 +113,7 @@ void MediaPool::initialize(Clock* clock, ModuleRegistry* registry, ConnectionMan
                     
                     if (audioMatch && videoMatch) {
                         // Found matching player - load parameters
-                        auto paramsJson = deferredParams.paramsJson;
-                        
-                        if (paramsJson.contains("startPosition")) {
-                            player->startPosition.set(paramsJson["startPosition"]);
-                        }
-                        if (paramsJson.contains("speed")) {
-                            player->speed.set(paramsJson["speed"]);
-                        }
-                        if (paramsJson.contains("volume")) {
-                            player->volume.set(paramsJson["volume"]);
-                        }
-                        if (paramsJson.contains("loop")) {
-                            player->loop.set(paramsJson["loop"]);
-                        }
-                        if (paramsJson.contains("loopSize")) {
-                            player->loopSize.set(paramsJson["loopSize"]);
-                        }
-                        if (paramsJson.contains("regionStart")) {
-                            player->regionStart.set(paramsJson["regionStart"]);
-                        }
-                        if (paramsJson.contains("regionEnd")) {
-                            player->regionEnd.set(paramsJson["regionEnd"]);
-                        }
-                        if (paramsJson.contains("audioEnabled")) {
-                            player->audioEnabled.set(paramsJson["audioEnabled"]);
-                        }
-                        if (paramsJson.contains("videoEnabled")) {
-                            player->videoEnabled.set(paramsJson["videoEnabled"]);
-                        }
+                        ofDeserialize(deferredParams.paramsJson, player->getParameters());
                         
                         ofLogNotice("MediaPool") << "Restored parameters for player " << i 
                                                  << " (audio: " << deferredParams.audioFile 
@@ -1332,9 +1312,24 @@ void MediaPool::setModeIdle() {
     currentMode.store(PlaybackMode::IDLE, std::memory_order_relaxed);
 }
 
+void MediaPool::setPlayStyleFromParam(const void* sender, int& style) {
+    setPlayStyle(static_cast<PlayStyle>(style));
+}
+
+void MediaPool::setPolyphonyModeFromParam(const void* sender, int& mode) {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    polyphonyMode_ = static_cast<PolyphonyMode>(mode);
+    ofLogNotice("MediaPool") << "Polyphony mode set to: " << (mode == 1 ? "POLYPHONIC" : "MONOPHONIC");
+}
+
 //--------------------------------------------------------------
 // Play style control (applies to both manual preview and sequencer playback)
 void MediaPool::setPlayStyle(PlayStyle style) {
+    // Sync with parameter
+    if (playStyleParam.get() != static_cast<int>(style)) {
+        playStyleParam.set(static_cast<int>(style));
+    }
+
     std::lock_guard<std::mutex> lock(stateMutex);
     currentPlayStyle = style;
     ofLogNotice("MediaPool") << "Play style set to: " << (int)style;
@@ -1872,103 +1867,48 @@ void MediaPool::setEnabled(bool enabled) {
 
 ofJson MediaPool::toJson(class ModuleRegistry* registry) const {
     ofJson json;
-    
-    // Save enabled state
+    ofSerialize(json, params);
     json["enabled"] = isEnabled();
     
-    // Save active player index
-    json["activePlayerIndex"] = currentIndex;
-    
-    // Save play style
-    json["playStyle"] = static_cast<int>(currentPlayStyle);
-    
-    // Save polyphony mode
-    json["polyphonyMode"] = (polyphonyMode_ == PolyphonyMode::POLYPHONIC) ? 1.0f : 0.0f;
-    
-    // Save all players with their file paths and parameters
-    // File paths are saved as-is (should already be absolute from file system)
+    // Serialize players
     ofJson playersArray = ofJson::array();
     std::lock_guard<std::mutex> lock(stateMutex);
     
-    // Log how many players we're serializing
-    size_t validPlayers = 0;
-    for (size_t i = 0; i < players.size(); i++) {
-        if (players[i].get()) {
-            validPlayers++;
-        }
-    }
-    ofLogNotice("MediaPool") << "Serializing " << validPlayers << " players to session (total players: " << players.size() << ")";
-    
-    for (size_t i = 0; i < players.size(); i++) {
-        auto player = players[i].get();
+    for (const auto& player : players) {
         if (player) {
             ofJson playerJson;
-            std::string audioPath = player->getAudioFilePath();
-            std::string videoPath = player->getVideoFilePath();
-            
-            // Save file paths (empty string if not set)
-            playerJson["audioFile"] = audioPath;
-            playerJson["videoFile"] = videoPath;
+            playerJson["audioFile"] = player->getAudioFilePath();
+            playerJson["videoFile"] = player->getVideoFilePath();
             
             // Save MediaPlayer parameters
             ofJson paramsJson;
-            paramsJson["startPosition"] = player->startPosition.get();
-            paramsJson["speed"] = player->speed.get();
-            paramsJson["volume"] = player->volume.get();
-            paramsJson["loop"] = player->loop.get();
-            paramsJson["loopSize"] = player->loopSize.get();
-            paramsJson["regionStart"] = player->regionStart.get();
-            paramsJson["regionEnd"] = player->regionEnd.get();
-            paramsJson["audioEnabled"] = player->audioEnabled.get();
-            paramsJson["videoEnabled"] = player->videoEnabled.get();
-            
+            ofSerialize(paramsJson, player->getParameters());
             playerJson["parameters"] = paramsJson;
+            
             playersArray.push_back(playerJson);
         }
     }
     json["players"] = playersArray;
     
-    // Log final count
-    if (playersArray.size() != validPlayers) {
-        ofLogWarning("MediaPool") << "Player count mismatch: " << validPlayers << " valid players, " 
-                                   << playersArray.size() << " serialized";
-    } else {
-        ofLogNotice("MediaPool") << "Successfully serialized " << playersArray.size() << " players to session";
-    }
-    
     return json;
 }
 
 void MediaPool::fromJson(const ofJson& json) {
+    ofDeserialize(json, params);
+    
     // Load enabled state
     if (json.contains("enabled")) {
         setEnabled(json["enabled"].get<bool>());
     }
     
-    // Load play style first (before loading players)
-    if (json.contains("playStyle")) {
-        int styleInt = json["playStyle"];
-        if (styleInt >= 0 && styleInt <= 2) {
-            setPlayStyle(static_cast<PlayStyle>(styleInt));
-        }
-    }
-    
-    // Load polyphony mode (default to MONOPHONIC for backward compatibility)
-    if (json.contains("polyphonyMode")) {
-        float modeValue = json["polyphonyMode"];
-        polyphonyMode_ = (modeValue >= 0.5f) ? PolyphonyMode::POLYPHONIC : PolyphonyMode::MONOPHONIC;
-        ofLogNotice("MediaPool") << "Loaded polyphony mode: " 
-                                  << (polyphonyMode_ == PolyphonyMode::POLYPHONIC ? "POLYPHONIC" : "MONOPHONIC");
-    } else {
-        polyphonyMode_ = PolyphonyMode::MONOPHONIC;  // Default for old sessions
-    }
+    // Sync internal state with loaded parameters
+    setPlayStyle(static_cast<PlayStyle>(playStyleParam.get()));
     
     // Load players from saved file paths
     if (json.contains("players") && json["players"].is_array()) {
         std::lock_guard<std::mutex> lock(stateMutex);
         
         auto playersArray = json["players"];
-        ofLogNotice("MediaPool") << "Loading " << playersArray.size() << " players from session...";
         
         // Clear existing players
         if (activePlayer) {
@@ -1983,112 +1923,34 @@ void MediaPool::fromJson(const ofJson& json) {
         deferredPlayerParams_.clear();
         deferredPlayerParams_.reserve(playersArray.size());
         
-        size_t filesAdded = 0;
-        size_t paramsStored = 0;
-        
-        // First pass: Add file paths directly to lists (skip addMediaFile to avoid file existence checks)
-        for (int i = 0; i < playersArray.size(); i++) {
-            auto playerJson = playersArray[i];
+        for (const auto& playerJson : playersArray) {
             std::string audioFile = playerJson.value("audioFile", "");
             std::string videoFile = playerJson.value("videoFile", "");
             
-            // Skip if both files are missing
-            if (audioFile.empty() && videoFile.empty()) {
-                ofLogWarning("MediaPool") << "Skipping player " << i << ": no audio or video file specified";
-                continue;
-            }
+            if (audioFile.empty() && videoFile.empty()) continue;
             
-            // During session restore, just add paths directly to lists without checking existence
-            // File existence will be checked later when mediaPair() is called
+            // Collect file paths
             if (!audioFile.empty()) {
-                // Check if already in list (avoid duplicates)
-                bool alreadyExists = false;
-                for (const auto& existingFile : audioFiles) {
-                    if (existingFile == audioFile) {
-                        alreadyExists = true;
-                        break;
-                    }
-                }
-                if (!alreadyExists) {
+                if (std::find(audioFiles.begin(), audioFiles.end(), audioFile) == audioFiles.end()) {
                     audioFiles.push_back(audioFile);
-                    filesAdded++;
-                    ofLogNotice("MediaPool") << "Added audio file path: " << audioFile;
                 }
             }
-            
             if (!videoFile.empty()) {
-                // Check if already in list (avoid duplicates)
-                bool alreadyExists = false;
-                for (const auto& existingFile : videoFiles) {
-                    if (existingFile == videoFile) {
-                        alreadyExists = true;
-                        break;
-                    }
-                }
-                if (!alreadyExists) {
+                if (std::find(videoFiles.begin(), videoFiles.end(), videoFile) == videoFiles.end()) {
                     videoFiles.push_back(videoFile);
-                    filesAdded++;
-                    ofLogNotice("MediaPool") << "Added video file path: " << videoFile;
                 }
             }
             
-            // Store player parameters for loading after mediaPair() creates players
-            // We'll match by file paths since indices might change
-            if (playerJson.contains("parameters")) {
-                deferredPlayerParams_.push_back({
-                    audioFile,
-                    videoFile,
-                    playerJson["parameters"]
-                });
-                paramsStored++;
-            } else {
-                // Still store entry even without parameters (for file matching)
-                deferredPlayerParams_.push_back({
-                    audioFile,
-                    videoFile,
-                    ofJson::object()  // Empty params object
-                });
-            }
+            // Store player parameters for deferred loading
+            deferredPlayerParams_.push_back({
+                audioFile,
+                videoFile,
+                playerJson.value("parameters", ofJson::object())
+            });
         }
         
-        ofLogNotice("MediaPool") << "Session restore: Added " << filesAdded << " file paths, "
-                                 << "stored " << paramsStored << " parameter sets. "
-                                 << "Deferred loading flag set. Players will be created in completeRestore().";
-        
-        // Store active player index for restoration after players are created
-        if (json.contains("activePlayerIndex")) {
-            deferredActivePlayerIndex_ = json["activePlayerIndex"];
-            ofLogNotice("MediaPool") << "Active player index to restore: " << deferredActivePlayerIndex_;
-        } else {
-            deferredActivePlayerIndex_ = 0;
-        }
-        
-        // DON'T try to load parameters here - players don't exist yet!
-        // Parameters will be loaded in completeRestore() after mediaPair() creates players
-        
-        // Keep defer flag true - media loading will happen later in completeRestore()
-        // Don't call mediaPair() here - it will be called by SessionManager after session load completes
-        // deferMediaLoading_ remains true until completeRestore() is called
-        // This prevents blocking during session restore
-    }
-    // Legacy support: If no players array but directory exists, use directory-based loading
-    // This handles old session files that only saved the directory path
-    else if (json.contains("directory")) {
-        ofLogNotice("MediaPool") << "Loading from legacy directory-based format";
-        std::string dir = json["directory"];
-        if (!dir.empty() && ofDirectory(dir).exists()) {
-            setDataDirectory(dir);
-            
-            // Restore active player index
-            if (json.contains("activePlayerIndex")) {
-                int index = json["activePlayerIndex"];
-                if (index >= 0 && index < (int)players.size()) {
-                    setCurrentIndex(index);
-                }
-            }
-        } else {
-            ofLogWarning("MediaPool") << "Legacy directory not found: " << dir;
-        }
+        // Store active player index for restoration
+        deferredActivePlayerIndex_ = json.value("activePlayerIndex", 0);
     }
 }
 

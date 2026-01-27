@@ -56,6 +56,7 @@ public:
     void setParameter(const std::string& paramName, float value, bool notify = true) override;
     float getParameter(const std::string& paramName) const override;
     ModuleMetadata getMetadata() const override;
+    void setEnabled(bool enabled) override;
     
     // Routing interface - Oscilloscope produces video output
     ofxVisualObject* getVideoOutput() const override { 
@@ -107,8 +108,22 @@ public:
     
     // Update method (called from main thread)
     void update() override;
-    
+
+    // Parameter listeners
+    void onEnabledParamChanged(bool& val);
+    void onScaleParamChanged(float& val);
+    void onPointSizeParamChanged(float& val);
+    void onColorParamChanged(ofColor& val);
+    void onBackgroundColorParamChanged(ofColor& val);
+
 private:
+    // Parameters
+    ofParameter<bool> enabledParam;
+    ofParameter<float> scaleParam;
+    ofParameter<float> pointSizeParam;
+    ofParameter<ofColor> colorParam;
+    ofParameter<ofColor> backgroundColorParam;
+
     // Audio buffer management
     static constexpr size_t MAX_BUFFER_SIZE = 44100 * 2;  // 2 seconds at 44.1kHz
     

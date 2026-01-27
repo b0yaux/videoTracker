@@ -57,12 +57,12 @@ public:
     // Audio processing
     void audioOut(ofSoundBuffer& output);
     
-    // Connection management
-    /**
-     * Disconnect module at connection index
-     * @param connectionIndex Index of connection to remove
-     */
-    void disconnectModule(size_t connectionIndex);
+    // Connection management interface (from Module base class)
+    int connectModule(std::shared_ptr<Module> module) override;
+    void disconnectModule(std::shared_ptr<Module> module) override;
+    
+    // Connection restoration (for session loading)
+    void restoreConnections(const ofJson& connectionsJson, class ModuleRegistry* registry) override;
     
     /**
      * Get number of connected modules
@@ -84,6 +84,9 @@ public:
      */
     int getConnectionIndex(std::shared_ptr<Module> module) const;
     
+    // Parameters access
+    ofParameterGroup& getParameterGroup() override { return params; }
+
     // Per-connection volume control
     /**
      * Set volume for a specific connection
@@ -105,11 +108,6 @@ public:
      * @param volume Master volume (0.0 to 1.0)
      */
     void setMasterVolume(float volume);
-    
-    /**
-     * Get master volume
-     * @return Master volume value
-     */
     float getMasterVolume() const;
     
     /**
@@ -136,20 +134,18 @@ public:
     // Port-based routing interface (Phase 1)
     std::vector<Port> getInputPorts() const override;
     std::vector<Port> getOutputPorts() const override;
-    
-    // Connection management interface (from Module base class)
-    int connectModule(std::shared_ptr<Module> module) override;
-    void disconnectModule(std::shared_ptr<Module> module) override;
-    
-    // Connection restoration (for session loading)
-    /**
-     * Restore connections from JSON (called after all modules are loaded)
-     * @param connectionsJson Array of connection info with moduleName and volume
-     * @param registry ModuleRegistry to look up modules by name
-     */
-    void restoreConnections(const ofJson& connectionsJson, class ModuleRegistry* registry) override;
-    
+
 private:
+    // Parameter listeners
+    void onMasterVolumeParamChanged(float& volume);
+
+    // Internal connection management
+    void disconnectModuleAtIndex(size_t connectionIndex);
+
+private:
+    // Parameters
+    ofParameter<float> masterVolumeParam;
+
     // Underlying sound mixer
     ofxSoundMixer soundMixer_;
     

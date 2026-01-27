@@ -75,6 +75,7 @@ public:
     // Serialization
     ofJson toJson(class ModuleRegistry* registry = nullptr) const override;
     void fromJson(const ofJson& json) override;
+    void restoreConnections(const ofJson& connectionsJson, class ModuleRegistry* registry) override;
     
     // Video processing (from ofxVisualObject)
     void process(ofFbo& input, ofFbo& output) override;
@@ -106,6 +107,9 @@ public:
      */
     int getConnectionIndex(std::shared_ptr<Module> module) const;
     
+    // Parameters access
+    ofParameterGroup& getParameterGroup() override { return params; }
+
     // Per-source opacity control
     /**
      * Set opacity for a specific source
@@ -152,43 +156,29 @@ public:
      */
     bool reorderSource(size_t fromIndex, size_t toIndex);
     
+    // Blend mode control
+    /**
+     * Set blend mode for compositing
+     * @param mode OpenFrameworks blend mode (OF_BLENDMODE_ADD, OF_BLENDMODE_MULTIPLY, OF_BLENDMODE_ALPHA)
+     */
+    void setCompositingBlendMode(ofBlendMode mode);
+    
+    /**
+     * Get current blend mode
+     * @return Current blend mode
+     */
+    ofBlendMode getCompositingBlendMode() const;
+    
     // Master opacity control
     /**
      * Set master opacity for all connections
      * @param opacity Master opacity (0.0 to 1.0)
      */
     void setMasterOpacity(float opacity);
-    
-    /**
-     * Get master opacity
-     * @return Master opacity value
-     */
     float getMasterOpacity() const;
     
-    // Blend mode control
-    /**
-     * Set blend mode for compositing
-     * @param mode OpenFrameworks blend mode (OF_BLENDMODE_ADD, OF_BLENDMODE_MULTIPLY, OF_BLENDMODE_ALPHA)
-     */
-    void setBlendMode(ofBlendMode mode);
-    
-    /**
-     * Get current blend mode
-     * @return Current blend mode
-     */
-    ofBlendMode getBlendMode() const;
-    
-    // Auto-normalization (for ADD mode to prevent white-out)
-    /**
-     * Enable/disable auto-normalization for ADD mode
-     * @param enabled True to enable auto-normalization
-     */
+    // Auto-normalization
     void setAutoNormalize(bool enabled);
-    
-    /**
-     * Get auto-normalization state
-     * @return True if auto-normalization is enabled
-     */
     bool getAutoNormalize() const;
     
     // Viewport management (simplified - auto-adjusts to window size)
@@ -211,24 +201,20 @@ public:
      */
     int getViewportHeight() const { return viewportHeight_; }
     
+private:
+    // Parameters
+    ofParameter<float> masterOpacityParam;
+    ofParameter<int> blendModeParam;
+    ofParameter<bool> autoNormalizeParam;
+    
+    // Parameter listeners
+    void onMasterOpacityParamChanged(float& opacity);
+    void onBlendModeParamChanged(int& modeIndex);
+    void onAutoNormalizeParamChanged(bool& enabled);
+
     // Direct access to underlying objects (for advanced use)
     ofxVideoMixer& getVideoMixer() { return videoMixer_; }
-    const ofxVideoMixer& getVideoMixer() const { return videoMixer_; }
-    ofxVisualOutput& getVisualOutput() { return visualOutput_; }
-    const ofxVisualOutput& getVisualOutput() const { return visualOutput_; }
-    
-    // ofxVisualObject interface
-    ofFbo& getOutputBuffer() { return outputFbo_; }
-    
-    // Connection restoration (for session loading)
-    /**
-     * Restore connections from JSON (called after all modules are loaded)
-     * @param connectionsJson Array of connection info with moduleName and opacity
-     * @param registry ModuleRegistry to look up modules by name
-     */
-    void restoreConnections(const ofJson& connectionsJson, ModuleRegistry* registry) override;
-    
-private:
+
     // Internal video mixer (mixes all connected sources)
     ofxVideoMixer videoMixer_;
     

@@ -244,6 +244,9 @@ public:
     float getLastDragValue() const { return lastDragValue; }
     void setLastDragValue(float value) { lastDragValue = value; }
     
+    // Parameters access
+    ofParameterGroup& getParameterGroup() override { return params; }
+
     // Note: Focus management flags removed - these are GUI concerns managed by TrackerSequencerGUI
     // Update step active state (clears manually triggered steps when duration expires)
     void updateStepActiveState();
@@ -252,6 +255,7 @@ public:
     
     // Setters
     void setStepsPerBeat(float steps);  // Supports fractional values (1/2, 1/4, 1/8) and negative for backward reading
+    void setGatingEnabled(bool enabled);
     
     // Parameter synchronization methods (for ParameterRouter system)
     // Get position parameter from current edit step (for sync)
@@ -304,6 +308,16 @@ private:
     
     Clock* clock;
     
+    // Parameters
+    ofParameter<float> stepsPerBeatParam;
+    ofParameter<bool> gatingEnabledParam;
+    ofParameter<int> currentPatternIndexParam;
+    
+    // Parameter listeners
+    void onStepsPerBeatChanged(float& steps);
+    void onGatingEnabledChanged(bool& enabled);
+    void onCurrentPatternIndexChanged(int& index);
+
     // Pattern sequencer state (app-specific)
     float stepsPerBeat = 4.0f;  // Supports fractional values (1/2, 1/4, 1/8) and negative for backward reading
     bool gatingEnabled = true;

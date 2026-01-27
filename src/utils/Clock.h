@@ -9,6 +9,7 @@
 #include "ofMain.h"
 #include "ofxSoundObjects.h"
 #include "ofJson.h"
+#include "ofParameter.h"
 
 // Configuration structure for Clock
 struct ClockConfig {
@@ -47,6 +48,16 @@ public:
     void reset();
     bool isPlaying() const;  // Master transport state - single source of truth
     
+    // Parameter access
+    ofParameterGroup& getParameters() { return params; }
+    
+    // Serialization
+    ofJson toJson() const;
+    void fromJson(const ofJson& json);
+    
+    // Audio callback (inherited from ofxSoundOutput)
+    void audioOut(ofSoundBuffer& buffer) override;
+    
     // Audio-rate listener system
     void addAudioListener(std::function<void(ofSoundBuffer&)> listener);
     void removeAudioListener();
@@ -69,14 +80,15 @@ public:
     float getMaxBPM() const;
     float getSampleRate() const;
     
-    // Serialization
-    ofJson toJson() const;
-    void fromJson(const ofJson& json);
-    
-    // Audio callback (inherited from ofxSoundOutput)
-    void audioOut(ofSoundBuffer& buffer) override;
-    
 private:
+    // Parameters
+    ofParameterGroup params;
+    ofParameter<float> bpmParam;
+    
+    // Parameter listeners
+    void onBpmParamChanged(float& bpm);
+
+
     // State
     // Master transport state - single source of truth for global playback
     // All transport control goes through Clock (start/stop/pause/reset)

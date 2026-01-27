@@ -54,7 +54,7 @@ public:
     void setParameter(const std::string& paramName, float value, bool notify = true) override;
     float getParameter(const std::string& paramName) const override;
     ModuleMetadata getMetadata() const override;
-    
+
     // Serialization
     ofJson toJson(class ModuleRegistry* registry = nullptr) const override;
     void fromJson(const ofJson& json) override;
@@ -63,12 +63,6 @@ public:
     void process(ofFbo& input, ofFbo& output) override;
     
     // Connection management
-    /**
-     * Disconnect module at source index
-     * @param sourceIndex Index of source to remove
-     */
-    void disconnectModule(size_t sourceIndex);
-    
     /**
      * Get number of connected modules
      * @return Number of connections
@@ -170,7 +164,21 @@ public:
     // ofxVisualObject interface
     ofFbo& getOutputBuffer() { return outputFbo_; }
     
+    // Parameter listeners
+    void onMasterOpacityParamChanged(float& val);
+    void onBlendModeParamChanged(int& val);
+    void onAutoNormalizeParamChanged(bool& val);
+
 private:
+    // Internal connection management
+    void disconnectModuleAtIndex(size_t sourceIndex);
+
+private:
+    // Parameters
+    ofParameter<float> masterOpacityParam;
+    ofParameter<int> blendModeParam;
+    ofParameter<bool> autoNormalizeParam;
+
     // Underlying video mixer
     ofxVideoMixer videoMixer_;
     

@@ -29,7 +29,7 @@ class ModuleGUI;
 class SessionManager {
 public:
     // Default constructor (for member initialization)
-    SessionManager() : projectManager_(nullptr), clock(nullptr), registry(nullptr), factory(nullptr), router(nullptr), connectionManager_(nullptr), viewManager_(nullptr), guiManager_(nullptr), pendingImGuiState_(""), pendingVisibilityState_(ofJson::object()), postLoadCallback_(nullptr), projectOpenedCallback_(nullptr) {}
+    SessionManager() : projectManager_(nullptr), clock(nullptr), registry(nullptr), factory(nullptr), router(nullptr), connectionManager_(nullptr), viewManager_(nullptr), guiManager_(nullptr), currentSessionName_(""), postLoadCallback_(nullptr), projectOpenedCallback_(nullptr), pendingImGuiState_(""), pendingVisibilityState_(ofJson::object()) {}
     
     // Constructor with all dependencies (including ProjectManager)
     SessionManager(
@@ -212,20 +212,6 @@ private:
      * Resolve session path (uses ProjectManager if available, otherwise assumes full path)
      */
     std::string resolveSessionPath(const std::string& sessionName) const;
-    
-    /**
-     * Migrate legacy format to new format
-     */
-    bool migrateLegacyFormat(const ofJson& json);
-    
-    /**
-     * Migrate legacy state files into unified session format
-     * Consolidates tracker_sequencer_state.json, sequencer_state.json, 
-     * media_settings.json, and module_layouts.json into session.json
-     * @param sessionPath Path to session file to create/update
-     * @return true if migration was successful or no legacy files found
-     */
-    bool migrateLegacyFiles(const std::string& sessionPath);
     
     /**
      * Restore mixer connections after all modules are loaded

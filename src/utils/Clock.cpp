@@ -17,6 +17,12 @@ Clock::Clock()
     , beatInterval(0.0f)
     , beatAccumulator(0.0)
     , samplesPerBeat(0.0f) {
+    
+    params.setName("Clock");
+    params.add(bpmParam.set("BPM", 120.0f, 20.0f, 480.0f));
+    
+    // Listen for parameter changes
+    bpmParam.addListener(this, &Clock::onBpmParamChanged);
 }
 
 //--------------------------------------------------------------
@@ -34,13 +40,14 @@ void Clock::setup() {
 
 //--------------------------------------------------------------
 void Clock::setBPM(float bpm) {
-    // Silent clamping using config
-    float clampedBpm = ofClamp(bpm, config.minBPM, config.maxBPM);
-    if (clampedBpm > 0 && clampedBpm != this->bpm.load()) {
-        this->bpm.store(clampedBpm);
-        onBPMChanged();
-    }
+    bpmParam.set(bpm);
 }
+
+void Clock::onBpmParamChanged(float& bpmValue) {
+    this->bpm.store(bpmValue);
+    onBPMChanged();
+}
+
 
 //--------------------------------------------------------------
 float Clock::getBPM() const {
@@ -243,30 +250,14 @@ void Clock::onBPMChanged() {
 //--------------------------------------------------------------
 ofJson Clock::toJson() const {
     ofJson json;
-    float bpmValue = bpm.load();
-    json["bpm"] = bpmValue;
-    ofLogNotice("Clock") << "Serializing BPM to JSON: " << bpmValue;
-    // Note: stepsPerBeat removed - step timing is now per-TrackerSequencer instance
-    // Note: isPlaying is intentionally not saved (transient state)
+    ofSerialize(json, params);
     return json;
 }
 
 //--------------------------------------------------------------
 void Clock::fromJson(const ofJson& json) {
-    if (json.contains("bpm")) {
-        float bpmValue = json["bpm"].get<float>();
-        float bpmBefore = getBPM();
-        ofLogNotice("Clock") << "Loading BPM from JSON: " << bpmValue << " (current: " << bpmBefore << ")";
-        
-        // Set the BPM (this will clamp if needed)
-        setBPM(bpmValue);
-        
-        float bpmAfter = getBPM();
-        ofLogNotice("Clock") << "BPM loaded: " << bpmAfter << " (requested: " << bpmValue << ")";
-    } else {
-        ofLogWarning("Clock") << "JSON does not contain 'bpm' key, keeping current BPM: " << getBPM();
-    }
-    // Note: stepsPerBeat removed - step timing is now per-TrackerSequencer instance
-    // Old JSON files with stepsPerBeat will be ignored (backward compatible)
-    // Note: isPlaying is intentionally not loaded (transient state)
+    ofDeserialize(json, params);
+    // Sync atomic bpm with loaded parameter
+    bpm.store(bpmParam.get());
+    onBPMChanged();
 }

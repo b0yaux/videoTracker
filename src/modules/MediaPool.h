@@ -85,6 +85,9 @@ public:
     std::vector<std::string> getPlayerNames() const;
     std::vector<std::string> getPlayerFileNames() const;  // Get actual file names
     
+    // Parameters access
+    ofParameterGroup& getParameterGroup() override { return params; }
+
     // Audio/video files
     std::vector<std::string> getAudioFiles() const;
     std::vector<std::string> getVideoFiles() const;
@@ -167,6 +170,10 @@ public:
     PlayStyle getPlayStyle() const;
     void onPlaybackEnd();
     
+    // Parameter listeners
+    void setPlayStyleFromParam(const void* sender, int& style);
+    void setPolyphonyModeFromParam(const void* sender, int& mode);
+
     // Update method for end-of-media detection
     void update() override;
     
@@ -206,6 +213,10 @@ public:
     PolyphonyMode getPolyphonyMode() const;
     
 private:
+    // Parameters
+    ofParameter<int> playStyleParam;
+    ofParameter<int> polyphonyModeParam;
+
 private:
     Clock* clock;
     std::vector<std::unique_ptr<MediaPlayer>> players;

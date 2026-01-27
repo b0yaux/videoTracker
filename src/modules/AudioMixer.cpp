@@ -5,6 +5,13 @@
 #include <algorithm>
 
 AudioMixer::AudioMixer() {
+    // Setup parameters
+    params.setName("AudioMixer");
+    params.add(masterVolumeParam.set("Master Volume", 1.0f, 0.0f, 1.0f));
+    
+    // Add listeners
+    masterVolumeParam.addListener(this, &AudioMixer::onMasterVolumeParamChanged);
+
     // Initialize sound mixer
     soundMixer_.setName("Audio Mixer");
     soundMixer_.setMasterVolume(1.0f);
@@ -101,10 +108,8 @@ Module::ModuleMetadata AudioMixer::getMetadata() const {
 
 ofJson AudioMixer::toJson(class ModuleRegistry* registry) const {
     ofJson json;
-    json["type"] = "AudioMixer";
-    json["name"] = getName();
+    ofSerialize(json, params);
     json["enabled"] = isEnabled();
-    json["masterVolume"] = getMasterVolume();
     
     // Serialize connections
     std::lock_guard<std::mutex> lock(connectionMutex_);
@@ -123,15 +128,14 @@ ofJson AudioMixer::toJson(class ModuleRegistry* registry) const {
 }
 
 void AudioMixer::fromJson(const ofJson& json) {
+    ofDeserialize(json, params);
+    
     // Load enabled state
     if (json.contains("enabled")) {
         setEnabled(json["enabled"].get<bool>());
     }
     
-    // Load master volume
-    if (json.contains("masterVolume")) {
-        setMasterVolume(json["masterVolume"].get<float>());
-    }
+    // Listeners triggered by ofDeserialize will sync state with soundMixer_
     
     // Note: Connections are restored by SessionManager via restoreConnections()
     // after all modules are loaded
@@ -166,6 +170,12 @@ void AudioMixer::restoreConnections(const ofJson& connectionsJson, ModuleRegistr
 }
 
 void AudioMixer::audioOut(ofSoundBuffer& output) {
+    if (!isEnabled()) {
+        output.set(0.0f);
+        currentAudioLevel_ = 0.0f;
+        return;
+    }
+
     // Delegate to underlying sound mixer
     size_t numConnections = soundMixer_.getNumConnections();
     
@@ -283,7 +293,7 @@ void AudioMixer::disconnectModule(std::shared_ptr<Module> module) {
     }
 }
 
-void AudioMixer::disconnectModule(size_t connectionIndex) {
+void AudioMixer::disconnectModuleAtIndex(size_t connectionIndex) {
     std::lock_guard<std::mutex> lock(connectionMutex_);
     if (connectionIndex >= connectedModules_.size()) {
         ofLogWarning("AudioMixer") << "Invalid connection index: " << connectionIndex;
@@ -375,8 +385,11 @@ float AudioMixer::getConnectionVolume(size_t connectionIndex) const {
 }
 
 void AudioMixer::setMasterVolume(float volume) {
-    volume = ofClamp(volume, 0.0f, 1.0f);
-    soundMixer_.setMasterVolume(volume);
+    masterVolumeParam.set(volume);
+}
+
+void AudioMixer::onMasterVolumeParamChanged(float& volume) {
+    soundMixer_.setMasterVolume(ofClamp(volume, 0.0f, 1.0f));
 }
 
 float AudioMixer::getMasterVolume() const {

@@ -7,6 +7,19 @@
 #include <glm/glm.hpp>
 
 Spectrogram::Spectrogram() {
+    // Setup parameters
+    params.setName("Spectrogram");
+    params.add(fftSizeParam.set("FFT Size", 2048, 256, 8192));
+    params.add(windowTypeParam.set("Window Type", 3, 0, 4));
+    params.add(speedParam.set("Speed", 1.0f, 0.1f, 5.0f));
+    params.add(fftScaleParam.set("FFT Scale", 1, 0, 2));
+
+    // Add listeners
+    fftSizeParam.addListener(this, &Spectrogram::onFftSizeParamChanged);
+    windowTypeParam.addListener(this, &Spectrogram::onWindowTypeParamChanged);
+    speedParam.addListener(this, &Spectrogram::onSpeedParamChanged);
+    fftScaleParam.addListener(this, &Spectrogram::onFftScaleParamChanged);
+
     // Initialize FFT
     setupFft();
     
@@ -210,14 +223,9 @@ std::vector<Port> Spectrogram::getOutputPorts() const {
 
 ofJson Spectrogram::toJson(class ModuleRegistry* registry) const {
     ofJson json;
-    json["type"] = "Spectrogram";
-    json["name"] = getName();
-    json["enabled"] = isEnabled();
-    json["fftSize"] = fftSize_;
-    json["speed"] = speed_;
-    json["fftScale"] = static_cast<int>(fftScale_);
+    ofSerialize(json, params);
     
-    // Serialize volume color stops
+    // Serialize volume color stops (still manual as they are not ofParameters)
     json["volumeColorStops"] = ofJson::array();
     for (const auto& stop : volumeColorStops_) {
         ofJson stopJson;
@@ -229,55 +237,13 @@ ofJson Spectrogram::toJson(class ModuleRegistry* registry) const {
         json["volumeColorStops"].push_back(stopJson);
     }
     
-    // Serialize window type
-    int windowTypeIndex = 3;  // Default to HAMMING
-    if (windowType_ == OF_FFT_WINDOW_RECTANGULAR) windowTypeIndex = 0;
-    else if (windowType_ == OF_FFT_WINDOW_BARTLETT) windowTypeIndex = 1;
-    else if (windowType_ == OF_FFT_WINDOW_HANN) windowTypeIndex = 2;
-    else if (windowType_ == OF_FFT_WINDOW_HAMMING) windowTypeIndex = 3;
-    else if (windowType_ == OF_FFT_WINDOW_SINE) windowTypeIndex = 4;
-    json["windowType"] = windowTypeIndex;
-    
     return json;
 }
 
 void Spectrogram::fromJson(const ofJson& json) {
-    if (json.contains("enabled")) {
-        setEnabled(json["enabled"].get<bool>());
-    }
-    if (json.contains("fftSize")) {
-        setFftSize(json["fftSize"].get<int>());
-    }
-    if (json.contains("windowType")) {
-        int typeIndex = json["windowType"].get<int>();
-        fftWindowType type = OF_FFT_WINDOW_HAMMING;
-        if (typeIndex == 0) type = OF_FFT_WINDOW_RECTANGULAR;
-        else if (typeIndex == 1) type = OF_FFT_WINDOW_BARTLETT;
-        else if (typeIndex == 2) type = OF_FFT_WINDOW_HANN;
-        else if (typeIndex == 3) type = OF_FFT_WINDOW_HAMMING;
-        else if (typeIndex == 4) type = OF_FFT_WINDOW_SINE;
-        setWindowType(type);
-    }
-    if (json.contains("speed")) {
-        setSpeed(json["speed"].get<float>());
-    }
-    if (json.contains("fftScale")) {
-        int scaleIndex = json["fftScale"].get<int>();
-        FftScale scale = FFT_SCALE_LOG;
-        if (scaleIndex == 0) scale = FFT_SCALE_LINEAR;
-        else if (scaleIndex == 1) scale = FFT_SCALE_LOG;
-        else if (scaleIndex == 2) scale = FFT_SCALE_MEL;
-        setFftScale(scale);
-    }
-    // Backward compatibility: migrate old frequencyScale to fftScale
-    else if (json.contains("frequencyScale")) {
-        int scaleIndex = json["frequencyScale"].get<int>();
-        FftScale scale = FFT_SCALE_LOG;
-        if (scaleIndex == 0) scale = FFT_SCALE_LINEAR;
-        else if (scaleIndex == 1) scale = FFT_SCALE_LOG;
-        else if (scaleIndex == 2) scale = FFT_SCALE_MEL;
-        setFftScale(scale);
-    }
+    ofDeserialize(json, params);
+    
+    // Listeners triggered by ofDeserialize will sync state
     
     // Load volume color stops
     if (json.contains("volumeColorStops") && json["volumeColorStops"].is_array()) {
@@ -416,9 +382,21 @@ void Spectrogram::update() {
 
 // setEnabled() is inherited from Module base class
 
+void Spectrogram::setEnabled(bool enabled) {
+    enabledParam.set(enabled);
+}
+
+void Spectrogram::onEnabledParamChanged(bool& val) {
+    Module::setEnabled(val);
+}
+
 void Spectrogram::setFftSize(int fftSize) {
+    fftSizeParam.set(fftSize);
+}
+
+void Spectrogram::onFftSizeParamChanged(int& val) {
     // Ensure fftSize is power of 2 and within range
-    int newSize = std::max(256, std::min(8192, fftSize));
+    int newSize = std::max(256, std::min(8192, val));
     // Round to nearest power of 2
     int power = 1;
     while (power < newSize) power <<= 1;
@@ -432,10 +410,52 @@ void Spectrogram::setFftSize(int fftSize) {
 }
 
 void Spectrogram::setWindowType(fftWindowType windowType) {
-    if (windowType_ != windowType) {
-        windowType_ = windowType;
+    int typeIndex = 3; // Default HAMMING
+    if (windowType == OF_FFT_WINDOW_RECTANGULAR) typeIndex = 0;
+    else if (windowType == OF_FFT_WINDOW_BARTLETT) typeIndex = 1;
+    else if (windowType == OF_FFT_WINDOW_HANN) typeIndex = 2;
+    else if (windowType == OF_FFT_WINDOW_HAMMING) typeIndex = 3;
+    else if (windowType == OF_FFT_WINDOW_SINE) typeIndex = 4;
+    windowTypeParam.set(typeIndex);
+}
+
+void Spectrogram::onWindowTypeParamChanged(int& val) {
+    fftWindowType type = OF_FFT_WINDOW_HAMMING;
+    if (val == 0) type = OF_FFT_WINDOW_RECTANGULAR;
+    else if (val == 1) type = OF_FFT_WINDOW_BARTLETT;
+    else if (val == 2) type = OF_FFT_WINDOW_HANN;
+    else if (val == 3) type = OF_FFT_WINDOW_HAMMING;
+    else if (val == 4) type = OF_FFT_WINDOW_SINE;
+    
+    if (windowType_ != type) {
+        windowType_ = type;
         setupFft();
         textureDirty_ = true;  // Window type change requires texture regeneration
+    }
+}
+
+void Spectrogram::setSpeed(float speed) {
+    speedParam.set(speed);
+}
+
+void Spectrogram::onSpeedParamChanged(float& val) {
+    float clampedVal = std::max(0.1f, std::min(5.0f, val));
+    if (speed_ != clampedVal) {
+        speed_ = clampedVal;
+        updateHistorySize();
+        textureDirty_ = true;  // Speed change affects history size and texture dimensions
+    }
+}
+
+void Spectrogram::setFftScale(FftScale scale) {
+    fftScaleParam.set(static_cast<int>(scale));
+}
+
+void Spectrogram::onFftScaleParamChanged(int& val) {
+    FftScale scale = static_cast<FftScale>(std::max(0, std::min(2, val)));
+    if (fftScale_ != scale) {
+        fftScale_ = scale;
+        textureDirty_ = true;  // Scale change requires texture regeneration
     }
 }
 
@@ -457,19 +477,6 @@ float Spectrogram::getVolumeStop(int stopIndex) const {
         return volumeColorStops_[stopIndex].volumeDb;
     }
     return -120.0f;  // Default fallback
-}
-
-void Spectrogram::setSpeed(float speed) {
-    speed_ = std::max(0.1f, std::min(5.0f, speed));
-    updateHistorySize();
-    textureDirty_ = true;  // Speed change affects history size and texture dimensions
-}
-
-void Spectrogram::setFftScale(FftScale scale) {
-    if (fftScale_ != scale) {
-        fftScale_ = scale;
-        textureDirty_ = true;  // Scale change requires texture regeneration
-    }
 }
 
 void Spectrogram::setupFft() {

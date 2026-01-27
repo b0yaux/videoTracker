@@ -329,233 +329,25 @@ void Pattern::doubleSteps() {
 
 ofJson Pattern::toJson() const {
     ofJson json;
-    
-    // Save stepCount explicitly to preserve pattern length
-    json["stepCount"] = (int)steps.size();
-    
-    // Save steps (JSON key "cells" kept for backward compatibility)
-    ofJson patternArray = ofJson::array();
-    for (size_t i = 0; i < steps.size(); i++) {
-        ofJson stepJson;
-        const auto& step = steps[i];
-        stepJson["index"] = step.index;
-        stepJson["length"] = step.length;
-        stepJson["note"] = step.note;      // Save as direct field
-        stepJson["chance"] = step.chance;   // Save as direct field
-        stepJson["ratioA"] = step.ratioA;   // Save as direct field
-        stepJson["ratioB"] = step.ratioB;   // Save as direct field
-        
-        // Save parameter values (external parameters only, note/chance/ratio are now direct fields)
-        ofJson paramJson = ofJson::object();
-        for (const auto& pair : step.parameterValues) {
-            // Skip note, chance, and ratio if they exist in map (for backward compatibility during migration)
-            if (pair.first != "note" && pair.first != "chance" && pair.first != "ratio") {
-            paramJson[pair.first] = pair.second;
-            }
-        }
-        stepJson["parameters"] = paramJson;
-        patternArray.push_back(stepJson);
-    }
-    json["cells"] = patternArray;  // Keep "cells" key for backward compatibility
-    
-    // Save column configuration
-    ofJson columnArray = ofJson::array();
-    for (const auto& col : columnConfig) {
-        ofJson colJson;
-        colJson["parameterName"] = col.parameterName;
-        // displayName removed - derived from parameterName via getDisplayName()
-        colJson["category"] = static_cast<int>(col.category);  // Save as int for enum
-        colJson["isRequired"] = col.isRequired;
-        colJson["columnIndex"] = col.columnIndex;
-        // Also save isRemovable for backward compatibility
-        colJson["isRemovable"] = col.isRemovable();
-        columnArray.push_back(colJson);
-    }
-    json["columnConfig"] = columnArray;
-    
-    // Save stepsPerBeat (per-pattern)
+    json["steps"] = steps;
+    json["columnConfig"] = columnConfig;
     json["stepsPerBeat"] = stepsPerBeat;
-    
     return json;
 }
 
 void Pattern::fromJson(const ofJson& json) {
-    // Handle both old format (array of steps) and new format (object with steps and columnConfig)
-    // JSON key "cells" kept for backward compatibility
-    ofJson stepsJson;
-    int stepCount = 16;  // Default step count (fallback only)
-    
-    if (json.is_array()) {
-        // Old format: just array of steps
-        stepsJson = json;
-        stepCount = (int)stepsJson.size();  // Infer from array size
-        // Initialize default columns for old format
-        initializeDefaultColumns();
-    } else if (json.is_object()) {
-        // New format: object with steps and columnConfig
-        if (json.contains("cells") && json["cells"].is_array()) {
-            stepsJson = json["cells"];  // JSON key "cells" for backward compatibility
-        } else {
-            ofLogError("Pattern") << "Invalid JSON format: expected 'cells' array";
-            return;
-        }
-        
-        // Load stepCount if present (new format) - this is the authoritative value
-        // Only fall back to array size if stepCount is not explicitly saved
-        if (json.contains("stepCount") && json["stepCount"].is_number()) {
-            stepCount = json["stepCount"];  // Direct conversion (ofJson supports this)
-        } else {
-            // No stepCount in JSON - infer from array size (backward compatibility)
-            stepCount = (int)stepsJson.size();
-        }
-        
-        // Load column configuration if present
-        if (json.contains("columnConfig") && json["columnConfig"].is_array()) {
-            columnConfig.clear();
-            for (const auto& colJson : json["columnConfig"]) {
-                ColumnConfig col;
-                if (colJson.contains("parameterName")) col.parameterName = colJson["parameterName"];
-                // displayName removed - derived from parameterName via getDisplayName()
-                
-                // Load new fields (with backward compatibility)
-                if (colJson.contains("category") && colJson["category"].is_number()) {
-                    col.category = static_cast<ColumnCategory>(static_cast<int>(colJson["category"]));
-                } else {
-                    // Backward compatibility: infer category from parameter name
-                    if (col.parameterName == "index" || col.parameterName == "length") {
-                        col.category = ColumnCategory::TRIGGER;
-                    } else if (col.parameterName == "chance" || col.parameterName == "ratio") {
-                        col.category = ColumnCategory::CONDITION;
-                    } else {
-                        col.category = ColumnCategory::PARAMETER;
-                    }
-                }
-                
-                if (colJson.contains("isRequired") && colJson["isRequired"].is_boolean()) {
-                    col.isRequired = colJson["isRequired"];
-                } else if (colJson.contains("isRemovable") && colJson["isRemovable"].is_boolean()) {
-                    // Backward compatibility: convert isRemovable to isRequired (inverted)
-                    col.isRequired = !colJson["isRemovable"];
-                } else {
-                    // Default: infer from parameter name
-                    col.isRequired = (col.parameterName == "index" || col.parameterName == "length");
-                }
-                
-                // isInternal is always inferred from parameter name (not serialized)
-                // chance and note are internal, everything else is external
-                
-                if (colJson.contains("columnIndex")) col.columnIndex = colJson["columnIndex"];
-                columnConfig.push_back(col);
-            }
-        } else {
-            // No column config in JSON - initialize defaults
-            initializeDefaultColumns();
-        }
-        
-        // Load stepsPerBeat (per-pattern, default to 4.0 if not present)
-        if (json.contains("stepsPerBeat") && json["stepsPerBeat"].is_number()) {
-            // Support both int (legacy) and float (new) formats
-            if (json["stepsPerBeat"].is_number_float()) {
-                stepsPerBeat = json["stepsPerBeat"];
-            } else if (json["stepsPerBeat"].is_number_integer()) {
-                stepsPerBeat = static_cast<float>(json["stepsPerBeat"]);
-            } else {
-                stepsPerBeat = 4.0f;  // Default fallback
-            }
-            // Clamp to valid range: -96 to 96, excluding 0
-            if (stepsPerBeat == 0.0f) {
-                stepsPerBeat = 4.0f;
-            }
-            stepsPerBeat = std::max(-96.0f, std::min(96.0f, stepsPerBeat));
-        } else {
-            stepsPerBeat = 4.0f;  // Default fallback
-        }
-    } else {
-        ofLogError("Pattern") << "Invalid JSON format: expected array or object";
-        return;
+    if (json.contains("steps") && json["steps"].is_array()) {
+        steps = json["steps"].get<std::vector<Step>>();
+    } else if (json.contains("cells") && json["cells"].is_array()) {
+        // Transitional support for 'cells' key if we just renamed it
+        steps = json["cells"].get<std::vector<Step>>();
     }
     
-    // Resize to stepCount (preserves user-set pattern length)
-    // This overwrites any previous size set by Pattern constructor
-    steps.clear();
-    steps.resize(stepCount);
-    
-    ofLogNotice("Pattern") << "Loading pattern with stepCount=" << stepCount 
-                           << " (cells in JSON: " << stepsJson.size() << ")";
-    
-    // Load step data (may be fewer items than stepCount if pattern was extended)
-    for (size_t i = 0; i < stepsJson.size() && i < (size_t)stepCount; i++) {
-        auto stepJson = stepsJson[i];
-        Step step;
-        
-        // Load fixed fields - handle null values gracefully
-        if (stepJson.contains("index") && !stepJson["index"].is_null()) {
-            step.index = stepJson["index"];
-        } else if (stepJson.contains("mediaIndex") && !stepJson["mediaIndex"].is_null()) {
-            step.index = stepJson["mediaIndex"]; // Legacy support
-        }
-        // else: use default value (-1) from Step constructor
-        
-        if (stepJson.contains("length") && !stepJson["length"].is_null()) {
-            step.length = stepJson["length"];
-        } else if (stepJson.contains("stepLength") && !stepJson["stepLength"].is_null()) {
-            step.length = stepJson["stepLength"]; // Legacy support
-        }
-        // else: use default value (1) from Step constructor
-        
-        // Load note and chance as direct fields (new format)
-        if (stepJson.contains("note") && !stepJson["note"].is_null()) {
-            step.note = stepJson["note"];
-        }
-        // else: use default value (-1) from Step constructor
-        
-        if (stepJson.contains("chance") && !stepJson["chance"].is_null()) {
-            step.chance = stepJson["chance"];
-        }
-        // else: use default value (100) from Step constructor
-        
-        // Load ratio as direct fields (new format)
-        if (stepJson.contains("ratioA") && !stepJson["ratioA"].is_null()) {
-            step.ratioA = stepJson["ratioA"];
-        }
-        // else: use default value (1) from Step constructor
-        
-        if (stepJson.contains("ratioB") && !stepJson["ratioB"].is_null()) {
-            step.ratioB = stepJson["ratioB"];
-        }
-        // else: use default value (1) from Step constructor
-        
-        // Load parameter values (new format)
-        if (stepJson.contains("parameters") && stepJson["parameters"].is_object()) {
-            auto paramJson = stepJson["parameters"];
-            for (auto it = paramJson.begin(); it != paramJson.end(); ++it) {
-                // Skip null parameter values
-                if (!it.value().is_null() && it.value().is_number()) {
-                    std::string paramName = it.key();
-                    // Backward compatibility: migrate note/chance/ratio from parameters map to direct fields
-                    if (paramName == "note" || paramName == "chance" || paramName == "ratio") {
-                        step.setParameterValue(paramName, it.value()); // This will set the direct field and remove from map
-                    } else {
-                        step.setParameterValue(paramName, it.value());
-                    }
-                }
-            }
-        } else {
-            // Legacy: migrate old format to new parameter map
-            if (stepJson.contains("position") && !stepJson["position"].is_null()) {
-                step.setParameterValue("position", stepJson["position"]);
-            }
-            if (stepJson.contains("speed") && !stepJson["speed"].is_null()) {
-                step.setParameterValue("speed", stepJson["speed"]);
-            }
-            if (stepJson.contains("volume") && !stepJson["volume"].is_null()) {
-                step.setParameterValue("volume", stepJson["volume"]);
-            }
-        }
-        // Legacy: audioEnabled/videoEnabled fields are ignored (backward compatibility)
-        
-        steps[i] = step;
+    if (json.contains("columnConfig") && json["columnConfig"].is_array()) {
+        columnConfig = json["columnConfig"].get<std::vector<ColumnConfig>>();
     }
+    
+    stepsPerBeat = json.value("stepsPerBeat", 4.0f);
 }
 
     // Steps per beat methods

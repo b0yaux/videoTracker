@@ -23,6 +23,15 @@ static std::string getDebugTimestamp() {
 }
 
 AudioOutput::AudioOutput() {
+    // Setup parameters
+    params.setName("AudioOutput");
+    params.add(masterVolumeParam.set("Master Volume", 1.0f, 0.0f, 1.0f));
+    params.add(audioDeviceParam.set("Audio Device", -1, -1, 100));
+    
+    // Add listeners
+    masterVolumeParam.addListener(this, &AudioOutput::onMasterVolumeParamChanged);
+    audioDeviceParam.addListener(this, &AudioOutput::onAudioDeviceParamChanged);
+
     // Initialize sound mixer (mixes all connected sources)
     soundMixer_.setName("Audio Mixer");
     soundMixer_.setMasterVolume(1.0f);
@@ -159,11 +168,8 @@ Module::ModuleMetadata AudioOutput::getMetadata() const {
 
 ofJson AudioOutput::toJson(class ModuleRegistry* registry) const {
     ofJson json;
-    json["type"] = "AudioOutput";
-    json["name"] = getName();
+    ofSerialize(json, params);
     json["enabled"] = isEnabled();
-    json["masterVolume"] = getMasterVolume();
-    json["audioDevice"] = getAudioDevice();
     
     // Serialize connections - use UUIDs for reliability (consistent with router system)
     std::lock_guard<std::mutex> lock(connectionMutex_);
@@ -192,43 +198,14 @@ ofJson AudioOutput::toJson(class ModuleRegistry* registry) const {
 }
 
 void AudioOutput::fromJson(const ofJson& json) {
+    ofDeserialize(json, params);
+    
     // Load enabled state
     if (json.contains("enabled")) {
         setEnabled(json["enabled"].get<bool>());
     }
     
-    // Load master volume
-    if (json.contains("masterVolume")) {
-        setMasterVolume(json["masterVolume"].get<float>());
-    }
-    
-    // Load audio device - ensure devices are enumerated first
-    if (json.contains("audioDevice")) {
-        int savedDeviceIndex = json["audioDevice"].get<int>();
-        
-        // If devices aren't enumerated yet, enumerate them now
-        if (audioDevices_.empty()) {
-            refreshAudioDevices();
-        }
-        
-        // Only set device if we have valid devices and the index is valid
-        if (!audioDevices_.empty() && savedDeviceIndex >= 0 && savedDeviceIndex < static_cast<int>(audioDevices_.size())) {
-            selectedAudioDevice_ = savedDeviceIndex;
-            // Don't call setupAudioStream() here - it will be called later in ofApp::setupSoundObjects()
-            // Just store the device index for now
-        } else {
-            // Invalid device index - use default device instead
-            ofLogWarning("AudioOutput") << "Invalid saved audio device index: " << savedDeviceIndex 
-                                       << ", using default device instead";
-            // refreshAudioDevices() already set selectedAudioDevice_ to default, so we're good
-        }
-    } else {
-        // No saved device - ensure default is selected
-        if (audioDevices_.empty()) {
-            refreshAudioDevices();
-        }
-        // refreshAudioDevices() already selects default if selectedAudioDevice_ is invalid
-    }
+    // Listeners triggered by ofDeserialize will sync internal mixer and device selection
     
     // Note: Connections are restored by SessionManager via restoreConnections()
     // after all modules are loaded
@@ -305,6 +282,13 @@ void AudioOutput::audioOut(ofSoundBuffer& buffer) {
     // Initialize buffer to silence first (important for proper audio processing)
     buffer.set(0.0f);
     
+    if (!isEnabled()) {
+        currentAudioLevel_ = 0.0f;
+        std::lock_guard<std::mutex> lock(connectionMutex_);
+        connectionAudioLevels_.clear();
+        return;
+    }
+
     // Clean up expired connections periodically (every 1000 calls)
     static int cleanupCounter = 0;
     if (++cleanupCounter % 1000 == 0) {
@@ -573,6 +557,10 @@ std::vector<ofSoundDevice> AudioOutput::getAudioDevices() const {
 }
 
 void AudioOutput::setAudioDevice(int deviceIndex) {
+    audioDeviceParam.set(deviceIndex);
+}
+
+void AudioOutput::onAudioDeviceParamChanged(int& deviceIndex) {
     // Ensure devices are enumerated
     if (audioDevices_.empty()) {
         refreshAudioDevices();
@@ -814,7 +802,7 @@ void AudioOutput::disconnectModule(std::shared_ptr<Module> module) {
                                 << (module ? module->getName() : "null");
 }
 
-void AudioOutput::disconnectModule(size_t connectionIndex) {
+void AudioOutput::disconnectModuleAtIndex(size_t connectionIndex) {
     std::lock_guard<std::mutex> lock(connectionMutex_);
     if (connectionIndex >= connectedModules_.size()) {
         ofLogWarning("AudioOutput") << "Invalid connection index: " << connectionIndex;
@@ -987,8 +975,11 @@ float AudioOutput::getConnectionVolume(size_t connectionIndex) const {
 }
 
 void AudioOutput::setMasterVolume(float volume) {
-    volume = ofClamp(volume, 0.0f, 1.0f);
-    soundMixer_.setMasterVolume(volume);
+    masterVolumeParam.set(volume);
+}
+
+void AudioOutput::onMasterVolumeParamChanged(float& volume) {
+    setMasterVolume(volume);
 }
 
 float AudioOutput::getMasterVolume() const {

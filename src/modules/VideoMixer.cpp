@@ -6,6 +6,17 @@
 
 VideoMixer::VideoMixer() 
     : masterOpacity_(1.0f) {
+    // Setup parameters
+    params.setName("VideoMixer");
+    params.add(masterOpacityParam.set("Master Opacity", 1.0f, 0.0f, 1.0f));
+    params.add(blendModeParam.set("Blend Mode", 0, 0, 2));
+    params.add(autoNormalizeParam.set("Auto Normalize", true));
+
+    // Add listeners
+    masterOpacityParam.addListener(this, &VideoMixer::onMasterOpacityParamChanged);
+    blendModeParam.addListener(this, &VideoMixer::onBlendModeParamChanged);
+    autoNormalizeParam.addListener(this, &VideoMixer::onAutoNormalizeParamChanged);
+
     // Initialize video mixer
     videoMixer_.setName("Video Mixer");
     videoMixer_.setMasterOpacity(1.0f);
@@ -21,6 +32,51 @@ VideoMixer::~VideoMixer() {
     std::lock_guard<std::mutex> lock(connectionMutex_);
     connectedModules_.clear();
     sourceOpacities_.clear();
+}
+
+void VideoMixer::setMasterOpacity(float opacity) {
+    masterOpacityParam.set(opacity);
+}
+
+void VideoMixer::onMasterOpacityParamChanged(float& val) {
+    masterOpacity_ = ofClamp(val, 0.0f, 1.0f);
+    videoMixer_.setMasterOpacity(masterOpacity_);
+}
+
+float VideoMixer::getMasterOpacity() const {
+    return masterOpacity_;
+}
+
+void VideoMixer::setBlendMode(ofBlendMode mode) {
+    int modeIndex = 0;
+    if (mode == OF_BLENDMODE_ADD) modeIndex = 0;
+    else if (mode == OF_BLENDMODE_MULTIPLY) modeIndex = 1;
+    else if (mode == OF_BLENDMODE_ALPHA) modeIndex = 2;
+    blendModeParam.set(modeIndex);
+}
+
+void VideoMixer::onBlendModeParamChanged(int& val) {
+    ofBlendMode mode = OF_BLENDMODE_ADD;
+    if (val == 0) mode = OF_BLENDMODE_ADD;
+    else if (val == 1) mode = OF_BLENDMODE_MULTIPLY;
+    else if (val == 2) mode = OF_BLENDMODE_ALPHA;
+    videoMixer_.setBlendMode(mode);
+}
+
+ofBlendMode VideoMixer::getBlendMode() const {
+    return videoMixer_.getBlendMode();
+}
+
+void VideoMixer::setAutoNormalize(bool enabled) {
+    autoNormalizeParam.set(enabled);
+}
+
+void VideoMixer::onAutoNormalizeParamChanged(bool& val) {
+    videoMixer_.setAutoNormalize(val);
+}
+
+bool VideoMixer::getAutoNormalize() const {
+    return videoMixer_.getAutoNormalize();
 }
 
 std::string VideoMixer::getName() const {
@@ -152,20 +208,7 @@ Module::ModuleMetadata VideoMixer::getMetadata() const {
 
 ofJson VideoMixer::toJson(class ModuleRegistry* registry) const {
     ofJson json;
-    json["type"] = "VideoMixer";
-    json["name"] = getName();
-    json["enabled"] = isEnabled();
-    json["masterOpacity"] = getMasterOpacity();
-    
-    // Serialize blend mode
-    ofBlendMode mode = getBlendMode();
-    int modeIndex = 0;
-    if (mode == OF_BLENDMODE_ADD) modeIndex = 0;
-    else if (mode == OF_BLENDMODE_MULTIPLY) modeIndex = 1;
-    else if (mode == OF_BLENDMODE_ALPHA) modeIndex = 2;
-    json["blendMode"] = modeIndex;
-    
-    json["autoNormalize"] = getAutoNormalize();
+    ofSerialize(json, params);
     
     // Serialize connections
     std::lock_guard<std::mutex> lock(connectionMutex_);
@@ -184,30 +227,9 @@ ofJson VideoMixer::toJson(class ModuleRegistry* registry) const {
 }
 
 void VideoMixer::fromJson(const ofJson& json) {
-    // Load enabled state
-    if (json.contains("enabled")) {
-        setEnabled(json["enabled"].get<bool>());
-    }
+    ofDeserialize(json, params);
     
-    // Load master opacity
-    if (json.contains("masterOpacity")) {
-        setMasterOpacity(json["masterOpacity"].get<float>());
-    }
-    
-    // Load blend mode
-    if (json.contains("blendMode")) {
-        int modeIndex = json["blendMode"].get<int>();
-        ofBlendMode mode = OF_BLENDMODE_ADD;
-        if (modeIndex == 0) mode = OF_BLENDMODE_ADD;
-        else if (modeIndex == 1) mode = OF_BLENDMODE_MULTIPLY;
-        else if (modeIndex == 2) mode = OF_BLENDMODE_ALPHA;
-        setBlendMode(mode);
-    }
-    
-    // Load auto-normalize
-    if (json.contains("autoNormalize")) {
-        setAutoNormalize(json["autoNormalize"].get<bool>());
-    }
+    // Listeners triggered by ofDeserialize will sync state
     
     // Note: Connections are restored by SessionManager via restoreConnections()
     // after all modules are loaded
@@ -242,6 +264,15 @@ void VideoMixer::restoreConnections(const ofJson& connectionsJson, ModuleRegistr
 }
 
 void VideoMixer::process(ofFbo& input, ofFbo& output) {
+    if (!isEnabled()) {
+        if (output.isAllocated()) {
+            output.begin();
+            ofClear(0, 0, 0, 0);
+            output.end();
+        }
+        return;
+    }
+
     // Delegate to underlying video mixer
     // Note: ofxVideoMixer ignores input and pulls from all connected inputs
     videoMixer_.process(input, output);
@@ -339,7 +370,7 @@ void VideoMixer::disconnectModule(std::shared_ptr<Module> module) {
     }
 }
 
-void VideoMixer::disconnectModule(size_t sourceIndex) {
+void VideoMixer::disconnectModuleAtIndex(size_t sourceIndex) {
     std::lock_guard<std::mutex> lock(connectionMutex_);
     if (sourceIndex >= connectedModules_.size()) {
         ofLogWarning("VideoMixer") << "Invalid source index: " << sourceIndex;
@@ -427,33 +458,6 @@ float VideoMixer::getConnectionOpacity(size_t sourceIndex) const {
     }
     return sourceOpacities_[sourceIndex];
 }
-
-void VideoMixer::setMasterOpacity(float opacity) {
-    opacity = ofClamp(opacity, 0.0f, 1.0f);
-    masterOpacity_ = opacity;
-    videoMixer_.setMasterOpacity(opacity);
-}
-
-float VideoMixer::getMasterOpacity() const {
-    return masterOpacity_;
-}
-
-void VideoMixer::setBlendMode(ofBlendMode mode) {
-    videoMixer_.setBlendMode(mode);
-}
-
-ofBlendMode VideoMixer::getBlendMode() const {
-    return videoMixer_.getBlendMode();
-}
-
-void VideoMixer::setAutoNormalize(bool enabled) {
-    videoMixer_.setAutoNormalize(enabled);
-}
-
-bool VideoMixer::getAutoNormalize() const {
-    return videoMixer_.getAutoNormalize();
-}
-
 
 void VideoMixer::ensureOutputFbo(int width, int height) {
     if (width <= 0 || height <= 0) {

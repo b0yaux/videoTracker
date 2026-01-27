@@ -31,7 +31,7 @@ SessionManager::SessionManager(
     ParameterRouter* router,
     ConnectionManager* connectionManager,
     ViewManager* viewManager
-) : projectManager_(projectManager), clock(clock), registry(registry), factory(factory), router(router), connectionManager_(connectionManager), viewManager_(viewManager), guiManager_(nullptr), currentSessionName_(""), postLoadCallback_(nullptr), projectOpenedCallback_(nullptr), pendingImGuiState_(""), pendingVisibilityState_(ofJson::object()) {
+) : projectManager_(projectManager), clock(clock), registry(registry), factory(factory), router(router), connectionManager_(connectionManager), viewManager_(viewManager), guiManager_(nullptr), currentSessionName_(""), pendingImGuiState_(""), pendingVisibilityState_(ofJson::object()), postLoadCallback_(nullptr), projectOpenedCallback_(nullptr) {
     if (!clock || !registry || !factory || !router) {
         ofLogError("SessionManager") << "SessionManager initialized with null pointers";
     }
@@ -104,39 +104,28 @@ ofJson SessionManager::serializeAll() const {
     // Module instance visibility state
     if (guiManager_) {
         json["gui"]["visibleInstances"] = ofJson::object();
-        json["gui"]["visibleInstances"]["mediaPool"] = ofJson::array();
-        json["gui"]["visibleInstances"]["tracker"] = ofJson::array();
-        json["gui"]["visibleInstances"]["audioOutput"] = ofJson::array();
-        json["gui"]["visibleInstances"]["videoOutput"] = ofJson::array();
-        json["gui"]["visibleInstances"]["audioMixer"] = ofJson::array();
-        json["gui"]["visibleInstances"]["videoMixer"] = ofJson::array();
         
-        auto visibleMediaPool = guiManager_->getVisibleInstances(ModuleType::INSTRUMENT);
-        for (const auto& name : visibleMediaPool) {
-            json["gui"]["visibleInstances"]["mediaPool"].push_back(name);
-        }
+        // Save visible instances for all module types generically
+        std::vector<ModuleType> types = { 
+            ModuleType::SEQUENCER, 
+            ModuleType::INSTRUMENT, 
+            ModuleType::EFFECT, 
+            ModuleType::UTILITY 
+        };
         
-        auto visibleTracker = guiManager_->getVisibleInstances(ModuleType::SEQUENCER);
-        for (const auto& name : visibleTracker) {
-            json["gui"]["visibleInstances"]["tracker"].push_back(name);
-        }
-        
-        auto visibleUtility = guiManager_->getVisibleInstances(ModuleType::UTILITY);
-        // Separate utility types by checking module metadata (generic approach)
-        for (const auto& name : visibleUtility) {
-            auto module = registry->getModule(name);
-            if (module) {
-                auto metadata = module->getMetadata();
-                std::string typeName = metadata.typeName;
-                if (typeName == "AudioOutput") {
-                    json["gui"]["visibleInstances"]["audioOutput"].push_back(name);
-                } else if (typeName == "VideoOutput") {
-                    json["gui"]["visibleInstances"]["videoOutput"].push_back(name);
-                } else if (typeName == "AudioMixer") {
-                    json["gui"]["visibleInstances"]["audioMixer"].push_back(name);
-                } else if (typeName == "VideoMixer") {
-                    json["gui"]["visibleInstances"]["videoMixer"].push_back(name);
-                }
+        for (auto type : types) {
+            std::string typeKey;
+            switch (type) {
+                case ModuleType::SEQUENCER: typeKey = "sequencer"; break;
+                case ModuleType::INSTRUMENT: typeKey = "instrument"; break;
+                case ModuleType::EFFECT: typeKey = "effect"; break;
+                case ModuleType::UTILITY: typeKey = "utility"; break;
+            }
+            
+            json["gui"]["visibleInstances"][typeKey] = ofJson::array();
+            auto visible = guiManager_->getVisibleInstances(type);
+            for (const auto& name : visible) {
+                json["gui"]["visibleInstances"][typeKey].push_back(name);
             }
         }
     }
@@ -180,16 +169,10 @@ bool SessionManager::deserializeAll(const ofJson& json) {
     
     // Check version
     std::string version = json.value("version", "");
-    if (version.empty()) {
-        // Legacy format - try migration
-        ofLogNotice("SessionManager") << "Legacy format detected, attempting migration";
-        return migrateLegacyFormat(json);
-    }
-    
     if (version != SESSION_VERSION) {
-        ofLogWarning("SessionManager") << "Session version mismatch: " << version 
-                                       << " (expected " << SESSION_VERSION << ")";
-        // Continue anyway - might still work
+        ofLogError("SessionManager") << "Session version mismatch: " << version 
+                                     << " (expected " << SESSION_VERSION << ")";
+        return false;
     }
     
     // Load clock
@@ -549,9 +532,6 @@ bool SessionManager::loadSessionFromPath(const std::string& filePath) {
         return false;
     }
     
-    // First, try to migrate any legacy files into the session
-    migrateLegacyFiles(filePath);
-    
     ofFile file(filePath, ofFile::ReadOnly);
     if (!file.is_open()) {
         ofLogError("SessionManager") << "Failed to open file for reading: " << filePath;
@@ -586,246 +566,7 @@ bool SessionManager::loadSessionFromPath(const std::string& filePath) {
         }
     }
     
-    // Handle legacy data in session
-    if (json.contains("legacy") && json["legacy"].is_object()) {
-        auto legacy = json["legacy"];
-        
-        // Migrate legacy TrackerSequencer state
-        if (legacy.contains("trackerSequencerState") && registry) {
-            ofLogNotice("SessionManager") << "Migrating legacy TrackerSequencer state from session";
-            auto trackers = registry->getModulesByType(ModuleType::SEQUENCER);
-            if (!trackers.empty()) {
-                try {
-                    trackers[0]->fromJson(legacy["trackerSequencerState"]);
-                    ofLogNotice("SessionManager") << "Migrated TrackerSequencer state";
-                } catch (const std::exception& e) {
-                    ofLogError("SessionManager") << "Failed to migrate TrackerSequencer state: " << e.what();
-                }
-            }
-        }
-        
-        // Migrate legacy sequencer state (similar to trackerSequencerState)
-        if (legacy.contains("sequencerState") && registry) {
-            ofLogNotice("SessionManager") << "Migrating legacy sequencer state from session";
-            auto trackers = registry->getModulesByType(ModuleType::SEQUENCER);
-            if (!trackers.empty()) {
-                try {
-                    trackers[0]->fromJson(legacy["sequencerState"]);
-                    ofLogNotice("SessionManager") << "Migrated sequencer state";
-                } catch (const std::exception& e) {
-                    ofLogError("SessionManager") << "Failed to migrate sequencer state: " << e.what();
-                }
-            }
-        }
-    }
-    
     return deserializeAll(json);
-}
-
-//--------------------------------------------------------------
-bool SessionManager::migrateLegacyFormat(const ofJson& json) {
-    // Legacy format: tracker_sequencer_state.json
-    // This is a TrackerSequencer-only save file
-    // We can load it into a TrackerSequencer module if one exists
-    
-    ofLogNotice("SessionManager") << "Attempting to migrate legacy TrackerSequencer format";
-    
-    // Check if this looks like a TrackerSequencer state file
-    if (json.contains("pattern") || json.contains("patterns") || json.contains("columnConfig")) {
-        // This is a TrackerSequencer state file
-        // Try to find an existing TrackerSequencer in the registry
-        if (registry) {
-            auto trackers = registry->getModulesByType(ModuleType::SEQUENCER);
-            if (!trackers.empty()) {
-                auto tracker = trackers[0];
-                try {
-                    tracker->fromJson(json);
-                    ofLogNotice("SessionManager") << "Migrated legacy TrackerSequencer state";
-                    return true;
-                } catch (const std::exception& e) {
-                    ofLogError("SessionManager") << "Failed to migrate TrackerSequencer state: " << e.what();
-                    return false;
-                }
-            }
-        }
-    }
-    
-    ofLogError("SessionManager") << "Unknown legacy format or no TrackerSequencer found";
-    return false;
-}
-
-//--------------------------------------------------------------
-bool SessionManager::migrateLegacyFiles(const std::string& sessionPath) {
-    ofLogNotice("SessionManager") << "Checking for legacy state files to migrate...";
-    
-    std::string dataPath = ofToDataPath("", true);
-    bool migrated = false;
-    ofJson consolidatedJson;
-    
-    // Check if we already have a session file
-    bool hasSessionFile = ofFile::doesFileExist(sessionPath);
-    if (hasSessionFile) {
-        // Load existing session
-        ofFile file(sessionPath, ofFile::ReadOnly);
-        if (file.is_open()) {
-            std::string jsonString = file.readToBuffer().getText();
-            file.close();
-            try {
-                consolidatedJson = ofJson::parse(jsonString);
-                ofLogNotice("SessionManager") << "Loaded existing session file for migration";
-            } catch (const std::exception& e) {
-                ofLogWarning("SessionManager") << "Failed to parse existing session: " << e.what();
-                consolidatedJson = ofJson::object();
-            }
-        }
-    } else {
-        // Start with empty session structure
-        consolidatedJson["version"] = SESSION_VERSION;
-        consolidatedJson["metadata"] = ofJson::object();
-        consolidatedJson["modules"] = ofJson::object();
-        consolidatedJson["gui"] = ofJson::object();
-    }
-    
-    // Migrate tracker_sequencer_state.json
-    std::string trackerStatePath = ofToDataPath("tracker_sequencer_state.json", true);
-    if (ofFile::doesFileExist(trackerStatePath)) {
-        ofLogNotice("SessionManager") << "Found tracker_sequencer_state.json, migrating...";
-        ofFile file(trackerStatePath, ofFile::ReadOnly);
-        if (file.is_open()) {
-            std::string jsonString = file.readToBuffer().getText();
-            file.close();
-            try {
-                ofJson trackerJson = ofJson::parse(jsonString);
-                // Store in a legacy section for migration during load
-                if (!consolidatedJson.contains("legacy")) {
-                    consolidatedJson["legacy"] = ofJson::object();
-                }
-                consolidatedJson["legacy"]["trackerSequencerState"] = trackerJson;
-                migrated = true;
-                ofLogNotice("SessionManager") << "Migrated tracker_sequencer_state.json";
-            } catch (const std::exception& e) {
-                ofLogError("SessionManager") << "Failed to parse tracker_sequencer_state.json: " << e.what();
-            }
-        }
-    }
-    
-    // Migrate sequencer_state.json
-    std::string sequencerStatePath = ofToDataPath("sequencer_state.json", true);
-    if (ofFile::doesFileExist(sequencerStatePath)) {
-        ofLogNotice("SessionManager") << "Found sequencer_state.json, migrating...";
-        ofFile file(sequencerStatePath, ofFile::ReadOnly);
-        if (file.is_open()) {
-            std::string jsonString = file.readToBuffer().getText();
-            file.close();
-            try {
-                ofJson sequencerJson = ofJson::parse(jsonString);
-                if (!consolidatedJson.contains("legacy")) {
-                    consolidatedJson["legacy"] = ofJson::object();
-                }
-                consolidatedJson["legacy"]["sequencerState"] = sequencerJson;
-                migrated = true;
-                ofLogNotice("SessionManager") << "Migrated sequencer_state.json";
-            } catch (const std::exception& e) {
-                ofLogError("SessionManager") << "Failed to parse sequencer_state.json: " << e.what();
-            }
-        }
-    }
-    
-    // Migrate module_layouts.json
-    std::string layoutsPath = ofToDataPath("module_layouts.json", true);
-    if (ofFile::doesFileExist(layoutsPath)) {
-        ofLogNotice("SessionManager") << "Found module_layouts.json, migrating...";
-        ofFile file(layoutsPath, ofFile::ReadOnly);
-        if (file.is_open()) {
-            std::string jsonString = file.readToBuffer().getText();
-            file.close();
-            try {
-                ofJson layoutsJson = ofJson::parse(jsonString);
-                if (layoutsJson.contains("layouts") && layoutsJson["layouts"].is_object()) {
-                    // Merge into GUI section
-                    if (!consolidatedJson.contains("gui")) {
-                        consolidatedJson["gui"] = ofJson::object();
-                    }
-                    consolidatedJson["gui"]["moduleLayouts"] = layoutsJson["layouts"];
-                    migrated = true;
-                    ofLogNotice("SessionManager") << "Migrated module_layouts.json";
-                }
-            } catch (const std::exception& e) {
-                ofLogError("SessionManager") << "Failed to parse module_layouts.json: " << e.what();
-            }
-        }
-    }
-    
-    // Migrate media_settings.json (store in settings section)
-    std::string mediaSettingsPath = ofToDataPath("media_settings.json", true);
-    if (ofFile::doesFileExist(mediaSettingsPath)) {
-        ofLogNotice("SessionManager") << "Found media_settings.json, migrating...";
-        ofFile file(mediaSettingsPath, ofFile::ReadOnly);
-        if (file.is_open()) {
-            std::string jsonString = file.readToBuffer().getText();
-            file.close();
-            try {
-                ofJson mediaJson = ofJson::parse(jsonString);
-                if (!consolidatedJson.contains("settings")) {
-                    consolidatedJson["settings"] = ofJson::object();
-                }
-                if (mediaJson.contains("mediaDirectory")) {
-                    consolidatedJson["settings"]["mediaDirectory"] = mediaJson["mediaDirectory"];
-                }
-                migrated = true;
-                ofLogNotice("SessionManager") << "Migrated media_settings.json";
-            } catch (const std::exception& e) {
-                ofLogError("SessionManager") << "Failed to parse media_settings.json: " << e.what();
-            }
-        }
-    }
-    
-    // Save consolidated session if we migrated anything
-    if (migrated) {
-        // Create backup of old session if it exists
-        if (hasSessionFile) {
-            std::string backupPath = sessionPath + ".backup";
-            if (!ofFile::doesFileExist(backupPath)) {
-                ofFile::copyFromTo(sessionPath, backupPath, false, true);
-                ofLogNotice("SessionManager") << "Created backup: " << backupPath;
-            }
-        }
-        
-        // Save consolidated session
-        ofFile file(sessionPath, ofFile::WriteOnly);
-        if (file.is_open()) {
-            file << consolidatedJson.dump(4);
-            file.close();
-            ofLogNotice("SessionManager") << "Saved consolidated session to " << sessionPath;
-            
-            // Optionally rename legacy files (add .migrated extension)
-            // This preserves them for reference but marks them as migrated
-            if (ofFile::doesFileExist(trackerStatePath)) {
-                std::string migratedPath = trackerStatePath + ".migrated";
-                ofFile::moveFromTo(trackerStatePath, migratedPath, false, true);
-            }
-            if (ofFile::doesFileExist(sequencerStatePath)) {
-                std::string migratedPath = sequencerStatePath + ".migrated";
-                ofFile::moveFromTo(sequencerStatePath, migratedPath, false, true);
-            }
-            if (ofFile::doesFileExist(layoutsPath)) {
-                std::string migratedPath = layoutsPath + ".migrated";
-                ofFile::moveFromTo(layoutsPath, migratedPath, false, true);
-            }
-            if (ofFile::doesFileExist(mediaSettingsPath)) {
-                std::string migratedPath = mediaSettingsPath + ".migrated";
-                ofFile::moveFromTo(mediaSettingsPath, migratedPath, false, true);
-            }
-            
-            return true;
-        } else {
-            ofLogError("SessionManager") << "Failed to save consolidated session";
-            return false;
-        }
-    }
-    
-    ofLogNotice("SessionManager") << "No legacy files found to migrate";
-    return true;  // Success (nothing to migrate)
 }
 
 //--------------------------------------------------------------

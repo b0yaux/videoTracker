@@ -1,11 +1,14 @@
 #pragma once
 
+#include "ofMain.h"
 #include <string>
 #include <vector>
 #include <map>
 #include <functional>
 #include <memory>
 #include "ofJson.h"
+#include "ofParameter.h"
+#include "ofEvent.h"
 
 // Forward declarations for routing interface
 class ofxSoundObject;
@@ -123,6 +126,10 @@ struct Port {
 // This allows for future BespokeSynth-style evolution where TrackerSequencer becomes a Module too
 class Module {
 public:
+    Module() {
+        params.add(enabledParam.set("Enabled", true));
+        enabledParam.addListener(this, &Module::onEnabledParamChanged);
+    }
     virtual ~Module() = default;
     
     // Identity
@@ -313,8 +320,14 @@ public:
     // Serialization interface
     // Each module implements its own serialization logic
     // registry parameter is optional - provided when serializing from ModuleRegistry for UUID/name lookup
-    virtual ofJson toJson(class ModuleRegistry* registry = nullptr) const = 0;
-    virtual void fromJson(const ofJson& json) = 0;
+    virtual ofJson toJson(class ModuleRegistry* registry = nullptr) const {
+        ofJson json;
+        ofSerialize(json, const_cast<Module*>(this)->getParameterGroup());
+        return json;
+    }
+    virtual void fromJson(const ofJson& json) {
+        ofDeserialize(json, getParameterGroup());
+    }
     
     /**
      * Unified initialization method - replaces postCreateSetup, configureSelf, and completeRestore
@@ -342,6 +355,24 @@ public:
         class ParameterRouter* parameterRouter = nullptr,
         bool isRestored = false
     ) {}
+
+    /**
+     * Get the parameter group for this module
+     * @return Reference to ofParameterGroup
+     */
+    virtual ofParameterGroup& getParameterGroup() { return params; }
+    
+    /**
+     * Get a parameter by name from the group
+     * @param name Parameter name
+     * @return ofAbstractParameter pointer, or nullptr if not found
+     */
+    virtual ofAbstractParameter* getParameterPtr(const std::string& name) {
+        if (params.contains(name)) {
+            return &params.get(name);
+        }
+        return nullptr;
+    }
     
     /**
      * Connection type enumeration (matches ConnectionManager::ConnectionType)
@@ -431,9 +462,16 @@ public:
     virtual ofEvent<TriggerEvent>* getEvent(const std::string& eventName) { return nullptr; }
     
     // Enable/disable state
-    virtual void setEnabled(bool enabled) { enabled_ = enabled; }
+    virtual void setEnabled(bool enabled) { 
+        enabledParam.set(enabled); 
+    }
     bool isEnabled() const { return enabled_; }
     
+    // Parameter listeners
+    void onEnabledParamChanged(bool& val) {
+        enabled_ = val;
+    }
+
     // Capability query interface - modules declare what they can do
     // Used instead of type-specific checks (dynamic_pointer_cast)
     /**
@@ -448,11 +486,7 @@ public:
      * @return Vector of all capabilities
      */
     virtual std::vector<ModuleCapability> getCapabilities() const { return {}; }
-    
-    // REMOVED: getIndexRange() - use parameter system instead
-    // Modules that provide index ranges should expose an "index" parameter
-    // with dynamic min/max values in getParameters()
-    
+
     /**
      * Restore connections from JSON (for modules that support connections, like mixers)
      * Default implementation does nothing - modules that need connection restoration override this
@@ -556,6 +590,7 @@ public:
      */
     const Port* getOutputPort(const std::string& portName) const {
         // Use thread-local static storage to cache ports and avoid dangling pointers
+        // This is safe because ports are const and don't change during module lifetime
         thread_local static std::vector<Port> cachedPorts;
         thread_local static const Module* cachedModule = nullptr;
         
@@ -657,6 +692,12 @@ public:
     }
 
 protected:
+    // Parameter group for serialization and UI
+    ofParameterGroup params;
+    
+    // Core parameters
+    ofParameter<bool> enabledParam;
+
     // Parameter change callback for synchronization systems
     std::function<void(const std::string&, float)> parameterChangeCallback;
     bool enabled_ = true;  // Module enabled state (default: enabled)

@@ -13,6 +13,12 @@ enum class ColumnCategory {
     PARAMETER     // Optional: how to play (position, speed, volume, external params)
 };
 
+NLOHMANN_JSON_SERIALIZE_ENUM(ColumnCategory, {
+    {ColumnCategory::TRIGGER, "TRIGGER"},
+    {ColumnCategory::CONDITION, "CONDITION"},
+    {ColumnCategory::PARAMETER, "PARAMETER"},
+})
+
 // Column configuration for pattern grid
 struct ColumnConfig {
     std::string parameterName;      // e.g., "index", "length", "position", "speed", "volume", "chance"
@@ -46,6 +52,8 @@ struct ColumnConfig {
         result[0] = std::toupper(result[0]);
         return result;
     }
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(ColumnConfig, parameterName, category, isRequired, columnIndex)
 };
 
 // Step represents a single row in a tracker pattern (the step data)
@@ -87,6 +95,8 @@ struct Step {
     bool operator==(const Step& other) const;
     bool operator!=(const Step& other) const;
     std::string toString() const;
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Step, index, length, note, chance, ratioA, ratioB, parameterValues)
 };
 
 // Pattern represents a complete tracker pattern (sequence of steps)

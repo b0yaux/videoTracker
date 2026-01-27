@@ -21,6 +21,18 @@ TrackerSequencer::TrackerSequencer()
       currentPatternIndex(0),
       draggingStep(-1), draggingColumn(-1), lastDragValue(0.0f), dragStartY(0.0f), dragStartX(0.0f),
       connectionManager_(nullptr) {
+    
+    // Setup parameters
+    params.setName("TrackerSequencer");
+    params.add(stepsPerBeatParam.set("Steps Per Beat", 4.0f, -96.0f, 96.0f));
+    params.add(gatingEnabledParam.set("Gating Enabled", true));
+    params.add(currentPatternIndexParam.set("Current Pattern", 0, 0, 100));
+    
+    // Listeners
+    stepsPerBeatParam.addListener(this, &TrackerSequencer::onStepsPerBeatChanged);
+    gatingEnabledParam.addListener(this, &TrackerSequencer::onGatingEnabledChanged);
+    currentPatternIndexParam.addListener(this, &TrackerSequencer::onCurrentPatternIndexChanged);
+    
     // PlaybackState is initialized with default values in struct definition
     // Initialize with one empty pattern (default 16 steps)
     patterns.push_back(Pattern(16));
@@ -691,10 +703,31 @@ void TrackerSequencer::onTimeEvent(TimeEvent& data) {
 
 //--------------------------------------------------------------
 void TrackerSequencer::setStepsPerBeat(float steps) {
+    stepsPerBeatParam.set(steps);
+}
+
+void TrackerSequencer::onStepsPerBeatChanged(float& steps) {
+    stepsPerBeat = steps;
     // Set stepsPerBeat for current pattern only (per-pattern timing)
     getCurrentPattern().setStepsPerBeat(steps);
     updateStepInterval();
-    // Note: stepsPerBeat is now per-pattern, not per-instance
+}
+
+void TrackerSequencer::setGatingEnabled(bool enabled) {
+    gatingEnabledParam.set(enabled);
+}
+
+void TrackerSequencer::onGatingEnabledChanged(bool& enabled) {
+    gatingEnabled = enabled;
+}
+
+void TrackerSequencer::onCurrentPatternIndexChanged(int& index) {
+    if (index >= 0 && index < (int)patterns.size()) {
+        currentPatternIndex = index;
+        ofLogNotice("TrackerSequencer") << "Switched to pattern " << index;
+    } else {
+        ofLogWarning("TrackerSequencer") << "Invalid pattern index: " << index;
+    }
 }
 
 void TrackerSequencer::updateStepInterval() {
@@ -748,22 +781,8 @@ void TrackerSequencer::setCurrentStep(int step) {
 
 ofJson TrackerSequencer::toJson(class ModuleRegistry* registry) const {
     ofJson json;
-    json["currentStep"] = playbackState.playbackStep;  // Save playback step for backward compatibility
-    // Note: GUI state (editStep, etc.) no longer saved here - managed by TrackerSequencerGUI
-    
-    // Save enabled state
+    ofSerialize(json, params);
     json["enabled"] = isEnabled();
-    
-    // Note: stepsPerBeat is now saved per-pattern (in Pattern::toJson)
-    // Keep sequencer-level stepsPerBeat for backward compatibility only (legacy files)
-    json["stepsPerBeat"] = stepsPerBeat;  // Legacy: keep for backward compatibility
-    
-    // Column configuration is now saved per-pattern (in Pattern::toJson)
-    // No need to save it here - each pattern saves its own columnConfig
-    
-    // Save multi-pattern support
-    json["currentPatternIndex"] = currentPatternIndex;
-    patternChain.toJson(json);
     
     // Save all patterns
     ofJson patternsArray = ofJson::array();
@@ -772,10 +791,8 @@ ofJson TrackerSequencer::toJson(class ModuleRegistry* registry) const {
     }
     json["patterns"] = patternsArray;
     
-    // Pattern chain serialization is handled by PatternChain::toJson()
-    
-    // Legacy: Save single pattern for backward compatibility
-    json["pattern"] = getCurrentPattern().toJson();
+    // Pattern chain serialization
+    patternChain.toJson(json);
     
     return json;
 }
@@ -798,102 +815,44 @@ bool TrackerSequencer::saveState(const std::string& filename) const {
 }
 
 void TrackerSequencer::fromJson(const ofJson& json) {
+    ofDeserialize(json, params);
+    
     // Load enabled state
     if (json.contains("enabled")) {
         setEnabled(json["enabled"].get<bool>());
     }
     
-    // Load basic properties
-    if (json.contains("currentStep")) {
-        playbackState.playbackStep = json["currentStep"];
-    }
-    // Note: GUI state (editStep, etc.) no longer loaded here - managed by TrackerSequencerGUI
+    // Sync state with parameters
+    stepsPerBeat = stepsPerBeatParam.get();
+    currentPatternIndex = currentPatternIndexParam.get();
+    gatingEnabled = gatingEnabledParam.get();
     
-    // Load stepsPerBeat (backward compatibility: if sequencer-level exists, apply to all patterns)
-    // New format: each pattern saves its own stepsPerBeat in Pattern::toJson/fromJson
-    if (json.contains("stepsPerBeat")) {
-        // Support both int (legacy) and float (new) formats
-        if (json["stepsPerBeat"].is_number_float()) {
-            stepsPerBeat = json["stepsPerBeat"];
-        } else if (json["stepsPerBeat"].is_number_integer()) {
-            stepsPerBeat = static_cast<float>(json["stepsPerBeat"]);
-        } else {
-            stepsPerBeat = 4.0f;  // Default fallback
-        }
-        // Clamp to valid range: -96 to 96, excluding 0
-        if (stepsPerBeat == 0.0f) {
-            stepsPerBeat = 4.0f;
-        }
-        stepsPerBeat = std::max(-96.0f, std::min(96.0f, stepsPerBeat));
-        
-        // Backward compatibility: apply sequencer-level value to all patterns that don't have their own
-        for (auto& pattern : patterns) {
-            // Only set if pattern doesn't already have a value (from Pattern::fromJson)
-            // Patterns loaded from JSON will have their own stepsPerBeat, so this only affects new patterns
-            if (pattern.getStepsPerBeat() == 4.0f && patterns.size() > 0 && &pattern != &patterns[0]) {
-                // This is a newly created pattern (not loaded from JSON), apply legacy value
-                pattern.setStepsPerBeat(stepsPerBeat);
-            }
-        }
-        // Also apply to first pattern if it was created before loading (backward compatibility)
-        if (!patterns.empty() && patterns[0].getStepsPerBeat() == 4.0f) {
-            patterns[0].setStepsPerBeat(stepsPerBeat);
-        }
-    } else {
-        stepsPerBeat = 4.0f;  // Default fallback (kept for backward compatibility)
-    }
-    
-    // Column configuration is now per-pattern (loaded in Pattern::fromJson)
-    
-    // Load multi-pattern support (new format)
+    // Load multi-pattern support
     if (json.contains("patterns") && json["patterns"].is_array()) {
         patterns.clear();
         auto patternsArray = json["patterns"];
         for (const auto& patternJson : patternsArray) {
-            // Create pattern with default step count - fromJson will set correct count from JSON
-            Pattern p(16);  // Default step count - actual count comes from JSON stepCount field or array size
+            Pattern p(16);
             p.fromJson(patternJson);
-            // Pattern size is now per-pattern, preserved from JSON stepCount field
             patterns.push_back(p);
         }
         
-        // Load current pattern index
-        if (json.contains("currentPatternIndex")) {
-            int loadedIndex = json["currentPatternIndex"];
-            if (loadedIndex >= 0 && loadedIndex < (int)patterns.size()) {
-                currentPatternIndex = loadedIndex;
-            } else {
-                currentPatternIndex = 0;
-            }
-        }
-        
-        // Load pattern chain (handles both new and legacy formats)
+        // Load pattern chain
         patternChain.fromJson(json, (int)patterns.size());
         
-        ofLogNotice("TrackerSequencer") << "Loaded " << patterns.size() << " patterns, current pattern: " << currentPatternIndex;
-    } else if (json.contains("pattern") && json["pattern"].is_array()) {
-        // Legacy: Load single pattern (backward compatibility)
-        patterns.clear();
-        Pattern p(16);  // Default step count - actual count comes from JSON stepCount field or array size
-        p.fromJson(json["pattern"]);
-        // Pattern size is now per-pattern, preserved from JSON stepCount field
-        patterns.push_back(p);
-        currentPatternIndex = 0;
-        patternChain.clear();
-        // Initialize pattern chain with the single pattern for legacy files
-        patternChain.addEntry(0);
-        patternChain.setEnabled(true);
-        ofLogNotice("TrackerSequencer") << "Loaded legacy single pattern format";
-    } else {
-        // No pattern data - ensure we have at least one empty pattern
-        if (patterns.empty()) {
-            patterns.push_back(Pattern(16));  // Default step count
+        // Verify current pattern index
+        if (currentPatternIndex >= (int)patterns.size()) {
             currentPatternIndex = 0;
+            currentPatternIndexParam.set(0);
         }
-        // Initialize pattern chain with the first pattern
-        if (patternChain.getSize() == 0 && !patterns.empty()) {
-            patternChain.addEntry(0);
-            patternChain.setEnabled(true);
+        
+        ofLogNotice("TrackerSequencer") << "Loaded " << patterns.size() << " patterns, current pattern: " << currentPatternIndex;
+    } else {
+        // Ensure at least one empty pattern
+        if (patterns.empty()) {
+            patterns.push_back(Pattern(16));
+            currentPatternIndex = 0;
+            currentPatternIndexParam.set(0);
         }
     }
 }
@@ -1516,12 +1475,7 @@ void TrackerSequencer::updateStepActiveState() {
 // Multi-pattern support implementation
 //--------------------------------------------------------------
 void TrackerSequencer::setCurrentPatternIndex(int index) {
-    if (index >= 0 && index < (int)patterns.size()) {
-        currentPatternIndex = index;
-        ofLogNotice("TrackerSequencer") << "Switched to pattern " << index;
-    } else {
-        ofLogWarning("TrackerSequencer") << "Invalid pattern index: " << index;
-    }
+    currentPatternIndexParam.set(index);
 }
 
 int TrackerSequencer::addPattern() {

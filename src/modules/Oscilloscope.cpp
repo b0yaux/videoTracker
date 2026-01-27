@@ -12,6 +12,19 @@ static bool orthoMatrixInitialized_ = false;
 
 Oscilloscope::Oscilloscope() 
     : maxBufferSize_(MAX_BUFFER_SIZE) {
+    // Setup parameters
+    params.setName("Oscilloscope");
+    params.add(scaleParam.set("Scale", 0.5f, 0.1f, 5.0f));
+    params.add(pointSizeParam.set("Point Size", 1.0f, 0.5f, 2.0f));
+    params.add(colorParam.set("Color", ofColor::white));
+    params.add(backgroundColorParam.set("Background Color", ofColor::black));
+
+    // Add listeners
+    scaleParam.addListener(this, &Oscilloscope::onScaleParamChanged);
+    pointSizeParam.addListener(this, &Oscilloscope::onPointSizeParamChanged);
+    colorParam.addListener(this, &Oscilloscope::onColorParamChanged);
+    backgroundColorParam.addListener(this, &Oscilloscope::onBackgroundColorParamChanged);
+
     // Initialize with default parameters
     updateBufferSize();
     ensureOutputFbo();
@@ -25,6 +38,57 @@ Oscilloscope::Oscilloscope()
 
 Oscilloscope::~Oscilloscope() {
     // Cleanup handled by smart pointers
+}
+
+void Oscilloscope::setEnabled(bool enabled) {
+    enabledParam.set(enabled);
+}
+
+void Oscilloscope::onEnabledParamChanged(bool& val) {
+    Module::setEnabled(val);
+}
+
+void Oscilloscope::setScale(float scale) {
+    scaleParam.set(scale);
+}
+
+void Oscilloscope::onScaleParamChanged(float& val) {
+    // Allow scale > 1.0 for larger visualizations (can exceed NDC bounds)
+    scale_ = std::max(0.1f, val);  // Minimum 0.1, no maximum
+}
+
+void Oscilloscope::setPointSize(float pointSize) {
+    pointSizeParam.set(pointSize);
+}
+
+void Oscilloscope::onPointSizeParamChanged(float& val) {
+    pointSize_ = std::max(0.5f, std::min(2.0f, val));
+}
+
+void Oscilloscope::setThickness(float thickness) {
+    setPointSize(thickness);
+}
+
+void Oscilloscope::setColor(const ofColor& color) {
+    colorParam.set(color);
+}
+
+void Oscilloscope::onColorParamChanged(ofColor& val) {
+    color_ = val;
+    colorDirty_ = true;
+    updateNormalizedColor();
+}
+
+void Oscilloscope::setBackgroundColor(const ofColor& color) {
+    backgroundColorParam.set(color);
+}
+
+void Oscilloscope::onBackgroundColorParamChanged(ofColor& val) {
+    backgroundColor_ = val;
+}
+
+float Oscilloscope::getPointSize() const {
+    return pointSize_;
 }
 
 std::string Oscilloscope::getName() const {
@@ -140,59 +204,14 @@ std::vector<Port> Oscilloscope::getOutputPorts() const {
 
 ofJson Oscilloscope::toJson(class ModuleRegistry* registry) const {
     ofJson json;
-    json["type"] = "Oscilloscope";
-    json["name"] = getName();
-    json["enabled"] = isEnabled();
-    json["scale"] = scale_;
-    json["pointSize"] = pointSize_;
-    
-    // Serialize colors
-    json["color"]["r"] = color_.r;
-    json["color"]["g"] = color_.g;
-    json["color"]["b"] = color_.b;
-    json["color"]["a"] = color_.a;
-    
-    json["backgroundColor"]["r"] = backgroundColor_.r;
-    json["backgroundColor"]["g"] = backgroundColor_.g;
-    json["backgroundColor"]["b"] = backgroundColor_.b;
-    json["backgroundColor"]["a"] = backgroundColor_.a;
-    
+    ofSerialize(json, params);
     return json;
 }
 
 void Oscilloscope::fromJson(const ofJson& json) {
-    if (json.contains("enabled")) {
-        setEnabled(json["enabled"].get<bool>());
-    }
-    if (json.contains("scale")) {
-        setScale(json["scale"].get<float>());
-    }
-    if (json.contains("thickness")) {
-        // Legacy support - map to pointSize
-        setPointSize(json["thickness"].get<float>());
-    }
-    if (json.contains("pointSize")) {
-        setPointSize(json["pointSize"].get<float>());
-    }
+    ofDeserialize(json, params);
     
-    // Load colors (setColor will update the cache)
-    if (json.contains("color")) {
-        ofColor c;
-        c.r = json["color"]["r"].get<int>();
-        c.g = json["color"]["g"].get<int>();
-        c.b = json["color"]["b"].get<int>();
-        c.a = json["color"]["a"].get<int>();
-        setColor(c);  // This will call updateNormalizedColor()
-    }
-    
-    if (json.contains("backgroundColor")) {
-        ofColor bg;
-        bg.r = json["backgroundColor"]["r"].get<int>();
-        bg.g = json["backgroundColor"]["g"].get<int>();
-        bg.b = json["backgroundColor"]["b"].get<int>();
-        bg.a = json["backgroundColor"]["a"].get<int>();
-        setBackgroundColor(bg);
-    }
+    // Listeners triggered by ofDeserialize will sync state
 }
 
 void Oscilloscope::process(ofSoundBuffer& input, ofSoundBuffer& output) {
@@ -302,36 +321,7 @@ void Oscilloscope::update() {
     }
 }
 
-// setEnabled() is inherited from Module base class
-
-void Oscilloscope::setScale(float scale) {
-    // Allow scale > 1.0 for larger visualizations (can exceed NDC bounds)
-    scale_ = std::max(0.1f, scale);  // Minimum 0.1, no maximum
-}
-
-
-void Oscilloscope::setColor(const ofColor& color) {
-    color_ = color;
-    colorDirty_ = true;
-    updateNormalizedColor();
-}
-
-void Oscilloscope::setBackgroundColor(const ofColor& color) {
-    backgroundColor_ = color;
-}
-
-void Oscilloscope::setThickness(float thickness) {
-    // Legacy method - maps to pointSize for backward compatibility
-    pointSize_ = std::max(0.5f, std::min(2.0f, thickness));
-}
-
-void Oscilloscope::setPointSize(float pointSize) {
-    pointSize_ = std::max(0.5f, std::min(2.0f, pointSize));
-}
-
-float Oscilloscope::getPointSize() const {
-    return pointSize_;
-}
+// Listeners handled above
 
 
 void Oscilloscope::updateBufferSize() {
