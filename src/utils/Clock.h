@@ -14,7 +14,6 @@
 struct ClockConfig {
     float minBPM = 20.0f;
     float maxBPM = 480.0f;
-    float bpmSmoothFactor = 0.05f;
     float pulseFadeFactor = 0.75f;
     float pulseThreshold = 0.05f;
 };
@@ -83,8 +82,7 @@ private:
     // All transport control goes through Clock (start/stop/pause/reset)
     // Other components subscribe via addTransportListener() to be notified of changes
     bool playing;
-    std::atomic<float> currentBpm;
-    std::atomic<float> targetBpm;
+    std::atomic<float> bpm;
     
     // Configuration
     ClockConfig config;

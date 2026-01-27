@@ -11,8 +11,7 @@
 //--------------------------------------------------------------
 Clock::Clock() 
     : playing(false)
-    , currentBpm(120.0f)
-    , targetBpm(120.0f)
+    , bpm(120.0f)
     , beatPulse(0.0f)
     , lastBeatTime(0.0f)
     , beatInterval(0.0f)
@@ -30,22 +29,22 @@ void Clock::setup() {
     // Audio-rate clock doesn't need to connect to sound system
     // It will be called directly from ofApp::audioOut()
     
-    ofLogNotice("Clock") << "Audio-rate clock setup complete - BPM: " << currentBpm.load();
+    ofLogNotice("Clock") << "Audio-rate clock setup complete - BPM: " << bpm.load();
 }
 
 //--------------------------------------------------------------
 void Clock::setBPM(float bpm) {
     // Silent clamping using config
     float clampedBpm = ofClamp(bpm, config.minBPM, config.maxBPM);
-    if (clampedBpm > 0 && clampedBpm != targetBpm.load()) {
-        targetBpm.store(clampedBpm);
+    if (clampedBpm > 0 && clampedBpm != this->bpm.load()) {
+        this->bpm.store(clampedBpm);
         onBPMChanged();
     }
 }
 
 //--------------------------------------------------------------
 float Clock::getBPM() const {
-    return currentBpm.load();
+    return bpm.load();
 }
 
 //--------------------------------------------------------------
@@ -57,7 +56,7 @@ void Clock::start() {
         // Don't calculate samplesPerBeat here - wait for first audioOut() call
         // to get accurate sample rate from the actual audio stream
         // This ensures sample-accurate timing from the start
-        ofLogNotice("Clock") << "Audio-rate clock started at BPM: " << currentBpm.load() << " (will detect SR from first buffer)";
+        ofLogNotice("Clock") << "Audio-rate clock started at BPM: " << bpm.load() << " (will detect SR from first buffer)";
         
         // Notify transport listeners
         for (auto& listener : transportListeners) {
@@ -154,21 +153,14 @@ void Clock::audioOut(ofSoundBuffer& buffer) {
     // Recalculate timing when sample rate changes OR when starting (samplesPerBeat == 0)
     // This ensures we always have valid timing values
     if ((sampleRate > 0.0f) && (samplesPerBeat == 0.0f || abs(bufferSampleRate - sampleRate) > 1.0f)) {
-        float current = currentBpm.load();
-        float beatsPerSecond = current / 60.0f;
+        float currentBpm = bpm.load();
+        float beatsPerSecond = currentBpm / 60.0f;
         samplesPerBeat = sampleRate / beatsPerSecond;
     }
     
-    // Smooth BPM changes for audio-rate transitions using config
-    float current = currentBpm.load();
-    float target = targetBpm.load();
-    if (abs(current - target) > 0.1f) {
-        current = current * (1.0f - config.bpmSmoothFactor) + target * config.bpmSmoothFactor;
-        currentBpm.store(current);
-    }
-    
     // Update samples per beat for sample-accurate timing
-    float beatsPerSecond = current / 60.0f;
+    float currentBpm = bpm.load();
+    float beatsPerSecond = currentBpm / 60.0f;
     samplesPerBeat = sampleRate / beatsPerSecond;
     
     // Sample-accurate beat detection
@@ -183,7 +175,7 @@ void Clock::audioOut(ofSoundBuffer& buffer) {
             TimeEvent beatEvent;
             beatEvent.beat = beatCounter;
             beatEvent.timestamp = ofGetElapsedTimef();
-            beatEvent.bpm = current;
+            beatEvent.bpm = currentBpm;
             
             ofNotifyEvent(timeEvent, beatEvent);
             beatPulse = 1.0f;
@@ -215,8 +207,8 @@ void Clock::setSampleRate(float rate) {
         
         // Recalculate timing if playing
         if (playing) {
-            float current = currentBpm.load();
-            float beatsPerSecond = current / 60.0f;
+            float currentBpm = bpm.load();
+            float beatsPerSecond = currentBpm / 60.0f;
             samplesPerBeat = sampleRate / beatsPerSecond;
         }
     }
@@ -251,12 +243,9 @@ void Clock::onBPMChanged() {
 //--------------------------------------------------------------
 ofJson Clock::toJson() const {
     ofJson json;
-    // CRITICAL: Save targetBpm, not currentBpm
-    // currentBpm is the smoothed/interpolated value that updates in audio thread
-    // targetBpm is the actual user-set value that should be preserved
-    float bpm = targetBpm.load();
-    json["bpm"] = bpm;
-    ofLogNotice("Clock") << "Serializing BPM to JSON: " << bpm << " (targetBpm, currentBpm: " << currentBpm.load() << ")";
+    float bpmValue = bpm.load();
+    json["bpm"] = bpmValue;
+    ofLogNotice("Clock") << "Serializing BPM to JSON: " << bpmValue;
     // Note: stepsPerBeat removed - step timing is now per-TrackerSequencer instance
     // Note: isPlaying is intentionally not saved (transient state)
     return json;
@@ -265,23 +254,15 @@ ofJson Clock::toJson() const {
 //--------------------------------------------------------------
 void Clock::fromJson(const ofJson& json) {
     if (json.contains("bpm")) {
-        float bpm = json["bpm"].get<float>();
+        float bpmValue = json["bpm"].get<float>();
         float bpmBefore = getBPM();
-        float targetBefore = targetBpm.load();
-        ofLogNotice("Clock") << "Loading BPM from JSON: " << bpm << " (current: " << bpmBefore << ", target: " << targetBefore << ")";
+        ofLogNotice("Clock") << "Loading BPM from JSON: " << bpmValue << " (current: " << bpmBefore << ")";
         
-        // Set the target BPM (this will clamp if needed)
-        setBPM(bpm);
-        
-        // CRITICAL: Immediately sync currentBpm to targetBpm when loading from JSON
-        // This ensures the BPM is correct immediately, not after audio thread smoothing
-        // Without this, getBPM() would return the old currentBpm value until smoothing completes
-        float newTarget = targetBpm.load();
-        currentBpm.store(newTarget);
+        // Set the BPM (this will clamp if needed)
+        setBPM(bpmValue);
         
         float bpmAfter = getBPM();
-        float targetAfter = targetBpm.load();
-        ofLogNotice("Clock") << "BPM loaded - current: " << bpmAfter << ", target: " << targetAfter << " (requested: " << bpm << ")";
+        ofLogNotice("Clock") << "BPM loaded: " << bpmAfter << " (requested: " << bpmValue << ")";
     } else {
         ofLogWarning("Clock") << "JSON does not contain 'bpm' key, keeping current BPM: " << getBPM();
     }
