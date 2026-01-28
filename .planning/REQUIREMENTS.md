@@ -40,27 +40,28 @@
 | Scripting-Ref Branch | Deprecated over-complexified experimentation. |
 
 ## Traceability
+
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| INF-01 | Pending | Pending |
-| INF-02 | Pending | Pending |
-| INF-03 | Pending | Pending |
-| INF-04 | Pending | Pending |
-| GRPH-01 | Pending | Pending |
-| GRPH-02 | Pending | Pending |
-| GRPH-03 | Pending | Pending |
-| GRPH-04 | Pending | Pending |
-| MOD-01 | Pending | Pending |
-| MOD-02 | Pending | Pending |
-| MOD-03 | Pending | Pending |
-| UI-01 | Pending | Pending |
-| UI-02 | Pending | Pending |
-| UI-03 | Pending | Pending |
+| INF-01 | Phase 1 | Pending |
+| INF-02 | Phase 1 | Pending |
+| INF-03 | Phase 1 | Pending |
+| INF-04 | Phase 1 | Pending |
+| GRPH-01 | Phase 3 | Pending |
+| GRPH-02 | Phase 4 | Pending |
+| GRPH-03 | Phase 3 | Pending |
+| GRPH-04 | Phase 3 | Pending |
+| MOD-01 | Phase 2 | Pending |
+| MOD-02 | Phase 2 | Pending |
+| MOD-03 | Phase 2 | Pending |
+| UI-01 | Phase 5 | Pending |
+| UI-02 | Phase 5 | Pending |
+| UI-03 | Phase 5 | Pending |
 
 **Coverage:**
 - v1 requirements: 14 total
-- Mapped to phases: 0
-- Unmapped: 14 ⚠️
+- Mapped to phases: 14
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-01-28*
