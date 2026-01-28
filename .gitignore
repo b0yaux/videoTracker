@@ -65,10 +65,9 @@ addons/imgui/.git
 *.ini
 
 # Documentation and media (not source code)
-docs/
-screenshots/
 *.md
 !README.md
+!.planning/
 *.txt
 !CMakeLists.txt
 *.prd
