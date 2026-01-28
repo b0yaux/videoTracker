@@ -68,6 +68,7 @@ addons/imgui/.git
 *.md
 !README.md
 !.planning/
+!.planning/*.md
 *.txt
 !CMakeLists.txt
 *.prd
